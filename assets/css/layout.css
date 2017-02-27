@@ -1,0 +1,153 @@
+/*------------------------------------
+* sext
+*
+* @author linghua.zhang@me.com
+* @link http://lhzhang.com/
+* @update 2011-12-20
+* 
+* |/ | (~ (~
+* |\.|._)._)
+* --------------------------------- */
+/*
+@import url(http://fonts.googleapis.com/css?family=Galdeano);
+@import url(http://fonts.googleapis.com/css?family=Electrolize);
+@import url(http://fonts.googleapis.com/css?family=Cuprum);
+*/
+body{
+    margin-left:auto;
+    margin-right:auto;
+    font-family:"Galdeano","Hiragino Sans GB","Microsoft YaHei",Trebuchet,"Trebuchet MS",Tahoma,"Lucida Grande","Lucida Sans Unicode",Verdana,sans-serif;
+    color:#000000;
+    background-color:#ffffff;
+}
+header{
+    padding:.5em 10px;
+    border-bottom: 1px solid #cccccc;
+    color: #dd0000;
+    margin: 0px 10px;
+}
+nav{
+    font-family: "Electrolize",sans-serif;
+    font-size: 1.2em;
+    text-transform: uppercase;
+    float: left;
+    width: 9em;
+    text-align: right;
+    margin-left: -12em;
+    margin-top: -1em;
+}
+#description{
+    text-align: right;
+}
+#container{
+    width:750px;
+    margin:2em auto;
+    display:block;
+    padding:0.2em;
+    border-top: 6px solid #EE0000;
+    box-shadow: 0 0 10px 0 #cfcfcf;
+    min-height: 650px;
+}
+
+.content{
+    font-size:16px;
+    line-height:24px;
+    width:auto;
+    padding:20px;
+    min-height: 500px;
+}
+.row-fluid{
+    min-height: 450px;
+}
+.listing{
+    min-height:450px;
+}
+.paginator {
+    font: 14px Arial,Helvetica,sans-serif;
+    color: #AAA;
+    margin: 20px 0;
+    text-align: center;
+    line-height: 150%;
+    display: block;
+}
+footer{
+    display:block;
+    border-top: 1px dashed #CCC;
+    text-align: center;
+}
+
+#sidebar{
+    float:right;
+    margin-right: -350px;
+    margin-top: -134px;
+}
+#weibo{
+    width:230px;
+}
+#douban{
+    width: 230px;
+text-align: center;
+}
+#xiami{
+    margin-right: 80px;
+}
+
+#sidebar p{
+    text-align: center;
+    color:#dd0000;
+}
+
+#tag_cloud{
+    margin-bottom: 1em;
+}
+#tag_cloud a:hover{
+    color:#333333 !important;
+    text-decoration:none;
+}
+
+.listing-item,.listing-seperator{
+  list-style-type:none;
+}
+.listing-item a{
+    padding:.2em 1em;
+
+}
+
+
+.listing-item time{
+    color:#999999;
+    }
+.listing-seperator{
+    font-weight:bold;
+    }
+.meta{
+    text-align:right;
+    font-size:12px;
+    }
+
+.post{
+    padding:.5em 0em;
+    }
+
+
+embed,object,iframe{
+    display:block;
+    margin:4px auto;
+    }
+
+.paginator a,.paginator span{
+    padding: 0 4px;
+    margin: 2px;
+    text-decoration: none;
+}
+
+.paginator .current-page {
+    color: white;
+    background: #ff0000;
+}
+
+.paginator a:hover{
+    color: white;
+    background: #83BF73;
+}
+

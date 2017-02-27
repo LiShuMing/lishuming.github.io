@@ -1,0 +1,24 @@
+---
+layout: nil
+Title: Feed
+---
+
+<?xml version="1.0" encoding="UTF-8"?>
+
+<feed xmlns="http://www.w3.org/2005/Atom">
+
+	<title type="text" xml:lang="en">{{ site.description }}</title>
+	<link type="application/atom+xml" href="http://alemontree.com/assets/include/" rel="self"/>
+	<link type="text" href="http://alemontree.com" rel="alternate"/>
+
+  {% for post in site.posts limit:10 %}
+	  <entry>
+      <title>{{ post.title | xml_escape }}</title>
+      <link href="{{ site.url }}{{ post.url }}"/>
+      <updated>{{ post.date | date_to_xmlschema }}</updated>
+      <author>{{ site.author }}</author>
+      <id>{{ site.url }}{{ post.id }}</id>
+      <content type="html">{{ post.content | xml_escape }}{% include rss_footer.html %}</content>
+ 	  </entry>
+  {% endfor %}
+/feed>

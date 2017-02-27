@@ -1,0 +1,51 @@
+<!DOCTYPE HTML>
+<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="en" lang="en-us">
+  <head>
+    <meta name="baidu-site-verification" content="1n8gVseD2X" />
+    <meta property="qc:admins" content="1567134637614557642556375" />
+    <meta property="wb:webmaster" content="9953317856bae37b" />
+    
+    <meta http-equiv="content-type" content="text/html; charset=utf-8" />
+    <meta name="author" content="{{ site.author }}" />
+    <title>{{page.title}}|{{site.author}}|柠檬树|alemontree</title>
+    <link rel="shortcut icon" href="lsm.ico">
+
+    <link rel="stylesheet" type="text/css" href="{{ BASE_PATH }}/assets/css/layout.css">
+    <link rel="stylesheet" type="text/css" href="{{ BASE_PATH }}/assets/css/style.css">
+
+    <script type="text/javascript" src="/media/js/jquery-1.7.1.min.js"></script>
+  </head>
+  <body>
+    <div id="container">
+
+      <div id="main" role="main">
+
+        <header>
+        <nav>
+          <span><a href="/" class="navigator" title="Go to homepage">HOME</a></span>
+          <span><a href="{{ BASE_PATH }}/assets/include/categories.html" class="navigator" title="Category" >CATEGORIES</a></span>
+          <span><a href="{{ BASE_PATH }}/assets/include/tags/tags.html" class="navigator" title="Tag Cloud" >TAGS</a></span>
+          <span><a href="{{ BASE_PATH }}/assets/include/links/links.html" class="navigator" title="Link">LINKS</a></span>
+          <span><a href="{{ BASE_PATH }}/assets/include/about/about.html" class="navigator" title="About" >ABOUT</a></span>
+          <span><a href="{{ BASE_PATH }}/assets/include/feed/feed.html" class="navigator" title="Subscribe by RSS" >RSS</a></span>
+        </nav>
+        <h1>{{ site.title }}</h1>
+        <div id="description">{{ site.description }}</div>
+        </header>
+
+        <article class="content">
+        {{ content }}
+        </article>
+
+     </div>
+
+    <footer>
+        <p><small>Powered by <a href="https://github.com/mojombo/jekyll">Jekyll</a> | Copyright 2013.11.11 - {{site.time | date:"%Y.%m.%d"}} by <a href="{{ BASE_PATH }}/assets/include/about/about.html">Mr.Think</a> | <span class="label label-info">{{site.time | date:"%Y-%m-%d %H:%M:%S %Z"}}</span></small></p>
+    </footer>
+   </div>
+    
+    
+
+</body>
+   
+</html>

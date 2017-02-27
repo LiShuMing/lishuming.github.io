@@ -1,0 +1,7 @@
+markdown: kramdown 
+highlighter: pygments
+paginate: 16
+
+title: Aphasia
+description: Cogito ergo sum.
+author: Mr.Think
