@@ -7,5 +7,3 @@ description: Cogito ergo sum.
 author: Mr.Think
 # Gems
 gems: [jekyll-paginate]
-
-theme: jekyll-theme-slate
