@@ -1,0 +1,8 @@
+cmake-build-debug/
+.idea/
+.vscode
+1
+target/
+*.out
+.gdb_history
+*.swp
