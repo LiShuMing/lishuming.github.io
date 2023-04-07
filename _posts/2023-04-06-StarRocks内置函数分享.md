@@ -1,6 +1,6 @@
 ---  
 layout: post  
-title: 毕业即是回忆  
+title: StarRocks内置函数分享
 categories: 技术分享-summary  
 tags: 2023
 ---  
@@ -176,5 +176,5 @@ TableFunction的定义主要有这几个函数：
 - 如果开发后发现有其他时间没法完成了，也没关系，联系我们的社区同学，以便于重新assign。
 
 ### 福建
-- ![如何在StarRocks中添加内置函数?.key](/assets/ppts/2023/如何在StarRocks中添加内置函数?.key.jpg)
+- ![如何在StarRocks中添加内置函数?.key](/assets/ppts/2023/如何在StarRocks中添加内置函数?.key)
 - ![内置函数分享.pdf](/assets/ppts/2023/内置函数分享.pdf)
