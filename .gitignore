@@ -6,3 +6,5 @@ target/
 *.out
 .gdb_history
 *.swp
+.DS_Store
+tags
