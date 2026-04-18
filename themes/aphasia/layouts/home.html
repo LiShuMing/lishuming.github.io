@@ -1,0 +1,40 @@
+{{ define "main" }}
+<ul class="listing">
+{{ $paginator := .Paginate (where .Site.RegularPages "Type" "posts") }}
+{{ $year := "" }}
+{{ range $paginator.Pages }}
+  {{ $y := .Date.Format "2006-01" }}
+  {{ if ne $year $y }}
+    {{ $year = $y }}
+    <li class="listing-seperator">{{ $y }}</li>
+  {{ end }}
+  <li class="listing-item">
+    <time datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>
+    <a href="{{ .RelPermalink }}" title="{{ .Title }}">{{ .Title }}</a>
+  </li>
+{{ end }}
+</ul>
+
+<div id="post-pagination" class="paginator">
+  {{ if $paginator.HasPrev }}
+    <a href="{{ $paginator.Prev.URL }}">&lt;前页</a>
+  {{ else }}
+    <span class="previous disabled">&lt;前页</span>
+  {{ end }}
+
+  {{ range $paginator.Pagers }}
+    {{ if eq . $paginator }}
+      <span class="current-page">{{ .PageNumber }}</span>
+    {{ else }}
+      <a href="{{ .URL }}">{{ .PageNumber }}</a>
+    {{ end }}
+  {{ end }}
+
+  {{ if $paginator.HasNext }}
+    <a class="next" href="{{ $paginator.Next.URL }}">后页&gt;</a>
+  {{ else }}
+    <span class="next disabled">后页&gt;</span>
+  {{ end }}
+  (共{{ $paginator.TotalNumberOfElements }}篇)
+</div>
+{{ end }}
