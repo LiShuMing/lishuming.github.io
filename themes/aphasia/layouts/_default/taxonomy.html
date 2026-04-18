@@ -1,0 +1,31 @@
+{{ define "main" }}
+<div id='tag_cloud'>
+{{ range .Data.Terms.ByCount }}
+  <a href="{{ .Page.RelPermalink }}" title="{{ .Page.Title }}" rel="{{ .Count }}">{{ .Page.Title }} ({{ .Count }})</a>
+{{ end }}
+</div>
+
+<ul class="listing">
+{{ range .Data.Terms.ByCount }}
+  <li class="listing-seperator" id="{{ .Page.Title }}">{{ .Page.Title }}</li>
+  {{ range .Pages }}
+  <li class="listing-item">
+    <time datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>
+    <a href="{{ .RelPermalink }}" title="{{ .Title }}">{{ .Title }}</a>
+  </li>
+  {{ end }}
+{{ end }}
+</ul>
+
+<script src="/media/js/jquery.tagcloud.js" type="text/javascript" charset="utf-8"></script>
+<script language="javascript">
+$.fn.tagcloud.defaults = {
+    size: {start: 1, end: 1, unit: 'em'},
+    color: {start: '#f8e0e6', end: '#ff3333'}
+};
+
+$(function () {
+    $('#tag_cloud a').tagcloud();
+});
+</script>
+{{ end }}

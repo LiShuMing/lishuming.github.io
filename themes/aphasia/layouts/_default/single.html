@@ -1,0 +1,55 @@
+{{ define "main" }}
+<section class="post">
+{{ .Content }}
+</section>
+<section class="meta">
+<span class="author">
+  <a href="">{{ .Site.Params.author }}</a>
+</span>
+<span class="time">
+  /
+  <time datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>
+</span>
+<br />
+
+{{ if .Params.categories }}
+<span class="categories">
+  In categories
+  {{ range .Params.categories }}
+  <a href="{{ "/categories/" | relURL }}{{ . | urlize }}" title="{{ . }}">{{ . }}</a>&nbsp;
+  {{ end }}
+</span>
+{{ end }}
+{{ if .Params.tags }}
+<span class="tags">
+  tagged with 
+  {{ range .Params.tags }}
+  <a href="{{ "/tags/" | relURL }}{{ . | urlize }}" title="{{ . }}">{{ . }}</a>&nbsp;
+  {{ end }}
+</span>
+{{ end }}
+</section>
+
+{{ partial "disqus.html" . }}
+
+<script type="text/javascript">
+$(function(){
+  $(document).keydown(function(e) {
+    var url = false;
+    if (e.which == 37 || e.which == 74) {
+      {{ with .PrevInSection }}
+      url = '{{ .Permalink }}';
+      {{ end }}
+    }
+    else if (e.which == 39 || e.which == 75) {
+      {{ with .NextInSection }}
+      url = '{{ .Permalink }}';
+      {{ end }}
+    }
+    if (url) {
+      window.location = url;
+    }
+  });
+})
+</script>
+{{ end }}

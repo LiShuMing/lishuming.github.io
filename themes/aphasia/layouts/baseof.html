@@ -1,0 +1,39 @@
+<!DOCTYPE HTML>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="author" content="{{ .Site.Params.author }}" />
+    <title>{{ if .IsHome }}{{ .Site.Title }}{{ else }}{{ .Title }} | {{ .Site.Params.author }}{{ end }} | 柠檬树 | alemontree</title>
+    <link rel="shortcut icon" href="/lsm.ico">
+
+    <link rel="stylesheet" type="text/css" href="/assets/css/layout.css">
+    <link rel="stylesheet" type="text/css" href="/assets/css/style.css">
+    <link rel="stylesheet" type="text/css" href="/assets/css/highlight.css">
+
+    <script type="text/javascript" src="/media/js/jquery-1.7.1.min.js"></script>
+    {{ block "extra_head" . }}{{ end }}
+  </head>
+  <body>
+    <div id="container">
+      <div id="main" role="main">
+        <header>
+          <nav>
+            {{ range .Site.Menus.main }}
+            <span><a href="{{ .URL }}" class="navigator" title="{{ .Name }}">{{ .Name }}</a></span>
+            {{ end }}
+          </nav>
+          <h1>{{ .Site.Title }}</h1>
+          <div id="description">{{ .Site.Params.description }}</div>
+        </header>
+
+        <article class="content">
+        {{ block "main" . }}{{ end }}
+        </article>
+      </div>
+
+      <footer>
+        <p><small>Powered by <a href="https://gohugo.io/">Hugo</a> | Copyright 2013.11.11 - {{ now.Format "2006.01.02" }} by <a href="/about/">Mr.Think</a> | <span class="label label-info">{{ now.Format "2006-01-02 15:04:05 MST" }}</span></small></p>
+      </footer>
+    </div>
+  </body>
+</html>

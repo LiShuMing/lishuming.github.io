@@ -1,0 +1,51 @@
+baseURL = 'https://alemontree.com'
+languageCode = 'zh-CN'
+title = 'Aphasia'
+author = 'Mr.Think'
+description = 'Cogito ergo sum.'
+theme = 'aphasia'
+
+[params]
+  author = 'Mr.Think'
+  description = 'Cogito ergo sum.'
+
+[menu]
+  [[menu.main]]
+    name = 'HOME'
+    url = '/'
+    weight = 10
+  [[menu.main]]
+    name = 'CATEGORIES'
+    url = '/categories/'
+    weight = 20
+  [[menu.main]]
+    name = 'TAGS'
+    url = '/tags/'
+    weight = 30
+  [[menu.main]]
+    name = 'LINKS'
+    url = '/links/'
+    weight = 40
+  [[menu.main]]
+    name = 'ABOUT'
+    url = '/about/'
+    weight = 50
+  [[menu.main]]
+    name = 'RSS'
+    url = '/index.xml'
+    weight = 60
+
+[pagination]
+  pagerSize = 16
+
+[permalinks]
+  posts = '/:year/:month/:day/:slug/'
+
+[markup]
+  [markup.goldmark]
+    [markup.goldmark.renderer]
+      unsafe = true
+
+[taxonomies]
+  tag = 'tags'
+  category = 'categories'
