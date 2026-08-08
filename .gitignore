@@ -12,3 +12,8 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+.deepseekgui-images/
+.kun-canvas/
+.kun-design/
+.kun/
+.obsidian/
