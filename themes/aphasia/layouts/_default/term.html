@@ -3,7 +3,7 @@
 <ul class="listing">
 {{ range .Pages }}
   <li class="listing-item">
-    <time datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>
+    {{ if not .Date.IsZero }}<time datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>{{ end }}
     <a href="{{ .RelPermalink }}" title="{{ .Title }}">{{ .Title }}</a>
   </li>
 {{ end }}
