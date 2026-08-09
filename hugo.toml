@@ -43,6 +43,9 @@ theme = 'aphasia'
     endLevel = 3
     ordered = false
   [markup.goldmark]
+    [markup.goldmark.parser]
+      [markup.goldmark.parser.attribute]
+        block = true
     [markup.goldmark.renderer]
       unsafe = true
 
