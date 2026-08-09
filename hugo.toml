@@ -23,10 +23,6 @@ theme = 'aphasia'
     url = '/tags/'
     weight = 30
   [[menu.main]]
-    name = 'LINKS'
-    url = '/links/'
-    weight = 40
-  [[menu.main]]
     name = 'ABOUT'
     url = '/about/'
     weight = 50
@@ -42,6 +38,10 @@ theme = 'aphasia'
   posts = '/:year/:month/:day/:slug/'
 
 [markup]
+  [markup.tableOfContents]
+    startLevel = 2
+    endLevel = 3
+    ordered = false
   [markup.goldmark]
     [markup.goldmark.renderer]
       unsafe = true

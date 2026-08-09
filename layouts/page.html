@@ -1,0 +1,42 @@
+{{ define "main" }}
+{{- $hasToc := gt (len (findRE "<li>" .TableOfContents)) 0 -}}
+{{- $showToc := and (ne .Params.toc false) $hasToc -}}
+
+<div class="post-layout{{ if not $showToc }} post-layout--without-toc{{ end }}">
+  {{ if $showToc }}
+  <aside class="post-toc" aria-label="文章目录">
+    <details open>
+      <summary>文章目录</summary>
+      {{ .TableOfContents }}
+    </details>
+  </aside>
+  {{ end }}
+
+  <div class="post-main">
+    <section class="post">
+    {{ .Content }}
+    </section>
+  </div>
+</div>
+
+<script type="text/javascript">
+(function() {
+  var tocDetails = document.querySelector('.post-toc details');
+  var compactToc = window.matchMedia('(max-width: 65rem)');
+  if (tocDetails && compactToc.matches) {
+    tocDetails.removeAttribute('open');
+  }
+
+  if (tocDetails) {
+    var tocLinks = tocDetails.querySelectorAll('a');
+    for (var i = 0; i < tocLinks.length; i++) {
+      tocLinks[i].addEventListener('click', function() {
+        if (compactToc.matches) {
+          tocDetails.removeAttribute('open');
+        }
+      });
+    }
+  }
+})();
+</script>
+{{ end }}
