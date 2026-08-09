@@ -1,181 +1,647 @@
 ---
-title: StarRocks内置函数分享
+title: "StarRocks 内置函数实现原理：从函数解析到向量化执行"
+slug: "starrocks内置函数分享"
 date: 2023-04-06T00:00:00+08:00
+lastmod: 2026-08-09T00:00:00+08:00
 categories:
-  - 技术分享-summary
+  - 数据库
 tags:
-  - 2023
+  - StarRocks
+  - 内置函数
+  - 向量化执行
+  - 源码分析
+description: "结合 StarRocks 源码，系统分析标量函数、聚合函数、窗口函数和表函数从 FE 解析、函数注册到 BE 向量化执行的完整实现链路。"
+draft: false
 ---
 
-# 内置函数分享
+## 摘要
 
-大家好，我是StarRocks的Contributor，我叫李书明。今天是“源码实验”的第一期活动，想和大家分享下，“在StarRocks中如何添加内置函数？”
+内置函数看起来只是 SQL 表达式中的一个局部能力，实际上却横跨了数据库的类型系统、语义分析、执行计划、向量化数据模型、分布式聚合和 Pipeline 执行框架。一个函数能否正确工作，不只取决于“计算公式是否正确”，还取决于以下契约是否一致：
 
-就像编程语言中的函数一样，数据库中的函数执行逻辑也是根据输入参数计算函数的具体实现，然后返回输出结果。那么下面就聊一聊StarRocks中的函数。
+- FE 能否根据函数名和参数类型找到唯一、合法的函数签名；
+- FE 与 BE 是否对函数 ID、参数类型、返回类型和中间状态达成一致；
+- 实现能否正确处理普通列、常量列、Nullable 列、空批次和复杂类型；
+- 有状态函数能否在并行执行、分布式 Shuffle 和多阶段聚合中正确合并；
+- 函数申请的资源能否在 Fragment 和执行线程两个作用域内安全初始化与释放；
+- 实现是否保持 SQL 所要求的行数关系、NULL 语义和错误行为。
 
-在开始之前，先介绍下本次分享的大致内容，本次活动面向的是想在StarRocks中贡献的开发者，想通过本次活动能够帮助“新同学”源码开发StarRocks并贡献到社区，所以也想本次分享过程也会介绍下操作流程。总体包含4块内容：
+本文以本地 StarRocks 源码提交 [0fd27fd409f3a1ad8a4634d30baf8f22f48254f1](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1) 为分析基线，从四类函数的共同基础出发，逐步还原它们从 FE 到 BE 的完整调用链，并给出新增函数时需要关注的工程要点。
 
-1. 介绍下内置函数相关的背景内容，了解下实现一个内置函数相关的概念；
-2. 介绍下内置函数的实现原理，从实现接口、实现原理上能有个清晰的认识；
-3. 介绍下真实的操作流程及注意事项；
-4. 推广下我们最近的“Function Tasks”活动，可以在我们的TaskLists认领想要贡献的函数，并有机会获得奖品。
+> 本文讨论的是实现模型，而不是某个版本的函数清单。函数数量、UDF 能力和源码目录可能继续演进，因此阅读其他版本源码时应以对应分支为准。
 
-函数与表达式是整个数据库中实现核心计算逻辑的关键，因此在实践的过程中，会对StarRocks的类型系统、表达式执行及算子的执行有更加具体、全面的认识。同时函数、表达式的执行是计算密集型的，因此其对性能的要求非常高，所以在真正的实现过程中，会用到矢量化、SIMD及各种各样的Morden C++的使用技巧。函数实现是一门非常很技巧/技术含量的事情，也只有在实现过程中能够体会到“酸爽”的快感。欢迎大家踊跃尝试。
+## 一、先建立统一认识：函数的四种执行模型
 
-### 1. StarRocks内置函数背景介绍
+从 SQL 语义和输入、输出的行数关系看，StarRocks 中最常见的函数可以分为四类。
 
-下面开始第一部分，内置函数的背景介绍。
+| 函数类型 | 典型函数 | 输入与输出的关系 | 是否维护状态 | 主要执行载体 |
+| --- | --- | --- | --- | --- |
+| 标量函数（Scalar Function） | `abs`、`lower`、`json_query` | 一行输入对应一行输出 | 通常无状态，也可维护只读辅助状态 | 表达式树 |
+| 聚合函数（Aggregate Function） | `sum`、`avg`、`count` | 多行输入归约为一行或每组一行 | 是 | 聚合算子 |
+| 窗口函数（Window Function） | `row_number`、`rank`、`lead` | 通常保持输入行数，每行产生一个结果 | 是 | Analytic/Window 算子 |
+| 表函数（Table Function） | `unnest`、`json_each`、`generate_series` | 一行输入可展开为零行、一行或多行 | 可选 | Table Function 算子 |
 
-我们先看下函数的分类，根据输入、输出的对应关系，可以将函数分为三类：
+原演讲稿曾提出一个问题：为什么窗口函数经常没有被单独放进“输入到输出”的三分法中？
 
-- 1行输入对1行输出的，我们称为ScalarFunction，标量函数。像常见的abs/upper/lower等。
-- 多行输入对应1行输出的，我们称为AggregateFunction，聚合函数。像常见的min/max/sum/count。
-- 一行输入对应多行输出的，我们称为TableFunction，有时也叫SetReturnFunction。常见的unnest，将一行array展开为多行。
+原因在于，这里混合了两个分类维度：
 
-而除了上述分类方法之外，也可以按照函数的实现来分：
+1. 从 **SQL 语义** 看，窗口函数当然是一类独立函数。它不会像普通聚合那样减少结果集行数，而是在分区、排序和窗口范围上为每一行计算结果。
+2. 从 **执行实现** 看，窗口函数和聚合函数都需要维护状态，因此 StarRocks 复用了 `AggregateFunction` 的部分状态接口，再由 Analytic 算子负责 Partition、Peer Group 和 Frame 的推进。
 
-- 内置于数据库执行引擎内部的，用户直接可以用的，我们称为内置函数。
-- 而用户可以通过自己的代码实现其自定义的执行逻辑的，同时支持动态加载的，我们称之为user defined function，同时也按照上述的分类方法，又分为UDF/UDAF/UDTF，不同的系统支持不同语言的UDF，比如可以用SQL/python/c++/java实现的。而甚至有些引擎开始支持用WASM支持自定义函数。
+所以更准确的结论是：**窗口函数在语义上独立，在底层状态抽象上与聚合函数共享基础设施。**
 
-有小伙伴会问，我们常说的WindowFunction怎么没有分到？小伙伴们可以想一想，下面的介绍会给出答案。
+UDF 则是另一条分类轴。Scalar、Aggregate、Window 和 Table 描述的是函数的执行语义；Built-in 与 UDF 描述的是函数由系统静态内置，还是由用户动态扩展。二者不能混为一谈。
 
-而同样在StarRocks我们也有内置函数和用户自定义函数，而本次分享的主题就是怎么实现一个内置函数，这样一次代码贡献就可以让所有的StarRocks用户用到，是很有成就感的一件事情。除此之外，我们也支持用户自定义函数，不过我们目前仅支持Java实现UDF。关于目前StarRocks内置函数及Java UDF的实现可以参考我们的官方文档及Github上的文档介绍。
+## 二、贯穿所有函数的三层契约
 
-下面看看怎么样在10行以内实现一个内置函数？左边这个就是仅仅用了7行代码就实现了一个最简单”hello world”的dummy function。这个是一个标量函数，简单来说就两块内容，函数实现及函数注册，上面就是实现、下面是函数的注册。代码添加后，编译运行就可以像其他内置函数一样查询了。
+无论函数属于哪一种执行模型，它都必须跨越 FE、Thrift 和 BE 三层。可以把总体链路概括为：
 
-函数的实现需要定义函数的输入参数和输出参数类型，我们先看看StarRocks支持的类型。这里介绍了三个地方的类型，Thrift协议中定义的类型及FE、BE定义的类型映射关系。类型可以分为两大类，Primitive简单类型和Nested类型，复杂的嵌套类型，目前最新的3.0版本中我们都有支持。在FE中，PrimivitiveType类定义了FE到Thrift协议类型的映射，CataLog.Type是类型实现的抽象类，具体实现有ScalarType/ArrayType/MapType和StructType。在BE中，类型定义在logical_type.h文件中，除了提供跟Thrift协议一一映射的类型，同时还基于C++ traits和宏定义提供了方便类型匹配的模版函数，这样就可以在编译器基于TypeDispatch优化根据不同的类型执行特定类型的代码，甚至可以做特定的优化，消除了类型抽象的代价，减少执行开销。但弊端是代码膨胀、编译也会变慢。
+~~~text
+SQL 文本
+   |
+   v
+FE Parser -> FunctionCallExpr -> ExpressionAnalyzer
+   |                              |
+   |                              +-- 参数类型推导、隐式转换、重载选择
+   |                              +-- 从 FunctionSet 查找函数签名
+   v
+TExpr / TFunction / TTypeDesc
+   |
+   v
+BE 表达式或算子
+   |
+   +-- Scalar  -> VectorizedFunctionCallExpr -> ScalarFunction
+   +-- Aggregate -> AggregateFunction + Aggregate Operator
+   +-- Window  -> AggregateFunction/WindowFunction + Analytic Operator
+   +-- Table   -> TableFunction + TableFunctionOperator
+   |
+   v
+Column / Chunk
+~~~
 
-不同的数据类型映在BE测则是基于Column保存的。Column是StarRocks数据在内存中保存的数据结构，这个也是矢量化处理的基础，每个Column就是一列数据，多个Column就组成了Chunk。Column是基类，它提供了基本的操作函数，包括append添加数据、serialize序列化等操作。其派生类有FixedLengthColumn、BinaryColumn、JsonColumn、ArrayColumn、MapColumn等，而FixedLengthColumn作为模板类，可以根据不同的模板参数展开为固定长度的数据类型Column。
+这条链路中存在三个必须同时成立的契约。
 
-除了数据类型Column，之外需要特别注意的两个常见Column，ConstColumn和NullableColumn，它们都是Column的派生类。
+### 2.1 类型契约：同一个 SQL 类型在三层中的表示
 
-ConstColumn表示这列数据都是相同的，只用1行数据表示，但真实长度则通过size来确定，访问任何一行数据，只需要返回第一行数据既可以，这样方便做一些特定函数的处理，比如标量函数中，针对ConstColumn可以只需要处理一行既可以返回。
+| 层次 | 主要表示 | 作用 |
+| --- | --- | --- |
+| FE | `Type`、`ScalarType`、`ArrayType`、`MapType`、`StructType` 等 | SQL 语义检查、重载匹配、隐式转换和返回类型推导 |
+| Thrift | `TTypeDesc`、`TTypeNode`、`TPrimitiveType` | 在 FE 与 BE 之间序列化类型信息 |
+| BE | `TypeDescriptor`、`LogicalType`、`RunTimeTypeTraits` 等 | 选择物理 Column、模板实例和执行路径 |
 
-NullableColumn表示该数据Column是有Null值，包含了数据Column和Null值Column，其中Null值Column是一个uint_8的定长Column，通过0/1标识该行是否为空，1表示null, 0表示非null。
+FE 的类型系统位于 [fe/fe-type/src/main/java/com/starrocks/type](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-type/src/main/java/com/starrocks/type)，跨进程描述定义在 [gensrc/thrift/Types.thrift](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/gensrc/thrift/Types.thrift)，BE 的逻辑类型入口则是 [be/src/types/logical_type.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/types/logical_type.h)。
 
-而在函数处理，一定要小心，需要首先确定输入的Column是普通的Column还是ConstColumn、Nullable，对ConstColumn和NullableColumn一定要特定的处理。这里就不一一说明了，在真正写代码的时候，也建议增加ConstColumn/NullableColumn输入测试，我们遇到过很多这种CornerCase的bug，写代码的时候也要小心。值得一提的是，嵌套类型（array/map/struct)内部实现也是嵌套了多个Column组成的，相较于普通的数据类型需要展开后才能处理，增加了额外的难度，使用时也需要注意。
+函数开发中常见的一类错误，是只在 BE 增加了模板实例，却没有同步 FE 签名；或者 FE 声明的返回类型与 BE 实际返回的 Column 不一致。这类问题未必在编译阶段暴露，可能直到计划下发、表达式初始化甚至查询运行时才失败。
 
-最后也多提一句函数和表达式的关系，表达式是查询引擎中更加基础的概念，它不仅包含函数表达式还包含了SQL标准中的非函数表达，比如case when,比如算数表达式、比如Predicate表达式等等。而SclarFunction对应的则是VectorizedFunctionCallExpr表达式。而其他函数，比如AggFunction和TableFunction则是算子实现框架的一部分，并没有通过表达式框架来实现。最后强调一点，函数、表达式应该是实现StarRocks高性能的很重要的一部分，也是矢量化执行很重要的一部分，其核心逻辑是按列处理，并在此基础上做更多算法及SIMD优化。
+### 2.2 数据契约：函数处理的是 Column，而不是单个值
 
-### 2. StarRocks的函数原理
+StarRocks 的 BE 采用向量化执行。算子以 `Chunk` 为批次传递数据，`Chunk` 中的每个字段由一个 `Column` 表示。标量函数的核心签名不是传统意义上的：
 
-好，我们在介绍每类函数的实现原理。我们先说标量函数，聚合函数、窗口函数及Table函数我们后面会一一介绍。
+~~~cpp
+Value function(Value input);
+~~~
 
-StarRocks的核心代码，分为两大块，FE和BE，其中FE用Java编写，BE则用C++编写。针对标量函数，FE测首先从SQL中将函数解析为FunctionCallExpr，然后再ExpressionAnalyze阶段根据函数id及输入、输出参数类型从函数表中获取对应的函数，并在Fragment分发阶段转换成对应的Thrift Plan。
+而是：
 
-而在BE测，表达式初始化阶段会从thrift中生成VectorizedFunctionCallExpr，并prepare阶段通过函数id在BE测的函数表中获取相应的函数，并在Open阶段调用函数定义的prepare_func，然后不断的get_next执行函数逻辑，最后Close阶段调用函数定义的close_func，释放状态资源。多说一句关于函数实现定义中的`FunctionContext`参数，该参数保存了函数声明周期内的状态，便于在各个阶段交互，比如常量参数、参数类型以及内存使用等。
+~~~cpp
+StatusOr<ColumnPtr> function(FunctionContext* context, const Columns& columns);
+~~~
 
-在be测添加了一个函数接口之后，如何让这个函数可以用起来？下面再讲讲，刚刚那个例子中的注册逻辑实现的原理。针对标量函数，目前基于Python脚本将fe/be的实现了注册流程的自动化。只需要在functions.py中添加一行注册逻辑就行。
+也就是说，函数一次处理一批值。常见 Column 类型包括：
 
-这个注册代码包含了这几个字段，包括：函数id（必须保障其唯一性）、函数名、函数的返回类型以及函数的输入类型。同时也包括两个可选部分，如果函数依赖些状态传递，则需要实现prepare_func和close_func，比如函数有多个参数时，当有的参数是常量时，就可以在Prepare时将该参数解析并在close时销毁。
+| Column | 物理含义 | 函数实现需要关注的内容 |
+| --- | --- | --- |
+| `FixedLengthColumn<T>` | 定长数值、日期等连续数组 | 模板类型与 LogicalType 是否匹配 |
+| `BinaryColumn` | 字符串或二进制数据 | offsets、bytes 生命周期和追加成本 |
+| `NullableColumn` | 数据列加一份 NULL 位图 | NULL 传播、结果位图和数据列行数一致性 |
+| `ConstColumn` | 一个物理值表示一批相同的逻辑值 | 不能假设底层数据列与逻辑行数相同 |
+| `ArrayColumn`、`MapColumn`、`StructColumn` | 嵌套列 | 子列、offsets 和多层 Nullable 的一致性 |
+| `JsonColumn`、`VariantColumn` | 半结构化数据 | 类型分派、解析成本和异常路径 |
 
-StarRocks的标量函数支持多个输入参数也支持变参，可以根据需要灵活定义注册。添加完这个注册代码之后，在编译阶段会将该注册逻辑同时添加到FE和BE的代码中。在FE启动的时候，就会调用initBuiltins将内置函数注册到内存中，SQL运行期间就可以查到该内置函数的定义了。
+相关实现可以从 [be/src/column/column.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/column/column.h) 和 [be/src/column/chunk.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/column/chunk.h) 开始阅读。
 
-而类似，在BE测同样也会维护一个function_id到函数的映射。在函数表达式执行期间会根据function_id查找对应的函数。具体实现在BuiltInFunctions::find_builtin_function定义中。
+`ConstColumn` 与 `NullableColumn` 尤其容易被低估：
 
-说完了标量函数，我们再说聚合函数，同样整体逻辑也包含两大块，函数实现及函数注册，先说函数实现。聚合函数相较于标量函数，稍微复杂是：
+~~~text
+ConstColumn
+  logical size = N
+  data column   = [value]
 
-- 在分布式调度执行逻辑中，聚合函数一般都会有多个阶段的，先会在本机做预聚合（local aggregate），然后再根据GroupByKey Shuffle之后再做聚合(final agg)。当然对于有distinct的聚合，可能还有3阶段、4阶段，这里就不展开了，有兴趣的同学可以自己试着阅读下SQL影响的Plan。
-- 还有一点是聚合函数必须要维护一个函数状态，用于预聚合和最终聚合时计算使用，比如sum agg，需要为维护一个总和值，在update或者merge时都需要更新该状态。函数状态也是函数实现的一部分了。
+NullableColumn
+  data column = [v0, v1, v2, ...]
+  null bitmap = [ 0,  1,  0, ...]
+~~~
 
-了解了agg函数的背景之后，我们看看实现一个agg函数所需要实现的几个主要接口。
+函数不能直接把所有输入都强制转换成普通数据列。更稳妥的实现方式是使用 `ColumnViewer`、`ColumnBuilder`、`ColumnHelper` 或项目中已有的函数模板，将常量展开、NULL 检查和结果构造交给统一辅助设施。对于复杂类型，还要继续处理子列自身的 Nullable 和 offsets。
 
-- update： 这个用于local agg，读取数据、不断地更新中间状态；
-- serialize_to_column：在local agg结束以后，需要做Shuffle，这个时候需要将中间状态序列化成可以网络传输的列，很多状态都是直接基于BinaryColumn传输的。这个类型是在注册时指定的，后面会讲到；
-- merge： 在final 阶阶段，agg算子的输入是已经预处理过的中间状态，这个时候调用merge函数对中间状态结果进行合并、更新；
-- finalize_to_column：当final阶段处理完之后，需要将中间状态生成最终的结果，需要调用final_to_column函数，输出到指定结果类型的列。
+因此，一个标量函数至少应验证以下输入组合：
 
-以上四个函数是聚合函数最重要的实现，除此之外还有些其他的一些接口，用作不同的目的，这里特别介绍的是convert_to_serialize_format接口，这个接口的实现是说当local agg聚合时发现预聚合没有太多用，group by key比较稀疏，就不多处理了，直接将input的原始数据按照中间状态类型输出结果。目前的这个实现是自适应的，因此实现agg函数的时候也要实现该接口。
+- 普通列；
+- 常量列；
+- Nullable 列；
+- 常量 Nullable 列；
+- 全 NULL；
+- 空 Chunk；
+- 边界值、非法值和超长输入；
+- 如果支持复杂类型，还包括空数组、NULL 元素和嵌套 Nullable。
 
-说完了agg函数的实现，讲一讲agg函数的注册逻辑。跟标量函数一样，同样需要在FE和BE测都需要注册，但是不一样的是聚合函数目前没有一个框架自动实现，需要开发者分别在FE、BE相应的代码上添加。现在StarRocks已经内置了大量的聚合函数，同学们也不用担心，可以参考下这些聚合函数的实现代码。在FE测，当新增一个内置函数式，需要在registerBuiltinAvgAggFunction中注册该聚合函数，要添加上每一个输入类型、输出类型及中间状态类型的可能。在BE测，则是有aggregate functions resolver实现的，之前这个文件太大了编译起来很耗时，现在拆成了多个函数，比如avg函数的注册方式就在register_avg定义中。
+### 2.3 身份契约：FE 与 BE 必须找到同一个函数
 
-聚合函数讲完了，我们再说一下窗口函数，窗口函数从其实现上，也是继承于聚合函数，因为它的处理逻辑也是多行输入返回一行输出结果。但不同的是聚合函数是讲相同的group by key聚合，而窗口函数则是按照窗口范围聚合数据聚合的。我们先了解下窗口函数的窗口是怎么定义的？
+FE 完成重载选择后，会把函数签名及函数标识序列化进执行计划。BE 收到计划后，再根据标识找到真正的执行实现。函数 ID 因而不是普通的内部序号，而是连接 FE 签名与 BE 实现的稳定身份。
 
-窗口函数支持两种Frame类型，Rows和Range，Rows是根据行数定义范围的。Range则是按照数据值的范围定义的，比如range between。默认窗口是Range between unbounded preceding and current。而窗口函数从分类上可以分为3类：
+如果函数名、参数类型和返回类型都正确，但 FE 与 BE 使用了不同的 ID，BE 仍会报“找不到函数实现”。反过来，重复使用一个 ID 也会导致生成阶段或运行时映射冲突。
 
-- 普通聚合函数的，比如count/sum/avg都可以用作窗口函数
-- 排序类型：rank/dense_rank/row_number，这类函数只能使用无界窗口；
-- 分析类型：lead/lag/first_value、last_value；
+## 三、标量函数：从 SQL 调用到向量化计算
 
-StarRocks目前也实现了不少对应的窗口函数，在实现过程中也可以参考下实现。
+标量函数是理解内置函数机制的最佳入口，因为它完整展示了函数解析、代码生成、执行生命周期和 Column 计算模型。
 
-WindowFunction是继承AggreteFunction实现的，但额外增加了针对窗口的实现接口。窗口函数目前实现都是单阶段的，不用考虑分布式问题。其核心接口就是这三个：
+### 3.1 FE：函数解析与重载选择
 
-- update_batch_single_state_with_frame，根据窗口的边界更新窗口函数
-- get_values：获取(start, end)范围内的聚合结果。
-- reset，会在Frame结束后调用。
+以 `abs(col)` 为例，FE 大致经历以下过程：
 
-这里要区分几个概念：
+1. Parser 构造 [FunctionCallExpr](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/ast/expression/FunctionCallExpr.java)。
+2. [ExpressionAnalyzer](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/ExpressionAnalyzer.java) 先分析子表达式，得到实际参数类型。
+3. FE 在 `FunctionSet` 中按函数名、参数个数和参数类型查找候选签名。
+4. 分析器结合精确匹配、隐式类型转换、可变参数、多态类型和 Decimal 特殊规则，确定最终重载。
+5. 确定返回类型，并把函数信息写入 Thrift 表达式树。
 
-- Partition: 分区键相同的行，也就是partittion by keys的划分的最小粒度。
-- Frame: 根据上下届确定的窗口大小，用于窗口计算；
-- PeerGroup: 则是为了更好地区分排序键引入的区别
-    - 针对Rows Frame类型同分区键结果相同
-    - 对于Range Frame类型则同排序键结果一样。
+`abs` 在注册表中有 DOUBLE、FLOAT、整数和多种 Decimal 重载。这里的重点是：BE 不负责重新猜测应该调用哪个 `abs`，重载决议主要在 FE 已经完成；BE 按计划中确定的函数描述执行。
 
-下面看一个具体的例子（无界窗口），对id列做partition和sort by操作之后然后求sum，针对range类型，其窗口是从partition 开始到相同的sort key结束，所以相同的id_int会有相同的结果。而对于rows base的窗口，则是每一行输出一个结果，所以看到相同的id_int会有不同的结果。
+### 3.2 一份元数据生成 FE 与 BE 注册表
 
-```java
+普通向量化标量函数主要登记在 [gensrc/script/functions.py](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/gensrc/script/functions.py) 中。每条记录包含：
 
-CREATE TABLE test_window 
-( 
-    id_int      INT         NOT NULL, 
-    value     INT         NOT NULL
-) ENGINE=OLAP 
-DUPLICATE KEY(`id_int`) 
-DISTRIBUTED BY HASH(`id_int`) BUCKETS 3 
-PROPERTIES ( 
-    "replication_num" = "1" 
-);
+~~~text
+function_id
+function_name
+exception_safe
+check_overflow
+return_type
+argument_types
+backend_symbol
+[prepare_symbol]
+[close_symbol]
+~~~
 
-SELECT 
-id_int,  
-sum(id_int) OVER (partition by id_int order by id_int RANGE BETWEEN UNBOUNDED PRECEDING AND current row) as range_window, 
-sum(id_int) OVER (partition by id_int order by id_int ROWS BETWEEN UNBOUNDED PRECEDING AND current row) as row_window 
-FROM test_window order by id_int;
-```
+例如，无参数函数 `pi()` 的登记项是：
 
-讲完了窗口函数的实现，窗口函数是如何注册的呢？他的注册逻辑跟聚合函数是类似的。多提一句，除了上述的窗口函数实现之外，针对简单的sum/count/avg我们还实现了一种滑动窗口式的removable cumulative的窗口时间，针对窗口的很多优化可以参考下paper。
+~~~python
+[10010, "pi", True, False, "DOUBLE", [], "MathFunctions::pi"]
+~~~
 
-最后我们聊一下TableFunction，跟聚合函数一样，table函数也是内嵌于TableFunction算子内部的。其实现逻辑大致分为两块：
+[gen_functions.py](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/gensrc/script/gen_functions.py) 会读取这份元数据并生成两侧代码：
 
-- 上游算子push_chunk时，将输入chunk保存至TableFunction状态中；
-- 在TableFunction算子pull_chunk输出时，调用TableFunction的process逻辑，并根据State状态处理返回。
+~~~text
+functions.py
+   |
+   +-- FE: VectorizedBuiltinFunctions.java
+   |       注册函数名、参数类型、返回类型和函数 ID
+   |
+   +-- BE: generated BuiltinFunctions registry
+           将函数 ID 映射到 C++ 函数及 prepare/close 回调
+~~~
 
-TableFunction的定义主要有这几个函数：
+FE 在 [FunctionSet.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/catalog/FunctionSet.java) 中调用 `VectorizedBuiltinFunctions.initBuiltins(this)`。BE 则通过 [builtin_functions.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/builtin_functions.h) 中的 `find_builtin_function(fid)` 查询生成的注册表。
 
-- 初始化：初始化TableFunctionState
-- process：这也是窗口函数的核心逻辑，执行窗口函数并返回多行数组列及相应的offset
-- close：销毁TableFunctionState
+这种设计消除了手写两份标量函数签名的重复劳动，但它没有消除一致性要求：函数元数据、C++ 声明、C++ 实现和测试仍必须同时更新，生成文件本身不应直接修改。
 
-目前TableFunction注册也需要手动在FE/BE上添加实现，在FE上，需要在TableFunction::InitBuiltIn方法中添加新的函数签名，注意添加该函数的输入类型和返回类型。同样在BE中也有TableFunctionResolver中注册新的函数签名。目前StarRocks也支持了部分TableFunction，包括，unnest/mutli_unnest/json_each和generate_series等。添加新的内置函数时可以参考下。
+### 3.3 BE：`VectorizedFunctionCallExpr` 的执行生命周期
 
-### 3. 内置函数开发
+BE 的入口是 [function_call_expr.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/function_call_expr.cpp) 中的 `VectorizedFunctionCallExpr`。它的核心流程可以简化为：
 
-现在基本的内置函数原理已经了解了，小伙伴们是不是蠢蠢欲动，想小试牛刀了？下面聊聊如何真正的开发实践？
+~~~text
+prepare
+  |
+  +-- 准备子表达式
+  +-- 根据 fid 查找 FunctionDescriptor
+  +-- 创建 FunctionContext，记录参数与返回类型
 
-先大致说下基本的开发环境。硬件层面，我们一般都是本地+远端服务器配合开发，而且服务器尽量配置高一点，这样编译速度会快点。开发软件上，be一般是vscode或者clion，都可以的，fe因为都是java代码，还是会有Idea神器。基础工具，c++编译gcc/clang都支持，如果条件的话，推荐还是使用clang，编译性能会好点而且错误提示也比较友好。
+open
+  |
+  +-- 计算并保存常量参数
+  +-- 调用 FRAGMENT_LOCAL prepare
+  +-- 调用 THREAD_LOCAL prepare
 
-开发环境配置，首先是在本地/远程的代码clone，（小伙伴本最好先fork下我们的代码，方便后续提交pr)。配置环境的，强烈推荐基于docker环境开发，当然动手能力强的也可以直接在ubuntu/centos服务器上编译源码开发。因为docker环境中把开发依赖的组件都集成好，连三方依赖库也是编译好的。基本上开箱即用，等下我会按照docker环境的方式演示下。
+evaluate_checked
+  |
+  +-- 批量计算所有子表达式，得到 Columns
+  +-- 调用 scalar_function(context, columns)
+  +-- 检查 Status、容量限制和返回列结构
+  +-- 调整无参数常量函数的逻辑行数
 
-然后编译测试脚本，这里也不一一介绍了。我们官方文档中应该都有介绍。如果小伙伴在使用过程中，发现文档介绍不合理或者不清晰的话，可以即使在官方微信群或者在github上提issue提问或者修复。
+close
+  |
+  +-- 调用 THREAD_LOCAL close
+  +-- 调用 FRAGMENT_LOCAL close
+~~~
 
-而等代码开发好了，怎么提交PR呢？
+其中，`exception_safe` 决定调用实现时是否需要启用异常捕获保护，`check_overflow` 决定是否对返回 Column 做容量上限检查。这两个字段不是文档标签，而会影响真实的执行路径。
 
-- 创建一个issue，如果有issue的话就不用了；
-- 先把代码Push到自己fork的分支，然后提交到StarRocks的Project中。在提交之后，为了保证代码质量会有很多测试集成流程，小伙伴们在提交之后需要多加留意并耐心等待。
+### 3.4 `FunctionContext`：函数状态与资源的边界
 
-下面我花几分钟简单演示下，开发流程是如何操作的。
+[function_context.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/function_context.h) 为函数提供类型信息、常量参数、错误与告警、内存管理，以及可选的函数状态。
 
-### 4. 函数认领任务
+| 状态作用域 | 生命周期与共享范围 | 适合保存的内容 |
+| --- | --- | --- |
+| `FRAGMENT_LOCAL` | Fragment 级别，同一 Fragment 的执行上下文可共享 | 由常量参数构造且可安全共享的只读对象 |
+| `THREAD_LOCAL` | 每个执行线程或 Driver 私有 | 非线程安全的解析器、临时缓冲区、线程私有状态 |
 
-到最后宣传下我们的2023函数认领任务。所有的Functions Tasks都在这个issue里。
+例如，正则表达式、格式字符串或 JSON Path 如果是常量参数，可以在 `prepare` 中预编译，避免每一行重复解析。实现时需要明确对象是否线程安全：把可变对象放入 Fragment 共享状态，可能产生数据竞争；把大对象放入每个 Thread 状态，又可能放大内存消耗。
 
-- 在认领时，记得@通知下我们的社区同学，告知下你认领了这个函数。
-- 在开发过前记得同社区同学即使沟通实现的思路或者函数的行为定等。
-- 在开发过程中切记同社区同学一起讨论，有问题也可以在issue或者论坛即使反馈。
-- 如果开发后发现有其他时间没法完成了，也没关系，联系我们的社区同学，以便于重新assign。
+### 3.5 最小源码案例：`pi()`
 
-### 附件
-- ![如何在StarRocks中添加内置函数?.key](/assets/ppts/2023/如何在StarRocks中添加内置函数?.key)
-- ![内置函数分享.pdf](/assets/ppts/2023/内置函数分享.pdf)
+`pi()` 的 C++ 实现位于 [math_functions.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/math_functions.cpp)：
+
+~~~cpp
+StatusOr<ColumnPtr> MathFunctions::pi(
+        FunctionContext* context,
+        const Columns& columns) {
+    return ColumnHelper::create_const_column<TYPE_DOUBLE>(M_PI, 1);
+}
+~~~
+
+这个实现虽然很短，却完整经过了以下链路：
+
+~~~text
+SQL pi()
+  -> FE 在生成的签名表中解析到 fid=10010
+  -> TFunction 将 fid 下发到 BE
+  -> VectorizedFunctionCallExpr 按 fid 查找 MathFunctions::pi
+  -> 函数返回 ConstColumn<double>
+  -> 表达式框架将无参数常量结果调整为当前 Chunk 的逻辑行数
+~~~
+
+对应单测 [function_call_expr_test.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/test/exprs/function_call_expr_test.cpp) 直接构造 `TFunction`，设置 `fid=10010`，再经过表达式的 `prepare/open/evaluate/close` 生命周期，验证结果为常量列且值为 `M_PI`。
+
+这个案例说明：测试一个内置函数，不能只测试计算公式，还应尽量覆盖真实表达式生命周期和注册映射。
+
+## 四、聚合函数：可并行、可分布式合并的状态机
+
+聚合函数的本质不是“循环调用一个累加函数”，而是定义一套可以在并行执行和分布式阶段之间迁移、合并的状态协议。
+
+### 4.1 状态生命周期
+
+以 `sum` 为例，单机直觉是把每一行加到同一个变量中；在分布式执行中，更接近下面的过程：
+
+~~~text
+输入 Chunk
+   |
+   +-- Driver 1: create -> update -> partial state A
+   +-- Driver 2: create -> update -> partial state B
+   +-- Driver 3: create -> update -> partial state C
+                              |
+                              v
+                     serialize / shuffle
+                              |
+                              v
+                     merge(A, B, C)
+                              |
+                              v
+                          finalize
+                              |
+                              v
+                          SQL 结果
+~~~
+
+[aggregate.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/aggregate.h) 中的 `AggregateFunction` 抽象包含以下关键能力：
+
+| 接口 | 作用 |
+| --- | --- |
+| `create` / `destroy` | 构造和销毁聚合状态 |
+| `reset` | 将已有状态恢复为初始状态 |
+| `update` | 把原始输入行更新到状态中 |
+| `serialize_to_column` | 将本地状态编码为可传输的中间列 |
+| `merge` | 把序列化的中间状态合并到当前状态 |
+| `finalize_to_column` | 将状态转换为最终 SQL 结果 |
+| `convert_to_serialize_format` | 将原始输入批量转换为中间格式，支持某些预聚合策略 |
+
+`AggregateFunctionStateHelper<State>` 使用 placement new 在框架提供的状态内存中构造具体 `State`，并负责析构。这意味着聚合状态不是一个随意分配的普通对象：它的大小、对齐、构造、析构和序列化格式都是执行框架契约的一部分。
+
+### 4.2 Intermediate Type 是分布式执行协议
+
+聚合函数通常涉及三类类型：
+
+~~~text
+Input Type -> Intermediate Type -> Result Type
+~~~
+
+例如，`avg` 的状态至少要同时保存 sum 和 count，Intermediate Type 就不能简单等同于最终返回的 DOUBLE。对于 HLL、Bitmap、Percentile 等函数，中间状态还可能是专用对象或二进制编码。
+
+Intermediate Type 的重要性在于：它会跨越本地聚合、Exchange、网络传输和最终合并阶段。FE 声明的中间类型、BE 实际序列化的 Column 和 `merge` 期待读取的布局必须完全一致。这里发生的不一致，比普通标量函数的返回类型错误更危险，因为它可能只在特定执行计划或数据规模下出现。
+
+### 4.3 注册方式：FE 签名与 BE Resolver
+
+聚合函数没有直接复用普通标量函数的 `functions.py` 注册流程。
+
+- FE 在 [FunctionSet.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/catalog/FunctionSet.java) 中注册聚合函数签名，描述函数名、输入类型、返回类型和中间类型。
+- BE 的 [aggregate_factory.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/factory/aggregate_factory.cpp) 构造 `AggregateFuncResolver`，再按 sum/count、avg、min/max、distinct、variance、window 等类别加载实现映射。
+- [aggregate_resolver.hpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/factory/aggregate_resolver.hpp) 提供普通、not-null 和 variadic 等注册辅助接口。
+
+因此，新增聚合函数时必须同时检查两侧：FE 决定“SQL 是否能解析以及计划中使用什么类型”，BE 决定“具体状态机由哪一个模板实例执行”。
+
+### 4.4 为什么 `convert_to_serialize_format` 值得关注
+
+当聚合基数很高、局部预聚合收益较低时，执行引擎可能不希望为每个 key 都创建复杂状态。此时可以把原始输入转换为可供后续阶段合并的中间表示，再由下游继续处理。
+
+`convert_to_serialize_format` 因此不是 `serialize_to_column` 的简单批量版本：
+
+- `serialize_to_column` 面向已经构造并更新过的聚合状态；
+- `convert_to_serialize_format` 面向原始输入列，直接生成中间格式。
+
+理解这一区别，有助于分析高基数聚合、两阶段聚合和预聚合自适应策略。
+
+## 五、窗口函数：复用状态接口，但不改变行数
+
+窗口函数的调用形式是：
+
+~~~sql
+function(args) OVER (
+    PARTITION BY ...
+    ORDER BY ...
+    ROWS | RANGE BETWEEN ... AND ...
+)
+~~~
+
+可以用下面的 SQL 观察滑动窗口：
+
+~~~sql
+SELECT
+    uid,
+    category,
+    event_date,
+    price,
+    SUM(price) OVER (
+        PARTITION BY uid, category
+        ORDER BY event_date
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS rolling_sum
+FROM orders;
+~~~
+
+它包含三个不能混淆的概念：
+
+| 概念 | 定义 | 在示例中的含义 |
+| --- | --- | --- |
+| Partition | `PARTITION BY` 划分的独立计算集合 | 相同 uid、category 的行 |
+| Peer Group | `ORDER BY` 值相同的一组同级行 | event_date 相同的行 |
+| Frame | 当前结果行实际可见的窗口边界 | 当前行及其前两行 |
+
+`ROWS` 按物理行位置计算边界；`RANGE` 按排序键的值域和 Peer Group 语义计算边界。缺省 Frame 还会受到是否存在 `ORDER BY` 以及具体函数语义的影响，不能笼统理解为固定的“前 N 行”。
+
+### 5.1 为什么窗口函数继承聚合接口
+
+[window.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/window.h) 中的 `WindowFunction` 复用了 `AggregateFunctionStateHelper`。这并不意味着窗口函数等同于聚合函数，而是因为二者都需要：
+
+- 创建、重置和销毁状态；
+- 将一段输入更新到状态；
+- 从状态中产生结果；
+- 在窗口移动时复用已有计算。
+
+窗口独有的行为则体现在 [aggregate.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/aggregate.h) 中的批量 Frame 更新、`get_values`、可移除累计状态和收缩重置等接口，以及 Pipeline 的 [analytic_sink_operator.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/analysis/analytic_sink_operator.cpp) 与 [analytic_source_operator.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/analysis/analytic_source_operator.cpp)。
+
+### 5.2 滑动窗口为什么需要“可移除状态”
+
+假设窗口从 `[0, 2]` 移动到 `[1, 3]`：
+
+~~~text
+旧 Frame: row0 row1 row2
+新 Frame:      row1 row2 row3
+               -row0 +row3
+~~~
+
+最直接的实现是清空状态，再扫描 row1、row2、row3。对于支持逆运算或可移除状态的函数，可以只移除 row0，再加入 row3，把每一行的重算成本降为增量更新。
+
+并非所有聚合状态都支持高效移除。例如 sum/count 容易维护，某些 distinct 或复杂近似状态则很难直接撤销。因此执行框架同时保留了累计更新、状态收缩重置和重新计算等路径。分析窗口函数性能时，不能只看 SQL 中 Frame 的宽度，还要看具体函数能否使用增量维护。
+
+### 5.3 普通聚合函数与窗口专用函数
+
+`sum`、`avg` 等普通聚合函数也可以在 `OVER` 子句中使用；`row_number`、`rank`、`lead`、`lag` 等则是窗口专用函数。二者最终都由 Analytic 算子驱动，但状态输入和产出规则不同：
+
+- 普通聚合窗口函数根据 Frame 中的值更新聚合状态；
+- `rank`、`dense_rank` 依赖 Peer Group 边界；
+- `lead`、`lag` 需要按当前位置访问偏移行；
+- `row_number` 主要维护分区内行号。
+
+这也是为什么“窗口函数只是聚合函数加一个 `OVER`”并不准确。
+
+## 六、表函数：一行输入如何展开为多行
+
+表函数改变的是行数关系。以 `unnest([10, 20, 30])` 为例，一行输入会生成三行输出。执行引擎不但要返回函数结果，还要知道每一段结果属于哪一行输入，以便复制左侧普通列。
+
+### 6.1 FE 与 BE 的职责
+
+FE 在 [TableFunction.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/catalog/TableFunction.java) 中注册 `unnest`、`json_each`、`subdivide_bitmap`、`generate_series` 等内置表函数签名，并在规划阶段生成 Table Function 节点。
+
+BE 的 [table_function.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/table_function/table_function.h) 定义以下生命周期：
+
+| 接口 | 作用 |
+| --- | --- |
+| `init` | 创建具体的 `TableFunctionState` |
+| `prepare` | 初始化与 RuntimeState 无关的资源 |
+| `open` | 初始化运行期资源 |
+| `process` | 消费一批参数列，返回结果列与 offsets |
+| `close` | 释放状态和资源 |
+
+具体实现由 [table_function_factory.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/table_function/table_function_factory.cpp) 解析，[table_function_operator.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/table_function_operator.cpp) 负责在 Pipeline 中执行。
+
+### 6.2 offsets 是输入行与输出行的映射协议
+
+`process` 返回 `pair<Columns, UInt32Column::Ptr>`。第一部分是表函数生成的结果列，第二部分是前缀 offsets。
+
+假设三行输入分别生成 2、0、3 行：
+
+~~~text
+input row          0       1          2
+generated count    2       0          3
+offsets          [ 0,      2,         2,         5 ]
+
+result rows         r0 r1                r2 r3 r4
+belongs to input     0  0                 2  2  2
+~~~
+
+因此：
+
+~~~text
+offsets[i + 1] - offsets[i]
+    = 第 i 行输入产生的输出行数
+~~~
+
+`TableFunctionOperator` 根据 offsets 复制外部列，并把函数结果拼成新的 Chunk。若一次展开的数据超过目标 Chunk 大小，`TableFunctionState` 中的 `offset`、`processed_rows` 以及 Operator 内部游标会记录消费进度，下次 `pull_chunk` 继续输出。
+
+这套机制同时解决了三个问题：
+
+- 一行展开多行后，如何保持普通列与函数结果对齐；
+- 一个输入 Chunk 产生超大结果时，如何限制单个输出 Chunk 的内存；
+- Pipeline 的 `push_chunk` / `pull_chunk` 背压模型如何与表函数配合。
+
+需要特别区分：`process` 在这里是表函数的核心逻辑；窗口函数则由 Analytic 算子按 Partition 和 Frame 驱动，两者的输入输出关系并不相同。
+
+## 七、内置函数与 UDF：扩展方式的边界
+
+早期 StarRocks 的 UDF 能力主要围绕 Java 展开，当前分析基线已经包含多种扩展方式：
+
+| 扩展方式 | 当前源码中的定位 | 适用场景 | 主要代价 |
+| --- | --- | --- | --- |
+| C++ 内置函数 | 编译进 BE，签名在 FE 注册 | 高频、通用、性能敏感的基础能力 | 需要修改源码、完整测试并随版本发布 |
+| Java UDF | 支持标量、聚合、窗口和表函数形态 | 复用 Java 生态、动态交付业务逻辑 | JVM 调用、类型转换、对象与内存管理成本 |
+| Python UDF | 实验性能力，当前主要为标量函数 | 算法验证、Python 生态集成 | Python 服务和跨进程/序列化开销 |
+| SQL UDF | 用 SQL 表达式封装可复用逻辑 | 组合已有函数，降低重复 SQL | 能力受 SQL 表达式和优化器展开规则约束 |
+
+Java UDF 的 BE 实现集中在 [be/src/udf/java](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/udf/java)，Python UDF 位于 [be/src/udf/python](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/udf/python)，SQL UDF 的 FE 表示可从 [SqlFunction.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/catalog/SqlFunction.java) 阅读。
+
+选择内置函数还是 UDF，可以按以下顺序判断：
+
+1. 能否直接用已有 SQL 函数组合表达？如果可以，优先使用 SQL 或 SQL UDF。
+2. 是否是组织内部、快速迭代的业务逻辑？如果是，优先考虑 UDF。
+3. 是否需要成为所有用户可依赖的公共语义，并且位于高频性能路径？这时更适合内置函数。
+4. 是否需要优化器识别特殊语义、下推谓词、使用索引或参与常量折叠？仅增加运行时实现通常不够，还可能需要扩展 FE 和优化器规则。
+
+## 八、如何新增一个内置函数
+
+新增函数前，最重要的工作不是写代码，而是先明确语义契约。
+
+### 8.1 先写清楚函数契约
+
+建议至少回答以下问题：
+
+- 函数名、别名和重载分别是什么？
+- 参数是否允许隐式转换？是否支持可变参数？
+- 返回类型是固定类型，还是由输入类型、精度或 Scale 推导？
+- NULL 是传播、忽略、报错，还是参与特定语义？
+- 非法输入返回 NULL、返回错误还是截断？
+- 常量参数能否在 `prepare` 阶段预处理？
+- 函数是否确定性？能否常量折叠？
+- 对聚合函数而言，中间状态能否序列化、合并和销毁？
+- 对窗口函数而言，是否支持滑动移除？
+- 对表函数而言，零行输出和超大展开如何处理？
+
+如果这些问题没有先确定，FE、BE、文档和兼容性测试很容易各自形成不同解释。
+
+### 8.2 新增标量函数
+
+典型流程如下：
+
+1. 在 `be/src/exprs` 下选择合适模块，声明并实现向量化 C++ 函数。
+2. 优先复用 `ColumnViewer`、`ColumnBuilder`、`ColumnHelper` 或同类函数模板，处理 Const、Nullable 和类型分派。
+3. 在 `gensrc/script/functions.py` 中分配唯一函数 ID，登记所有重载和可选的 prepare/close 回调。
+4. 通过构建流程重新生成 FE 与 BE 注册代码，不直接编辑生成文件。
+5. 增加 BE 函数测试和表达式生命周期测试；如涉及类型推导，再增加 FE Analyzer 或 Plan 测试。
+6. 更新 SQL 文档，明确参数、返回类型、NULL、错误和边界行为。
+
+如果函数有常量配置参数，例如正则表达式或格式字符串，应考虑在 `prepare` 中构建状态，在 `close` 中对称释放，而不是在每一行重复解析。
+
+### 8.3 新增聚合函数
+
+除计算逻辑外，还需要：
+
+1. 定义 State 结构及其初始值；
+2. 实现 create、destroy、reset 和 update；
+3. 定义稳定的中间表示，实现 serialize 与 merge；
+4. 实现 finalize，必要时实现 `convert_to_serialize_format`；
+5. 在 FE `FunctionSet` 注册输入、中间和返回类型；
+6. 在 BE Aggregate Resolver 注册具体模板实例；
+7. 验证单阶段、两阶段、并行合并、空输入、全 NULL 和高基数场景。
+
+聚合测试不能只验证“单个状态连续 update”的结果，还应验证：
+
+~~~text
+finalize(update(all rows))
+    ==
+finalize(merge(
+    serialize(update(partition 1)),
+    serialize(update(partition 2)),
+    ...
+))
+~~~
+
+这条等价关系是可分布式聚合正确性的核心。
+
+### 8.4 新增窗口函数
+
+需要先判断它属于哪一种：
+
+- 已有聚合函数的窗口用法；
+- 依赖 Peer Group 的排名函数；
+- 依赖行位置的 offset/value 函数；
+- 需要自定义 Frame 状态的新函数。
+
+然后分别验证无 `ORDER BY`、重复排序键、空分区、单行分区、ROWS/RANGE、多种边界以及大分区。若实现可移除累计状态，还应对比增量结果与完整重算结果。
+
+### 8.5 新增表函数
+
+需要同时更新 FE 的 `TableFunction.initBuiltins` 和 BE 的 Table Function Resolver，并重点验证：
+
+- 每行生成 0、1、多行时 offsets 是否正确；
+- 多列返回值是否等长；
+- LEFT JOIN 语义下零行结果如何补齐；
+- 展开结果超过 `chunk_size` 时是否能分批恢复；
+- Const、Nullable 和复杂参数列是否正确；
+- 外部列复制后是否仍与结果列逐行对齐。
+
+### 8.6 编译、测试与提交
+
+在 StarRocks 仓库根目录可以按改动范围执行：
+
+~~~bash
+./build.sh --be
+./build.sh --fe
+./run-be-ut.sh --gtest_filter 'VectorizedFunctionCallExprTest.*'
+~~~
+
+测试名称应替换为新增函数对应的测试套件。函数改动还应尽量补充 SQL 层回归测试，以覆盖 FE 解析、计划下发和 BE 执行的完整链路。
+
+提交开源项目 PR 时，建议保持以下顺序：
+
+1. 先搜索现有 Issue、函数和进行中的 PR，避免重复实现；
+2. 对新语义先创建 Issue 或设计讨论，明确与其他数据库的兼容边界；
+3. Fork 仓库并在独立分支实现；
+4. 在本地完成格式检查、目标编译和相关测试；
+5. PR 描述中给出语义、实现路径、测试矩阵和兼容性说明；
+6. 根据 CI 与 Review 意见补充测试，而不仅是修到“能够编译”。
+
+StarRocks 社区早期曾通过年度“函数认领任务”集中推进能力建设。对于长期维护的技术文档，更稳妥的参与入口是当前 GitHub Issues、贡献指南和社区讨论，避免依赖已经结束的年度任务。
+
+## 九、阅读源码时最值得追踪的入口
+
+| 主题 | 源码入口 |
+| --- | --- |
+| FE 函数表达式 | [FunctionCallExpr.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/ast/expression/FunctionCallExpr.java) |
+| FE 表达式分析 | [ExpressionAnalyzer.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/analyzer/ExpressionAnalyzer.java) |
+| FE 内置函数集合 | [FunctionSet.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/catalog/FunctionSet.java) |
+| 标量函数元数据 | [functions.py](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/gensrc/script/functions.py) |
+| 注册代码生成器 | [gen_functions.py](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/gensrc/script/gen_functions.py) |
+| BE 标量表达式 | [function_call_expr.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/function_call_expr.cpp) |
+| 函数上下文 | [function_context.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/function_context.h) |
+| 向量化 Column | [be/src/column](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/column) |
+| 聚合函数抽象 | [aggregate.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/aggregate.h) |
+| 聚合函数注册 | [be/src/exprs/agg/factory](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/factory) |
+| 窗口函数实现 | [window.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/agg/window.h) |
+| 表函数抽象 | [table_function.h](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exprs/table_function/table_function.h) |
+| 表函数 Pipeline 算子 | [table_function_operator.cpp](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/table_function_operator.cpp) |
+
+推荐的阅读顺序不是按目录从头浏览，而是选择一个具体函数做纵向追踪：
+
+~~~text
+SQL 文档
+  -> FE 函数签名
+  -> FE Analyzer 的类型决议
+  -> Thrift 中的 TFunction
+  -> BE Resolver 或函数 ID
+  -> C++ 实现
+  -> Column 辅助设施
+  -> 单元测试与 SQL 回归测试
+~~~
+
+这条路径能够把“函数公式”还原为完整的数据库执行能力。
+
+## 十、总结
+
+StarRocks 内置函数的实现可以归纳为四种不同的核心模型：
+
+- 标量函数是 **基于 Column 的批量表达式计算**；
+- 聚合函数是 **可以序列化、合并和终结的分布式状态机**；
+- 窗口函数是 **由 Partition、Peer Group 和 Frame 驱动的逐行状态计算**；
+- 表函数是 **通过 offsets 维护输入行与展开结果映射的行数扩展算子**。
+
+四者共享 FE 类型分析、Thrift 计划描述和 BE 向量化数据结构，但它们在行数关系、状态生命周期、注册方式和执行算子上有本质差异。
+
+真正高质量的函数实现，需要同时满足语义正确、类型一致、NULL 与常量列安全、状态可管理、分布式结果可合并、内存可控以及测试可验证。理解这些约束后，新增内置函数就不再是“找一个 C++ 文件补一段逻辑”，而是在 StarRocks 的分析与执行体系中加入一份完整、可长期兼容的 SQL 能力。

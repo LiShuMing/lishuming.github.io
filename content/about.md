@@ -1,44 +1,29 @@
 ---
 title: 关于我
-tags: 关于我
+tags:
+  - 关于我
+description: "关于这个博客，以及我对数据库、AI Infra 和技术学习的兴趣。"
 ---
 
-#### **关于我**
+## 关于我
 
-中科院某所研二学生，热爱计算机技术，羡慕狂热的Geek精神。   
-现在正努力的学习中，希望做一名优秀的技术人员。   
+你好，欢迎来到我的个人博客。
 
-正在学习的语言：C++,python。  
-喜欢的产品： Emacs,Tex,Debian。
+我对数据库与 AI Infra 保持着长期而朴素的学习热情。相比追逐短期概念，我更喜欢沿着论文、源码和可复现的实验，理解一个系统为什么这样设计、不同模块如何协作，以及性能与复杂度之间做出了怎样的取舍。
 
-困在帝都，不堪重负。  
-热爱跑步，不想年少白头，督促自己锻炼身体。  
-喜欢小津、侯笑贤的电影，西部片、武士片、武侠片也都喜欢。  
-  
+在数据库方向，我尤其关注查询优化器、向量化与 Pipeline 执行、存储引擎、分布式系统和云原生架构；在 AI Infra 方向，我希望持续学习面向 AI 工作负载的数据系统、检索与索引、推理基础设施、Agent Runtime 及其可观测性。
 
+这个博客主要记录阅读源码、分析开源项目和验证技术想法的过程。文章未必给出唯一答案，但会尽量保留推理依据、源码入口和实验方法，让结论可以继续讨论和验证。
 
-#### **其他站点**
+技术之外，我也喜欢阅读、电影和跑步。持续学习固然重要，保持好奇心和生活的节奏同样重要。
 
-邮箱: [lism2013@hotmail.com](lism2013@hotmail.com)   
+## 关于本站
 
-Git     : [https://github.com/LiShuMing](https://github.com/LiShuMing)  
-博客园  ：[http://www.cnblogs.com/sansan/](http://www.cnblogs.com/sansan/)   
-CSDN博客：[http://blog.csdn.net/crispy_rice](http://blog.csdn.net/crispy_rice)  
-  
-  
-Mtime: [http://i.mtime.com/1708758/](http://i.mtime.com/1708758/)  
-点点博客：[http://www.diandian.com/dianlog/my-sansan](http://my-sansan.diandian.com/)     
+本站既是一份学习笔记，也是一块长期维护的个人知识空间。我希望通过写作把零散认识整理成结构化内容，也借此发现理解中的空白。
 
+如果文章中的内容对你有所帮助，或者你对数据库、AI Infra 及开源系统有不同看法，欢迎交流。
 
+## 联系方式
 
-
-
-
-
-
-
-
-
-
-
-.
+- [GitHub：LiShuMing](https://github.com/LiShuMing)
+- [邮箱：lism2013@hotmail.com](mailto:lism2013@hotmail.com)
