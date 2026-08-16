@@ -2,6 +2,7 @@
 public/
 resources/
 .hugo_build.lock
+.jupyterlite.doit.db
 
 # OS
 .DS_Store
@@ -19,3 +20,6 @@ Thumbs.db
 .obsidian/
 
 _drafts/
+tags
+*.temp
+*.lock

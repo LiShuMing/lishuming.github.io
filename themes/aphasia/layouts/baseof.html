@@ -23,7 +23,7 @@
             <span><a href="{{ .URL }}" class="navigator" title="{{ .Name }}">{{ .Name }}</a></span>
             {{ end }}
           </nav>
-          <h1>{{ .Site.Title }}</h1>
+          <h1><a href="/" class="sitename" rel="home" title="返回首页">{{ .Site.Title }}</a></h1>
           <div id="description">{{ .Site.Params.description }}</div>
         </header>
 

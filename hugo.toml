@@ -43,11 +43,24 @@ theme = 'aphasia'
     endLevel = 3
     ordered = false
   [markup.goldmark]
+    [markup.goldmark.extensions]
+      [markup.goldmark.extensions.passthrough]
+        enable = true
+        [markup.goldmark.extensions.passthrough.delimiters]
+          block = [['\[', '\]'], ['$$', '$$']]
+          inline = [['\(', '\)']]
     [markup.goldmark.parser]
       [markup.goldmark.parser.attribute]
         block = true
     [markup.goldmark.renderer]
       unsafe = true
+  [markup.highlight]
+    codeFences = true
+    lineNos = true
+    lineNumbersInTable = false
+    noClasses = true
+    style = 'monokai'
+    tabWidth = 4
 
 [taxonomies]
   tag = 'tags'

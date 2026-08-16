@@ -17,7 +17,10 @@ lishuming's website, powered by [Hugo](https://gohugo.io/).
 │   ├── assets/css/        # 样式文件
 │   ├── assets/images/     # 图片
 │   ├── media/js/          # JavaScript
+│   ├── notebooks/         # JupyterLite 内容与可下载的 .ipynb
 │   └── lsm.ico            # 站点图标
+├── jupyter-lite.json      # 浏览器 Notebook 配置
+├── requirements-jupyterlite.txt
 ├── themes/aphasia/        # 自定义主题
 │   └── layouts/           # HTML 模板
 └── .github/workflows/     # GitHub Actions 自动部署
@@ -51,6 +54,22 @@ hugo server -D
 hugo
 # 构建产物输出到 public/ 目录
 ```
+
+### 构建浏览器 Notebook
+
+```bash
+python -m pip install -r requirements-jupyterlite.txt
+hugo --minify
+jupyter lite build \
+  --contents static/notebooks \
+  --output-dir public/lab \
+  --apps notebooks \
+  --no-sourcemaps \
+  --no-unused-shared-packages
+python -m http.server --directory public 8000
+```
+
+Notebook 页面需要通过 HTTP 访问，不能直接用 `file://` 打开。需要在文章内嵌 Notebook 时，在 Front Matter 中设置 `notebook: true`，并使用 `notebook` shortcode。
 
 ## 发布新文章
 

@@ -30,8 +30,26 @@ jobs:
           hugo-version: '0.164.0'
           extended: true
 
-      - name: Build
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install JupyterLite
+        run: python -m pip install -r requirements-jupyterlite.txt
+
+      - name: Build Hugo
         run: hugo --minify
+
+      - name: Build browser notebooks
+        run: >-
+          jupyter lite build
+          --contents static/notebooks
+          --output-dir public/lab
+          --apps notebooks
+          --no-sourcemaps
+          --no-unused-shared-packages
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
