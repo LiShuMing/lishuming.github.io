@@ -60,3 +60,21 @@
 .highlight .vg { color: #19177C } /* Name.Variable.Global */
 .highlight .vi { color: #19177C } /* Name.Variable.Instance */
 .highlight .il { color: #666666 } /* Literal.Number.Integer.Long */
+
+/* Python identifiers that Chroma leaves as plain text. */
+.highlight code.language-python .code-token-variable {
+  color:#9cdcfe;
+}
+
+.highlight code.language-python .code-token-call {
+  color:#dcdcaa;
+}
+
+.highlight code.language-python .code-token-member,
+.highlight code.language-python .code-token-method {
+  color:#4ec9b0;
+}
+
+.highlight code.language-python .code-token-method {
+  font-weight:600;
+}

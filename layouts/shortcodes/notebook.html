@@ -1,0 +1,24 @@
+{{- $src := .Get "src" -}}
+{{- $download := .Get "download" -}}
+{{- $title := .Get "title" | default "交互式 Notebook" -}}
+<section class="notebook-embed" data-notebook-embed>
+  <div class="notebook-embed__header">
+    <div>
+      <strong>{{ $title }}</strong>
+      <span>Python 在浏览器内运行，首次启动需要加载运行时。</span>
+    </div>
+    <div class="notebook-embed__actions">
+      <a href="{{ $src }}" target="_blank" rel="noopener">新窗口运行</a>
+      {{- with $download }}
+      <a href="{{ . }}" download>下载 .ipynb</a>
+      {{- end }}
+    </div>
+  </div>
+  <button class="notebook-embed__toggle" type="button" aria-expanded="false">
+    在文章内加载 Notebook
+  </button>
+  <div class="notebook-embed__frame" hidden>
+    <iframe data-src="{{ $src }}" title="{{ $title }}" loading="lazy" allow="clipboard-read; clipboard-write"></iframe>
+  </div>
+  <noscript>浏览器未启用 JavaScript，请使用“新窗口运行”或“下载 .ipynb”。</noscript>
+</section>

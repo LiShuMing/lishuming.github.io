@@ -1,3 +1,14 @@
+{{ define "extra_head" }}
+{{- if .Param "math" }}
+  {{ partial "math.html" . }}
+{{- end }}
+{{- if .Param "notebook" }}
+<link rel="stylesheet" href="/assets/css/notebook.css">
+<script defer src="/media/js/notebook-embed.js"></script>
+{{- end }}
+<script defer src="/media/js/code-highlight.js"></script>
+{{ end }}
+
 {{ define "main" }}
 {{- $hasToc := gt (len (findRE "<li>" .TableOfContents)) 0 -}}
 {{- $showToc := and (ne .Params.toc false) $hasToc -}}
