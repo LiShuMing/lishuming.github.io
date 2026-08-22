@@ -15,7 +15,7 @@ math: true
 notebook: true
 ---
 
-在[《从 GPU 到 LLM 微调：一条面向 RTX 5070 Ti 的实践学习路线》]({{< relref "learn-gpu-llm.md" >}})中，除了基本的numpy理论学习之外，还希望能够完成：
+在[《从 GPU 到 LLM 微调：一条面向 RTX 5070 Ti 的实践学习路线》]({{< relref "2026-08-15-gpu-to-llm-finetuning-roadmap.md" >}})中，除了基本的numpy理论学习之外，还希望能够完成：
 
 1. 能判断 shape、broadcasting 和矩阵乘是否合法；
 2. 能把逐样本 Python 循环改写为向量化计算；
@@ -23,7 +23,7 @@ notebook: true
 4. 不依赖 autograd 写出 `forward → loss → backward → update`；
 5. 能用梯度检查和训练曲线证明实现是正确的。
 
-[《深入 NumPy：从 ndarray 内存模型到科学计算与张量生态》]({{< relref "dive-numpy.md" >}})已经完成了 ndarray、strides、广播、dtype、向量化与 BLAS/LAPACK 的理论铺垫。本文不再重复 API，而是把这些概念放进一个可以运行、可以失败、也可以验证的项目：**只用 NumPy 训练一个两层 MLP，对双月牙数据进行分类。**
+[《深入 NumPy：从 ndarray 内存模型到科学计算与张量生态》]({{< relref "2026-08-16-numpy-internals.md" >}})已经完成了 ndarray、strides、广播、dtype、向量化与 BLAS/LAPACK 的理论铺垫。本文不再重复 API，而是把这些概念放进一个可以运行、可以失败、也可以验证的项目：**只用 NumPy 训练一个两层 MLP，对双月牙数据进行分类。**
 
 本文对应的 Notebook 已保存执行结果，也可以直接在浏览器里修改参数、重启 Kernel 和重新运行。浏览器版本基于 Pyodide/WASM，适合验证算法和数值结果；文中的耗时只代表本次本地 CPU 执行，不应拿来评价本机 OpenBLAS、MKL 或 GPU 性能。
 
