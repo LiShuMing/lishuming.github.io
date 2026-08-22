@@ -91,9 +91,9 @@ source ./scripts/cuda_env.sh
 
 第一阶段不用 GPU，重点是消除 shape 和梯度上的模糊感。
 
-**理论基础进度：已完成。** [《深入 NumPy：从 ndarray 内存模型到科学计算与张量生态》]({{< relref "dive-numpy.md" >}}) 已系统梳理 ndarray 内存模型、strides、广播、dtype、向量化以及 BLAS/LAPACK 等核心内容，接下来进入矩阵计算、反向传播和小型神经网络的实践阶段。
+**理论基础进度：已完成。** [《深入 NumPy：从 ndarray 内存模型到科学计算与张量生态》]({{< relref "2026-08-16-numpy-internals.md" >}}) 已系统梳理 ndarray 内存模型、strides、广播、dtype、向量化以及 BLAS/LAPACK 等核心内容，接下来进入矩阵计算、反向传播和小型神经网络的实践阶段。
 
-**实践项目进度：已完成。** [《NumPy 项目实践：从向量化到手写两层 MLP 与反向传播》]({{< relref "numpy-mlp-practice.md" >}}) 提供了可在浏览器运行的 Notebook，并以向量化、稳定 softmax、手写 backward、有限差分梯度检查和学习率对照完成了阶段验收。
+**实践项目进度：已完成。** [《NumPy 项目实践：从向量化到手写两层 MLP 与反向传播》]({{< relref "2026-08-16-numpy-mlp-practice.md" >}}) 提供了可在浏览器运行的 Notebook，并以向量化、稳定 softmax、手写 backward、有限差分梯度检查和学习率对照完成了阶段验收。
 
 第 1 周练习 `ndarray`、dtype、axis、reshape、transpose、broadcasting 和向量化。每次矩阵运算先在纸上推导 shape，再运行代码验证。还要分别用 Python 循环和 NumPy 向量化实现欧氏距离，观察实现方式对性能的影响。
 
