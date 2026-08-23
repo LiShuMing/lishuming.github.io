@@ -1,5 +1,5 @@
 ---
-title: "深入 NumPy：从 ndarray 内存模型到科学计算与张量生态"
+title: "【LLM】NumPy：从 ndarray 内存模型到科学计算与张量生态"
 date: 2026-08-16T00:00:00+08:00
 categories:
   - AI Infra

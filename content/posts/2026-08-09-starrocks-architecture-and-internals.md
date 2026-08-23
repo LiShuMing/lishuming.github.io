@@ -1,5 +1,5 @@
 ---
-title: "StarRocks 实现原理与源码深度分析：从 CBO、Pipeline 到湖仓一体"
+title: "【源码】StarRocks 实现原理与源码深度分析：从 CBO、Pipeline 到湖仓一体"
 date: 2026-08-09T00:00:00+08:00
 categories:
   - 数据库
