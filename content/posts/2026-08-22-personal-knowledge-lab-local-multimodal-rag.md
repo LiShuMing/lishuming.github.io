@@ -1,5 +1,5 @@
 ---
-title: "给自己的照片和文档建一套可解释的本地检索：Personal Knowledge Lab 阶段复盘"
+title: "【实验】Personal Knowledge Lab : 本地多模态Context索引系统搭建"
 slug: "personal-knowledge-lab-local-multimodal-rag"
 date: 2026-08-22T19:30:00+08:00
 lastmod: 2026-08-22T19:30:00+08:00

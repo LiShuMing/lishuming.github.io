@@ -1,5 +1,5 @@
 ---
-title: "NumPy 项目实践：从向量化到手写两层 MLP 与反向传播"
+title: "【LLM】NumPy实践：从向量化到手写两层 MLP 与反向传播"
 date: 2026-08-16T00:00:00+08:00
 categories:
   - AI Infra

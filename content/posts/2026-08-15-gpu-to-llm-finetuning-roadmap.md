@@ -1,5 +1,5 @@
 ---
-title: "从 GPU 到 LLM 微调：一条面向 RTX 5070 Ti 的实践学习路线"
+title: "【LLM】 LLM学习：一条面向 RTX 5070 Ti 的实践学习路线"
 date: 2026-08-15T00:00:00+08:00
 categories:
   - AI Infra

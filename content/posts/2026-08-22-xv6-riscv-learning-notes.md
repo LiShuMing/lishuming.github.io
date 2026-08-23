@@ -1,5 +1,5 @@
 ---
-title: "从 WSL 到 xv6 Shell：RISC-V xv6 启动、调度、中断与分页源码学习笔记"
+title: "【源码】RISC-V xv6 : 启动、调度、中断与分页源码学习笔记"
 date: 2026-08-22T00:00:00+08:00
 categories:
   - 操作系统
