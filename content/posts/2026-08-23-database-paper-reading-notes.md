@@ -1,8 +1,8 @@
 ---
-title: "数据库论文精读：现代硬件、元数据与云存储"
+title: "【Paper】数据库系统论文精读：从现代硬件到工业自治"
 slug: "database-paper-reading-notes"
 date: 2026-08-23T20:21:00+08:00
-lastmod: 2026-08-23T20:46:00+08:00
+lastmod: 2026-08-29T00:00:00+08:00
 categories:
   - 数据库
 tags:
@@ -13,16 +13,21 @@ tags:
   - 云原生
   - 分布式存储
   - 文件系统
-description: "持续更新的数据库与存储系统论文精读笔记：从 Bf-Tree、HopsFS、PolarFS 到 Tectonic，理解现代硬件、分布式元数据与资源池化如何重新定义系统边界。"
+  - 查询优化器
+  - Learned Optimizer
+  - History-Based Optimization
+  - 分布式事务
+  - Remote Shuffle
+description: "持续更新的数据库系统论文精读笔记：从 Bf-Tree、HopsFS、PolarFS、Tectonic 到 Aurora Limitless、FuxiShuffle、LOAM 与 Ultron，理解现代硬件、云存储、分布式执行与反馈闭环如何重新定义系统边界。"
 draft: false
 toc: true
 ---
 
 这是一篇持续更新的数据库论文精读笔记。
 
-我不准备把它写成论文摘要的集合。摘要只能回答“作者做了什么”，真正值得反复思考的是：**系统原来被什么约束，硬件变化后哪个旧假设失效了，作者移动了哪条软件边界，又为此引入了什么复杂度。**
+当前记录覆盖十四项看起来相距很远的研究与工业实践：Bf-Tree 讨论单机超内存索引，HopsFS 与 Tectonic 讨论文件系统元数据和资源池化，PolarFS 讨论云数据库共享存储；Aurora Limitless 讨论 PostgreSQL 兼容 OLTP 如何横向扩展，FuxiShuffle 讨论中间数据交换怎样服务化并获得自适应容错；Redshift、MaxCompute、Databricks、OceanBase、SQL Server、Databricks Lakehouse 与 Oracle 的八项工作，则讨论统计、学习模型、执行历史、索引、数据布局和计划稳定性如何形成可信的优化闭环。
 
-当前记录覆盖四篇看起来相距很远的论文：Bf-Tree 讨论单机超内存索引，HopsFS 与 Tectonic 讨论文件系统元数据和资源池化，PolarFS 讨论云数据库共享存储。它们的共同点却很明确：现代 SSD、RDMA、多核 CPU 和分布式数据库不会自动转化成系统能力，软件必须重新选择缓存粒度、状态归属、I/O 路径和串行化边界。
+它们的共同点很明确：现代 SSD、RDMA、多核 CPU、分布式数据库和海量执行历史不会自动转化成系统能力，软件必须重新选择缓存粒度、状态归属、I/O 路径、决策依据和安全验证边界。
 
 ## 阅读索引
 
@@ -32,6 +37,16 @@ toc: true
 | 文件系统 / 元数据 | [HopsFS](#hopsfs用-newsql-扩展层级文件系统元数据) | FAST 2017 | 精读 | 能否把 NameNode 的内存状态变成可水平扩展的数据库事务？ |
 | 工业架构 / 分布式存储 | [PolarFS](#polarfs面向云数据库的共享存储) | PVLDB 2018 | 精读 | 如何把共享存储的远程 I/O 延迟压到接近本地盘？ |
 | 文件系统 / 资源池化 | [Tectonic](#tectonic从专用存储烟囱走向-eb-级统一底座) | FAST 2021 | 精读 | 如何让 Blob 与数仓共享同一个 EB 级存储池，同时保持隔离？ |
+| 分布式 OLTP / PostgreSQL | [Aurora Limitless](#aurora-limitless让-postgresql-兼容-oltp-横向扩展) | SIGMOD Companion 2026 | 精读 | 如何把单 Writer Aurora 扩展成 Router + Shard，同时保留事务语义？ |
+| 执行引擎 / Remote Shuffle | [FuxiShuffle](#fuxishuffle把数据交换变成自适应可恢复的服务) | SIGMOD Companion 2026 | 精读 | Shuffle 服务如何同时选择介质、调度时机、数据布局和恢复策略？ |
+| 云数仓 / 自治基础设施 | [Redshift Re-invented](#redshift-re-invented先建立能够反馈的系统底座) | SIGMOD 2022 | 精读 | 存算分离、遥测与弹性基础设施为何是自治优化的前提？ |
+| 优化器 / 增量统计 | [Redshift Incremental Stats](#redshift-增量统计把全表-analyze-变成可合并状态) | PVLDB 2026 | 精读 | 如何用可合并 Sketch 持续维护 CBO 统计？ |
+| 优化器 / Learned Optimizer | [LOAM](#loam当统计缺失环境未知且不能在线试错) | SIGMOD 2026 Industry | 精读 | 缺少统计且环境变化时，如何安全比较候选计划？ |
+| 优化器 / HBO | [Ultron](#ultron记住-aqe-的修正让下一次少走弯路) | PVLDB 2026 | 精读 | 如何把 AQE 的运行时修正变成下一次优化的历史？ |
+| 优化器 / 参数化查询 | [ScalePQO](#scalepqo一个模板一个模型也是一种不可扩展) | PVLDB 2026 | 精读 | 模板与参数规模增长时，模型和 Plan Cache 如何共同演进？ |
+| 物理设计 / LLM | [LLM Index Tuning](#llm-索引调优最好的一次回答不是可部署系统) | PVLDB 2026 | 精读 | LLM 适合生成索引候选，还是直接承担最终决策？ |
+| 物理设计 / 自治聚簇 | [AutoLiquid](#autoliquid推荐聚簇键不难自动应用才难) | VLDB 2026 Industry | 公开设计预读 | 如何在改变数据布局前低成本验证收益？ |
+| 优化器 / Plan Stability | [Oracle Real-Time SPM](#oracle-real-time-spm先让新计划发生再阻止它继续发生) | VLDB 2026 Industry | 公开设计预读 | 如何在计划演进与回退风险之间建立接受协议？ |
 
 这里的阅读状态分为四级：**待读、粗读、精读、源码 / 复现**。后续增加论文时，先更新索引，再在对应分类下补充正文；对尚未确认的判断保留为问题，不把推测写成事实。
 
@@ -646,7 +661,1059 @@ Tectonic 并没有给出所谓“现代分布式文件系统的终极拓扑”�
 
 ---
 
-## 四篇论文放在一起看
+## 分布式 OLTP：在 PostgreSQL 语义上横向扩展
+
+### Aurora Limitless：让 PostgreSQL 兼容 OLTP 横向扩展
+
+#### 论文信息
+
+- 论文：[Aurora PostgreSQL Limitless Database: Building a Highly Scalable OLTP Database](https://software.imdea.org/~gotsman/papers/limitless-sigmod26.pdf)
+- 作者：Dmitry Arkhangelskiy、Saikiran Avula、Sachit Batra、Jin Chen、Radwan Deeb、Alexey Gotsman 等
+- 出处：SIGMOD Companion 2026
+- DOI：[10.1145/3788853.3803089](https://doi.org/10.1145/3788853.3803089)
+- 产品文档：[Amazon Aurora PostgreSQL Limitless Database](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/limitless.html)
+
+#### 为什么读这篇论文
+
+经典 Aurora 已经把计算与分布式存储分离，但写入入口仍然是一台 Primary DB Instance。增加 Read Replica 可以扩展读，无法突破单 Writer 的 CPU、Buffer Pool、连接数和写吞吐上限。业务继续增长时，只能垂直扩容，或让应用自己维护多个数据库、路由规则与跨库事务。
+
+Aurora Limitless 试图保留 PostgreSQL 驱动、SQL、事务和运维体验，同时把一个逻辑数据库拆成可以独立扩展的 Router Fleet 与 Shard Fleet。它真正要解决的不是“数据库能不能分片”，而是：
+
+> **在没有中心化事务管理器的条件下，如何把分片、路由、跨分片事务、DDL、查询下推和弹性扩缩封装进一个 PostgreSQL 兼容服务？**
+
+#### 三种表：分片并没有从数据建模中消失
+
+Aurora Limitless 提供三种表类型：
+
+| 表类型 | 物理放置 | 主要用途 | 代价 |
+|---|---|---|---|
+| Sharded Table | 按用户指定 Shard Key 哈希分布 | 大表写入与容量横向扩展 | 非 Shard Key 访问可能 Scatter-Gather |
+| Reference Table | 在所有 Shard 完整复制 | 小字典表与 Sharded Table 本地 Join | 更新和存储随 Shard 数放大 |
+| Standard Table | 完整放在一个指定 Shard | 不需要扩展的普通表、迁移过渡 | 容量和写入仍受单 Shard 限制 |
+
+共享相同 Shard Key 的表可以 Collocate。例如 `customers` 与 `orders` 都按 `cust_id` 分布，同一客户的数据会落到同一个 Shard。以 `cust_id` 为边界的事务与 Join 因而可以退化成单 Shard 操作。
+
+这里需要澄清“免应用分片”的含义：应用不再维护连接池、路由中间件、2PC 和分片拓扑，但用户仍要决定哪些表分片、选择哪个 Shard Key、哪些表复制。论文在 Future Work 中也承认，Shard Key 是接近 One-way Door 的决定，变更通常需要数据迁移。Limitless 消除的是分片的执行与运维泄漏，不是数据局部性本身。
+
+#### Router 与 Shard：控制、协调和执行如何分工
+
+```text
+PostgreSQL Client
+       |
+       v
+Router Fleet
+  - Session endpoint / transaction coordinator
+  - topology + schema + placement cache
+  - distributed planner / result assembly
+       |
+       +----------+----------+
+       |          |          |
+       v          v          v
+   Shard 1    Shard 2    Shard N
+ PostgreSQL  PostgreSQL  PostgreSQL
+ Aurora vol. Aurora vol. Aurora vol.
+       \          |          /
+        Aurora distributed storage across 3 AZs
+```
+
+Shard 持有数据分区并执行下推计划；Router 接收所有应用流量，维护 Shard Group 的 Schema 与 Placement 视图，选择 Snapshot、驱动跨 Shard Commit，并把客户端 Session 多路复用到 Router–Shard 连接上。一个连接在 Session 生命周期内固定到某个 Router，但 Router 到 Shard 的连接可在事务结束后复用。
+
+Router 不是全部元数据的最终控制面。独立 Cluster-management Service 维护权威拓扑、节点生命周期和变更传播；Router 保存服务查询所需的状态，并对应用表现为统一端点。Router 故障可由 DNS 把新连接导向其他实例，Shard 则可配置跨 AZ Standby，因为某个 Shard 不可用会直接让其数据分区不可用。
+
+#### 时间戳 MVCC 与非阻塞 2PC
+
+社区 PostgreSQL 的 Snapshot 主要由 Transaction ID 集合描述。Aurora Limitless 为跨 Shard 可见性改造了事务内核，使用 Amazon Time Sync 提供的有界时钟误差，把 Snapshot 与 Commit Order 表达为标量时间戳。
+
+跨 Shard 写仍使用 2PC，但不设置全局中心协调器：
+
+```text
+Router chooses snapshot timestamp
+  -> execute on participating shards
+  -> PREPARE on every participant
+  -> choose one participant as lead shard
+  -> commit decision becomes durable at lead
+  -> other shards commit according to lead state
+  -> wait out clock uncertainty when required
+  -> return success
+```
+
+Router 失败后，Prepared Transaction 不依赖原 Router 内存才能恢复：若没有 Shard 持久化 Commit Decision，事务可以 Abort；若部分 Shard 已提交，Lead Shard 的状态成为权威，其余 Participant 查询 Lead 后收敛。把 Lead 放在参与事务的 Shard 中，避免了每笔事务都经过一个全局 Transaction Manager。
+
+Commit Wait 保证 External Consistency：对外返回前，系统确保未来事务的 Snapshot 不会落到这个 Commit 之前。论文称 Amazon Time Sync 的误差界通常低于 1ms，且持久化写延迟往往已经覆盖这段等待；这不表示时钟同步是零成本，也不表示系统支持所有 PostgreSQL 隔离级别。当前设计扩展了 Read Committed 与 Repeatable Read，并明确没有提供 Serializable。
+
+#### 混合扩缩：Serverless 与 Limitless 不是同义词
+
+Aurora Serverless V2 解决单个 Router 或 Shard 的纵向弹性：根据负载调整 ACU、CPU、内存和 Buffer Cache。Limitless 在此基础上增加横向弹性：
+
+- Router 压力上升时向 Router Fleet 增加实例；
+- Shard 达到计算或存储阈值时执行 Shard Split，把细粒度 Table Slice 迁移到新 Shard；
+- Router 与 Shard 使用不同扩容信号：Shard 更关注计算与 Buffer Cache，Router 更关注连接、协调和内存；
+- 整个 Shard Group 有统一的最小/最大 ACU Budget，再根据各节点真实消耗动态分配。
+
+所以 Serverless 回答“单个计算单元需要多少资源”，Limitless 还要回答“应该有多少计算单元、数据如何重新分布以及跨单元语义如何保持”。短时洪峰可以先 Scale-up，持续饱和再 Scale-out，二者组合才能同时控制迁移频率和长期容量。
+
+#### 查询执行：Single-Shard 是 Sweet Spot
+
+Router 使用 PostgreSQL Partition Pruning 判断查询能否只访问一个 Shard；若可以，就把整条查询下推，减少 Router–Shard Round Trip。跨 Shard 查询则拆成 Shard Subplan，在数据侧做 Filter、Partial Aggregate、Sort 或可下推 Join，再由 Router 汇总。
+
+下推不是无条件的：
+
+- Mutable、`STABLE/VOLATILE` 或 Definer Function 可能必须在 Router 执行；
+- Collocated Sharded Table 与 Reference Table 更容易完成本地 Join；
+- 某些 Outer Join、Anti Join 不能按相同方式下推；
+- Standard Table 与其他表类型的 Join 当前可能回到 Router。
+
+因此系统是否接近单机体验，很大程度取决于 Shard Key 是否覆盖高频事务边界。Router 隐藏了分布式执行，但无法消灭跨 Shard 数据移动。
+
+#### 论文证据，以及数字的边界
+
+论文使用修改后的 HammerDB/TPC-C 类负载，包含 12,000 个 Warehouse、1,000 个并发 Client、1,000 万次 Iteration，约 10% 的事务跨 Shard：
+
+- 在相同 1,536 ACU Budget 下，从 2 Router / 4 Shard 扩到 4 Router / 8 Shard，NOPM 从 1,268,350 增至 2,012,763，提升 58.7%，平均 NEWORD 延迟从 29.70ms 降至 21.06ms；
+- 在 8 Router / 16 Shard 下把 Budget 从 1,536 提到 3,072 ACU，NOPM 提升 41.6%，平均延迟从 16.42ms 降至 9.72ms；
+- 论文写作时，生产最大规模达到 32 Router / 64 Shard，最常见配置为 4 Router / 8 Shard。
+
+这些结果证明混合扩缩在论文构造的良好分片负载上有效，不等于任意 PostgreSQL 应用都能线性扩展。实验已主动把表按 ID 分片，并把可单 Shard 执行的 Function 标记为 Distributed；跨 Shard 比例约 10%。如果大部分事务跨分片、存在热点 Shard Key，或者需要大量 Router 端 Join，结果会明显不同。“Millions TPS / Petabytes”是系统目标和整体能力描述，不能替代每种业务 Schema 的容量与延迟验证。
+
+#### 我的判断
+
+Aurora Limitless 最值得学习的是一种渐进式分布式数据库路线：不是从零重写 PostgreSQL，而是保留 Planner、Executor、类型和生态，再系统改造 Snapshot、Commit、DDL、Partition Pruning 与连接管理。它证明 Shared-storage Aurora 与 Shared-nothing Sharding 并非互斥：每个 Shard 内继续使用 Aurora 分布式存储，Shard 之间再通过数据分区扩展写入。
+
+复杂度也没有消失。过去由应用承担的 Shard Key、拓扑、跨库事务与扩容问题，被集中到了 Router、时间服务、2PC Recovery、Schema 传播和 Shard Split 状态机中。托管服务的价值正是让平台团队统一承担这部分复杂度，但数据库建模仍决定 Fast Path 的比例。
+
+#### 待继续验证
+
+- Read Committed 与 Repeatable Read 的 Snapshot Timestamp、Commit Timestamp 和 Clock-uncertainty Wait 的完整状态机；
+- Router Failover、Lead Shard 决议和 In-doubt Transaction 回收如何避免错误提交；
+- Shard Split 的 Snapshot Copy、增量追赶、切换锁和失败恢复路径；
+- Global Unique Constraint、Secondary Index 与 Foreign Key 跨 Shard 时的真实边界；
+- 与 Citus、Vitess、CockroachDB、Aurora DSQL 在兼容性、隔离级别和跨 Region 能力上的逐项比较。
+
+---
+
+## 执行引擎：Remote Shuffle 的自适应与容错
+
+### FuxiShuffle：把数据交换变成自适应、可恢复的服务
+
+#### 论文信息
+
+- 论文：[FuxiShuffle: An Adaptive and Resilient Shuffle Service for Distributed Data Processing on Alibaba Cloud](https://arxiv.org/pdf/2602.22580)
+- 作者：Yuhao Lin、Zhipeng Tang、Jiayan Tong、Junqing Xiao、Bin Lu、Yuhang Li、Chao Li 等
+- 出处：SIGMOD Companion 2026
+- DOI：[10.1145/3788853.3803085](https://doi.org/10.1145/3788853.3803085)
+
+#### 为什么读这篇论文
+
+Shuffle 是分布式执行中最容易被低估的算子边界。逻辑上它只是按 Key 重分区，物理上却同时涉及上游 Fan-out、下游 Fan-in、内存与磁盘选择、网络拥塞、碎片聚合、任务调度、倾斜统计、版本去重和失败重算。
+
+固定策略很难适应多租户生产环境：全部 In-memory 容易挤爆内存，全部 On-disk 会浪费空闲 DRAM；Staged Scheduling 延长关键路径，Gang Scheduling 又让 Reader 长时间占着资源等数据；不给 Backup 会扩大失败重算，全部 Backup 则把正常路径拖慢。
+
+FuxiShuffle 的核心问题因此不是“Push 比 Pull 快吗”，而是：
+
+> **能否根据任务和实时资源，在每个 Shuffle 生命周期阶段选择不同模式，并让失败恢复不丢掉下游已经完成的工作？**
+
+#### 四个角色与两种数据介质
+
+```text
+Compute Framework / Fuxi
+          |
+     Job Manager                 Shuffle Service Manager
+  job-level policy/schedule <--> global resource/health control
+          |
+Writer -> Shuffle Proxy -> Shuffle Agent -> Reader
+          batch/aggregate    memory or Pangu disk
+```
+
+- **Shuffle Proxy** 与 Writer 同机，合并小包并做初步 Partition Aggregation，降低网络碎片；
+- **Shuffle Agent** 是数据面 Worker，接收多个 Writer 的数据，按 Partition 聚合为连续 Block，并放入内存或磁盘；
+- **Job Manager** 根据任务优先级、预测时间、数据规模和资源决定 Shuffle Mode、Agent 分配与 Reader 启动时机；
+- **Shuffle Service Manager** 管理全局 Agent 资源、分配和健康状态。
+
+Shuffle Agent 既可以和 Compute Worker 同机，用共享内存承载 In-memory Shuffle；也可以部署在 Storage Node，使用盘古磁盘承载 On-disk Shuffle。这不是一套永远独立的 Remote Shuffle Cluster，而是一套允许计算侧内存和存储侧磁盘共同参与的数据交换服务。
+
+Reader 不依赖中心调度器逐条告诉它数据位置。Primary Index 记录 Agent 聚合文件中的 Writer、`RetryIdx`、Offset 和 Length，Backup Index 记录 Writer Backup；Reader 合并元数据、按最大 `RetryIdx` 去重，自己构造读取路径。这让生产、消费和故障切换解耦，也把版本正确性放进了可验证的元数据协议。
+
+#### 自适应一：选择 In-memory 还是 On-disk
+
+短任务、小数据适合留在内存，长任务或大 Partition 更适合磁盘。系统用输入规模、Shuffle Operator、Key Cardinality 和历史画像预测 Task Runtime `t̂`，再用动态阈值决定模式：
+
+```text
+Mode = In-memory, if t̂ <= τmode
+       On-disk,   otherwise
+
+τ*mode = arg max y(τmode)
+         subject to z(τmode) <= Zavailable
+```
+
+`y(τ)` 表示阈值下可以被内存加速的数据比例，`z(τ)` 表示每机平均内存需求，`Zavailable` 来自 Worker 实时上报。历史曲线可以按小时离线更新，后台 Daemon 再根据可用内存约每 30 秒重算阈值。
+
+这不是一个静态“小于多少 GB 就进内存”的规则。它把 Admission Control 写成受实时容量约束的收益最大化：集群空闲时吸收更多 In-memory Shuffle，压力升高时主动退回 On-disk。
+
+#### 自适应二：Progressive Scheduling 与 Pre-read
+
+三种 Reader 调度方式代表不同取舍：
+
+| 模式 | Reader 何时启动 | 优势 | 代价 |
+|---|---|---|---|
+| Staged | 所有 Writer 完成后 | Reader 不空等、资源成本低 | 无法重叠上下游，E2E 更长 |
+| Gang | Writer 与 Reader 同时 | Pipeline 最早启动 | Reader 可能长期占资源等待 |
+| Progressive | Writer 达到动态进度阈值后 | 接近 Gang 的延迟，减少无效等待 | 需要进度预测与增量可读协议 |
+
+Job Manager 为每个下游 Stage 维护阈值 `λS`。Pre-start 在上游进度达到阈值时申请并启动 Reader；Pre-read 则让 Reader 轮询已经 Commit 的 Block，一边等待新数据，一边顺序消费当前可见数据。
+
+系统不会机械启用 Pipeline：并发很低、可以一次拿齐资源的小 Job 会选择 Gang；遇到 Sort 或 Global Aggregate 这类 Blocking Edge 时，把 `λS` 设为 1，退回 Staged。Progressive Scheduling 的价值在于承认“更早启动”同时影响 E2E 和 CU Cost，阈值必须由算子依赖和资源状况共同决定。
+
+Partition 级 Runtime Statistics 还服务 Dynamic Partition Insertion 与 Adaptive Skew Join：系统根据 Data Size、Record Count、Distinct Key 拆分热点 Partition，必要时拆左侧热点并复制对应右侧 Partition。Shuffle Service 因而不只是字节搬运层，也成为 AQE 的观测面。
+
+#### 自适应三：不是所有 Chunk 都值得备份
+
+FuxiShuffle 支持四类布局：
+
+- **Shuffle Agent File**：聚合后的主读取路径；
+- **Default Backup**：Writer 本地备份，Agent 读取失败时避免重跑；
+- **Remote Backup**：Writer 与 Agent 同机时把备份放到远端，避免共同失效；
+- **Backup Only**：超大 Block 跳过 Agent 聚合，直接写双副本，避免大流量占用 Agent 网络与 I/O。
+
+是否备份由 Writer Runtime、Partition 总大小和单 Block 大小共同决定。长时间运行或重传代价高的 Writer 值得备份；很小、重算便宜的数据可以不备份；足够大的 Block 本身没有碎片读问题，则走 Backup Only，省去再转发和聚合。
+
+这比“所有中间数据双写”更接近成本模型：Backup 的收益是减少失败重算，成本是前台写时延、磁盘空间和 I/O 竞争。系统按 Chunk 选择策略，让正常路径接近 NoBackup，异常路径接近 AllBackup。
+
+#### Shuffle Agent Group、内存水位与多源读取
+
+超大规模下，把所有 Writer 汇聚到一个 Agent 会形成 Incast。FuxiShuffle 先把 Writer 分组，让多个 Agent 分摊一个 Reader 所需的数据；每个 Agent Group 内提供逻辑 Replica，Writer 遇到网络、内存、磁盘或机器故障时切换到另一个 Agent。Reader 最后从整个 Group 聚合 Fragment。
+
+In-memory Shuffle 与 Compute Worker 共机时，Agent 使用 Yellow/Red 双水位：
+
+- 超过 Yellow Line，按优先级平滑 Spill 低优先级数据；
+- 超过 Red Line，立即淘汰最低优先级且已有 Backup 的数据，防止 OOM；
+- Worker 内存突然增长时动态下调水位，让 Shuffle 内存主动让路；
+- Reader 优先走内存 Agent，失败或变慢后切到 Backup。
+
+因此“内存级性能、磁盘级可靠性”不是因为内存数据天然可靠，而是布局规划、优先级、Spill、Backup 与 Reader Failover 共同建立的行为。
+
+#### Incremental Recovery：恢复时不丢 Reader 进度
+
+传统 Partial Re-execution 往往在某段 Shuffle 丢失后终止 Reader，重跑相关 Writer，再让 Reader 从头开始。反复故障会形成“下游丢进度—上游重算—再次失败”的串行循环。
+
+FuxiShuffle 让 Reader 继续处理仍然有效的数据，同时重跑缺失 Writer；新版本到达后只补读缺口。正确性依赖双阶段校验：
+
+1. 恢复前从 Job Manager 获得 Writer Version、`RetryIdx` 与 Checksum，确认缺失范围可定位、现有数据仍有效；
+2. 重跑 Writer 产生新版本后，Reader 选择性拉取并验证聚合 Checksum；发现 Missing 或 Duplicate 就放弃增量路径，退回 Full Re-execution。
+
+这个设计优化的不是“重算本身更快”，而是让上游重算与下游有效计算并行，并只丢弃真正不可信的部分。没有 Version 与 Checksum 约束的增量恢复，只会把性能问题变成静默错误。
+
+#### 论文证据，以及数字的边界
+
+论文测试集群包含 20 台计算节点（每台 96 Logical Core、412GB RAM）和 18 台存储节点（每台约 104TB Raw HDD），使用 1TB/10TB TPC-DS 与 TeraSort，对比生产定制的 Hadoop-like、Spark-like Baseline：
+
+- 综合结果中，FuxiShuffle 相对 Baseline 平均降低 76.36% E2E Runtime 和 67.14% CU Cost；
+- Progressive Scheduling 实验中，E2E 接近 Gang Scheduling，同时避免其 Reader 等待造成的高 CU Cost；
+- 在一次故障实验中，Adaptive Backup 的正常路径接近 NoBackup，异常路径优于 NoBackup 与 AllBackup；
+- 随机故障下注入短时网络断连，启用容错后 E2E 和 CU Cost 分别只增加约 9.6% 和 8.1%；关闭容错时 E2E 接近三倍、CU Cost 约翻倍；
+- Shuffle Agent 绑定的专用 Core 约占单机 CPU 的 3%–5%。
+
+这些数字来自阿里内部测试集群和定制 Baseline，不应直接等价为“比开源 Hadoop/Spark 固定快 76%”。其中同时叠加了 Agent 聚合、自适应介质、调度、布局和恢复，无法把全部收益归到某一个机制；生产环境的网络超卖、Pangu 配置、任务分布和既有优化程度都会改变结果。
+
+#### 与 Remote Shuffle Service 的关系
+
+Celeborn、Uniffle、Magnet、Riffle 等系统都在不同程度上把 Shuffle 从 Executor 本地盘中解耦。FuxiShuffle 的区别不宜简化成“Push-based RSS”：它同时支持计算节点内存与存储节点磁盘，关注的不只是服务化存储，还包括上游/下游调度解耦、每 Chunk 布局选择、Agent Group Failover 和不中断 Reader 的增量恢复。
+
+Remote Shuffle 的普遍收益是让 Compute Worker 更容易释放和替换，代价则是多一层网络、共享服务容量治理和复杂元数据状态机。是否值得部署，取决于计算弹性、失败频率、网络成本和本地盘资源之间的权衡，不是所有规模都需要独立 Shuffle Service。
+
+#### 我的判断
+
+FuxiShuffle 最有价值的地方，是把“Shuffle 策略”从 Job 启动前的一次静态选择，改成贯穿写入、调度、布局、读取和恢复的连续控制过程。Mode、Reader Start、Backup 和 Recovery 各自都有局部策略，但它们共享 Runtime Telemetry 和元数据版本，最终形成一条闭环。
+
+它也说明中间数据服务不能只追求吞吐。对生产 SQL 平台而言，真正目标是 E2E Runtime、CU Cost、失败放大和多租户隔离的组合。内存命中更高却让 Reader 长时间空等，或者备份更完整却拖慢所有正常 Job，都不是全局最优。
+
+#### 待继续验证
+
+- Job Manager、Shuffle Service Manager 与 Fuxi Scheduler 的状态归属及故障恢复；
+- Primary/Backup Index 的持久化、垃圾回收与 `RetryIdx` 并发更新协议；
+- Progressive Scheduling 阈值如何结合 Critical Path、Backpressure 与资源碎片动态调整；
+- Backup Only 在热点 Partition、跨机网络和 Pangu I/O 之间的完整成本模型；
+- Incremental Recovery 在多个 Writer 同时重跑、Partition Scheme 改变时的 Checksum 证明；
+- 与 Celeborn、Uniffle 在开源可复现实验上的同硬件比较。
+
+---
+
+## 工业查询优化：从代价模型到反馈闭环
+
+### 引言：优化器真正缺少的不是另一个模型
+
+经典查询优化器建立在一个很优雅的抽象上：统计信息描述数据，代价模型预测执行成本，搜索器在候选计划中选择代价最低者。
+
+```text
+Statistics + Cost Model + Search Space
+                  |
+                  v
+             Best Plan
+```
+
+这里需要先区分“优化器框架”和“反馈来源”。Volcano/Cascades 解决的是如何用规则、物理属性与 Memo 组织候选搜索：逻辑等价表达式归入同一 Group，Transformation Rule 扩展等价空间，Implementation Rule 产生物理算子，代价模型再做剪枝。后来的 Learned Optimizer、HBO 与自治调优通常没有抛弃这套搜索骨架，而是在基数、代价、候选排序、历史状态或验证环节补充新的信号。
+
+这个抽象没有过时，但工业环境不断击穿它的边界：
+- 统计信息会过期，数据湖中的列统计可能根本不存在；
+- 共享集群的资源负载持续变化；
+- 同一条参数化 SQL 在不同参数下需要完全不同的计划；
+- 优化器选出的新计划即使平均更好，也可能让某次关键请求慢上数十倍。
+
+更重要的是，现代数据平台已经积累了过去不曾拥有的资产：数十亿次查询的执行记录、算子级基数、Shuffle 与 Spill 指标、表版本、扫描遥测，以及能够低成本回放或影子验证的存算分离基础设施。于是问题从“能否把代价估得更准”逐渐变成：
+
+> **能否把历史执行统计变成下一次决策的依据，并且让错误决策的代价始终可控？**
+
+本节围绕八项工业数据库工作展开。它们分别来自 MaxCompute、Amazon Redshift、Databricks、OceanBase、Microsoft SQL Server 与 Oracle，看起来涉及学习型优化器、增量统计、参数化查询、索引、数据布局和计划稳定性，实际上都在回答同一个问题：如何构造一条可信的优化闭环。
+
+本节不是摘要合集。阅读重点是四件事：系统观察到了什么，如何把观测表示成可复用状态，如何修改决策，以及如何验证修改不会造成不可接受的回退。
+
+### 阅读地图与结论
+
+#### 八项工作的定位
+
+| 工作 | 公开版本 | 决策对象 | 反馈来源 | 核心方法 |
+| --- | --- | --- | --- | --- |
+| [Amazon Redshift Re-invented](https://doi.org/10.1145/3514221.3526045) | SIGMOD 2022 | 存储、计算与自治基础设施 | 全平台遥测 | RMS、弹性计算、代码生成与自治组件 |
+| [Incremental Query Optimizer Statistics in Amazon Redshift](https://www.amazon.science/publications/incremental-query-optimizer-statistics-in-amazon-redshift) | PVLDB 2026 | CBO 单列统计 | 增量数据 | HLL++、Space Saving、Count Sketch、KLL |
+| [Learned Query Optimizer in Alibaba MaxCompute](https://arxiv.org/abs/2602.07336) | SIGMOD 2026 Industry | 候选物理计划 | 历史默认计划与执行环境 | 无统计编码、环境建模、领域自适应 |
+| [Ultron](https://doi.org/10.14778/3827998.3828038) | PVLDB 2026 | Join、Runtime Filter、分区数 | 子计划级执行历史 | Softstore、QuickPredict、单调优化应用 |
+| [Towards Industrial-Scale Parametric Query Optimization](https://www.vldb.org/pvldb/vol19/p4303-mo.pdf) | PVLDB 2026 | 参数化 SQL 的计划缓存 | 参数—计划—延迟样本 | 模板聚类、分层训练、KL 漂移检测 |
+| [LLM-Driven Index Tuning on Microsoft SQL Server](https://arxiv.org/abs/2603.09181) | PVLDB 2026 | 索引集合 | SQL、Schema、Showplan 与实测耗时 | GPT-5 与 DTA 的实证比较、规则蒸馏 |
+| [AutoLiquid](https://vldb.org/2026/program.html) | VLDB 2026 Industry | Liquid Clustering Key | 扫描遥测与抽样验证 | 候选筛选、影子验证、验证后提交 |
+| [Real-Time SQL Plan Management in Oracle](https://vldb.org/2026/program.html) | VLDB 2026 Industry | SQL Plan Baseline | 前台执行与历史参考计划 | 前台验证、计划接受与回退 |
+
+截至 2026 年 8 月 28 日，AutoLiquid 与 Real-Time SPM 的公开入口主要是 VLDB 2026 会议摘要和产品文档，会议尚未召开。本节对其采用“公开设计预读”，不把摘要之外的实现猜测写成论文事实；其余六项工作均对照公开全文阅读。
+
+#### 先说结论
+
+读完这些工作，我得到九个判断：
+
+1. **工业优化器的发展方向不是用机器学习、神经网络或 LLM 替换 CBO，而是把统计、历史、模型与验证器组合成闭环。** LOAM、Ultron 和 ScalePQO 都保留原生优化器，只在候选生成、代价比较或计划选择处介入。
+2. **历史不是一个万能的 `plan_hash -> latency` 缓存，也不应只停留在整条 Plan 粒度。** 可复用历史必须绑定子计划、参数、表规模、Schema 或执行环境，否则“精确的旧答案”可能比粗糙的新估计更危险。
+3. **统计信息仍是最便宜、最通用的知识。** Redshift 用可合并 Sketch 降低统计维护成本，并刻意把结果转换回已有 PostgreSQL 风格统计，避免修改优化器热路径。
+4. **缺少统计信息时，模型只能学习代理信号。** LOAM 用表标识、访问分区、Join 列、谓词结构和历史成本间接推断数据特征；`statistics-free` 不等于模型不需要数据知识。
+5. **不确定性来自两个方向：数据分布和运行环境。** 大多数优化器只处理前者；LOAM 明确指出，即使计划自身不变，共享集群的 CPU、I/O、内存和负载也会改变实际 CPU Cost。
+6. **生产安全通常来自单调决策，而不是更复杂的预测器。** Ultron 只在有历史证据时把 SHJ 提升为 BHJ，Runtime Filter 只增不减；Oracle 用已接受计划做锚点；AutoLiquid 在真正改变布局前先验证收益。
+7. **LLM 擅长提出候选，不擅长承担最终责任。** GPT-5 能发现 DTA 因代价误差而错过的索引，但同一输入的五次输出波动很大，直接把 LLM 候选塞回 DTA 也可能因为同一个错误代价模型而继续选错。
+8. **规模问题最终会变成模型与状态的生命周期问题。** 十万个 Project、五千个 SQL 模板、数亿张表或数十亿次查询，使“每对象一个模型、每次决策一次远程查询”都不可行。
+9. **优化的终点不是选出一次更快的计划，而是让系统在变化中稳定收敛。** 这也是本节最核心的主线。
+
+### 一个统一视角：Observe、Represent、Decide、Verify
+
+可以把八项工作统一成下面的控制闭环：
+
+```text
+                         +----------------------+
+                         |  Workload / Data     |
+                         +----------+-----------+
+                                    |
+                                    v
+  +---------+   telemetry   +-------+--------+   features/history
+  | Execute | ------------> |    Observe     | -------------------+
+  +----+----+               +----------------+                    |
+       ^                                                              v
+       |                                                        +-----+------+
+       |                                                        | Represent  |
+       |                                                        +-----+------+
+       |                                                              |
+       |                                                   candidates / scores
+       |                                                              v
+  +----+----------------+    guardrail / validation             +-----+------+
+  | Apply or Roll Back  | <------------------------------------ |   Decide   |
+  +---------------------+                                      +------------+
+```
+
+四个阶段缺一不可：
+
+- **Observe**：收集增量数据、算子实际行数、表大小、集群负载或 SQL 执行时间；
+- **Represent**：把观测压缩为 Sketch、计划 Hash、Embedding、Plan Baseline 或候选布局；
+- **Decide**：选择物理计划、Join 算法、Runtime Filter、分区数、索引或聚簇键；
+- **Verify**：通过保守阈值、单调状态机、影子评估、实测执行或基线比较限制回退。
+
+传统 CBO 主要覆盖 Represent 与 Decide。本节这些工作真正新增的是 Observe 与 Verify，并把四者连接成持续运行的系统。
+
+### Redshift Re-invented：先建立能够反馈的系统底座
+
+#### 论文信息
+
+- 论文：[Amazon Redshift Re-invented](https://doi.org/10.1145/3514221.3526045)
+- 出处：SIGMOD 2022 Industry
+- 阅读状态：精读
+
+#### 这篇论文为什么放在最前面
+
+《Amazon Redshift Re-invented》并不是一篇学习型优化器论文，却解释了后续自治能力为什么可能成立。没有统一遥测、共享存储、弹性计算、异步服务与可重用编译缓存，所谓“持续学习”很容易沦为一个离线实验。
+
+早期 Redshift 是典型 Shared-Nothing MPP：Leader 负责解析与优化，Compute Node 持有数据分片并执行。它的优势是数据本地性强，问题是数据与计算绑定：扩缩容要移动数据，存储与计算不能独立增长，并发负载也会争用同一集群。
+
+重构后的逻辑结构可以简化为：
+
+```text
+                       Leader / Optimizer
+                              |
+             +----------------+----------------+
+             |                                 |
+       Compute Cluster                   Concurrency Cluster
+       Memory + Local SSD                Memory + Local SSD
+             |                                 |
+             +---------------+-----------------+
+                             |
+                  Redshift Managed Storage
+                    S3 as source of truth
+```
+
+#### RMS 不是“把磁盘换成 S3”
+
+Redshift Managed Storage（RMS）的关键是重写状态归属：数据和事务元数据持久化到 S3，本地 SSD 与内存成为缓存层。RMS 依据 Block 的温度、年龄和访问模式预取与替换，并使用两级 Clock 策略区分首次访问的冷 Block 与重复访问的热 Block。
+
+这个设计带来三项后果：
+
+1. 计算节点损失本地盘不再意味着数据丢失，节点更接近可替换资源；
+2. Elastic Resize 主要迁移元数据和重新建立缓存，而不必复制整份底层数据；
+3. Concurrency Scaling 与 Data Sharing 可以让多个计算集群直接访问同一份已提交数据。
+
+论文明确写的是 Redshift 列式数据以 **1 MiB Block** 存在 RMS 中。Block 越大，远程读取、压缩和元数据摊销通常越好，但随机访问与无效读取也越多；Block 越小，细粒度访问更灵活，却会增加元数据、请求调度和对象访问成本。这里的 1 MiB 是列式扫描、S3 吞吐与本地缓存粒度之间的工程折中，而不是适用于所有存储系统的常数。
+
+#### 执行器优化仍然重要
+
+存算分离并没有让单机执行效率变得不重要。Redshift 仍然大量使用代码生成，并针对 CPU Cache Miss 显式生成 Prefetch。其思路是让哈希表 Probe 或 Bloom Filter 访问提前发出内存预取，再用 L1 Cache 中的小型循环缓冲隐藏访存延迟。
+
+Vectorized Execution 与 Code Generation 解决的是相邻但不同的问题：前者让一组固定 Kernel 按列式 Batch 工作，用摊薄解释器开销和更规则的数据访问换取稳定执行；后者根据当前表达式、数据类型与算子 Pipeline 生成专用机器码，减少虚函数分派、中间结果和无效分支，但会产生编译延迟与代码缓存压力。工业系统通常不是二选一：常见算子使用成熟向量化 Kernel，热点表达式或 Pipeline 再通过 Codegen 专门化，并用编译缓存摊薄冷启动。
+
+编译本身又可能成为短查询的冷启动成本，因此 Redshift 把编译服务外置，使用 Cluster 外部 CodeCache 复用编译结果。
+
+AQUA 则不是普通远程块存储接口，而是把过滤与聚合等计算靠近缓存数据执行的功能型接口。
+
+这一层工程细节很重要：云原生不是“所有东西远程化”，而是在耐久状态、缓存状态与计算状态之间重新划分边界。
+
+#### 自治组件为什么能够出现
+
+论文还介绍了 Automatic Table Optimization、AutoWLM 与自动物化视图等能力：
+
+- ATO 根据列访问、谓词选择率和 Join 图推荐 Distribution Key 与 Sort Key；
+- AutoWLM 根据计划特征预测执行时间、内存与编译时间，动态控制并发；
+- 自动物化视图综合查询收益与刷新成本，决定创建、刷新和重写。
+
+这些功能的共同基础不是“用了 ML”，而是系统已经能稳定收集查询、数据和资源遥测，并把后台动作与前台查询隔离。后面的 LOAM、Ultron 与 AutoLiquid 都建立在同样的工程前提上。
+
+
+### Redshift 增量统计：把全表 ANALYZE 变成可合并状态
+
+#### 论文信息
+
+- 论文：[Incremental Query Optimizer Statistics in Amazon Redshift](https://www.amazon.science/publications/incremental-query-optimizer-statistics-in-amazon-redshift)
+- 出处：PVLDB 2026
+- 阅读状态：精读
+
+#### 问题不是统计不准，而是统计来得太晚
+
+对十亿乃至百亿行表，重新扫描全表收集统计可能持续数小时。论文分析 Redshift Fleet 后发现，超过 100 亿行的大表，其 ANALYZE 时长 P90 超过 10 小时；涉及时间列谓词时，陈旧统计相较新鲜统计会带来 25 倍的 Q-Error。
+
+传统 ANALYZE 会扫描全表或样本，构造 PostgreSQL 风格的单列统计：
+
+- Row Count、Average Width、Null Fraction、Min/Max；
+- NDV；
+- Most Common Values（MCV）及频率；
+- 去除 MCV 后的压缩等深直方图。
+
+真正困难的是，优化器需要的不是一种 Sketch，而是一组语义不同的统计量。
+
+#### 四种 Sketch 各司其职
+
+| 统计目标 | 数据结构 | 为什么选择它 |
+| --- | --- | --- |
+| NDV | HLL++ | 常数级插入、可合并、已有工程基础 |
+| MCV 候选 | Space Saving | 保证高频项进入候选集合 |
+| MCV 频率 | Count Sketch | 对候选值提供更准确、近似无偏的频率估计 |
+| 直方图分位点 | KLL | 有界空间、可反复合并，长期维护不会无限增长 |
+
+这组组合很有工程意味。Space Saving 擅长“找谁可能是热点”，但频率估计不够精；Count Sketch 擅长“这个候选到底出现多少次”；KLL 负责 Quantile；HLL++ 独立承担 NDV。统一所有任务的数据结构理论上更漂亮，却可能更慢、更大。
+
+论文给定参数下，四种 Sketch 的组合单线程吞吐约为每秒 1550 万次插入，占用约 90 KiB。这个数字说明在生产系统里，“算法渐进复杂度正确”远远不够，逐行 Hash、Cache 行为和序列化格式同样决定能否上线。
+
+#### 层次化合并与 Delta ANALYZE
+
+完整流程如下：
+
+```text
+Partition / Slice
+  -> construct per-column local sketches
+  -> merge on each Compute Node
+  -> merge again on Leader Node
+  -> convert sketches to existing optimizer statistics
+  -> transactionally persist sketches and statistics
+```
+
+第一次运行仍需 Full-Scan Bootstrap。之后 Delta ANALYZE 只扫描上次分析后新插入、且对当前 MVCC Snapshot 可见的数据。每个分区先生成增量 Sketch，再逐层 Merge，最后与 Sketch Store 中的旧状态合并。
+
+这里有一个很值得借鉴的决策：**Sketch 不直接进入优化器热路径。** 系统先把 Sketch 转换成已有 Catalog 中的 NDV、MCV 和 Histogram，优化器无需理解 KLL 或 Count Sketch，也不增加每次规划时的 Sketch 查询开销。它牺牲了一部分新算法表达能力，换取兼容性、可灰度性与故障隔离。
+
+#### 直方图并不是简单查询 KLL
+
+Redshift 使用去除 MCV 后的压缩直方图。KLL 中仍然包含 MCV，因此构造每个等深边界时，需要先查询一个 Rank，再累加落在当前边界之前的 MCV 频率，调整 Rank 后重新查询，直到边界稳定。
+
+简化表达如下：
+
+```text
+target rank over non-MCV values
+  -> query KLL
+  -> count MCV mass before current boundary
+  -> shift target rank
+  -> repeat until boundary no longer changes
+```
+
+这段算法体现了从 Sketch 到优化器统计的真正难点：不同概要各自近似正确，并不意味着组合后的统计语义自动正确。
+
+#### Sampling、Delete 与关键路径取舍
+
+Full Sketch Bootstrap 的逐行成本高于旧的 Sample ANALYZE。系统最终只让 Space Saving 和 KLL 处理 25% 样本，HLL++ 与 Count Sketch 仍处理全量数据。原因是 NDV 对采样敏感，而 Count Sketch 可以复用 HLL 的 Hash 结果。
+
+系统也没有强行让所有 Sketch 支持 Delete。Redshift 的目标负载以 Append 为主；当累计删除达到 10% 时，触发 Full-Scan 重建。论文给出的 Fleet 数据显示，86.6% 的表没有 Delete，发生 Delete 的表中约 85% 每天只删 10 行。对目标负载而言，复杂的可删除 Sketch 不值得其吞吐和空间代价。
+
+另一个失败尝试更有启发：团队最初把 Sketch 更新放在 Insert Path，希望用 S3 延迟掩盖开销，但实测仍明显拖慢 INSERT、COPY 和 CTAS，于是退回异步 Automatic ANALYZE。**最及时的反馈不一定是最好的反馈；写入关键路径的预算比新鲜度更硬。**
+
+#### 实验证据与边界
+
+在从 100 亿行开始、每轮增长 1% 的 10 TB TPC-H `lineitem` 实验中：
+
+- 25% Sampling 的首次 Sketch Bootstrap 约为旧 ANALYZE 的 2.8 倍；
+- 后续 Delta ANALYZE 最高快 68.4 倍；
+- 以 1% 增长触发增量统计、以 10% 增长触发旧 ANALYZE 时，累计成本在 34 轮后反超，同时统计新鲜度提高 10 倍；
+- 在数千个生产集群上线后，大表每周统计收集总计算时间降低约 40%。
+
+论文的目标是“以更低累计成本维持相同统计质量”，不是证明所有查询都变快。多列相关性仍然超出这些单列统计的表达范围；高频 Update/Delete 负载也会增加 Full Rebuild。它是面向追加型数仓的设计，不应直接外推到 OLTP。
+
+### LOAM：当统计缺失、环境未知且不能在线试错
+
+#### 论文信息
+
+- 论文：[Learned Query Optimizer in Alibaba MaxCompute: Challenges, Analysis, and Solutions](https://arxiv.org/abs/2602.07336)
+- 出处：SIGMOD 2026 Industry
+- 阅读状态：精读
+
+#### 四个生产约束
+
+LOAM 的出发点不是“神经网络比 CBO 更聪明”，而是 MaxCompute 让许多学术 LQO 的默认假设失效：
+
+1. 平均 5000 台机器的资源池动态调度，同一计划的执行环境不同；
+2. 海量数据和频繁修改使 Histogram 等统计可能缺失或陈旧；
+3. 候选计划代价很高，不能为训练而在线执行危险计划；
+4. 超过 10 万个 Project 的收益差异巨大，无法每个 Project 都训练并部署模型。
+
+因此 LOAM 的目标不是替代 MaxCompute 原生优化器，而是 Steering：原生优化器生成候选，学习模型负责比较候选，最终仍由成熟执行栈运行。
+
+#### Plan Explorer：先限制搜索空间的风险
+
+MaxCompute 暴露 75 个可调 Flag，涉及执行模式、Join、Shuffle、Spool、Filter 与并行度等。论文实验只选择其中 6 个相对安全、容易产生多样计划的 Flag；同时借鉴 Lero，对至少三个输入的子查询缩放估计基数，以影响计划结构。
+
+这说明 30% 的最高收益不能理解为“模型任意生成了全新计划”。LOAM 的上限首先受 Plan Explorer 限制：候选集合中没有好计划，再准确的排序器也无能为力。
+
+#### Statistics-Free 到底编码了什么
+
+`Statistics-Free` 的准确含义是“不把维护好的 Histogram、NDV 等作为必要输入”，而不是完全不需要数据特征。LOAM 从算子语义与稳定标识中学习间接信号：
+
+- TableScan：表标识、访问分区数、访问列数；
+- Join：Join 类型、Join 列标识；
+- Aggregate：聚合函数、聚合列与 Group-By 列；
+- Filter：谓词中函数的 Multi-Hot、涉及列的 Hash 编码。
+
+对于很深的谓词表达式树，LOAM 不编码完整 AST，而只保留函数集合与列标识。它承认这是粗粒度信息，再依靠重复工作负载的历史成本学习表、列与谓词的隐式数据分布。
+
+#### Tree Convolution 与环境特征
+
+计划树经过三层 Tree Convolution，通道数依次为 256、128、64；Pooling 后经过全连接层形成 32 维 Plan Embedding，再由一个简单 Cost Head 预测 CPU Cost。论文也比较了 Transformer、GCN 与 XGBoost，模型结构本身不是主要贡献。
+
+LOAM 在每个 Stage 上编码四类运行环境指标：
+
+```text
+CPU_IDLE    IO_WAIT    LOAD5    MEM_USAGE
+```
+
+指标每 20 秒采样，并在 Stage 执行窗口及分配机器范围内求平均。训练时，模型同时看到计划结构与实际环境，从而尝试分离“计划内在成本”和“当时机器有多忙”。LOAM 预测 CPU Cost，而非更容易受排队和网络长尾影响的端到端时延。
+
+线上规划时，未来机器尚未分配，环境当然不可知。论文证明：不知道未来环境的模型与知道真实环境的 Oracle 之间存在不可消除的期望差距。工程上，LOAM 把归一化环境特征设置为接近历史均值的代表值，以估计平均环境下的计划成本。这里不是“预测了未来”，而是选择了一个稳定的期望近似。
+
+#### 领域自适应为什么不需要执行候选计划
+
+训练数据主要是原生优化器产生并实际执行的默认计划，而线上要评分的是 Flag 与基数缩放产生的候选计划，二者存在 Covariate Shift。
+
+LOAM 增加 Domain Classifier，判断某个 Embedding 来自默认计划还是候选计划；Plan Encoder 前使用 Gradient Reversal Layer：
+
+```text
+Cost loss:     encoder learns plan features useful for CPU prediction
+Domain loss:   classifier learns to separate default / candidate plans
+Reversed grad: encoder learns to make the two domains indistinguishable
+```
+
+候选计划只需生成结构，不需要执行得到真实 Cost。Domain Classifier 想分清两个域，Plan Encoder 反过来消除域特征，使默认计划上训练的 Cost Head 更可能泛化到候选计划。
+
+这个方法降低了在线探索风险，但并不保证候选域与训练域完全对齐。若 Plan Explorer 未来加入新的算子或完全不同的计划形态，仍需要重新评估表示与分布漂移。
+
+#### Project Selector：先决定哪里值得用 AI
+
+LOAM 先用规则过滤训练数据不足、表生命周期太短或计划结构不合适的 Project，59.5% 的 Project 会被排除。剩余 Project 再由 XGBoost Ranker 根据默认计划结构、输入规模和历史 CPU Cost 估计“优化空间”，最终只部署到 Top-N。
+
+论文对整体覆盖给出的是一个保守估算：40.5% 的 Project 通过规则；随机抽取的 30 个 Project 中，约 10% 获得不低于 10% 的收益，因此估计至少约 4% 的 Project 能获得不低于 10% 的提升。这个数字不是“LOAM 已覆盖全体 Project 的 4%”，而是基于样本和当前保守 Plan Explorer 的推断。
+
+#### 如何理解“最高 30%”
+
+论文在五个高潜 Project 的 Flighting 回放中报告最高约 30% 的 CPU Cost 节省；不同 Project 差异明显，部分查询也会变慢。作者把五个高潜 Project 的结果视为随机样本中的上界，并没有宣称所有工作负载平均提升 30%。
+
+LOAM 最值得吸收的不是一个最高数字，而是三个生产化原则：**显式建模不可控环境、用领域自适应代替危险试跑、先筛选值得部署的租户。**
+
+### Ultron：记住 AQE 的修正，让下一次少走弯路
+
+#### 论文信息
+
+- 论文：[Ultron: History-Based Query Optimization at Databricks](https://doi.org/10.14778/3827998.3828038)
+- 出处：PVLDB 2026
+- 阅读状态：精读
+
+#### History-Based Optimization 与 Learned Optimizer 的差别
+
+Databricks 每天处理数十亿查询，很多 Lakehouse 表缺少精细统计，但工作负载高度重复。论文统计：交互式 Runtime 中，前一周逐字重复的查询约占 45%～64%；DBSQL 为 67%～80%；约 85% 的 Join 会重复出现，这些 Join 占总执行时间的 73%。
+
+Ultron 不训练通用神经网络预测未知计划，而是保存具体事实：某个子计划实际产生多少行、是否需要重分区、某个 Runtime Filter 是否有效。它的优势是决策有 Provenance，劣势是冷启动时几乎帮不上忙。
+
+#### 三层架构：全局保存，本地决策
+
+```text
+Softstore
+  distributed, tenant-isolated history cache
+       |
+       | push
+       v
+QuickPredict on cluster
+  local hash lookup + drift awareness
+       |
+       v
+Ultron Applications
+  Join / Runtime Filter / Partition Count
+```
+
+Softstore 保存跨 Cluster 的历史，但不会让优化器同步远程读取。它主动把相关 Namespace 推到 Cluster 本地；网络抖动或服务故障时，优化器只是暂时不用历史，而不会阻塞规划。
+
+QuickPredict 对子计划计算 Hash，支持三种精度：
+
+- Literal-Sensitive：计划与参数常量完全一致；
+- Literal-Insensitive：忽略常量，复用同模板历史；
+- Plan-Shape：更模糊的结构匹配。
+
+历史 Key 还包含由输入表规模计算的 Size Factor。表小幅变化时会探测相邻 Size Factor 与 Literal-Insensitive Key，避免刚跨边界就完全冷启动；表增长明显时则不再盲用远古历史。
+
+出于隐私考虑，Softstore 按客户隔离，不保存 SQL 文本或 Literal，只保存不可逆的计划 Hash 与特定统计。这个选择同时服务性能、隔离与数据最小化。
+
+#### 应用一：从 SHJ 单向提升到 BHJ
+
+Broadcast Hash Join（BHJ）省去双侧 Shuffle，但 Build 侧过大时可能 OOM；Shuffle Hash Join（SHJ）更保守，但小 Build 表也要支付网络重分区成本。
+
+Ultron 的策略不是在两者之间来回探索：
+
+1. 无历史时沿用保守的 SHJ；
+2. 执行后记录真实 Build Cardinality；
+3. 下次只有在历史证明 Build 足够小时，才把 SHJ 提升成 BHJ；
+4. Join 算法的改变不会反过来改变 Build Cardinality，因此一次修正即可收敛。
+
+这是一种单向、可解释的优化。生产结果显示，Ultron 优化了全平台约 23% 的 Join，符合条件 Join 的中位时延降低约 25%，事后决策准确率约 96%。论文也明确存在错误决策，例如高倾斜表在逻辑大小可广播时仍可能导致问题。
+
+#### 应用二：逐层加入 Runtime Filter
+
+Runtime Filter 的收益依赖上游 Join 的实际选择率，而某个 Filter 加入后又会改变下游 Cardinality。这是典型的反馈依赖问题。
+
+Ultron 利用单调性避免震荡：一个有效 Runtime Filter 只会减少或保持下游行数，不会把先前的 Filter 变得无效。系统每轮根据新历史多加入一层有收益的 Filter，直到没有候选达到阈值。
+
+```text
+iteration 1: observe first selective join
+iteration 2: add RF-1, observe reduced downstream cardinality
+iteration 3: add RF-2 if it now becomes profitable
+...
+converge: no additional filter passes the threshold
+```
+
+论文在 TPC-H 合成实验中显示，历史选择的 Runtime Filter 可对部分查询获得约 2 倍改善。但这一应用在论文撰写时尚未像 Join Selection 一样全面生产部署，不能把合成结果当作 Fleet 平均收益。
+
+#### 应用三：记住 AQE 找到的分区数
+
+AQE 可以发现分区过大，再把热点分区拆小；正确性和健壮性得到保障，但第一次执行已经支付重分区成本。Ultron 记录 AQE 最终采用的分区数，下一次直接从这个值开始。
+
+我认为这是 Ultron 最凝练的设计：
+
+> **HBO 可以被理解为 AQE 的长期记忆。AQE 修复当前查询，HBO 让相同修复不必再次发生。**
+
+#### 边界：历史越精确，复用范围越窄
+
+Ultron 的主要限制包括：
+
+- Schema 变化目前会使相关历史整体失效，即使只是增加一个无关列；
+- 新 Query、新客户与一次性 Ad-hoc Query 缺少历史；
+- 跨租户泛化会引入隐私泄漏风险；
+- 异步缓存使问题复现更难，需要计划决策 Provenance 与时间旅行调试；
+- 更多 Ultron Application 可能让规划开销非线性增长。
+
+论文报告符合条件查询的额外优化时间中位数低于 5%，但 P95 在峰值观测中可到 12.6%。系统规模不是“缓存查找 O(1)”就自动解决的，状态推送、TTL、容量预留、Schema 失效与调试工具同样重要。
+
+### ScalePQO：一个模板一个模型，也是一种不可扩展
+
+#### 论文信息
+
+- 论文：[Towards Industrial-Scale Parametric Query Optimization](https://www.vldb.org/pvldb/vol19/p4303-mo.pdf)
+- 出处：PVLDB 2026
+- 实现：[ScalePQO / RankPQO Industry Artifact](https://github.com/songsong945/RankPQO-industry)
+- 阅读状态：精读
+
+#### 参数化查询的两个子问题
+
+同一 SQL 模板使用不同参数时，数据选择率和最佳计划可能发生突变。PQO 通常拆成：
+
+1. 离线产生一小组覆盖不同参数区域的 Candidate Plan；
+2. 在线根据当前 Parameter Vector，从缓存中选出最佳计划。
+
+OceanBase 自身会按参数选择率复用计划并在 Miss 时生成新计划。RankPQO 则同时编码 Parameter 与 Plan，通过 Learning-to-Rank 比较候选计划的相对性能，再选出有限的 Plan Cache。
+
+#### 工业规模击穿两个极端
+
+一模板一模型精度高，但 3300 个模板需要超过 3.4 GiB 模型存储与超过 1000 小时的数据收集；所有模板共享一个模型虽然便宜，Speedup 会从 33 个模板时的 2.34 倍下降到 3300 个模板时的 1.18 倍。
+
+ScalePQO 选择中间路线：
+
+```text
+all templates
+   -> train global ranking model
+   -> derive performance-related template embeddings
+   -> cluster similar templates
+   -> fine-tune one specialized model per cluster
+```
+
+关键不是用 SQL Edit Distance 聚类，而是用全局模型学到的表示聚类。语法相似不代表计划性能曲线相似；Embedding 试图捕获 Parameter、Plan 与性能之间的关系。
+
+#### 参数漂移要同时更新模型与 Plan Cache
+
+ScalePQO 把到达的 Parameter Vector 按时间顺序划成 Slot，计算最近两个 Slot 分布之间的 KL Divergence。漂移越明显，后台 Fine-Tune 的强度越大，同时从新分布中补充 Candidate Plan。
+
+Plan Cache 更新采用 Prepend：新计划放在前面，淘汰最旧计划。论文实验中它优于随机替换，说明时间局部性比无差别保留更适合演化负载。
+
+这里有两个独立状态必须更新：
+
+- Ranking Model 决定相同候选集里选谁；
+- Candidate Set 决定系统有没有覆盖新参数区域的计划。
+
+只 Fine-Tune 模型而不更新候选集，模型只能在过时选项中挑一个相对不差的；只换计划不更新模型，新计划也可能被错误排序。
+
+#### 证据与边界
+
+ScalePQO 集成在 OceanBase 上，在六组工作负载中相对原生优化器最高加速 1.62 倍，相对 RankPQO 最高 1.23 倍。5000 模板实验中，模型约 759 MiB；逐模板 RankPQO 约 5712 MiB。在线 Fine-Tune 与 Plan Update 在后台和 Query Execution 并行，不进入当前请求延迟。
+
+但论文明确假设底层数据分布相对稳定，主要处理 Parameter Distribution Drift。数据本身发生倾斜或统计变化时，即使参数分布不变，计划相对性能也会改变。Embedding Mean Pooling 可能丢掉多峰分布，K-Means 也不一定是最佳聚类算法；最终质量仍受 Candidate Enumeration 上限约束。
+
+### LLM 索引调优：最好的一次回答不是可部署系统
+
+#### 论文信息
+
+- 论文：[Evaluating the Practical Effectiveness of LLM-Driven Index Tuning on Microsoft SQL Server](https://arxiv.org/abs/2603.09181)
+- 作者：Xiaoying Wang、Wentao Wu、Vivek Narasayya、Surajit Chaudhuri
+- 出处：PVLDB 2026
+- 阅读状态：精读
+
+#### 这篇论文真正评测了什么
+
+Microsoft 工作不是 SIGMOD 2024 论文，而是 2026 年 PVLDB 工作；作者为 Xiaoying Wang、Wentao Wu、Vivek Narasayya 与 Surajit Chaudhuri。论文最终报告基于 **GPT-5**，每个输入独立调用五次，并与确定性的 SQL Server DTA 比较。
+
+输入包括 SQL、Schema、现有索引和 Showplan。数据集包含 TPC-H SF10 的 22 条查询，以及四组真实企业工作负载，共 127 条单查询 Case。评价使用真正的执行时间，而不是只看优化器 Estimated Cost。
+
+#### Best-of-Five 揭示潜力，也隐藏选择器
+
+五次回答中取最好结果时：
+
+- 约 67% 的单查询 Case 与 DTA 相当或更好；
+- 约 31% 比 DTA 至少快 20%；
+- LLM 往往推荐更少的索引；
+- LLM 的优势集中在 DTA 被错误 Cardinality / Cost Estimate 误导的查询。
+
+但“取五次中最好”隐含了一个尚未解决的 Oracle：系统必须先知道哪次最好。最差结果常明显落后 DTA，甚至产生 Timeout 或接近 10 倍的回退。同一 Prompt 的波动不是附属问题，而是生产部署的核心问题。
+
+#### LLM 与 DTA 的错误并不在同一个空间
+
+DTA 的搜索由 What-If Cost 驱动，稳定、可约束，但会继承优化器的估计误差。GPT-5 根据 SQL 结构、Showplan 与训练语料中的 DBA 经验提出索引，不直接受这个 Cost Model 约束，因此偶尔能跳出 DTA 的局部错误。
+
+然而，这不表示 LLM 会计算物理代价。它更像一个具有高方差的启发式候选生成器：能看到 Scan、Join、Filter 与 Covering Index 之间的语义关系，但无法可靠权衡索引维护成本、跨查询收益和存储预算。
+
+#### 为什么“把 LLM 候选交给 DTA”仍可能失败
+
+一个看似自然的混合方案是扩充 DTA Candidate Pool，再由 What-If Cost 选最终索引。论文发现，这种直接集成经常无收益甚至退化。
+
+原因很直接：DTA 原本就是因为 Cost Estimate 错误而错过 LLM 的好索引；候选进入同一个错误评估器后，仍可能被拒绝。即使 DTA 选中 Estimated Cost 更低的新索引，真实执行也可能更慢。
+
+```text
+LLM finds a candidate outside DTA's original search space
+                      |
+                      v
+same inaccurate What-If cost model evaluates it
+                      |
+          +-----------+-----------+
+          |                       |
+   good index rejected      bad index accepted
+```
+
+这个结果提醒我们：扩大 Search Space 不会自动修复 Objective Function。
+
+#### 多查询为什么更难
+
+多查询 Workload 要在索引数或空间预算下平衡共享收益。GPT-5 容易被大量上下文分散注意力，过度寻找跨查询共同模式，却忽略真正占据大部分执行时间的少数瓶颈查询。随着 Workload 从单条增加到四条，某个热点查询获得 DTA 同等或更好方案的概率可从约 50% 降到 5% 以下。
+
+DTA 在多查询场景整体更稳定。LLM 偶尔仍能找到 DTA 没枚举到的共享索引，但这不足以构成可依赖的全局组合优化器。
+
+#### 从 LLM 中蒸馏规则，比在线调用更可靠
+
+作者观察 GPT-5 的 Reasoning，提炼出一个确定性 Rule-Based Tuner：优先处理大表上的高成本 Scan，根据谓词与 Join 构造 Key，补充 Covering Columns，忽略收益很小的小表索引。这个简单规则恢复了相当一部分 LLM 优势，且没有采样方差。
+
+这是全文最有价值的结论：
+
+> LLM 的知识不一定要以“每次在线询问 LLM”的方式部署。先用 LLM 发现启发式，再把启发式蒸馏成可测试、可审计的程序，可能更适合系统软件。
+
+真正执行候选索引做验证当然能找出五次回答中最好的一个，但 Index Creation 与 Workload Execution 的成本通常显著高于调优本身。低成本、低扰动的验证机制，才是 LLM Index Tuning 走向生产的主要瓶颈。
+
+### AutoLiquid：推荐聚簇键不难，自动应用才难
+
+#### 论文信息
+
+- 论文：[AutoLiquid](https://vldb.org/2026/program.html)
+- 出处：VLDB 2026 Industry
+- 产品文档：[Use Liquid Clustering for Tables](https://docs.databricks.com/aws/en/tables/clustering)
+- 阅读状态：公开设计预读
+
+#### 从“推荐”走向“自治”
+
+Lakehouse 中，Clustering Key 决定文件 Min/Max 能否有效 Data Skipping。传统系统通常让用户人工选择 Key；当平台管理数亿张表时，人工方式无法扩展，而且 Workload 会变化。
+
+AutoLiquid 只要求用户声明：
+
+```sql
+CLUSTER BY AUTO
+```
+
+公开摘要给出的闭环分三步：
+
+1. 从 Scan Telemetry 中用轻量启发式生成候选 Clustering Key；
+2. 在抽样数据上做快速 Shadow Verification，测量真实 Pruning Benefit；
+3. 只有验证后的 Key 才会 Commit 并应用到 Liquid Clustering Table。
+
+```text
+scan telemetry
+   -> candidate keys
+   -> sampled shadow verification
+   -> verified improvement?
+          yes -> apply key
+          no  -> keep current layout
+```
+
+#### 存算分离为什么是验证器的一部分
+
+在传统存算一体系统中，验证新布局可能意味着复制整表或抢占线上节点。Lakehouse 的持久数据与计算资源解耦后，可以临时分配计算、读取相同 Snapshot 的抽样数据并评估候选，而不必先修改生产表。
+
+这与 LOAM 的“不能在线执行危险计划”形成有趣对照：查询计划可能在一次执行中耗费巨大资源，因而 LOAM 用 Domain Adaptation 避免试跑；数据布局改变更慢，但可在独立计算上对样本做 Shadow Verification，AutoLiquid 因而选择“验证后提交”。验证策略取决于系统能否廉价隔离副作用。
+
+#### 已公开证据与尚不能确认的细节
+
+会议摘要报告：相较用户人工选择的 Key，AutoLiquid 在超过 95% 的评测表上达到相当或更好的性能，并已在 Databricks 生产管理数百万张表。
+
+当前公开摘要没有足够信息证明早期草稿中的以下说法：一定使用 Hilbert Curve、具体 Overlap Ratio 阈值、文件冲突选择算法或写放大数字。因此本节不把它们作为既定实现。可以确认的是候选来自 Scan Telemetry，决策经过 Sampled Shadow Verification，且系统遵循 Verify-Before-Commit。
+
+### Oracle Real-Time SPM：先让新计划发生，再阻止它继续发生
+
+#### 论文信息
+
+- 论文：[Real-Time SQL Plan Management in Oracle](https://vldb.org/2026/program.html)
+- 出处：VLDB 2026 Industry
+- 产品文档：[Overview of SQL Plan Management](https://docs.oracle.com/en/database/oracle/oracle-database/26/tgsql/overview-of-sql-plan-management.html)
+- 阅读状态：公开设计预读
+
+#### Plan Stability 与 Plan Evolution 的矛盾
+
+Stored Outline 或固定 Plan 可以阻止升级、统计刷新、DML 与新索引引起的回退，但也会阻止真正更好的计划。Oracle 11g 引入 SQL Plan Management（SPM）：维护 Accepted Plan Set，新计划只有经过验证才能进入 Baseline。
+
+传统验证主要由后台任务完成。在 Autonomous Cloud 中，自动升级、统计维护和索引变化更频繁，而后台资源有限，回退可能在被发现前持续很久。
+
+Real-Time SPM 把验证移到 Foreground Session：Hard Parse 发现新计划时，从 Automatic SQL Tuning Set 中找历史 Reference Plan；新计划至少执行一次，执行结束后与 Reference 的真实表现比较，再创建或更新 SQL Plan Baseline。
+
+#### 必须纠正“影子执行并中途熔断”的误读
+
+早期草稿把 Real-Time SPM 描述为基线计划服务用户、候选计划后台影子执行，并在超过 `1.5 × baseline` 时强制中断。公开论文摘要与 Oracle 官方文档并不支持这个机制。
+
+更准确的流程是：
+
+```text
+hard parse selects a previously unseen plan
+        |
+        v
+foreground executes the new plan at least once
+        |
+        v
+compare observed performance with a historical reference plan
+        |
+        +-- better -> accept into SQL plan baseline
+        |
+        +-- worse  -> reject / enforce better known plan later
+```
+
+所以 Real-Time SPM 能快速阻止**后续执行**继续使用退化计划，但不能保证第一次新计划完全没有用户可见的回退。它把检测窗口从后台任务的小时级缩短到前台执行周期，而不是创造零成本预知。
+
+#### 状态与可观测性
+
+SPM 的状态落在 SQL Management Base 中，包含 SQL Signature、Accepted / Unaccepted Plan 与 Baseline。`DBA_SQL_PLAN_BASELINES` 中的 `FOREGROUND_LAST_VERIFIED`、`ORIGIN` 和 `NOTES` 可用于识别前台验证。
+
+相比 Ultron，Oracle SPM 更保守：它不需要泛化到相似子计划，而是围绕同一 SQL 的已知计划集合做接受控制；相比离线 Shadow Verification，它直接使用用户前台执行的真实结果，反馈最准，但第一次探索成本由真实请求承担。
+
+截至本节合并时，VLDB 2026 摘要确认 Real-Time SPM 已部署在 Oracle 生产环境，Oracle 26ai 文档也描述了前台验证流程；公开信息尚不足以支持早期草稿中的“0 次重大回退”“监控开销低于 1%～2%”等数字，故不引用。
+
+### 横向比较：八种系统到底在学习什么
+
+#### 决策闭环对照
+
+| 系统 | 观察值 | 持久状态 | 修改动作 | 安全机制 | 冷启动行为 |
+| --- | --- | --- | --- | --- | --- |
+| Redshift Incremental Stats | 新增行与 MVCC Delta | 合并后的列 Sketch | 更新 NDV / MCV / Histogram | 保留原 Catalog 接口，删除达阈值全量重建 | 首次全表 Bootstrap |
+| LOAM | 默认计划 CPU Cost、Stage 环境 | 每 Project Cost Model | 候选计划排序 | 保守 Explorer、领域自适应、Project 筛选 | 依赖历史训练数据 |
+| Ultron | 子计划行数、AQE 修正 | Plan Hash 对应的精确事实 | Join、RF、Partition Count | 单调应用、无历史则沿用原优化器 | 退化为原生 CBO / AQE |
+| ScalePQO | 参数、候选计划、真实延迟 | Cluster Model + Plan Cache | 参数实例选计划 | 异步更新、有限候选集 | 使用初始训练模型 |
+| LLM Index Tuning | SQL、Schema、Showplan | 候选索引与推理文本 | 建议索引集合 | 当前仍依赖昂贵实测验证 | 可直接生成，但方差高 |
+| AutoLiquid | Scan Telemetry | 当前 Key 与候选收益 | 更新 Clustering Key | Sampled Shadow Verification | 保留当前布局 |
+| Oracle Real-Time SPM | 新计划真实执行表现 | Accepted Plan Baseline | 接受或拒绝新计划 | Reference Plan 比较 | 首个新计划仍需执行 |
+
+#### Learned、History-Based 与 Autonomic 不应混为一谈
+
+三类方法的知识来源不同：
+
+- **Learned Optimizer**：从许多 Plan-Cost 样本学习函数，能够在一定范围内泛化；
+- **History-Based Optimizer**：复用某个精确 Query / Subplan 的实际历史，泛化少但 Provenance 强；
+- **Autonomic Controller**：观察系统、提出动作、验证收益、持续调整，模型可能只是其中一个组件。
+
+LOAM 更接近第一类，Ultron 是第二类，AutoLiquid 与 Real-Time SPM 更接近第三类。ScalePQO 位于 Learned 与 History-Based 之间：模型负责跨参数选择，Plan Cache 与漂移检测负责持续适应。
+
+#### “无统计”与“用历史”并不是对立路线
+
+Redshift 说明统计仍是通用 CBO 最便宜的输入；LOAM 说明统计无法及时维护时，可以从历史计划与算子语义学习代理表示；Ultron 则在重复负载上绕过估计，直接复用真实结果。
+
+更完整的系统可能同时使用三层知识：
+
+```text
+fresh statistics available?
+  yes -> CBO estimate
+  no  -> learned proxy from plan semantics
+
+exact matching history available?
+  yes -> override selected high-confidence decisions
+
+runtime sees unexpected reality?
+  yes -> AQE repairs current execution and records feedback
+```
+
+问题不再是“CBO 还是 AI”，而是如何定义优先级、置信度、失效条件和回退路径。
+
+### 从论文中抽象出的生产设计原则
+
+#### 让知识靠近决策，但让收集远离关键路径
+
+Ultron 把历史 Push 到 Cluster 本地，避免 Planner 远程查询；Redshift 放弃 Insert-Path Sketch，转用异步 ANALYZE；LOAM 在线只做候选评分，训练留在离线。
+
+统一原则是：**读侧要近，写侧可异步。** 反馈晚一轮通常可以接受，阻塞每一条查询或写入则不可接受。
+
+#### 先定义失效协议，再讨论预测精度
+
+任何历史与模型都会过期：
+
+- Redshift 用 Insert / Delete 比例触发刷新或重建；
+- Ultron 用 Size Factor 与 Schema Change 失效历史；
+- ScalePQO 用 KL Divergence 检测 Parameter Drift；
+- LOAM 用稳定表比例筛除不适合训练的 Project；
+- Oracle 用 Reference Plan 与 Accepted Baseline 管理演进。
+
+一个没有 Invalidity Protocol 的高精度模型，只是一次性 Benchmark 结果。
+
+#### 优先构造单调优化
+
+如果每次应用优化都会改变下一轮观测，系统可能在多个决策之间 Flip-Flop。Ultron 的 BHJ Promotion、Runtime Filter Progressive Addition，Oracle 的 Accepted Plan Set，AutoLiquid 的 Verify-Before-Commit 都在限制状态只能向已验证方向移动。
+
+单调性不是数学装饰，而是减少线上探索风险的核心手段。
+
+#### 把最坏情况纳入目标函数
+
+平均收益不能描述生产风险。更合理的目标至少包括：
+
+```text
+ExpectedGain
+  - λ1 * RegressionProbability
+  - λ2 * WorstCasePenalty
+  - λ3 * OptimizationOverhead
+  - λ4 * MaintenanceCost
+```
+
+LLM Index Tuning 的 Best-of-Five 很亮眼，但 Worst Response 决定能否自动执行；LOAM 的项目筛选关注 ROI；Ultron 只选择容易证明收敛的 Application。这些都说明工业优化器优化的不是单一 Latency，而是收益、风险和运营成本的组合。
+
+#### 不要让模型同时承担候选生成、评分与安全验证
+
+将三个角色拆开更容易审计：
+
+- Candidate Generator 追求覆盖率；
+- Ranker / Cost Model 追求相对选择质量；
+- Validator / Guardrail 负责阻止灾难性结果。
+
+LOAM 的 Explorer 与 Cost Predictor、ScalePQO 的 Candidate Set 与 Rank Model、AutoLiquid 的 Heuristic 与 Shadow Verification 都遵循这种分工。LLM 直接端到端输出最终索引之所以危险，正是把三个角色压在一个高方差模型上。
+
+### Future ：优化器正在变成一个有记忆的控制系统
+
+这些论文共同展示了一次重要迁移：优化器从“每次编译都从 Catalog 重新推理”的无状态组件，演进成持续吸收执行结果的有状态控制系统。
+
+但“有记忆”会引入新的系统问题：
+
+- 历史属于谁，Cluster、Tenant、Database 还是 Query Template？
+- Schema、数据量、分布、硬件或引擎版本变化时，哪些历史还能复用？
+- 一个决策如何解释到具体历史样本或模型版本？
+- 状态服务故障时，优化器能否无阻塞地退回原生路径？
+- 多租户之间能否共享知识而不泄漏计划结构与数据分布？
+- 新模型带来的收益是否超过训练、存储、推理和验证成本？
+
+因此，下一代优化器的关键接口可能不只是：
+
+```text
+optimize(logical_plan, catalog_statistics) -> physical_plan
+```
+
+而更接近：
+
+```text
+optimize(
+    logical_plan,
+    catalog_statistics,
+    execution_history,
+    environment_prior,
+    safety_policy,
+    state_version
+) -> physical_plan + decision_provenance
+```
+
+这里最重要的新返回值是 `decision_provenance`：为什么使用这个历史、为什么相信这个预测、何时应当失效、如何回退。没有可追溯性，反馈闭环越复杂，线上问题越难复现。
+
+最终，我并不认为这些工作宣告了传统 CBO 的终结。恰恰相反，它们在给 CBO 补上长期缺失的感知、记忆和安全机制：增量统计让 Catalog 更及时，Learned Model 补偿缺失信号，HBO 记住运行时纠错，Plan Baseline 和 Shadow Verification 管理探索风险。
+
+> **工业查询优化的未来，不是找到一个永远正确的模型，而是构造一个即使模型会错，也能持续学习、稳定收敛并限制损失的系统。**
+
+### 参考资料
+
+- [Learned Query Optimizer in Alibaba MaxCompute: Challenges, Analysis, and Solutions](https://arxiv.org/abs/2602.07336)
+- [SIGMOD 2026 Industry Papers: LOAM](https://2026.sigmod.org/sigmod_industry_papers.shtml)
+- [Amazon Redshift Re-invented](https://www.amazon.science/publications/amazon-redshift-re-invented)
+- [Incremental Query Optimizer Statistics in Amazon Redshift](https://www.amazon.science/publications/incremental-query-optimizer-statistics-in-amazon-redshift)
+- [Ultron: History-Based Query Optimization at Databricks](https://doi.org/10.14778/3827998.3828038)
+- [Towards Industrial-Scale Parametric Query Optimization](https://www.vldb.org/pvldb/vol19/p4303-mo.pdf)
+- [ScalePQO / RankPQO Industry Artifact](https://github.com/songsong945/RankPQO-industry)
+- [Evaluating the Practical Effectiveness of LLM-Driven Index Tuning on Microsoft SQL Server](https://arxiv.org/abs/2603.09181)
+- [VLDB 2026 Program: AutoLiquid and Real-Time SQL Plan Management](https://vldb.org/2026/program.html)
+- [Databricks: Use Liquid Clustering for Tables](https://docs.databricks.com/aws/en/tables/clustering)
+- [Oracle: Overview of SQL Plan Management](https://docs.oracle.com/en/database/oracle/oracle-database/26/tgsql/overview-of-sql-plan-management.html)
+- [Oracle Optimizer Blog: What Is Real-Time SQL Plan Management?](https://blogs.oracle.com/optimizer/what-is-realtime-spm)
+
+---
+
+## 四篇存储论文放在一起看
 
 Bf-Tree、HopsFS、PolarFS 与 Tectonic 分别研究索引、元数据、共享存储和统一文件系统，却遵循相似的推理路径：
 
@@ -711,4 +1778,4 @@ Bf-Tree、HopsFS、PolarFS 与 Tectonic 分别研究索引、元数据、共享�
 - 可以连接到下一篇论文的问题。
 ```
 
-这篇笔记会沿着“数据结构、执行引擎、存储系统、分布式协议、云原生架构”逐步扩展。每增加一篇论文，都应该让已有问题得到一部分回答，或产生一个更准确的新问题。
+这篇笔记会沿着“数据结构、执行引擎、查询优化、存储系统、分布式协议、云原生架构与自治系统”逐步扩展。每增加一篇论文，都应该让已有问题得到一部分回答，或产生一个更准确的新问题。
