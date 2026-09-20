@@ -16,7 +16,13 @@ description: "结合 Apache Calcite 源码，分析 VolcanoPlanner 如何记账�
 draft: false
 ---
 
-上一篇《[深入 Calcite 优化器：Hep、Volcano、谓词推导与 Join Reorder]({{< relref "2026-08-24-dive-calcite.md" >}})》回答的是"Calcite 的能力边界在哪里"：Hep 与 Volcano 各自解决什么问题、Metadata 如何充当事实总线、Null-Rejecting 与 Outer Join Reorder 的合法性来自哪里、CBO 之后为什么还要一轮物理改写。那篇文章把 Volcano 当作一个"会按代价搜索的黑盒"来使用，`RelSet` / `RelSubset` 只给了一张示意图。
+上一篇《[深入 Calcite 优化器：Hep、Volcano、谓词推导与 Join Reorder]({{< relref "2026-08-24-dive-calcite.md" >}})》回答的是"Calcite 的能力边界在哪里"：
+- Hep 与 Volcano 各自解决什么问题
+- Metadata 如何充当事实总线
+- Null-Rejecting 与 Outer Join Reorder 的合法性来自哪里
+- CBO 之后为什么还要一轮物理改写。
+
+那篇文章把 Volcano 当作一个"会按代价搜索的黑盒"来使用，`RelSet` / `RelSubset` 只给了一张示意图。
 
 本文接着把这个黑盒拆开，只回答三个问题：
 
@@ -26,9 +32,9 @@ draft: false
 
 这三个问题的答案有相当一部分与"Calcite 是标准 Cascades 实现"这一直觉不符，所以本文全部结论都对应到具体源码行，并附一个在本机真实跑通、可复现的例子。
 
-## 核心结论
+## 结论
 
-1. **`VolcanoCost` 的比较只看 `rowCount`。** `isLe` / `isLt` 内部都有一个 `if (true)` 短路分支，真正比较三元组 `(rowCount, cpu, io)` 的代码是其后的死代码。cpu 与 io 会被完整累加、完整打印，但从不参与任何一次胜负判定。
+1. **`VolcanoCost` 的比较只看 `rowCount`。** `isLe` / `isLt` 内部都有一个 `if (true)` 短路分支，真正比较三元组 `(rowCount, cpu, io)` 的代码是其后的死代码（TODO: 为何只比较rowCount，真正的基于calcite实现引擎hive/flik。cpu 与 io 会被完整累加、完整打印，但从不参与任何一次胜负判定。
 2. **默认路径（`IterativeRuleDriver`）完全不剪枝。** `calcite.planner.topdown.opt` 默认为 `false`，此时 `drive()` 就是一个"取匹配—执行—canonize"的裸循环，`IterativeRuleQueue` 明确注释"The rules are not sorted in any way"。历史上的 importance 启发式已经被移除，代价在整个搜索期间**不做任何裁决**，只在最后 `buildCheapestPlan()` 时一次性生效。
 3. **真正的 Cascades 上下界剪枝只存在于 opt-in 的 `TopDownRuleDriver` 里。** 它有 11 类任务、显式任务栈、逐孩子收紧的 Upper Bound；但即使打开，`RelMdLowerBoundCost` 对逻辑节点直接返回 `null`，所以 Lower Bound 只有在物理候选已经出现后才有意义。
 4. **Enforcer 的形态由 driver 在唯一一处调用点决定：`RelSet.addConverters(subset, required, !planner.topDownOpt)`。** 自底向上时插入代价为**无穷大**的 `AbstractConverter` 占位符（后续由 `ExpandConversionRule` 展开）；自顶向下时直接调 `Convention.enforce()` 生成真实物理算子（`EnumerableConvention` 会包一个 `EnumerableSort`）。
@@ -41,7 +47,6 @@ draft: false
 |------|----------|------|----------|
 | Apache Calcite | [e8e0dd5](https://github.com/apache/calcite/tree/e8e0dd54145c44f61b73acad1ffb96c14bddff78) | 2026-05-04 | VolcanoPlanner、RelSet/RelSubset、VolcanoCost、IterativeRuleDriver、TopDownRuleDriver、Trait Enforcement |
 
-与上一篇同一提交（1.41.0 之后、1.42.0 发布之前），因此两篇文章的源码引用互相可比。
 
 本文第八节的例子是在这个快照上**实际编译运行**得到的，计划、代价数字与任务 trace 都是程序真实输出，不是手工推演。但要强调：Rule 注册集合、Program 编排、Adapter 提供了哪些 Metadata，最终都由集成方决定；本文描述的是"用 `Programs.standard()` + Enumerable Convention 跑这个快照"时的行为。
 
@@ -74,7 +79,9 @@ findBestExp()
         CheapestPlanReplacer 沿 subset.best 链条把 Memo 还原成物理树
 ```
 
-只有 ③ 和 ⑤ 与本文主题直接相关，而它们的分工是全文的关键：**③ 负责把候选塞满 Memo，⑤ 负责按 `best` 指针抽计划**。在默认 driver 下，③ 里没有任何"因为太贵所以不搜了"的判断。
+只有 ③ 和 ⑤ 与本文主题直接相关，而它们的分工是全文的关键：
+- **③ 负责把候选塞满 Memo
+- ⑤ 负责按 `best` 指针抽计划**。在默认 driver 下，③ 里没有任何"因为太贵所以不搜了"的判断。
 
 `ensureRootConverters()` 有一个容易看错的细节：
 
@@ -84,9 +91,11 @@ for (RelNode rel : root.getRels()) {
     subsets.add((RelSubset) ((AbstractConverter) rel).getInput());
   }
 }
+
 for (RelSubset subset : root.set.subsets) {
   final ImmutableList<RelTrait> difference =
       root.getTraitSet().difference(subset.getTraitSet());
+  // WHY MUST 1?
   if (difference.size() == 1 && subsets.add(subset)) {
     register(new AbstractConverter(subset.getCluster(), subset,
         difference.get(0).getTraitDef(), root.getTraitSet()), root);
@@ -150,7 +159,7 @@ for (RelSubset subset : root.set.subsets) {
 三处细节都值得单独记住：
 
 - **①** 递归在 `RelSubset` 处终止，取的是 `bestCost` 快照。这意味着累计代价是**账本的函数**，账本没更新时上层代价也不会变——所以才需要 `propagateCostImprovements` 主动推送。
-- **②** 逻辑 Convention 的节点代价为无穷。这是 Volcano 逼迫搜索走到物理形态的机制，也是逻辑节点无法给出有意义 Lower Bound 的根源（见第七节）。
+- **②** 逻辑 Convention 的节点代价为无穷(因为需要将算子转换成真正的物理算子)。这是 Volcano 逼迫搜索走到物理形态的机制，也是逻辑节点无法给出有意义 Lower Bound 的根源（见第七节）。
 - **③** `zeroCost.isLt(cost)` 用的还是 rowCount-only 比较。所以一个 `(0 rows, 1e9 cpu, 0 io)` 的自身代价会被判定为"非正"并被抬成 `TINY = (1, 1, 0)`，cpu 那 `1e9` 直接消失。
 
 ### 2.2 代价改善如何向上传播
