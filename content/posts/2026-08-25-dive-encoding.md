@@ -1,7 +1,7 @@
 ---
 title: "【原理】Column Encoding：从信息表示到 Encoding-aware Execution"
 date: 2026-08-25T00:00:00+08:00
-lastmod: 2026-08-30T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 slug: "dive-encoding"
 categories:
   - 数据库
@@ -19,6 +19,8 @@ draft: false
 
 ## 引言：计算从来不是作用在“抽象数据”上
 
+同一逻辑列采用不同表示，会改变比较、聚合与数据搬运的成本，因此编码选择需要与算子一起评价，而不只是比较文件大小。
+
 1948 年，Claude Shannon 在《[A Mathematical Theory of Communication](https://doi.org/10.1002/j.1538-7305.1948.tb00917.x)》中把通信的基本问题概括为：如何在一个位置精确地或近似地复现另一个位置所选择的消息。信息论由此把“意义”和“表示”暂时分开，开始研究消息如何编码、传输，以及统计结构允许我们压缩到什么程度。
 
 这个问题同样存在于数据库内部。用户看到的是字符串、时间戳、金额和嵌套对象；处理器真正读取的却是 Bit、Byte、Offset、Dictionary ID 和连续的 Vector。一个逻辑值可以拥有多种物理表示，而不同表示会唤起完全不同的算法：
@@ -33,9 +35,9 @@ draft: false
     └─ Constant ────────► 元数据级判断，不必逐行执行
 ```
 
-“程序 = 数据结构 + 算法”之所以重要，是因为数据结构并不是算法之前的静态容器。表示方式决定了哪些操作便宜、哪些操作昂贵，也决定了 CPU Cache、Memory Bandwidth、SIMD、网络和存储系统如何参与计算。编码因此不是数据落盘时的一个附属选项，而是数据分布、执行算法与硬件之间的契约。
+表示方式改变了算法可利用的结构，也改变 CPU Cache、内存带宽与 SIMD 的使用方式。存储层省下的字节，可能在解码、重映射或数据交换时重新付出成本。
 
-熵给出了无损编码在统计意义上的理论边界，但查询引擎追求的并不只是最小字节数。压得更小的格式可能解码更慢，顺序扫描友好的格式可能不适合随机访问，局部字典可能节省 I/O 却无法直接用于跨文件 Join。数据库真正优化的是一个更复杂的目标：
+熵（Entropy）给出了无损编码在统计意义上的理论边界，但查询引擎追求的并不只是最小字节数。压得更小的格式可能解码更慢，顺序扫描友好的格式可能不适合随机访问，局部字典可能节省 I/O 却无法直接用于跨文件 Join。数据库真正优化的是一个更复杂的目标：
 
 ```text
 总成本 = 存储与读取成本
@@ -52,9 +54,11 @@ draft: false
 2. Filter、Join、Aggregate 和 Shuffle 如何直接利用这些形态？
 3. Parquet、Arrow、Velox、DuckDB 等系统如何把 Encoding 从存储层贯穿到执行层？
 
-贯穿全文的核心思考是：**高性能计算不是尽快把数据恢复成统一形态，而是在正确性允许的范围内，尽可能晚地放弃已经存在的结构。**
+下文沿表示、访问方式和转换边界展开，区分可直接计算的编码与需要先解码的格式。
 
-## 0. 核心结论
+## 从压缩字节到编码域计算
+
+### 表示层次与验证范围
 
 Column encoding 已经不是“存储压缩技巧”，而是现代计算引擎的核心执行机制之一。它贯穿了四层：
 
@@ -80,31 +84,13 @@ Serialization / Deserialization Optimization
   避免字符串、重复值、嵌套结构过早 materialize
 ```
 
-最重要的判断是：
+本文的判断限定为：已有字典传播、常量向量和按 Run 聚合说明，部分编码能够进入执行路径。是否把它提升为统一计划属性，还取决于转换成本、能力覆盖和维护预算。
 
-**未来高性能计算引擎不会把 encoding 当成 scan 之前的“解压步骤”，而会把 encoding 当成物理执行计划的一部分。**
+### Column Encoding 与 Compression 的区别
 
-也就是说，优化器和执行器要知道：
+编码与通用字节压缩改变的接口不同：前者利用值域与重复结构，可能允许直接计算；后者通常要先解压才能交给算子。
 
-```text
-这个 column 是 dictionary encoded
-这个 batch 是 RLE encoded
-这个 vector 是 constant
-这个 string column 可以用 global dictionary 做 join
-这个 timestamp column 可以用 delta/double-delta
-这个 float column 适合 ALP/Gorilla/Chimp
-这个 Parquet page 可以不解码直接过滤
-```
-
-这和 Query Engine 的本质高度一致：**利用数据分布、物理布局和硬件特性，降低执行代价。**
-
----
-
-## 1. Column Encoding 与 Compression 的区别
-
-很多系统文档会混用 encoding 和 compression，但在工程上二者应该区分。
-
-### 1.1 Encoding 是语义级转换
+#### Encoding 是语义级转换
 
 Encoding 利用列值的结构性特征，把逻辑值变成更适合存储和执行的表示。
 
@@ -141,7 +127,7 @@ delta-of-delta:
 
 这里利用的是时间序列单调递增和间隔稳定的分布特性。
 
-### 1.2 Compression 是字节级压缩
+#### Compression 是字节级压缩
 
 Compression 更接近通用压缩算法：
 
@@ -178,13 +164,13 @@ File
 
 **Encoding 决定数据是否适合被计算，Compression 决定数据是否更少占用 I/O 和存储。**
 
----
+### 学术脉络：Column Encoding 为什么会成为计算引擎核心能力？
 
-## 2. 学术脉络：Column Encoding 为什么会成为计算引擎核心能力？
+列式布局使同类型数据集中，批处理又降低逐值调用开销，两者共同为编码域计算提供条件；这些条件并不适用于所有点查和更新负载。
 
-### 2.1 Column Store 让数据天然更容易 encoding
+#### Column Store 让数据天然更容易 encoding
 
-经典的 Column Store 论文指出，列式存储把同一属性的值连续存放，这会显著增加相邻值的相似性，从而创造更好的压缩机会；同时，一次压缩多个相邻 tuple 能降低 per-tuple 的 CPU 和空间开销。Abadi、Madden、Ferreira 在 SIGMOD 2006 的 [Integrating Compression and Execution in Column-Oriented Database Systems](https://www.cs.umd.edu/~abadi/papers/abadisigmod06.pdf) 中进一步提出，Column Store 不应该只是“压缩后再解压执行”，而应该研究如何在压缩数据上执行查询。
+经典的 Column Store 论文指出，列式存储（Columnar Storage）把同一属性的值连续存放，这会显著增加相邻值的相似性，从而创造更好的压缩机会；同时，一次压缩多个相邻 tuple 能降低 per-tuple 的 CPU 和空间开销。Abadi、Madden、Ferreira 在 SIGMOD 2006 的 [Integrating Compression and Execution in Column-Oriented Database Systems](https://www.cs.umd.edu/~abadi/papers/abadisigmod06.pdf) 中进一步提出，Column Store 不应该只是“压缩后再解压执行”，而应该研究如何在压缩数据上执行查询。
 
 这篇论文的核心观点到今天仍然成立：
 
@@ -199,7 +185,7 @@ Column Store 的优势不是：
   + 可以直接在 compressed / encoded representation 上执行
 ```
 
-### 2.2 C-Store / Vertica：排序、投影和 encoding 是一体的
+#### C-Store / Vertica：排序、投影和 encoding 是一体的
 
 [C-Store](https://www.vldb.org/archives/website/2005/program/paper/thu/p553-stonebraker.pdf) 把列式系统定义成 read-optimized DBMS，核心设计包括 projections、按不同顺序存储、read-optimized store 和 write store。
 
@@ -223,7 +209,7 @@ RLE 几乎没收益。
 
 这也是为什么 Vertica、ClickHouse、Snowflake clustering、BigQuery clustering、StarRocks sort key、Doris sort key 都和 encoding/compression 有强关联。
 
-### 2.3 MonetDB/X100：vectorized execution 让 encoding 可以进入 CPU pipeline
+#### MonetDB/X100：vectorized execution 让 encoding 可以进入 CPU pipeline
 
 [MonetDB/X100](https://www.cidrdb.org/cidr2005/papers/P19.pdf) 提出以 vector processing 为核心的 query execution，使执行引擎能更好利用 CPU cache、SIMD 和 pipeline。X100 论文明确指出，它像 Volcano-style engine，但关键区别是所有执行都基于 vector processing，从而显著提高 CPU efficiency。
 
@@ -246,7 +232,7 @@ operator:
 
 这就是现代引擎 Velox、DuckDB、ClickHouse、Photon、DataFusion、Trino 的共同方向。
 
-### 2.4 BitWeaving / ByteSlice：encoding 可以直接服务 predicate scan
+#### BitWeaving / ByteSlice：encoding 可以直接服务 predicate scan
 
 BitWeaving 的目标是让 main-memory scan 接近 processor speed，通过 bit-level parallelism 让 predicate evaluation 更接近 bare metal speed。
 
@@ -274,17 +260,19 @@ SIMD compare many values at once
 produce selection mask
 ```
 
-这和数据库向量化执行、selection vector、SIMD filter 是同一个方向。
+这和数据库向量化执行（Vectorized Execution）、selection vector、SIMD filter 是同一个方向。
+
+## 按数据分布与访问方式选择表示
+
+### Column Encoding 的主要类型与适用分布
+
+编码收益依赖数据分布：常量、连续重复、小值域和局部相似字符串分别适合不同表示；单一压缩率不能解释解码与访问成本。
 
 ---
 
-## 3. Column Encoding 的主要类型与适用分布
+#### Constant Encoding
 
-下面从数据分布特性出发，整理主流 encoding。
-
----
-
-### 3.1 Constant Encoding
+常量表示用一个值和长度代替逐行存储，并允许部分谓词只计算一次；有不同值时必须回退或切分。
 
 适用分布：
 
@@ -328,7 +316,9 @@ Constant encoding 是最简单但最重要的 encoding。
 
 ---
 
-### 3.2 Run-Length Encoding / Run-End Encoding
+#### Run-Length Encoding / Run-End Encoding
+
+游程编码（Run-Length Encoding）利用连续重复，而非仅仅低基数；打乱顺序会增加 Run 数并削弱压缩及按 Run 执行的收益。
 
 适用分布：
 
@@ -373,7 +363,9 @@ RLE 的效果高度依赖排序/聚簇。
 
 ---
 
-### 3.3 Dictionary Encoding
+#### Dictionary Encoding
+
+字典把重复值换成局部 ID，减少重复字符串存储与比较；高基数和跨字典计算则可能抵消收益。
 
 适用分布：
 
@@ -427,7 +419,9 @@ Dictionary encoding 是目前最重要的 column encoding。
 
 ---
 
-### 3.4 Bit-Packing / Frame of Reference / PFOR
+#### Bit-Packing / Frame of Reference / PFOR
+
+窄值域允许用较少位数保存整数或相对基值，异常值处理与解码分支则决定实际成本。
 
 适用分布：
 
@@ -468,7 +462,7 @@ DuckDB 支持 Bit Packing 和 Frame of Reference。
 
 Parquet 的 RLE/Bit-Packing Hybrid 则常用于 dictionary indices、definition/repetition levels 等小整数流。
 
-BtrBlocks、FastLanes 等新研究也把 bit-packing、FOR、dictionary、delta 等轻量压缩组合成更适合 data lake 和现代硬件的列格式。BtrBlocks 指出，云上 data lake 使用 Parquet 等开放格式，但远程对象存储和高速网络下，低效 decompression 会让 scan 变成 CPU-bound；BtrBlocks 使用一组 lightweight encoding schemes 来优化这种场景。 FastLanes 则强调对常见 LWC schemes 加速解码，并在真实数据上相比 Parquet 提升压缩率和 decompression 速度。
+BtrBlocks、FastLanes 等新研究也把 bit-packing、FOR、dictionary、delta 等轻量压缩组合成更适合 data lake 和现代硬件的列格式。BtrBlocks 指出，云上 data lake 使用 Parquet 等开放格式，但远程对象存储（Object Storage）和高速网络下，低效 decompression 会让 scan 变成 CPU-bound；BtrBlocks 使用一组 lightweight encoding schemes 来优化这种场景。 FastLanes 则强调对常见 LWC schemes 加速解码，并在真实数据上相比 Parquet 提升压缩率和 decompression 速度。
 
 工程意义：
 
@@ -479,7 +473,9 @@ Bit-packing/FOR 是 integer-heavy analytics 的基础设施。
 
 ---
 
-### 3.5 Delta / DoubleDelta Encoding
+#### Delta / DoubleDelta Encoding
+
+相邻值或相邻差分接近时，差分表示能缩小待编码整数；无序输入和随机访问可能需要更多恢复工作。
 
 适用分布：
 
@@ -522,7 +518,7 @@ Parquet 也支持 DELTA_BINARY_PACKED、DELTA_LENGTH_BYTE_ARRAY、DELTA_BYTE_ARR
 
 ---
 
-### 3.6 Float Encoding：Gorilla / Chimp / Patas / ALP / Byte Stream Split
+#### Float Encoding：Gorilla / Chimp / Patas / ALP / Byte Stream Split
 
 浮点数很特殊。
 
@@ -563,7 +559,7 @@ Float encoding 正在变成新热点。
 
 ---
 
-### 3.7 String Encoding：Dictionary / FSST / Delta Byte Array / Front Coding
+#### String Encoding：Dictionary / FSST / Delta Byte Array / Front Coding
 
 字符串是 OLAP 系统最难处理的数据类型之一：
 
@@ -594,7 +590,7 @@ string encoding 的关键目标不是只省空间，
 
 ---
 
-### 3.8 Nested Data Encoding：Definition / Repetition Levels
+#### Nested Data Encoding：Definition / Repetition Levels
 
 Parquet 和 BigQuery/Dremel 体系对嵌套数据使用 definition level 和 repetition level 表示嵌套结构。
 
@@ -623,11 +619,640 @@ schema evolution 更复杂
 
 Spark 文档显示，Spark 支持 Parquet vectorized decoding，并且 nested column vectorized reader 默认启用。 这说明主流引擎正在把 nested decode 也纳入 vectorized reader。
 
----
+### Encoding Selection：如何根据数据分布选择？
 
-## 4. 工业界主流系统与产品现状
+选择编码需要同时考虑数据分布与查询访问方式，因为顺序解码快的表示不一定支持低成本随机访问。
 
-### 4.1 Parquet：开放数据湖事实标准，encoding 非常丰富
+#### 选择 encoding 需要观察哪些统计信息？
+
+一个成熟 encoding selector 至少需要以下统计：
+
+```text
+cardinality
+run length distribution
+min / max
+delta distribution
+null ratio
+string length distribution
+prefix/suffix similarity
+sortedness / clustering degree
+value skew
+outlier ratio
+update frequency
+query pattern
+random access vs scan
+```
+
+简单表：
+
+| 数据分布 | 推荐 encoding |
+| --- | --- |
+| 全部值相同 | Constant |
+| 连续重复值 | RLE / Run-End Encoding |
+| 低基数字符串 | Dictionary / LowCardinality |
+| 小整数范围 | Bit-packing / FOR |
+| 单调整数 / timestamp | Delta / DoubleDelta |
+| 时间序列 float | Gorilla / Chimp / Patas |
+| 真实业务 double | ALP |
+| 高基数字符串但子串重复 | FSST |
+| prefix-heavy string | Delta Byte Array / front coding / FSST+ 类方向 |
+| 大量 null | validity bitmap + RLE/REE |
+| nested data | definition/repetition level encoding |
+
+#### 自动选择 vs 手动选择
+
+工业系统大致分两派。
+
+##### 自动选择派
+
+代表：
+
+```text
+Snowflake
+BigQuery
+Redshift ENCODE AUTO
+DuckDB auto compression
+Doris writer auto picks encoding
+```
+
+Redshift 官方文档说明，ENCODE AUTO 默认自动管理列 compression encoding；`ANALYZE COMPRESSION` 可以基于 sample 给出建议。 Doris 文档也显示 writer 会根据列类型和值分布选择 encoding。
+
+优点：
+
+```text
+用户负担低
+适合云服务
+避免错误配置
+```
+
+缺点：
+
+```text
+对特殊 workload 可能不最优
+encoding choice 不透明
+难以跨系统保持语义
+```
+
+##### 手动调优派
+
+代表：
+
+```text
+ClickHouse
+Redshift manual ENCODE
+Vertica projection encoding
+SingleStore 部分 schema-level encoding
+```
+
+ClickHouse 允许用户显式选择 codecs，并通过 LowCardinality 类型指定 dictionary-like storage。
+
+优点：
+
+```text
+专家用户可极致优化
+适合固定 workload
+适合可控数据分布
+```
+
+缺点：
+
+```text
+需要理解分布
+错误选择可能负优化
+schema 演化后可能过期
+```
+
+#### 为什么最优 encoding 不只取决于压缩率？
+
+假设两个方案：
+
+```text
+A:
+  压缩率 10:1
+  decode 速度 1 GB/s
+
+B:
+  压缩率 5:1
+  decode 速度 10 GB/s
+```
+
+如果 query 是 CPU-bound，B 可能更快。
+
+如果 query 是 object-store I/O-bound，A 可能更省钱。
+
+如果 column 是 sort key，过度压缩可能影响 range scan。Redshift 文档就特别说明，自动 compression 对 sort key columns 会避免过强压缩，因为 range-restricted scans 可能因此变差。
+
+所以 encoding selector 的目标函数应该是：
+
+```text
+minimize:
+  scan_time
+  + decode_time
+  + memory_bandwidth
+  + network_shuffle_time
+  + storage_cost
+  + write_amplification
+  + maintenance_cost
+```
+
+而不是只看：
+
+```text
+compressed_size
+```
+
+### 一个实用的 Encoding 选择矩阵
+
+下表只能缩小候选范围，最终选择仍需测量压缩、解码和目标查询；同一列在不同访问模式下可能需要不同表示。
+
+| 场景 | 数据特征 | 推荐 encoding | 执行优化 |
+| --- | --- | --- | --- |
+| 低基数字符串维度 | country、status、channel | Dictionary / LowCardinality | filter/join/group by on int code |
+| 高基数字符串但有重复子串 | URL、路径、日志、JSON text | FSST / Delta Byte Array | late materialization，string view |
+| 时间戳 | 单调、固定间隔 | Delta / DoubleDelta / bit-pack | range filter + min/max + SIMD decode |
+| 指标 float | time-series gauge | Gorilla / Chimp / Patas | batch decode，predicate pushdown |
+| 真实业务 double | 金额、价格、比率 | ALP | float → integer-like encoding |
+| 小范围整数 | age、small id、bucket | FOR / bitpacking / T64 | SIMD compare |
+| 连续重复值 | 排序后维度列 | RLE / REE | run-level filter/agg |
+| 全部相同 | partition column / constant projection | Constant | metadata-only execution |
+| 大量 null | sparse columns | validity bitmap + RLE/REE | null fast path |
+| 嵌套数据 | array/map/struct | def/rep levels | nested vectorized decode |
+| point lookup | serving/HTAP | seekable dictionary/RLE/LZ4 | random access fast path |
+
+## 执行路径：保持编码还是转换表示
+
+### Column Encoding 如何带来性能收益？
+
+编码只有节省的读取、搬运与计算超过转换成本时才有净收益；压缩比改善可能同时增加 CPU 解码时间。
+
+#### 存储空间收益
+
+表示变短直接减少持久化字节，但最终空间还需计入字典、索引和页头，不能只统计 ID 数组。
+
+最直接：
+
+```text
+少存 bytes
+降低磁盘成本
+降低对象存储成本
+降低 cache footprint
+降低 replica / backup / snapshot 成本
+```
+
+对于云数据仓库和 lakehouse，存储空间收益会直接转成成本收益。
+
+BigQuery 采用 columnar storage；Snowflake micro-partitions 以 compressed columnar 形式组织；ClickHouse、DuckDB、Doris、Redshift 都强调压缩减少存储并改善 I/O。
+
+#### Scan I/O 收益
+
+列存本身让 query 只读需要的列。
+
+Encoding/compression 进一步让需要读的列更小。
+
+```text
+SELECT sum(revenue)
+FROM fact
+WHERE event_date >= '2026-01-01'
+
+只读：
+  revenue
+  event_date
+
+不读：
+  user_agent
+  json_payload
+  comment
+  device_info
+```
+
+Column pruning + encoding + compression 组合后，scan bytes 可以显著下降。
+
+#### Memory Bandwidth 收益
+
+现代 CPU 上，很多 OLAP query 不是 ALU bound，而是 memory bandwidth bound。
+
+Encoding 后：
+
+```text
+int64 → bit-packed 12-bit
+string → dictionary int32
+timestamp → delta bit-packed
+boolean → bitmap / RLE
+```
+
+这样每个 cache line 包含更多 logical values。
+
+结果：
+
+```text
+更少 cache miss
+更少 DRAM bandwidth
+更高 SIMD lane utilization
+更少 TLB pressure
+```
+
+这解释了为什么 DuckDB 文档会提到 on-disk compressed tables 有时比 in-memory uncompressed tables 更快。
+
+#### CPU 执行收益
+
+Encoding 可以把复杂操作变简单：
+
+```text
+string equality:
+  strcmp("California", "California")
+
+变成：
+
+integer equality:
+  code == 17
+```
+
+Group by：
+
+```text
+hash(string)
+```
+
+变成：
+
+```text
+hash(int32)
+```
+
+Join：
+
+```text
+probe string key
+```
+
+变成：
+
+```text
+probe dictionary id
+```
+
+StarRocks 的 low-cardinality dictionary rewrite 就是这种方向：优化器可以改写 join predicates 和 projections，以利用 dictionary-encoded string columns。
+
+#### Operator Zero-copy 收益
+
+Trino UNNEST 的例子最典型。
+
+传统 UNNEST：
+
+```text
+复制输入元素
+生成展开后的新 block
+```
+
+DictionaryBlock UNNEST：
+
+```text
+base vector 不动
+只生成 indices
+```
+
+[Trino 的生产数据实验](https://trino.io/blog/2019/08/23/unnest-operator-performance-enhancements.html)报告查询最高约 9 倍加速、CPU 使用最多降低约 13 倍。具体收益依赖复制列宽度、嵌套结构和展开基数，不能直接外推到其他算子。
+
+这说明 encoding 还可以作为中间结果表示，而不只是文件格式。
+
+#### SerDe 收益
+
+SerDe 是大数据系统的长期瓶颈。
+
+典型浪费路径：
+
+```text
+Parquet dictionary encoded string
+  ↓
+decode 成 Java String / UTF-8
+  ↓
+再转 Arrow / UnsafeRow / ColumnVector
+  ↓
+shuffle 时再 serialize
+  ↓
+另一端再 deserialize
+```
+
+优化路径：
+
+```text
+Parquet dictionary encoded page
+  ↓
+Arrow DictionaryArray
+  ↓
+execution uses dictionary ids
+  ↓
+shuffle/exchange keeps encoded representation where possible
+```
+
+这里的收益并非来自更复杂的计算，而是来自少做了重复字符串分配、复制和解码；前文 Arrow Reader 案例给出了这种差异的量级。
+
+DataFusion 文档也强调 Arrow 支持不同系统和语言之间 zero-copy interchange，避免 serialization overhead。
+
+### Encoding-aware Execution 的关键技术
+
+在编码域中计算需要证明逻辑结果不变；字典身份、排序性质和 NULL 语义是快速路径的前提，不能只检查表示标签。
+
+#### Late Decoding / Late Materialization
+
+延迟解码和延迟物化（Late Materialization）分别推迟值转换与列读取，只有后续算子不要求完整值时才能保留收益。
+
+核心原则：
+
+```text
+能不 decode 就不 decode
+能晚 decode 就晚 decode
+```
+
+例如：
+
+```text
+SELECT count(*)
+FROM t
+WHERE country = 'US'
+```
+
+如果 `country` 是 dictionary encoded：
+
+```text
+dict:
+0 -> CN
+1 -> JP
+2 -> US
+
+predicate:
+country = 'US'
+  ↓
+code = 2
+
+scan codes:
+[2, 0, 2, 1, 2]
+```
+
+无需把每个 code 解成 string。
+
+Late decoding 对 string 列尤其重要。
+
+#### Predicate Rewriting on Encoded Domain
+
+字典相等判断可以先定位目标 ID，再过滤 ID 向量；范围条件还需要字典保序或逐字典项判断。
+
+对于 equality predicate：
+
+```text
+col = 'abc'
+```
+
+dictionary-aware rewrite：
+
+```text
+code = dict_lookup('abc')
+```
+
+对于 IN predicate：
+
+```text
+col IN ('US', 'CN', 'JP')
+```
+
+变成：
+
+```text
+code IN (2, 5, 7)
+```
+
+对于 sorted dictionary，如果 dictionary 保序，range predicate 也可以改写：
+
+```text
+col BETWEEN 'A' AND 'M'
+```
+
+变成：
+
+```text
+code BETWEEN low_code AND high_code
+```
+
+但大多数普通 dictionary 不保证 order-preserving，因此 range predicate 更复杂。
+
+#### Dictionary Propagation through Join / Group By
+
+如果两个表共享 global dictionary：
+
+```text
+fact.country_code_id
+dim.country_code_id
+```
+
+join 可以直接在 int id 上做。
+
+如果 dictionary 是 per-page/per-file local dictionary，则需要：
+
+```text
+local code → global code remap
+```
+
+这就是为什么 global dictionary 是很多系统的优化方向。
+
+StarRocks 的 global low-cardinality dictionary optimization、ClickHouse LowCardinality global dictionary RFC、Parquet global dictionary research 都指向这个问题。StarRocks 文档已经显示其优化器能够利用 low-cardinality dictionary-encoded string columns 改写 join。
+
+#### RLE-aware Aggregation
+
+Run 内值相同，聚合可以利用长度累加贡献，但需保留 NULL 与溢出等语义。
+
+对于：
+
+```text
+values:
+A x 1,000,000
+B x 500,000
+```
+
+普通聚合：
+
+```text
+for row in rows:
+    count[row.value] += 1
+```
+
+RLE-aware：
+
+```text
+count[A] += 1,000,000
+count[B] += 500,000
+```
+
+这对 count、sum、min/max、group by 都可能有效。
+
+#### ConstantVector Optimization
+
+如果一个 vector 是 constant：
+
+```text
+col = 5 repeated 4096 rows
+```
+
+filter：
+
+```text
+col > 3
+```
+
+可以直接得出：
+
+```text
+全部通过
+```
+
+filter：
+
+```text
+col > 10
+```
+
+可以直接得出：
+
+```text
+全部不通过
+```
+
+ConstantVector 在 Velox、Presto/Trino、Arrow-like systems 中都非常常见。Velox 文档把 constant encoding 作为基本 vector encoding。
+
+#### LazyVector / Lazy Materialization
+
+Velox 支持 lazy materialization pattern。Meta 的 Velox 介绍明确说其 Vector 模块支持 lazy materialization。
+
+LazyVector 的意义：
+
+```text
+先只保留数据源引用和 row ids
+真正需要时再 load/decode
+```
+
+这对：
+
+```text
+filter 之后只剩少量 rows
+join probe 之后只需要部分 payload
+project 中某些 column 未被使用
+```
+
+非常有用。
+
+#### DecodedVector 抽象
+
+Velox 的 DecodedVector 很值得借鉴。
+
+它让 operator 可以看到逻辑 flat view，但对 flat、constant、single-level dictionary inputs 保持 zero-copy。
+
+这是工程上非常漂亮的折中：
+
+```text
+性能：
+  避免不必要 decode/copy
+
+工程复杂度：
+  operator 不必手写所有 encoding path
+```
+
+### Column Encoding 在 SerDe / 网络 / Shuffle 中的价值
+
+跨边界保留编码可能减少重复物化，但发送者与接收者必须共享表示语义和字典作用域，否则要承担重映射或解码成本。
+
+#### Parquet → Arrow：避免重复字符串 materialization
+
+这是最典型的 SerDe 优化。
+
+糟糕路径：
+
+```text
+Parquet dictionary:
+  dict + codes
+
+reader:
+  decode into strings
+
+execution:
+  compare/hash strings
+```
+
+优化路径：
+
+```text
+Parquet dictionary:
+  dict + codes
+
+reader:
+  Arrow DictionaryArray
+
+execution:
+  compare/hash integer codes
+```
+
+因此，SerDe 层如果丢失 Encoding，会让上游存储格式已经识别出的数据结构重新退化成重复值。
+
+#### Exchange / Shuffle 中保留 dictionary/RLE
+
+分布式引擎中，shuffle 是典型瓶颈：
+
+```text
+serialize
+network transfer
+deserialize
+hash
+partition
+```
+
+如果 string key 能变成 dictionary code：
+
+```text
+network bytes 少
+hash 更快
+deserialize 更快
+CPU cache 更好
+```
+
+但问题是：
+
+```text
+不同 partition / page / file 的 dictionary code 不一定一致
+```
+
+所以需要：
+
+```text
+global dictionary
+dictionary remapping
+dictionary normalization
+```
+
+这也是 StarRocks、ClickHouse、Parquet global dictionaries 等方向的核心。
+
+#### Intermediate Representation Encoding
+
+Trino/Presto 的 DictionaryBlock 和 Velox 的 DictionaryVector 说明，encoding 还可以表示中间执行结果：
+
+```text
+filter result:
+  base vector + selected indices
+
+join output:
+  probe/base vector + repeated indices
+
+unnest result:
+  base nested vector + expanded indices
+
+projection:
+  no-copy dictionary remap
+```
+
+这比单纯“压缩存储”更高级。
+
+## 工业界主流系统与产品现状
+
+磁盘编码、内存向量和网络序列化是三个边界，支持读取某种格式不代表算子会保留其编码。以下按所引文档与实现分别判断。
+
+### Parquet：开放数据湖事实标准，encoding 非常丰富
 
 Parquet 是当前 lakehouse 和大数据系统最核心的开放列式格式之一。
 
@@ -668,7 +1293,7 @@ nested decode 复杂
 
 ---
 
-### 4.2 ORC：Hadoop/Hive 生态中更强的内建索引与 encoding
+### ORC：Hadoop/Hive 生态中更强的内建索引与 encoding
 
 ORC 和 Parquet 一样是主流列式格式。ORC v1 引入 RLEv2，提供更好的 compression 和 fixed bit width encoding，并根据数据使用多种 sub-encoding。
 
@@ -694,7 +1319,7 @@ Trino 官方博客 **Even Faster ORC** 中提到，ORC reader 对 all-null case 
 
 ---
 
-### 4.3 Apache Arrow：内存格式与 SerDe 的核心标准
+### Apache Arrow：内存格式与 SerDe 的核心标准
 
 Arrow 是 in-memory columnar format。DataFusion 文档说，Arrow 定义标准化列式内存表示，使不同系统和语言可以 zero-copy 共享数据，避免 serialization overhead，并支持 vectorized execution。
 
@@ -731,7 +1356,7 @@ Arrow FAQ 也说明，Arrow 通常不是强压缩格式，而是面向 CPU 直�
 
 ---
 
-### 4.4 Velox：把 encoding 做成执行层一等公民
+### Velox：把 encoding 做成执行层一等公民
 
 Velox 是 Meta 开源的 unified execution engine。Meta 官方介绍说，Velox 的 Vector 模块是 Arrow-compatible columnar memory layout，支持 flat、dictionary、constant、sequence/RLE、frame of reference、lazy materialization 等 encoding。
 
@@ -762,7 +1387,7 @@ Velox 选择：
 
 ---
 
-### 4.5 Trino / Presto：DictionaryBlock 与 RLEBlock 贯穿执行
+### Trino / Presto：DictionaryBlock 与 RLEBlock 贯穿执行
 
 Presto/Trino 的论文 **Presto: SQL on Everything** 说明，Presto 可以使用 dictionary 和 RLE blocks；多个 pages 可以共享 dictionary，从而改善内存效率。
 
@@ -790,7 +1415,7 @@ base vector + selection/remapping indices
 
 ---
 
-### 4.6 DuckDB：轻量压缩与新型 encoding 的试验田
+### DuckDB：轻量压缩与新型 encoding 的试验田
 
 DuckDB 是当前 column encoding 创新非常活跃的开源系统之一。官方 storage docs 列出支持的 compression algorithms：
 
@@ -834,7 +1459,7 @@ DuckDB 也很快吸收学术成果：FSST、ALP、Chimp、Patas 都已经进入�
 
 ---
 
-### 4.7 ClickHouse：用户可显式选择 encoding/codecs，LowCardinality 工业化成熟
+### ClickHouse：用户可显式选择 encoding/codecs，LowCardinality 工业化成熟
 
 ClickHouse 的 encoding/codecs 体系很工程化。
 
@@ -886,7 +1511,7 @@ LowCardinality 过高 cardinality 时可能变差
 
 ---
 
-### 4.8 StarRocks / Doris：低基数字符串与字典执行优化
+### StarRocks / Doris：低基数字符串与字典执行优化
 
 StarRocks 文档说明其 internal tables 使用 columnar storage，物理上 column 被分成 data blocks，encoded、compressed 后持久化存储。
 
@@ -910,7 +1535,7 @@ join/group by rewrite
 
 ---
 
-### 4.9 Spark / Databricks Photon：从 row execution 到 columnar batch
+### Spark / Databricks Photon：从 row execution 到 columnar batch
 
 Spark 对 Parquet 的 vectorized reader 已经非常成熟。Spark 文档中 `spark.sql.parquet.enableVectorizedReader` 默认启用；`spark.sql.parquet.columnarReaderBatchSize` 控制 vectorized reader batch rows；nested column vectorized reader 也默认启用。
 
@@ -925,7 +1550,7 @@ scan/deserialize/decode/expression 也必须 columnar + vectorized。
 
 ---
 
-### 4.10 BigQuery / Snowflake：闭源产品也以 columnar compressed storage 为核心
+### BigQuery / Snowflake：闭源产品也以 columnar compressed storage 为核心
 
 BigQuery 官方文档说明，BigQuery 以 columnar format 存储 table data，即每列单独存储；列式数据库特别适合扫描整个数据集中的单列。 BigQuery Capacitor 博客进一步说明，BigQuery 使用支持 nested/repeated fields 的 columnar storage，并通过 definition/repetition levels 重建结构。
 
@@ -951,7 +1576,7 @@ Snowflake 官方文档说明，所有表数据自动划分为 micro-partitions�
 
 ---
 
-### 4.11 Redshift / Vertica / SingleStore：传统 MPP/HTAP 产品中的 encoding 工程
+### Redshift / Vertica / SingleStore：传统 MPP/HTAP 产品中的 encoding 工程
 
 Amazon Redshift 把 column compression encoding 作为用户可见能力。官方文档说明，ENCODE AUTO 是默认选项，由 Redshift 自动管理所有列的 compression encoding。 `ANALYZE COMPRESSION` 会基于表内容 sample 给出列 encoding 建议，并估计相比 RAW 的磁盘空间节省。
 
@@ -979,7 +1604,7 @@ HTAP 系统尤其需要 seekable encoding，否则 point lookup 会因为 block-
 
 ---
 
-### 4.12 RAPIDS cuDF / GPU 方向：encoding 也必须适配 GPU
+### RAPIDS cuDF / GPU 方向：encoding 也必须适配 GPU
 
 RAPIDS cuDF 的 Parquet writer 选项中，`use_dictionary=True` 会优先使用 dictionary encoding，但受 `max_dictionary_size` 限制。 NVIDIA 的 Parquet string guide 强调，string encoding/compression 的效果高度依赖数据本身，cardinality 和 string length 会主导结果；对于少于约 100K distinct values 的字符串列，默认 dictionary encoding 效果好。
 
@@ -1002,612 +1627,13 @@ GPU 对 encoding 的要求和 CPU 不一样：
 
 所以 GPU-accelerated query engine 很可能推动新的 tabular encoding 设计。
 
----
+## 扩展边界：属性、复杂度与正确性
 
-## 5. Column Encoding 如何带来性能收益？
+### 当前主要挑战
 
-### 5.1 存储空间收益
+支持更多编码会扩大算子、类型与边界条件的组合数量，因此实现复杂度和回归成本也是收益模型的一部分。
 
-最直接：
-
-```text
-少存 bytes
-降低磁盘成本
-降低对象存储成本
-降低 cache footprint
-降低 replica / backup / snapshot 成本
-```
-
-对于云数据仓库和 lakehouse，存储空间收益会直接转成成本收益。
-
-BigQuery 采用 columnar storage；Snowflake micro-partitions 以 compressed columnar 形式组织；ClickHouse、DuckDB、Doris、Redshift 都强调压缩减少存储并改善 I/O。
-
-### 5.2 Scan I/O 收益
-
-列存本身让 query 只读需要的列。
-
-Encoding/compression 进一步让需要读的列更小。
-
-```text
-SELECT sum(revenue)
-FROM fact
-WHERE event_date >= '2026-01-01'
-
-只读：
-  revenue
-  event_date
-
-不读：
-  user_agent
-  json_payload
-  comment
-  device_info
-```
-
-Column pruning + encoding + compression 组合后，scan bytes 可以显著下降。
-
-### 5.3 Memory Bandwidth 收益
-
-现代 CPU 上，很多 OLAP query 不是 ALU bound，而是 memory bandwidth bound。
-
-Encoding 后：
-
-```text
-int64 → bit-packed 12-bit
-string → dictionary int32
-timestamp → delta bit-packed
-boolean → bitmap / RLE
-```
-
-这样每个 cache line 包含更多 logical values。
-
-结果：
-
-```text
-更少 cache miss
-更少 DRAM bandwidth
-更高 SIMD lane utilization
-更少 TLB pressure
-```
-
-这解释了为什么 DuckDB 文档会提到 on-disk compressed tables 有时比 in-memory uncompressed tables 更快。
-
-### 5.4 CPU 执行收益
-
-Encoding 可以把复杂操作变简单：
-
-```text
-string equality:
-  strcmp("California", "California")
-
-变成：
-
-integer equality:
-  code == 17
-```
-
-Group by：
-
-```text
-hash(string)
-```
-
-变成：
-
-```text
-hash(int32)
-```
-
-Join：
-
-```text
-probe string key
-```
-
-变成：
-
-```text
-probe dictionary id
-```
-
-StarRocks 的 low-cardinality dictionary rewrite 就是这种方向：优化器可以改写 join predicates 和 projections，以利用 dictionary-encoded string columns。
-
-### 5.5 Operator Zero-copy 收益
-
-Trino UNNEST 的例子最典型。
-
-传统 UNNEST：
-
-```text
-复制输入元素
-生成展开后的新 block
-```
-
-DictionaryBlock UNNEST：
-
-```text
-base vector 不动
-只生成 indices
-```
-
-[Trino 的生产数据实验](https://trino.io/blog/2019/08/23/unnest-operator-performance-enhancements.html)报告查询最高约 9 倍加速、CPU 使用最多降低约 13 倍。具体收益依赖复制列宽度、嵌套结构和展开基数，不能直接外推到其他算子。
-
-这说明 encoding 还可以作为中间结果表示，而不只是文件格式。
-
-### 5.6 SerDe 收益
-
-SerDe 是大数据系统的长期瓶颈。
-
-典型浪费路径：
-
-```text
-Parquet dictionary encoded string
-  ↓
-decode 成 Java String / UTF-8
-  ↓
-再转 Arrow / UnsafeRow / ColumnVector
-  ↓
-shuffle 时再 serialize
-  ↓
-另一端再 deserialize
-```
-
-优化路径：
-
-```text
-Parquet dictionary encoded page
-  ↓
-Arrow DictionaryArray
-  ↓
-execution uses dictionary ids
-  ↓
-shuffle/exchange keeps encoded representation where possible
-```
-
-这里的收益并非来自更复杂的计算，而是来自少做了重复字符串分配、复制和解码；前文 Arrow Reader 案例给出了这种差异的量级。
-
-DataFusion 文档也强调 Arrow 支持不同系统和语言之间 zero-copy interchange，避免 serialization overhead。
-
----
-
-## 6. Encoding-aware Execution 的关键技术
-
-### 6.1 Late Decoding / Late Materialization
-
-核心原则：
-
-```text
-能不 decode 就不 decode
-能晚 decode 就晚 decode
-```
-
-例如：
-
-```text
-SELECT count(*)
-FROM t
-WHERE country = 'US'
-```
-
-如果 `country` 是 dictionary encoded：
-
-```text
-dict:
-0 -> CN
-1 -> JP
-2 -> US
-
-predicate:
-country = 'US'
-  ↓
-code = 2
-
-scan codes:
-[2, 0, 2, 1, 2]
-```
-
-无需把每个 code 解成 string。
-
-Late decoding 对 string 列尤其重要。
-
-### 6.2 Predicate Rewriting on Encoded Domain
-
-对于 equality predicate：
-
-```text
-col = 'abc'
-```
-
-dictionary-aware rewrite：
-
-```text
-code = dict_lookup('abc')
-```
-
-对于 IN predicate：
-
-```text
-col IN ('US', 'CN', 'JP')
-```
-
-变成：
-
-```text
-code IN (2, 5, 7)
-```
-
-对于 sorted dictionary，如果 dictionary 保序，range predicate 也可以改写：
-
-```text
-col BETWEEN 'A' AND 'M'
-```
-
-变成：
-
-```text
-code BETWEEN low_code AND high_code
-```
-
-但大多数普通 dictionary 不保证 order-preserving，因此 range predicate 更复杂。
-
-### 6.3 Dictionary Propagation through Join / Group By
-
-如果两个表共享 global dictionary：
-
-```text
-fact.country_code_id
-dim.country_code_id
-```
-
-join 可以直接在 int id 上做。
-
-如果 dictionary 是 per-page/per-file local dictionary，则需要：
-
-```text
-local code → global code remap
-```
-
-这就是为什么 global dictionary 是很多系统的优化方向。
-
-StarRocks 的 global low-cardinality dictionary optimization、ClickHouse LowCardinality global dictionary RFC、Parquet global dictionary research 都指向这个问题。StarRocks 文档已经显示其优化器能够利用 low-cardinality dictionary-encoded string columns 改写 join。
-
-### 6.4 RLE-aware Aggregation
-
-对于：
-
-```text
-values:
-A x 1,000,000
-B x 500,000
-```
-
-普通聚合：
-
-```text
-for row in rows:
-    count[row.value] += 1
-```
-
-RLE-aware：
-
-```text
-count[A] += 1,000,000
-count[B] += 500,000
-```
-
-这对 count、sum、min/max、group by 都可能有效。
-
-### 6.5 ConstantVector Optimization
-
-如果一个 vector 是 constant：
-
-```text
-col = 5 repeated 4096 rows
-```
-
-filter：
-
-```text
-col > 3
-```
-
-可以直接得出：
-
-```text
-全部通过
-```
-
-filter：
-
-```text
-col > 10
-```
-
-可以直接得出：
-
-```text
-全部不通过
-```
-
-ConstantVector 在 Velox、Presto/Trino、Arrow-like systems 中都非常常见。Velox 文档把 constant encoding 作为基本 vector encoding。
-
-### 6.6 LazyVector / Lazy Materialization
-
-Velox 支持 lazy materialization pattern。Meta 的 Velox 介绍明确说其 Vector 模块支持 lazy materialization。
-
-LazyVector 的意义：
-
-```text
-先只保留数据源引用和 row ids
-真正需要时再 load/decode
-```
-
-这对：
-
-```text
-filter 之后只剩少量 rows
-join probe 之后只需要部分 payload
-project 中某些 column 未被使用
-```
-
-非常有用。
-
-### 6.7 DecodedVector 抽象
-
-Velox 的 DecodedVector 很值得借鉴。
-
-它让 operator 可以看到逻辑 flat view，但对 flat、constant、single-level dictionary inputs 保持 zero-copy。
-
-这是工程上非常漂亮的折中：
-
-```text
-性能：
-  避免不必要 decode/copy
-
-工程复杂度：
-  operator 不必手写所有 encoding path
-```
-
----
-
-## 7. Encoding Selection：如何根据数据分布选择？
-
-### 7.1 选择 encoding 需要观察哪些统计信息？
-
-一个成熟 encoding selector 至少需要以下统计：
-
-```text
-cardinality
-run length distribution
-min / max
-delta distribution
-null ratio
-string length distribution
-prefix/suffix similarity
-sortedness / clustering degree
-value skew
-outlier ratio
-update frequency
-query pattern
-random access vs scan
-```
-
-简单表：
-
-| 数据分布 | 推荐 encoding |
-| --- | --- |
-| 全部值相同 | Constant |
-| 连续重复值 | RLE / Run-End Encoding |
-| 低基数字符串 | Dictionary / LowCardinality |
-| 小整数范围 | Bit-packing / FOR |
-| 单调整数 / timestamp | Delta / DoubleDelta |
-| 时间序列 float | Gorilla / Chimp / Patas |
-| 真实业务 double | ALP |
-| 高基数字符串但子串重复 | FSST |
-| prefix-heavy string | Delta Byte Array / front coding / FSST+ 类方向 |
-| 大量 null | validity bitmap + RLE/REE |
-| nested data | definition/repetition level encoding |
-
-### 7.2 自动选择 vs 手动选择
-
-工业系统大致分两派。
-
-#### 自动选择派
-
-代表：
-
-```text
-Snowflake
-BigQuery
-Redshift ENCODE AUTO
-DuckDB auto compression
-Doris writer auto picks encoding
-```
-
-Redshift 官方文档说明，ENCODE AUTO 默认自动管理列 compression encoding；`ANALYZE COMPRESSION` 可以基于 sample 给出建议。 Doris 文档也显示 writer 会根据列类型和值分布选择 encoding。
-
-优点：
-
-```text
-用户负担低
-适合云服务
-避免错误配置
-```
-
-缺点：
-
-```text
-对特殊 workload 可能不最优
-encoding choice 不透明
-难以跨系统保持语义
-```
-
-#### 手动调优派
-
-代表：
-
-```text
-ClickHouse
-Redshift manual ENCODE
-Vertica projection encoding
-SingleStore 部分 schema-level encoding
-```
-
-ClickHouse 允许用户显式选择 codecs，并通过 LowCardinality 类型指定 dictionary-like storage。
-
-优点：
-
-```text
-专家用户可极致优化
-适合固定 workload
-适合可控数据分布
-```
-
-缺点：
-
-```text
-需要理解分布
-错误选择可能负优化
-schema 演化后可能过期
-```
-
-### 7.3 为什么最优 encoding 不只取决于压缩率？
-
-假设两个方案：
-
-```text
-A:
-  压缩率 10:1
-  decode 速度 1 GB/s
-
-B:
-  压缩率 5:1
-  decode 速度 10 GB/s
-```
-
-如果 query 是 CPU-bound，B 可能更快。
-
-如果 query 是 object-store I/O-bound，A 可能更省钱。
-
-如果 column 是 sort key，过度压缩可能影响 range scan。Redshift 文档就特别说明，自动 compression 对 sort key columns 会避免过强压缩，因为 range-restricted scans 可能因此变差。
-
-所以 encoding selector 的目标函数应该是：
-
-```text
-minimize:
-  scan_time
-  + decode_time
-  + memory_bandwidth
-  + network_shuffle_time
-  + storage_cost
-  + write_amplification
-  + maintenance_cost
-```
-
-而不是只看：
-
-```text
-compressed_size
-```
-
----
-
-## 8. Column Encoding 在 SerDe / 网络 / Shuffle 中的价值
-
-### 8.1 Parquet → Arrow：避免重复字符串 materialization
-
-这是最典型的 SerDe 优化。
-
-糟糕路径：
-
-```text
-Parquet dictionary:
-  dict + codes
-
-reader:
-  decode into strings
-
-execution:
-  compare/hash strings
-```
-
-优化路径：
-
-```text
-Parquet dictionary:
-  dict + codes
-
-reader:
-  Arrow DictionaryArray
-
-execution:
-  compare/hash integer codes
-```
-
-因此，SerDe 层如果丢失 Encoding，会让上游存储格式已经识别出的数据结构重新退化成重复值。
-
-### 8.2 Exchange / Shuffle 中保留 dictionary/RLE
-
-分布式引擎中，shuffle 是典型瓶颈：
-
-```text
-serialize
-network transfer
-deserialize
-hash
-partition
-```
-
-如果 string key 能变成 dictionary code：
-
-```text
-network bytes 少
-hash 更快
-deserialize 更快
-CPU cache 更好
-```
-
-但问题是：
-
-```text
-不同 partition / page / file 的 dictionary code 不一定一致
-```
-
-所以需要：
-
-```text
-global dictionary
-dictionary remapping
-dictionary normalization
-```
-
-这也是 StarRocks、ClickHouse、Parquet global dictionaries 等方向的核心。
-
-### 8.3 Intermediate Representation Encoding
-
-Trino/Presto 的 DictionaryBlock 和 Velox 的 DictionaryVector 说明，encoding 还可以表示中间执行结果：
-
-```text
-filter result:
-  base vector + selected indices
-
-join output:
-  probe/base vector + repeated indices
-
-unnest result:
-  base nested vector + expanded indices
-
-projection:
-  no-copy dictionary remap
-```
-
-这比单纯“压缩存储”更高级。
-
----
-
-## 9. 当前主要挑战
-
-### 9.1 Encoding-aware Operator 代码复杂
+#### Encoding-aware Operator 代码复杂
 
 如果一个 operator 要支持：
 
@@ -1634,9 +1660,9 @@ null semantics 更复杂
 nested types 更复杂
 ```
 
-### 9.2 Dictionary Locality 问题
+#### Dictionary Locality 问题
 
-Parquet dictionary 通常是 per column chunk / page 级别。
+Parquet 的字典作用域通常是一个 Column Chunk；其 Dictionary Page 与引用该字典的数据页需要一起解释，不能把不同 Column Chunk 的相同 ID 当成同一值。
 
 这对 scan 有利，但对 join/group by 不够好。
 
@@ -1663,7 +1689,7 @@ runtime dictionary remapping
 dictionary-aware hash table
 ```
 
-### 9.3 高 cardinality 字符串
+#### 高 cardinality 字符串
 
 Dictionary encoding 在高 cardinality 下可能失败或 fallback。Parquet 官方文档说明，如果 dictionary 太大，会 fallback 到 plain encoding。
 
@@ -1680,7 +1706,7 @@ general compression + string view
 
 NVIDIA 的指南也说明，distinct values 高时，delta 和 delta length encoding 对短字符串可能更优。
 
-### 9.4 随机访问与 Seekability
+#### 随机访问与 Seekability
 
 很多 compression/encoding 对顺序 scan 友好，但对 point lookup 不友好。
 
@@ -1701,13 +1727,13 @@ SingleStore 文档强调，它把 Dictionary/RLE/LZ4 等 string encoding 扩展�
 
 这对 HTAP、serving、point query 很重要。
 
-### 9.5 Heavy Compression 可能让 Query CPU-bound
+#### Heavy Compression 可能让 Query CPU-bound
 
 在对象存储和高速网络时代，瓶颈可能从 I/O 变成 decompression CPU。
 
 BtrBlocks 论文直接指出，数据湖中开放格式如 Parquet 在远程访问和高吞吐网络下，低效 decompression 会让 scan CPU-bound，从而增加 query time 和 cost。
 
-所以未来不是“压得越小越好”，而是：
+因此评价目标不应只设为最小文件，而应计入：
 
 ```text
 压缩率
@@ -1720,7 +1746,7 @@ object-store read amplification
 
 一起优化。
 
-### 9.6 更新、删除、Compaction 会破坏 encoding 效果
+#### 更新、删除、Compaction 会破坏 encoding 效果
 
 Column encoding 通常对 immutable segment / sorted block 最有效。
 
@@ -1749,7 +1775,7 @@ clustering 变差
 
 所以现代 OLAP 系统必须把 encoding 与 compaction、clustering、sort key、row group rewrite 结合。
 
-### 9.7 Encoding 还是兼容性协议
+#### Encoding 还是兼容性协议
 
 Writer 能生成某种 Encoding，不等于所有 Reader 都能正确读取。Parquet 官方的[格式版本说明](https://parquet.apache.org/docs/file-format/versions/)特别区分两类演进：新增 Bloom 等可忽略元数据时，旧 Reader 仍可读取但性能退化；新增 `DELTA_*`、`BYTE_STREAM_SPLIT`、`RLE_DICTIONARY` 或 Data Page V2 等物理表示时，不支持它们的旧 Reader 可能直接无法解码。
 
@@ -1766,11 +1792,11 @@ candidate encoding
 
 这类问题不能只靠 `format_version=2` 推断。Parquet 文档明确指出，文件元数据中的版本字段历史上与实际 Feature 并非严格一一对应；可靠做法是按 Reader 实现和 Feature 建立能力清单，灰度写入新 Encoding，并在升级完成前保留可回滚的 Writer 策略。对 Lakehouse 而言，“压缩率更高但部分 Reader 不认识”首先是可用性事故，而不是性能优化。
 
----
+### 研究方向与尚待验证的边界
 
-## 10. 最新研究与发展趋势
+新格式与新编码需要同时评估读写兼容、访问粒度和执行成本；以下材料支持具体机制分析，不足以证明统一的行业迁移方向。
 
-### 10.1 Data Lake 格式正在重新思考 encoding
+#### Data Lake 格式正在重新思考 encoding
 
 Parquet/ORC 是十多年前为 Hadoop 生态设计的。现在硬件变了：
 
@@ -1798,7 +1824,7 @@ BtrBlocks、FastLanes 等研究都在重新审视 columnar storage format。BtrB
   object-store efficient
 ```
 
-### 10.2 String encoding 进入新阶段
+#### String encoding 进入新阶段
 
 FSST 已经从论文进入 DuckDB/CedarDB 等工程系统。DuckDB 支持 FSST，CedarDB 也公开介绍其使用 FSST 压缩 text columns，以减少存储并提升查询。
 
@@ -1815,7 +1841,7 @@ FSST 已经从论文进入 DuckDB/CedarDB 等工程系统。DuckDB 支持 FSST�
   尽量避免 materialize full string
 ```
 
-### 10.3 Float encoding 变得越来越重要
+#### Float encoding 变得越来越重要
 
 ALP、Chimp、Patas 等进入数据库系统，说明浮点压缩已从 time-series 专用算法变成 general columnar engine 关注点。DuckDB 已经支持 ALP、Chimp、Patas。
 
@@ -1832,9 +1858,9 @@ scientific data
 
 都会让 float/double 列变多。
 
-### 10.4 Encoding-aware Optimizer
+#### Encoding-aware Optimizer
 
-未来 optimizer 不仅要知道：
+若优化器要参与编码选择，仅知道以下统计还不够：
 
 ```text
 row count
@@ -1881,7 +1907,7 @@ shuffle size
 materialization decision
 ```
 
-### 10.5 Global Dictionary 会在 Lakehouse 中重新变热
+#### Global Dictionary：跨文件复用与维护代价
 
 当前 Parquet dictionary 通常局部于 column chunk，不适合跨文件执行。
 
@@ -1914,7 +1940,7 @@ delete/update
 
 这是很有价值的研究和工程方向。
 
-### 10.6 GPU-friendly Column Encoding
+#### GPU-friendly Column Encoding
 
 GPU 需要：
 
@@ -1938,7 +1964,7 @@ GPU decompression + decode fusion
 GPUDirect Storage + encoded column scan
 ```
 
-### 10.7 Encoding 与 AI 数据系统结合
+#### Encoding 与 AI 数据系统结合
 
 AI 时代新的数据类型正在进入数据库：
 
@@ -1973,11 +1999,11 @@ observability:
 
 Column encoding 会从传统 OLAP 扩展到 AI-native workload。
 
----
+### 对计算引擎设计的建议
 
-## 11. 对计算引擎设计的建议
+显式记录编码属性有助于延后解码，但需要新增传播、失效与转换规则。以下是面向可控执行器的建议，不适合在没有基准和语义测试时直接铺开。
 
-### 11.1 把 encoding 作为 Physical Plan Property
+#### 把 encoding 作为 Physical Plan Property
 
 建议在 Query Engine 中显式建模：
 
@@ -2004,7 +2030,7 @@ late decode
 decode placement decision
 ```
 
-### 11.2 Scan Operator 不应总是输出 FlatVector
+#### Scan Operator 不应总是输出 FlatVector
 
 Scan 的输出应该允许：
 
@@ -2021,7 +2047,9 @@ RunEndVector
 
 Velox、Trino、Arrow 的经验都说明，这是现代 vectorized engine 的关键。
 
-### 11.3 Expression Engine 要支持 encoded fast path
+#### Expression Engine 要支持 encoded fast path
+
+表达式可以在常量或字典上复用计算，但必须处理表达式确定性与错误语义，不能无条件把逐行调用缩成一次。
 
 例如：
 
@@ -2035,7 +2063,7 @@ cast on dictionary base values
 
 对于不支持的表达式，再 fallback 到 decode。
 
-### 11.4 Join / Aggregate 应支持 dictionary id path
+#### Join / Aggregate 应支持 dictionary id path
 
 尤其是字符串 key：
 
@@ -2049,7 +2077,7 @@ COUNT DISTINCT event_type
 
 StarRocks 对 low-cardinality dictionary string join 的 rewrite 是一个很好的工业信号。
 
-### 11.5 Encoding Selector 应同时考虑 workload
+#### Encoding Selector 应同时考虑 workload
 
 不要只基于数据分布选 encoding，还要基于查询：
 
@@ -2070,7 +2098,7 @@ StarRocks 对 low-cardinality dictionary string join 的 rewrite 是一个很好
   过度压缩会增加 rewrite 成本
 ```
 
-### 11.6 SerDe 边界要保留 encoding
+#### SerDe 边界要保留 encoding
 
 在以下边界都要尽量保留 encoding：
 
@@ -2101,119 +2129,13 @@ receiver 再 decode
 
 这种反复转换会吞掉很多收益。
 
----
+### 总结：Column Encoding 的本质
 
-## 12. 一个实用的 Encoding 选择矩阵
+Column Encoding 同时改变持久化字节、访存与算子成本，因此应按端到端查询评价，而不是仅看压缩率。Scan、Filter、Join 和 Aggregate 都可能利用已有表示，但 Exchange、UDF 或 Spill 也可能要求转换。
 
-| 场景 | 数据特征 | 推荐 encoding | 执行优化 |
-| --- | --- | --- | --- |
-| 低基数字符串维度 | country、status、channel | Dictionary / LowCardinality | filter/join/group by on int code |
-| 高基数字符串但有重复子串 | URL、路径、日志、JSON text | FSST / Delta Byte Array | late materialization，string view |
-| 时间戳 | 单调、固定间隔 | Delta / DoubleDelta / bit-pack | range filter + min/max + SIMD decode |
-| 指标 float | time-series gauge | Gorilla / Chimp / Patas | batch decode，predicate pushdown |
-| 真实业务 double | 金额、价格、比率 | ALP | float → integer-like encoding |
-| 小范围整数 | age、small id、bucket | FOR / bitpacking / T64 | SIMD compare |
-| 连续重复值 | 排序后维度列 | RLE / REE | run-level filter/agg |
-| 全部相同 | partition column / constant projection | Constant | metadata-only execution |
-| 大量 null | sparse columns | validity bitmap + RLE/REE | null fast path |
-| 嵌套数据 | array/map/struct | def/rep levels | nested vectorized decode |
-| point lookup | serving/HTAP | seekable dictionary/RLE/LZ4 | random access fast path |
+将 Encode、Decode、RemapDictionary、RunLengthAggregate、BitPackedFilter 与 LateMaterialize 纳入计划分析，可以解释转换发生在哪里。这不要求每个引擎都添加同名算子，也不意味着所有编码应当保持到执行结束；关键是记录作用域、语义与转换成本。
 
----
-
-## 13. 最值得精读的论文与系统
-
-### 学术基础
-
-| 论文 | 价值 |
-| --- | --- |
-| [C-Store: A Column-oriented DBMS](https://www.vldb.org/archives/website/2005/program/paper/thu/p553-stonebraker.pdf) | 列存、Projection、排序和 Read-optimized Architecture 的基础。 |
-| [Integrating Compression and Execution in Column-Oriented Database Systems](https://www.cs.umd.edu/~abadi/papers/abadisigmod06.pdf) | 压缩数据上执行查询的经典论文。 |
-| [MonetDB/X100](https://www.cidrdb.org/cidr2005/papers/P19.pdf) | Vectorized Execution 与 CPU-aware Query Processing 的经典。 |
-| [The Design and Implementation of Modern Column-Oriented Database Systems](https://stratos.seas.harvard.edu/files/stratos/files/columnstoresfntdbs.pdf) | Column Store 系统设计综述。 |
-| [BitWeaving](https://pages.cs.wisc.edu/~jignesh/publ/bitweaving.pdf) | Bit-level Parallel Scan。 |
-| [ByteSlice](https://www.cs.columbia.edu/~orestis/publications.html) | Byte-level SIMD-friendly Layout。 |
-| [FSST](https://vldb.org/pvldb/vol13/p2649-boncz.pdf) | 轻量级字符串压缩与随机访问。 |
-| [ALP](https://github.com/cwida/ALP) | 自适应无损浮点压缩。 |
-| [Chimp](https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf) / [Patas](https://github.com/andybaran/chimp) | 面向浮点时间序列的压缩。 |
-| [BtrBlocks](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf) / [FastLanes](https://github.com/cwida/FastLanes) | Data Lake 时代的列式轻量压缩。 |
-
-### 工业系统
-
-| 系统 | 值得关注点 |
-| --- | --- |
-| [Parquet](https://parquet.apache.org/docs/file-format/data-pages/encodings/) | Encoding + Compression 的开放标准，Dictionary、RLE、Delta 和 Byte Stream Split。 |
-| [ORC](https://orc.apache.org/specification/ORCv1/) | RLEv2、Stripe Statistics、Bloom Filter 和 Hive/Trino 生态。 |
-| [Arrow](https://arrow.apache.org/docs/format/Columnar.html) | Zero-copy 内存列式格式、DictionaryArray 和 Run-End Encoding。 |
-| [Velox](https://facebookincubator.github.io/velox/develop/vectors.html) | Vector Encoding 一等公民与 DecodedVector 抽象。 |
-| [Trino/Presto](https://trino.io/blog/2019/08/23/unnest-operator-performance-enhancements.html) | DictionaryBlock/RLEBlock 贯穿执行以及 UNNEST 无复制优化。 |
-| [DuckDB](https://duckdb.org/docs/stable/internals/storage.html) | 快速吸收 FSST、ALP、Chimp、Patas 等 Encoding 研究。 |
-| [ClickHouse](https://clickhouse.com/resources/engineering/database-compression) | LowCardinality、Delta、DoubleDelta、Gorilla 和 T64 可配置。 |
-| [StarRocks](https://docs.starrocks.io/docs/sql-reference/System_variable/#cbo_enable_low_cardinality_optimize_for_join) / [Doris](https://doris.apache.org/docs/dev/key-features/columnar-storage/) | 字典编码、Optimizer Rewrite 与基于分布的 Encoding。 |
-| [Spark](https://spark.apache.org/docs/latest/sql-data-sources-parquet.html) / [Photon](https://docs.databricks.com/aws/en/compute/photon) | Vectorized Parquet Reader、Columnar Batch 与 Lakehouse 执行引擎。 |
-| [BigQuery](https://cloud.google.com/bigquery/docs/storage_overview) / [Snowflake](https://docs.snowflake.com/en/user-guide/tables-clustering-micropartitions) | 自动列式压缩存储与 Metadata Pruning。 |
-| [Redshift](https://docs.aws.amazon.com/redshift/latest/dg/c_Compression_encodings.html) / Vertica / [SingleStore](https://docs.singlestore.com/db/v9.0/create-a-database/columnstore/) | 自动或手动列编码、Seekable Encoding 和经典 MPP 工程经验。 |
-| [RAPIDS cuDF](https://docs.rapids.ai/api/cudf/stable/user_guide/api_docs/api/cudf.dataframe.to_parquet/) | GPU Parquet Encoding/Compression，包括 Dictionary 与 Byte Stream Split。 |
-
----
-
-## 14. 总结：Column Encoding 的本质
-
-Column encoding 的本质不是“把数据压小”。
-
-它真正解决的是：
-
-```text
-如何利用数据分布，
-把逻辑数据转换成更接近硬件、更接近执行器、更接近网络传输的物理表示。
-```
-
-在现代计算引擎里，它同时影响：
-
-```text
-存储成本
-I/O 成本
-CPU decode 成本
-memory bandwidth
-cache locality
-SIMD utilization
-predicate evaluation
-join/group by cost
-shuffle bytes
-serialization/deserialization
-operator intermediate representation
-```
-
-如果用一句话总结：
-
-**Column encoding 是现代 Query Engine 的物理代数之一。**
-
-过去我们在 optimizer 里讨论：
-
-```text
-Scan
-Filter
-Project
-Join
-Aggregate
-Exchange
-Sort
-```
-
-未来还要讨论：
-
-```text
-Encode
-Decode
-RemapDictionary
-PropagateDictionary
-RunLengthAggregate
-BitPackedFilter
-LateMaterialize
-GlobalDictJoin
-```
-
-### 14.1 我的思考：Encoding 是物理代数，也是正确性契约
+#### 我的思考：Encoding 是物理代数，也是正确性契约
 
 把 Encoding 引入执行计划，不能只记录一个 `Dictionary` 或 `RLE` 标签。表示只有在特定作用域和语义下才成立：两个 Dictionary ID 相等，不代表它们来自不同字典时对应的逻辑值相等；有序字典可以支持范围比较，无序字典通常只能安全地做等值映射；浮点编码还必须保持 NaN、正负零和排序语义；嵌套类型则要同时维护 Null、Offset 与父子层级。
 
@@ -2241,8 +2163,42 @@ Cost:
 
 这使 Encoding 更像一种物理代数：算子不仅消费和产生 Row，也消费和产生带有表示属性的 Column。Optimizer 的职责不再只是选择 Join 顺序，还要选择何时保持结构、何时转换结构，以及转换发生在哪个成本最低的边界。
 
-我认为下一代计算引擎最值得投入的方向，不是让所有算子理解所有 Encoding，而是建立三层能力：公共的逻辑访问抽象、少数高收益的 Encoded Fast Path，以及随时可以回退的正确 Decode Path。这样既不会因为追求统一而过早物化，也不会让算子代码陷入 Encoding 组合爆炸。
+实现上可以先保留公共逻辑访问接口，只为目标负载中收益明确的表示增加快速路径，并保留正确的解码回退。代价是更多分派与测试组合；若字典重映射和状态传递超过计算节省，就应提前解码。
 
-最终，这篇文章想强调的不是“压缩数据也能计算”，而是一个更一般的判断：**数据在进入系统时已经携带结构，好的执行引擎应尽可能利用并传播这些结构，而不是先把它们抹平，再付出代价重新发现。**
+采用 Encoding Property 前，应以 Flat 路径为数值与 SQL 语义基准，覆盖字典不一致、NULL、浮点特殊值、Exchange 和 Spill。本文的统一属性模型是设计建议，不表示所列引擎已实现同一套跨算子协议。
 
-这也是下一代计算引擎值得深入投入的方向：**把 Encoding 从 Storage 层的隐式优化，提升为 Optimizer 和 Execution Engine 都能理解的一等物理属性。**
+## 最值得精读的论文与系统
+
+论文用于核对编码域算法的前提，源码用于核对表示如何穿过算子与序列化边界，两类证据不能互相替代。
+
+### 学术基础
+
+| 论文 | 价值 |
+| --- | --- |
+| [C-Store: A Column-oriented DBMS](https://www.vldb.org/archives/website/2005/program/paper/thu/p553-stonebraker.pdf) | 列存、Projection、排序和 Read-optimized Architecture 的基础。 |
+| [Integrating Compression and Execution in Column-Oriented Database Systems](https://www.cs.umd.edu/~abadi/papers/abadisigmod06.pdf) | 压缩数据上执行查询的经典论文。 |
+| [MonetDB/X100](https://www.cidrdb.org/cidr2005/papers/P19.pdf) | Vectorized Execution 与 CPU-aware Query Processing 的经典。 |
+| [The Design and Implementation of Modern Column-Oriented Database Systems](https://stratos.seas.harvard.edu/files/stratos/files/columnstoresfntdbs.pdf) | Column Store 系统设计综述。 |
+| [BitWeaving](https://pages.cs.wisc.edu/~jignesh/publ/bitweaving.pdf) | Bit-level Parallel Scan。 |
+| [ByteSlice](https://www.cs.columbia.edu/~orestis/publications.html) | Byte-level SIMD-friendly Layout。 |
+| [FSST](https://vldb.org/pvldb/vol13/p2649-boncz.pdf) | 轻量级字符串压缩与随机访问。 |
+| [ALP](https://github.com/cwida/ALP) | 自适应无损浮点压缩。 |
+| [Chimp](https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf) / [Patas](https://github.com/andybaran/chimp) | 面向浮点时间序列的压缩。 |
+| [BtrBlocks](https://www.cs.cit.tum.de/fileadmin/w00cfj/dis/papers/btrblocks.pdf) / [FastLanes](https://github.com/cwida/FastLanes) | Data Lake 时代的列式轻量压缩。 |
+
+### 工业系统
+
+| 系统 | 值得关注点 |
+| --- | --- |
+| [Parquet](https://parquet.apache.org/docs/file-format/data-pages/encodings/) | Encoding + Compression 的开放标准，Dictionary、RLE、Delta 和 Byte Stream Split。 |
+| [ORC](https://orc.apache.org/specification/ORCv1/) | RLEv2、Stripe Statistics、Bloom Filter 和 Hive/Trino 生态。 |
+| [Arrow](https://arrow.apache.org/docs/format/Columnar.html) | Zero-copy 内存列式格式、DictionaryArray 和 Run-End Encoding。 |
+| [Velox](https://facebookincubator.github.io/velox/develop/vectors.html) | Vector Encoding 一等公民与 DecodedVector 抽象。 |
+| [Trino/Presto](https://trino.io/blog/2019/08/23/unnest-operator-performance-enhancements.html) | DictionaryBlock/RLEBlock 贯穿执行以及 UNNEST 无复制优化。 |
+| [DuckDB](https://duckdb.org/docs/stable/internals/storage.html) | 快速吸收 FSST、ALP、Chimp、Patas 等 Encoding 研究。 |
+| [ClickHouse](https://clickhouse.com/resources/engineering/database-compression) | LowCardinality、Delta、DoubleDelta、Gorilla 和 T64 可配置。 |
+| [StarRocks](https://docs.starrocks.io/docs/sql-reference/System_variable/#cbo_enable_low_cardinality_optimize_for_join) / [Doris](https://doris.apache.org/docs/dev/key-features/columnar-storage/) | 字典编码（Dictionary Encoding）、Optimizer Rewrite 与基于分布的 Encoding。 |
+| [Spark](https://spark.apache.org/docs/latest/sql-data-sources-parquet.html) / [Photon](https://docs.databricks.com/aws/en/compute/photon) | Vectorized Parquet Reader、Columnar Batch 与 Lakehouse 执行引擎。 |
+| [BigQuery](https://cloud.google.com/bigquery/docs/storage_overview) / [Snowflake](https://docs.snowflake.com/en/user-guide/tables-clustering-micropartitions) | 自动列式压缩存储与 Metadata Pruning。 |
+| [Redshift](https://docs.aws.amazon.com/redshift/latest/dg/c_Compression_encodings.html) / Vertica / [SingleStore](https://docs.singlestore.com/db/v9.0/create-a-database/columnstore/) | 自动或手动列编码、Seekable Encoding 和经典 MPP 工程经验。 |
+| [RAPIDS cuDF](https://docs.rapids.ai/api/cudf/stable/user_guide/api_docs/api/cudf.dataframe.to_parquet/) | GPU Parquet Encoding/Compression，包括 Dictionary 与 Byte Stream Split。 |

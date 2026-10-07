@@ -1,7 +1,7 @@
 ---
 title: "【论文】2026 数据库内核研究进展：从因子化执行到自适应优化与增量维护"
 date: 2026-09-19T00:00:00+08:00
-lastmod: 2026-09-19T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 slug: "database-research-frontiers-2026"
 categories:
   - 数据库
@@ -17,25 +17,15 @@ description: "围绕 SIGMOD、VLDB、OSDI、FAST 与 CIDR 的近期论文，分�
 draft: false
 ---
 
-读完一轮数据库新论文后，最容易留下的印象是系统又多了几个标签：GPU、LLM、存算分离、自动布局、增量计算。但这些标签并不能解释，为什么一个已有向量化执行、成本优化器和对象存储的系统，仍然会在某些负载下表现得很差。
+这组近期论文将优化对象从单个算子扩展到中间表示（Intermediate Representation）、数据子集和后续维护工作。FFX 讨论重复组合是否需要展开，SplitJoin 为不同数据部分选择计划，HATS 和 Enzyme 则把后台积压或下游变化纳入成本。它们解决的约束不同，不能用“GPU”“LLM”或“增量计算”这样的标签概括机制。
 
-把标签拿掉，这批工作反复触及几个更具体的问题：Join 生成的重复组合是否必须立即展开？同一条 SQL 的不同数据是否应该走同一计划？一次局部便宜的刷新是否会让下游更贵？今天为了压低读延迟而推迟的 compaction，明天会以什么形式回来？
-
-**我的主要判断是：数据库的优化对象正在从“如何更快执行这个算子”，扩展到“以什么表示、对哪部分数据、在什么状态下、承担多少后续工作”。** 这不是对整个领域的统计结论，而是下面这些论文共同呈现出的研究方向。
+本文按执行、优化、存储和增量维护展开，最后比较这些工作新增的成本项。讨论限定于所选论文，不据此判断整个领域的研究占比。
 
 这也延续了此前的 [Umbra 研究路线]({{< relref "2026-09-04-dive-umbra.md" >}}) 和 [数据库系统论文精读]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})：前者讨论执行器怎样逐步放松理想化假设，后者讨论现代硬件、工业系统和自治机制。本文进一步关注这些机制之间的边界，以及下一步值得验证的组合。
 
-## 核心判断
-
-1. **少产生中间数据，正在成为与加速算子同等重要的执行问题。** SplitJoin 改变数据子集的计划，FFX 改变中间结果的表示，两者分别减少不必要的中间工作和重复展开。
-2. **优化器的难点不只在预测精度，也在候选集合和反馈成本。** OBELISK 研究如何有限预算地探索计划，APQO 面对计划缓存本身会变化的问题。
-3. **存算分离需要重新组织整个数据路径。** 只卸载 compaction，未必解决 memtable、flush、网络和读路径的瓶颈；前台与后台各自最优，也未必组成一个稳定系统。
-4. **增量计算正在从代数变换走向维护决策。** 能生成 delta plan，只回答了“能不能”；历史成本、下游变化和布局收益，才回答“什么时候值得”。
-5. **这些方向都需要把状态纳入评价。** 计划缓存、历史反馈、维护积压和布局都会变化；一次静态 benchmark 很难充分说明长期收益。
-
 ## 一、先明确“最新”与“读过”的含义
 
-本文检索截止于 **2026 年 9 月 19 日**，从 [VLDB 2026](https://vldb.org/2026/program.html)、[SIGMOD 2026](https://2026.sigmod.org/sigmod_papers.shtml)、[OSDI 2026](https://www.usenix.org/conference/osdi26/technical-sessions)、[FAST 2026](https://www.usenix.org/conference/fast26/technical-sessions)、[CIDR 2026](https://www.cidrdb.org/cidr2026/program.html) 和 [SOSP 2025](https://sigops.org/s/conferences/sosp/2025/accepted.html) 的官方目录筛选，再回到原文、作者页面或出版方摘要。
+“近期进展”只覆盖本文实际检索和核对的材料，不代表会议论文全集。原稿检索截止于 **2026 年 9 月 19 日**，从 [VLDB 2026](https://vldb.org/2026/program.html)、[SIGMOD 2026](https://2026.sigmod.org/sigmod_papers.shtml)、[OSDI 2026](https://www.usenix.org/conference/osdi26/technical-sessions)、[FAST 2026](https://www.usenix.org/conference/fast26/technical-sessions)、[CIDR 2026](https://www.cidrdb.org/cidr2026/program.html) 和 [SOSP 2025](https://sigops.org/s/conferences/sosp/2025/accepted.html) 的官方目录筛选，再回到原文、作者页面或出版方摘要。
 
 这里包含不同出版体系：VLDB 对应 PVLDB，SIGMOD Research 对应 PACMMOD，OSDI、FAST、SOSP 是会议。APQO 的期刊出版时间是 2025 年 12 月，但属于 SIGMOD 2026；FFX 在 2026 年 9 月上传 arXiv，不代表它到 9 月才正式发表。本文没有穷尽 PVLDB v20、全部 online-first 和 2027 已接收稿，因此“最新”指本轮核实的近期研究窗口。
 
@@ -53,7 +43,11 @@ draft: false
 
 ## 二、查询执行：优化生成了什么，而不只是处理得多快
 
+执行效率不仅取决于处理速率，还取决于是否生成了不必要的中间数据。表示压缩、数据划分与硬件卸载分别处理不同部分的工作量。
+
 ### 2.1 FFX：把重复关系留在表示里
+
+因子化执行（Factorized Execution）通过共享结构保存重复组合，可以推迟元组展开，但必须保留 SQL 的重复次数语义。
 
 [FFX：Factorized and Vectorized Execution](https://amine.io/papers/2026-sigmod-ffx.pdf)（SIGMOD 2026）处理的是一个经常被向量化吞吐掩盖的问题：执行器可能在高效地处理大量本来不必展开的重复值。
 
@@ -74,9 +68,11 @@ FFX 使用 packed factorized vectors，把共享结构与批量计算结合起�
 
 它对已有 Diamond Hardened Join 阅读路线的推进是：从“把 Lookup 与 Expand 拆开、尽量晚扩张”，进一步走向“跨算子传递什么样的中间表示”。
 
-我的工程判断是，表示转换应成为优化器能够计价的决策。高重复、多对多连接可能从中受益；普通主外键查询未必值得承担额外结构成本。若用户最终要求全部九个组合，输出枚举仍然要发生。**因子化能够推迟或避免不必要的展开，不能消除语义要求的输出。**
+我的工程判断是，表示转换应成为优化器能够计价的决策。高重复、多对多连接可能从中受益；普通主外键查询未必值得承担额外结构成本。若用户最终要求全部九个组合，输出枚举仍然要发生。**因子化（Factorization）能够推迟或避免不必要的展开，不能消除语义要求的输出。**
 
 ### 2.2 SplitJoin：同一 Join order 不必适合所有数据
+
+全局平均选择率可能掩盖键之间的连接度数差异，因此同一连接顺序（Join Order）不一定适合所有数据子集。
 
 [One Join Order Does Not Fit All](https://arxiv.org/html/2510.25684v1)（VLDB 2026）从另一个位置处理中间结果问题。
 
@@ -90,7 +86,7 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ### 2.3 Prune、Split、Factorize、Expand 是四件不同的事
 
-这组论文最适合与已有 Hash Join、Dynamic Filter 和 Umbra 笔记一起读，因为它们改变的对象不同：
+过滤、划分、因子化与展开分别改变输入集合、执行计划或物理表示，因此一种机制的收益不能证明另一种机制已无必要：
 
 | 动作 | 改变什么 | 无法单独解决什么 |
 |---|---|---|
@@ -102,6 +98,8 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 据此可以提出一个组合实验：在同一组重复键和倾斜查询上，逐步开启过滤、划分和因子化，观察中间行数、峰值内存、转换成本与总延迟。这个实验建议不意味着这些机制已经能够直接组合，更不意味着组合必然优于单项。
 
 ### 2.4 Sirius：GPU 后端的价值要从查询入口量到结果出口
+
+复用前端可以减少 GPU 后端的接入成本，但端到端收益仍取决于搬运、覆盖与回退路径。
 
 [Sirius：Rethinking Analytical Processing in the GPU Era](https://www.cidrdb.org/cidr2026/papers/p12-yogatama.pdf)（CIDR 2026）探索复用现有前端、以 Substrait 对接 GPU 执行后端的方式，使用 GPU 算子库承接分析处理。
 
@@ -121,7 +119,11 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ## 三、优化器：从一次预测转向持续管理候选与反馈
 
+改进候选排序不能补回未生成的计划，离线搜索也只有在后续执行中摊销探索成本才产生净收益。候选管理与反馈生命周期因此需要独立评价。
+
 ### 3.1 OBELISK：离线搜索的核心是如何花预算
+
+离线计划搜索需要限制低收益候选的测量支出，OBELISK 用成本旋钮和反馈引导现有 CBO，而不是让 LLM 独立生成任意执行计划。
 
 [OBELISK](https://www.vldb.org/pvldb/vol19/p1674-pan.pdf)（PVLDB 19(7), 2026）通过成本缩放旋钮影响现有 CBO 的候选计划，结合 Bayesian optimization、LLM 推理和历史评估信息，减少低价值或重复的探索。
 
@@ -140,6 +142,8 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ### 3.2 APQO：缓存里的计划增加后，模型怎么办
 
+计划集合变化会改变参数到候选的映射，固定类别预测器不能直接假设旧输出空间仍完整。
+
 [APQO：An Adaptive Framework for Parametric Query Optimization](https://doi.org/10.1145/3769761)（PACMMOD 2025，SIGMOD 2026）关注参数化查询和变化中的计划集合。
 
 根据出版方摘要，APQO 同时使用参数和计划表示，通过离线预训练与在线校准适应动态计划缓存和分布变化。它所处理的结构性问题是：如果预测器只是把参数映射到固定计划类别，那么新增一个计划，就可能改变原来的预测任务。
@@ -150,7 +154,7 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ### 3.3 把学习优化器拆成四个可独立检验的部分
 
-结合上述工作，我倾向于使用下面的结构分析优化器，而不是笼统评价“模型准不准”：
+学习优化器的候选生成、评价、反馈和失效处理可以分别失败，因此预测精度不足以单独解释计划质量：
 
 | 部分 | 要回答的问题 | 失败时的实际表现 |
 |---|---|---|
@@ -163,9 +167,13 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ## 四、存储引擎：卸载之后，瓶颈和债务去了哪里
 
+卸载一个阶段只是转移工作位置，网络、上游缓冲和后台积压仍会限制系统。评估必须覆盖完整写入、读取与恢复路径。
+
 ### 4.1 O3-LSM：完整写路径不能只看 compaction
 
-[O3-LSM](https://cs.purdue.edu/homes/csjgwang/pubs/SIGMOD26_O3LSM.pdf)（SIGMOD 2026）把卸载范围扩展到 memtable、flush、compaction 三层，并利用 key-range shard 暴露并行度，同时考虑读委托与缓存。
+仅卸载压实（Compaction）无法消除 memtable 和 flush 瓶颈，O3-LSM 因而扩展到三层写入路径。
+
+[O3-LSM](https://cs.purdue.edu/homes/csjgwang/pubs/SIGMOD26_O3LSM.pdf)（SIGMOD 2026）把卸载范围扩展到 memtable、flush、compaction 三层，并利用 key-range shard 暴露并行度（Degree of Parallelism），同时考虑读委托与缓存。
 
 这解释了一个容易忽略的现象：compaction 从计算节点搬走后，写入吞吐仍可能被 buffer 容量、flush 或网络限制。优化一个阶段后，剩余阶段占据关键路径，系统并不会自动变成可无限扩展的写入服务。
 
@@ -183,17 +191,21 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ### 4.2 HATS：前台延迟与后台积压属于同一个问题
 
+压低后台工作可短期改善读延迟，却可能增加后续读放大，HATS 将前台读分配与后台压实调度共同考虑。
+
 [HATS](https://www.usenix.org/system/files/fast26-ren.pdf)（FAST 2026）在 Cassandra 上联合考虑粗粒度读分配、细粒度副本协调和 compaction 速率控制。
 
 它的启发在于两个局部最优会冲突：只平衡前台读，可能把请求送到正受后台任务干扰的节点；只为当前读延迟压低 compaction，又会让积压和读放大继续增加。
 
-这可以用一个自定义的时间序列例子理解：今天暂停维护，P99 降低；随后文件或层级重叠增加，同样一次读取要承担更多工作；积压最终集中偿还，尾延迟重新升高。第一阶段的“优化”可能只是把成本推迟了。
+这可以用一个自定义的时间序列例子理解：今天暂停维护，P99 降低；随后文件或层级重叠增加，同样一次读取要承担更多工作；积压最终集中偿还，尾延迟（Tail Latency）重新升高。第一阶段的“优化”可能只是把成本推迟了。
 
 因此我会同时记录四条曲线：前台延迟、后台资源使用、维护积压、读放大。只有前台变快且积压保持可控，才更接近持续收益。
 
 这条路线与分析系统中的后台 Merge 有可借鉴之处，但 Cassandra 的副本路由不能直接移植到文件合并系统。应先建立资源争用和维护积压的对应关系。
 
 ### 4.3 LogDrive：持久性与顺序可以分别设计
+
+持久化字节与提供全局有序日志是不同职责，LogDrive 和 AtomicLog 的分层使二者可以独立组合。
 
 [The LogDrive: Composable Durability for Cloud-Based Shared Logs](https://www.usenix.org/system/files/osdi26-vickers.pdf)（OSDI 2026）将持久性底座 LogDrive 与提供有序共享日志语义的 AtomicLog 区分开，Conflux 再基于它们实现复制状态，用于 Confluent 的元数据服务。
 
@@ -203,6 +215,8 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ### 4.4 Mantle：快速路径与权威状态分别放在哪里
 
+目录查询的索引路径可以与权威元数据分离，但更新一致性和恢复仍需协议支持；当前核对片段只足以讨论职责划分。
+
 [Mantle](https://madsys.cs.tsinghua.edu.cn/publication/mantle-efficient-hierarchical-metadata-management-for-cloud-object-storage-services/SOSP25-Li.pdf)（SOSP 2025）值得接在 HopsFS、Tectonic 后面阅读。
 
 本轮核对的作者正文片段描述了分片 TafDB 与每个 namespace 的轻量 IndexNode 的分工：海量权威元数据与目录快速查询路径不必采用同样的组织方式。层次目录看似只是路径字符串，实际涉及多轮解析、热点和更新争用。
@@ -211,11 +225,15 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 
 ## 五、增量计算：决定维护什么、何时维护、维护到哪里
 
+小变更不保证低维护成本，变化命中的历史状态和下游传播仍可能扩大工作量。增量视图维护（Incremental View Maintenance，IVM）与布局维护也需要区分。
+
 ### 5.1 Enzyme：单个视图的最优选择可能让下游更贵
+
+上游刷新方式会改变下游收到的变化，因此单个视图最便宜不一定使依赖图总成本最低。
 
 [Enzyme: Incremental View Maintenance for Data Engineering](https://arxiv.org/html/2603.27775v2)（SIGMOD 2026 Industry）将增量维护放回真实的数据工程流程：规范化计划、识别可用刷新策略，再结合历史执行反馈估算成本。
 
-特别值得关注的是 MV 依赖图。上游采用全量重算，即使在本节点更便宜，也可能向下游产生更多变化；因此逐视图选择最便宜策略，未必等价于全图最优。
+对物化视图（Materialized View，MV）依赖图，上游采用全量重算，即使在本节点更便宜，也可能向下游产生更多变化；因此逐视图选择最便宜策略，未必等价于全图最优。
 
 用一个虚构数字例子说明，数字不是论文实验：
 
@@ -231,6 +249,8 @@ SplitJoin 根据连接键度数等信息划分 heavy/light 部分，为不同部
 对自己的实验，我会在 delta 行数之外记录：变化命中的历史状态规模、删除比例、join 扇出、扫描与写回、下游变化大小和恢复成本。小 delta 不一定意味着小工作量。
 
 ### 5.2 WAIR：维护结果之外，还可以增量维护布局
+
+布局维护的收益来自未来扫描减少，而不只是文件排列更整齐。WAIR 根据工作负载选择值得支付重写成本的边界区域。
 
 [Workload-Aware Incremental Reclustering in Cloud Data Warehouses](https://arxiv.org/html/2602.23289v2)（SIGMOD 2026）讨论的是布局维护策略，而不是 SQL 结果的 IVM。
 
@@ -250,6 +270,8 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
 
 ### 5.3 AutoLiquid：选什么 key，与重写哪些文件是两个层次
 
+选择聚簇键与安排文件重写控制不同层次，比较 AutoLiquid 与 WAIR 前需要先核对各自目标和作用域。
+
 [AutoLiquid: Autonomic Data Layout Optimization for the Databricks Lakehouse](https://www.vldb.org/pvldb/vol19/p4023-liang.pdf) 已在 VLDB 2026 Industry 目录中提供正式论文入口。此前阅读笔记把它标为公开设计预读，本轮全文提取仍不稳定，因此维持这个证据等级。
 
 公开材料中的 workload 观测、候选 key、抽样验证和应用过程，可以用来提出它与 WAIR 的分工问题：前者帮助讨论“选择什么布局方向”，后者帮助讨论“如何逐步支付重写成本”。两者是否能直接组合，仍需核对各自目标函数与假设。
@@ -258,17 +280,19 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
 
 ### 5.4 Semirings：复杂度结论首先依赖语义
 
+维护集合存在性、重复次数或来源注释所需的状态不同，不能在未说明半环（Semiring）和更新条件时引用同一复杂度结论。
+
 [The Role of Semirings in Incremental View Maintenance](https://arxiv.org/abs/2606.07795v2) 是本轮补充的预印本，v2 更新于 2026 年 9 月 12 日，尚未核实正式会议归属。
 
 论文研究 semiring-annotated 数据库的 insert-only 维护，对特定查询类和半环条件给出复杂度分类。它提醒我们：讨论更新代价之前，要先明确维护的是集合存在性、重复次数，还是带来源的注释。
 
 直观上，同一个结果元组出现两次，在集合语义中仍只是“存在”，在 bag 语义中却有不同 multiplicity；如果需要保留来源，维护的对象又会变化。这是理解问题的例子，不是对论文定理的替代证明。
 
-本轮只核对摘要与定理陈述，因此不将受查询结构、半环性质等条件限制的结果推广到删除、任意 SQL 或外连接。它适合作为 DBSP 阅读后的理论补充，帮助列清楚语义前提。
+本轮只核对摘要与定理陈述，因此不将受查询结构、半环性质等条件限制的结果推广到删除、任意 SQL 或外连接（Outer Join）。它适合作为 DBSP 阅读后的理论补充，帮助列清楚语义前提。
 
 ## 六、这些论文共同推动了怎样的成本模型
 
-把各方向放在一起，可以看到成本模型的输入正在扩展。下面是我的综合分析框架，并非某篇论文给出的统一模型：
+中间表示与状态维护会改变后续工作量，因此成本分析不能止于当前算子。下面分别列出单次执行与长期运行的账目，不是可直接相加的耗时公式，也不是某篇论文的统一模型：
 
 ```text
 一次执行的代价
@@ -300,7 +324,7 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
 
 ## 七、下一步阅读与实验路线
 
-结合已有笔记，我会把后续工作安排为三个阶段。
+下一步应优先复现有明确机制和可构造对照的工作，避免同时组合多个未验证改动。可以按以下三个阶段推进。
 
 **第一阶段：先打通中间结果与维护代价。** 精读顺序为 SplitJoin → FFX → Enzyme → WAIR。前两篇回答执行时如何减少中间工作，后两篇回答重复运行时如何减少维护工作。配套实验分别采用有倾斜的多表 Join 与两级 MV DAG，并保留均匀数据、低重复数据和全量重算作为对照。
 
@@ -308,7 +332,7 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
 
 **第三阶段：补齐云端状态与语义边界。** 阅读 LogDrive → Mantle，并将 Sirius 与 Semirings 分别作为硬件路径和理论条件的专题。AutoLiquid 的正式全文核对也在此阶段补齐，再与 WAIR 比较完整决策流程。
 
-最终希望得到的不是一份越来越长的论文目录，而是几组可复用的判断：什么时候该减少数据，什么时候该改变表示，什么时候应该花钱探索，以及什么时候暂缓维护只是在积累未来成本。它们比单篇论文的最高加速比，更能指导下一次内核设计和性能诊断。
+跨论文组合仍需单独验证：FFX 与 SplitJoin 的收益不能直接相乘，Enzyme 与 WAIR 的目标函数也不能默认兼容。APQO、Mantle、AutoLiquid 和 Semirings 保持前文声明的有限阅读等级；补齐全文与实验条件后，才能据此提出实现细节或性能比较。
 
 ## 参考文献
 

@@ -1,7 +1,7 @@
 ---
 title: "【调研】Hash 还是 Sort：从优化器决策到运行时自适应"
 date: 2026-09-10T00:00:00+08:00
-lastmod: 2026-09-18T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 slug: "dive-hash-sort-strategy"
 categories:
   - 数据库
@@ -16,32 +16,30 @@ description: "结合 CockroachDB、TiDB、OceanBase、Trino 与 Apache Doris 源
 draft: false
 ---
 
-## 摘要
+## 调研问题：比较完整路径，而非孤立算法
 
-“Hash 还是 Sort”看似是算法课里的复杂度比较，真正落到数据库系统，却同时牵涉四个层面：
+### 摘要
+
+Hash 与 Sort 的选择必须比较完整执行路径，而不是只比较内核复杂度；前置排序、数据交换和内存溢写（Spill）都可能改变结果。本文从四个层面组织调研：
 
 - **物理算法**：Hash Join、Merge Join、Hash Aggregate、Stream Aggregate；
 - **数据组织**：无序、局部有序、全局有序、Hash 分区、Range 分区；
-- **资源行为**：CPU、缓存、内存峰值、磁盘 I/O、网络、并发和尾延迟；
-- **不确定性处置**：统计误差、数据倾斜、内存波动、spill 与运行时改判。
+- **资源行为**：CPU、缓存、内存峰值、磁盘 I/O、网络、并发和尾延迟（Tail Latency）；
+- **不确定性处置**：统计误差、数据倾斜（Data Skew）、内存波动、spill 与运行时改判。
 
 因此，正确的问题不是“`O(N)` 是否一定小于 `O(N log N)`”，而是：
 
-> 在当前物理属性、资源预算和估计可信度下，哪条执行路径的整体收益最高；如果判断错误，系统又能否把损失限制在可接受范围内？
+> 在当前物理属性（Physical Property）、资源预算和估计可信度下，哪条执行路径的整体收益最高；如果判断错误，系统又能否把损失限制在可接受范围内？
 
-对 CockroachDB、TiDB、OceanBase、Trino 与 Apache Doris 的源码分析显示，成熟系统并不存在一条统一路线：CockroachDB 把 Ordering 放入搜索状态，并在外部 Hash Join 递归分区失效时切换到外排加 Merge Join；TiDB 让 Merge Join 与 Stream Aggregate 依赖输入属性，同时让 Hash Join V2 在运行时按分区 spill 和恢复；OceanBase 把 Hash、Merge、Sort、Top-N、Prefix Sort 与 Group By 的成本拆得更细；Trino 和 Doris 则主动缩小 Join 算法集合，把工程资源集中到 build side、数据分布、Runtime Filter 和 spill。
+后文以 CockroachDB、TiDB、OceanBase、Trino 与 Apache Doris 的固定源码快照，对照属性搜索、算法准入和运行时降级；论文部分进一步讨论内存、倾斜与资源变化如何移动算法交叉点。
 
-这些实现共同指向一个结论：
+### 先拆掉一个伪命题：Hash 与 Sort 不是一对互斥算子
 
-> **优化器负责选择低预期成本的初始策略，执行器负责约束错误选择的最大 regret；Hash 与 Sort 的边界应当是一张随数据、属性、资源和硬件变化的 crossover surface，而不是一个固定阈值。**
+算法标签不足以描述执行策略，因为分区、排序和查找可以在同一个算子内部组合。先分清这些原语的作用，才能比较优化期选择与运行期降级。
 
----
+#### 两种基础的数据重组方式
 
-## 1. 先拆掉一个伪命题：Hash 与 Sort 不是一对互斥算子
-
-### 1.1 两种基础的数据重组方式
-
-Hash 与 Sort 更接近两种“组织数据”的原语：
+Hash 与 Sort 可以在同一执行路径组合使用，因为二者分别提供按键分区和按键有序的能力：
 
 ```text
 Hash
@@ -73,9 +71,9 @@ Sort
 2. **优化期属性选择**：是否值得提前建立 Ordering/Distribution 并由后续多个算子复用；
 3. **运行期退化路径选择**：继续分区、局部 spill、算法切换，还是在 stage 边界重新优化。
 
-### 1.2 复杂度只描述了很小一部分事实
+#### 复杂度只描述了很小一部分事实
 
-对一个等值 Join，常见的粗略模型是：
+等值 Join 的复杂度没有计入属性准备与跨层搬运，比较时需要把这些成本补回。下面是用于解释机制的粗略模型，不是五个系统共享的公式：
 
 ```text
 C_hash_join
@@ -113,11 +111,11 @@ C_merge ~= (N_left + N_right + N_matches) * sequential_cost
 - 分布式执行中，Broadcast、Hash Shuffle 与 Range Shuffle 谁主导成本；
 - 内存不足后，是一次顺序 spill，还是多轮递归分区和随机 I/O。
 
-所以，一个只看 `row_count` 的模型并没有在选择算法，它只是在选择一个经验常数。
+只看 `row_count` 的模型仍然可以比较候选，但无法区分同样行数下的行宽、倾斜与属性差异，其有效性取决于这些变量是否足够稳定。
 
-### 1.3 “流式”也不能只贴算子标签
+#### “流式”也不能只贴算子标签
 
-常见说法是 Hash 阻塞、Merge 流式。这个判断需要更精确：
+流式输出取决于输入准备与状态边界，不能只由算子名称判断。Merge Join 如果需要先排序，整条路径仍可能阻塞：
 
 | 算子 | 首行输出前的必要状态 | 关键边界 |
 |---|---|---|
@@ -129,13 +127,13 @@ C_merge ~= (N_left + N_right + N_matches) * sequential_cost
 
 因此，`LIMIT 10`、交互式查询和全量 ETL 不应共享同一套单一权重。
 
----
+### 优化器实际要搜索的是三维空间
 
-## 2. 优化器实际要搜索的是三维空间
+算法、数据移动和执行模式共同决定计划成本；省掉一次 Exchange 的收益可能超过局部查表优化。候选描述因此需要保留相关物理属性。
 
-### 2.1 算法、移动与执行模式必须联合决定
+#### 算法、移动与执行模式必须联合决定
 
-一个 Join Candidate 不应只表示 `HASH_JOIN`，而应至少表达：
+同一 Hash Join 在 Broadcast 与 Partitioned 模式下具有不同的网络和内存成本。为比较源码中的这些决策，可用以下分析维度描述候选；这不是待实现的统一接口：
 
 ```text
 JoinCandidate {
@@ -154,7 +152,7 @@ JoinCandidate {
 - 同一个 Hash Join，在“每个 worker 都复制 build side”和“build side 按 key 分区”下，峰值内存差一个集群规模因子；
 - spillable 并不意味着 spill 免费，它只是把 OOM 变成了可能很贵但可完成的执行。
 
-### 2.2 先做可行性过滤，再比较代价
+#### 先做可行性过滤，再比较代价
 
 Cost Model 不应该替代语义约束。候选生成至少要先回答：
 
@@ -177,9 +175,9 @@ Distribution:
 
 TiDB 源码就是一个很清楚的例子：Merge Join 不只是“算一遍成本”。候选生成阶段会检查 join key、`NULL-safe equality`、左右已有属性、排序前缀与 collation；条件不成立时，它根本不进入竞争集合。
 
-### 2.3 Physical Property 不是附属信息
+#### Physical Property 不是附属信息
 
-局部最优容易破坏全局最优：
+排序属性可被后续算子复用，因此子计划自身最便宜不一定使完整计划最便宜：
 
 ```text
 Plan A: 局部 Hash 更便宜
@@ -212,17 +210,15 @@ B_order_reuse
 
 同样的思路也适用于 Distribution：一个当前 Join 产生的 Hash Partitioning，可能让下一个 Join 或 Aggregate 免于再次 Shuffle。
 
----
+## 源码剖析
 
-## 3. 源码剖析
-
-比较五个系统如何回答三个问题：
+五个系统的候选集合和运行时退路不同，只有限定源码快照才能比较其职责划分。下文所有实现判断对应参考链接中的固定提交，不代表所有版本；比较围绕三个问题展开：
 
 1. 哪些候选进入优化器？
 2. 成本与物理属性如何参与选择？
 3. 估计错误后由谁兜底？
 
-### 3.1 CockroachDB：属性驱动候选，执行器允许 Hash 转 Sort
+### CockroachDB：属性驱动候选，执行器允许 Hash 转 Sort
 
 CockroachDB 的规则 `GenerateMergeJoins` 明确使用 interesting ordering 生成 Merge Join 候选。也就是说，Merge Join 不是扫描到等值谓词就机械生成，而是与可获得的顺序属性绑定。源码见 [GenerateMergeJoins](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/rules/join.opt#L253-L258)。
 
@@ -241,7 +237,7 @@ cost := memo.Cost{C: (0.9*leftRowCount + 1.1*rightRowCount) * cpuCostFactor}
 
 这不是一个精确的硬件模拟器，但至少把非对称 build side 和 memory pressure 放入了决策。源码见 [CockroachDB Hash/Merge Join cost](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/coster.go#L1062-L1136)。
 
-更值得注意的是运行时的 External Hash Join：
+运行时的 External Hash Join 还提供分区不收敛后的退路：
 
 ```text
 Phase 1: 两侧按 hash A 分区并落盘
@@ -253,7 +249,7 @@ Fallback: 若递归分区无法显著缩小分区，改用两侧外排 + Merge J
 
 这个设计给出了一个很重要的边界：**运行时切换不必重做整个查询计划，它可以只针对已经隔离出来的坏分区。** 已完成分区仍然走 Hash，缺乏进展的分区才付 Sort 成本。
 
-### 3.2 TiDB：Merge/Stream 依赖属性，Hash 负责通用路径与 spill
+### TiDB：Merge/Stream 依赖属性，Hash 负责通用路径与 spill
 
 TiDB 的 `GetMergeJoin` 先读取逻辑 Join 的左右可提供属性，再检查：
 
@@ -286,9 +282,9 @@ probe rows -----------------------------------+-> matching probe partitions spil
 
 这里也暴露出模型与执行器之间常见的断层：执行器已经知道 spill round、每轮字节数与分区数，优化器却未必把这些分布作为一等反馈信号。真正有价值的闭环，不是只收集“该 Join 用时多少”，而是把这些结构化运行指标反馈到下一次 crossover 判断。
 
-### 3.3 OceanBase：显式拆开 Hash、Merge、Sort 与 Group 成本
+### OceanBase：显式拆开 Hash、Merge、Sort 与 Group 成本
 
-OceanBase 的 Cost Model 是理解“公式应如何对应实现”的好样本。
+OceanBase 分别估算建表、探测、物化与排序操作，使不同数据路径的成本可以独立分析，而不只是给算法设置一个常数权重。
 
 Hash Join 成本显式包含：
 
@@ -320,7 +316,7 @@ Group By 侧则分别存在 `cost_merge_group` 与 `cost_hash_group`。Hash Grou
 
 它带来的启发不是照搬系数，而是：**一个可校准模型必须先有足够细的成本项；把所有差异压成 `rows * factor` 后，再多训练数据也很难解释错误来自哪里。**
 
-### 3.4 Trino：不比较 Merge Join，把问题转成 Join Distribution
+### Trino：不比较 Merge Join，把问题转成 Join Distribution
 
 Trino 当前通用 Join 路径以 Hash/Lookup Join 为核心。它的关键选择不是 Hash 与 Merge，而是：
 
@@ -339,7 +335,7 @@ dynamic filter = produce/consume
 
 这条路线常被误解为“算法不完整”。更准确的说法是：Trino 选择了较小的实现集合，用更少的策略分叉换取一致的分布式执行、Dynamic Filter 和 spill 语义；省下的复杂度并没有消失，而是转移到了 Join Type 与 distribution、spill 的语义合法性矩阵上——而这些约束即使引入 Merge Join 也一条都少不了。真正的代价是无法直接利用双方已有顺序做 Merge Join，也无法用一种内存更稳定的 Join 算法对冲 Hash 风险。
 
-### 3.5 Apache Doris：向量化 Hash Join + 分区 spill，排序服务于独立语义
+### Apache Doris：向量化 Hash Join + 分区 spill，排序服务于独立语义
 
 Doris 的 Nereids Cost Model 对 Join 的核心输入是 probe/build/output rows，并加入统计可信度、Join Cluster width 与 Runtime Filter 连通性的启发式调整；Quick Sort/Top-N 则单独计价，并对单阶段 Gather Sort 增加显著惩罚。源码见 [PhysicalQuickSort cost](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/CostModel.java#L257-L284) 与 [PhysicalHashJoin cost](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/CostModel.java#L384-L444)。
 
@@ -361,7 +357,9 @@ Doris 的 Nereids Cost Model 对 Join 的核心输入是 probe/build/output rows
 - 向量化 Hash Table 特化；
 - Partitioned Spill。
 
-### 3.6 五个系统的决策边界
+### 五个系统的决策边界
+
+同样支持 spill 的系统也未必支持 Hash-to-Merge 切换，不能把一种实现的退路外推给其他项目。以下按优化期和运行期分别比较。
 
 | 系统 | 优化期主决策 | Physical Property | 运行时兜底 | 主要盲区/代价 |
 |---|---|---|---|---|
@@ -373,11 +371,13 @@ Doris 的 Nereids Cost Model 对 Join 的核心输入是 probe/build/output rows
 
 没有哪个系统提供了“标准答案”。它们更像五种工程预算分配：搜索空间越丰富，优化器状态与成本校准越复杂；算法集合越窄，执行器的鲁棒性要求越高。
 
----
+## 交叉点为何移动：数据、成本与纠偏边界
 
-## 4. 真正决定 crossover 的变量
+### 真正决定 crossover 的变量
 
-### 4.1 Cardinality 不够，还要有 bytes、NDV 与 multiplicity
+最优算法的切换点随状态大小、已有顺序与资源条件变化，单一行数阈值会隐藏这些变量。下面分别分析其因果机制。
+
+#### Cardinality 不够，还要有 bytes、NDV 与 multiplicity
 
 Hash Table 的内存并不与输出行数简单相等：
 
@@ -401,7 +401,9 @@ hash_table_bytes
 
 例如，`NDV` 很低并不一定让 Hash Join 更省：若保留全部 build payload，大量相同 key 仍需存储，并可能形成很长的匹配列表；若结果是 `n:m`，真正危险的是 output expansion，而非 Hash Table directory。
 
-### 4.2 Existing Ordering 的价值必须跨算子计算
+#### Existing Ordering 的价值必须跨算子计算
+
+已有顺序可以减少当前 Sort 工作，也可能被下游复用，因此它的价值要在完整子树上计算。排序成本可拆为：
 
 排序成本应拆成：
 
@@ -427,9 +429,9 @@ order_preservation
 
 核心原则是：**Sort 是生产属性的 Enforcer，Merge/Stream 是消费属性的 Operator。** 不把二者分开，模型就无法表达“为后续算子提前投资”。
 
-### 4.3 Memory Budget 产生的不是线性惩罚，而是相变
+#### Memory Budget 产生的不是线性惩罚，而是相变
 
-Hash 的危险区域通常在：
+Hash 工作集接近可用内存时，少量估计误差就可能把一次 build/probe 推入分区和落盘路径，因此成本在阈值附近不宜按线性惩罚外推：
 
 ```text
 estimated_hash_bytes / effective_memory_budget ~= 1
@@ -451,9 +453,9 @@ Cost(op, M) -> expected runtime under memory M
 
 而不是只存一个 `peak_memory`。在多查询并发下，`M` 是运行时变量，优化器应看到一个区间或分布，而非编译时常数。
 
-### 4.4 Skew 的本质是 max，而平均数会掩盖它
+#### Skew 的本质是 max，而平均数会掩盖它
 
-分布式 Hash 的完成时间更接近最慢分区：
+分布式 Hash 的阶段完成时间受最慢分区约束，因为下游汇合必须等待该分区结束；平均分区大小无法表达这一长尾：
 
 ```text
 T_stage ~= max(T_partition_1 ... T_partition_p) + coordination
@@ -471,26 +473,28 @@ estimated_output_multiplicity
 
 倾斜同时放大四种风险：单分区内存、spill rounds、网络不均衡和 probe 长链。Sort/Range Partition 也会受倾斜影响，但更容易通过采样 boundary、局部切分与多路 merge 显式观察范围大小。
 
-### 4.5 网络经常比本地算法更先决定胜负
+#### 网络经常比本地算法更先决定胜负
 
-在 MPP 中，Join Cost 至少是：
+数据分布决策会改变 Join 的传输量和等待时间，因此相同的本地算法也可能表现出不同的端到端成本。下面列出通信路径的分析维度；它们量纲不同、阶段可能重叠，并非可直接相加的时延公式：
 
 ```text
-network_cost
-  = partition_or_range_cpu
-  + serialization
-  + compression
-  + bytes_on_wire
-  + receiver_deserialization
-  + backpressure
-  + straggler_penalty
+communication_path:
+  partition_or_range_cpu
+  serialization
+  compression
+  bytes_on_wire
+  receiver_deserialization
+  backpressure
+  straggler_wait
 ```
 
 Broadcast 的成本不是 `build_bytes`，而接近 `build_bytes * receiver_count`；Hash Shuffle 与 Range Shuffle 都要发送两侧数据，但 range boundary 的采样与全局顺序可能为下游带来收益。
 
 这也是为什么在 Trino、Doris 一类系统中，“Broadcast 还是 Partitioned”往往比“Hash 还是 Merge”更重要。
 
-### 4.6 Hardware Profile 会移动边界
+#### Hardware Profile 会移动边界
+
+Hash 与 Sort 对随机访问、顺序带宽和 SIMD 的依赖不同，更换硬件会改变常数项而不是改写算法复杂度。
 
 Hash 热路径依赖：
 
@@ -513,11 +517,11 @@ Sort/Merge 热路径依赖：
 
 同一套常数不能跨 CPU 代际、DRAM/CXL/NVMe、压缩格式和向量宽度长期有效。Cost Model 应绑定 hardware profile，并通过微基准周期性重校准。
 
----
+### 成本表示的缺口：从资源分项到风险
 
-## 5. 成本表示的缺口：从资源分项到风险
+保留资源分项有助于诊断和校准，但不等于模型已经表达了内存超限或尾延迟风险。源码中的折算位置与论文中的不确定性模型需要分开讨论。
 
-### 5.1 为什么一个数字不够
+#### 为什么一个数字不够
 
 优化器最后需要排序 Candidate，但不意味着分析时只能观察一个标量。把五个系统的成本表示拉出来看，它们恰好构成了一个谱系：分歧不在“要不要分项”，而在“分项在哪一步被折叠，以及折叠前能不能被利用”。
 
@@ -546,7 +550,7 @@ double leftCost = left.getCpuCost() * cpuWeight
 //      * configurable safety margin, choose the plan with lower memory usage
 ```
 
-翻译过来就是：当某个候选的 `maxMemory` 超过查询内存上限乘以一个安全边距时，应当直接选内存更低的那个，而不是继续比加权和。这正是 §5.2 要用 `RiskAwareScore` 表达的东西，也是 §4.3 “内存不足是相变而不是线性惩罚”的直接推论：加权和允许一个内存超限但 CPU 很便宜的计划胜出，而它实际上会 spill 或失败。Trino 把这件事写成 TODO 而不是已实现，恰好说明**维度保留下来了，并不等于风险建模已经跟上**。
+翻译过来就是：当某个候选的 `maxMemory` 超过查询内存上限乘以一个安全边距时，应当直接选内存更低的那个，而不是继续比加权和。这与 §5.2 讨论的风险问题相关，但硬性内存约束不等于其中的期望惩罚评分，也是 §4.3 “内存不足是相变而不是线性惩罚”的直接推论：加权和允许一个内存超限但 CPU 很便宜的计划胜出，而它实际上会 spill 或失败。Trino 把这件事写成 TODO 而不是已实现，恰好说明**维度保留下来了，并不等于风险建模已经跟上**。
 
 Doris 的 `Cost` 同样是三维（`cpuCost`/`memoryCost`/`networkCost`），但它在构造函数里就立即折成了标量：
 
@@ -575,7 +579,7 @@ type CostTrace struct {
 }
 ```
 
-参与比较的仍是一个 `float64`；分项存在 `trace.factorCosts` 里，按 factor 名（`cpuFactor`、`memFactor`、`netFactor`、`scanFactor`、`requestFactor`）累加，另有一条供 `EXPLAIN ANALYZE` 输出的可读 `formula`（如 `hashmem(rows*size*factor)`）。源码注释把用途写得很直接：`used to calibrate the cost model`。这是一个值得注意的分工：**分项不改善本次选择，它改善的是下一次校准**，而这恰好就是 §3.2 所说“把结构化运行指标反馈回 crossover 判断”的优化器侧入口。源码见 [CostVer2 与 CostTrace](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/util/costusage/cost_misc.go#L49-L68)。
+参与比较的仍是一个 `float64`；分项存在 `trace.factorCosts` 里，按 factor 名（`cpuFactor`、`memFactor`、`netFactor`、`scanFactor`、`requestFactor`）累加，另有一条供 `EXPLAIN ANALYZE` 输出的可读 `formula`（如 `hashmem(rows*size*factor)`）。源码注释把用途写得很直接：`used to calibrate the cost model`。这里的职责区分是：**分项不改善本次选择，它改善的是下一次校准**，而这恰好就是 §3.2 所说“把结构化运行指标反馈回 crossover 判断”的优化器侧入口。源码见 [CostVer2 与 CostTrace](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/util/costusage/cost_misc.go#L49-L68)。
 
 剩下两个系统用标量，但各自用不同方式补回标量丢掉的约束。OceanBase 的所有 `cost_*` 函数都把结果写回一个 `double &cost` 输出参数，细分体现在**函数入口的分支**（§3.3 的六种 Sort）而不是输出的维度上。CockroachDB 的 `memo.Cost` 主体也是标量 `C float64`，但比较函数 `Less` 是字典序的：
 
@@ -625,9 +629,9 @@ score
 
 这两种表达方式揭示了一个区别：标量负责给候选排序，分项成本负责解释排序。在分析错误计划时，只有保留分项视角，才能区分 `build_bytes` 误估、spill 曲线失真、Ordering 收益漏算和网络成本偏差。对照上面那张表可以看到，真正的差距不在“要不要分项”，而在“分项里少了哪几维”：把 spill 与属性收益纳入同一套表示，才是让 crossover 可解释的前提。
 
-### 5.2 用期望惩罚表达不确定性
+#### 用期望惩罚表达不确定性
 
-统计估计不是一个点，而是带置信度的分布。设 `s` 为运行时真实状态，候选计划为 `p`：
+真实基数与资源状态具有不确定性，但现有优化器未必显式维护概率分布。若研究中能够估计这种分布，便可用期望成本与尾部损失比较候选；这里是分析假设，不是统一方案设计。设 `s` 为运行时真实状态，候选计划为 `p`：
 
 ```text
 ExpectedCost(p) = E_s[Cost(p, s)]
@@ -643,9 +647,9 @@ RiskAwareScore(p)
 
 2024 年的 PARQO 把鲁棒计划选择定义为基于选择率误差分布的 expected penalty，并使用敏感性分析降低参数维数。这与 Hash/Sort crossover 非常契合：无需为所有统计量构造高维分布，只需优先分析最敏感的几个维度，例如 build bytes、heavy hitter ratio 与可用内存。论文见 [PARQO: Penalty-Aware Robust Plan Selection in Query Optimization](https://www.vldb.org/pvldb/vol17/p4627-xiu.pdf)。
 
-### 5.3 优化目标应该看 ranking 和 regret
+#### 优化目标应该看 ranking 和 regret
 
-Cost Model 的任务是选对相对顺序，而不是预测一个绝对毫秒数。因此评估至少包括：
+对候选选型而言，排序正确性比绝对成本拟合更直接；若模型还服务资源分配或 SLO 预测，绝对误差仍然重要。本文用以下指标评价选型：
 
 ```text
 pairwise_accuracy
@@ -660,11 +664,11 @@ regret
 
 从这些研究可以得到一个更审慎的判断：学习模型能够改善候选排序，却不能消除语义、物理属性和内存可行性的约束。它究竟应承担成本校正、候选重排还是更大范围的搜索责任，仍取决于训练数据、候选覆盖率和失效边界，不能仅凭预测精度下结论。
 
----
+### 运行时自适应：不要把“切换算法”理解为重启算子
 
-## 6. 运行时自适应：不要把“切换算法”理解为重启算子
+运行时调整只有在能保持已完成工作和输出语义时才有收益。切换位置决定了可复用状态、额外物化以及重复或遗漏结果的风险。
 
-### 6.1 三种安全的 adaptive barrier
+#### 三种安全的 adaptive barrier
 
 并不是任何时刻都适合从 Hash 切到 Sort。Hash Table 建了一半后直接丢弃并重排两侧，通常会浪费大量工作。更可行的边界是：
 
@@ -689,9 +693,9 @@ Feedback Time
   profile by plan signature + data epoch + hardware class
 ```
 
-### 6.2 运行时需要观察什么
+#### 运行时需要观察什么
 
-从解释运行时行为的角度，以下观测维度尤其重要。它们是调研中需要区分的指标，不代表每个系统已经完整暴露了这些 telemetry：
+仅记录 rows 无法区分行宽、倾斜和分区不收敛，需要联合观察状态与数据移动。下列指标用于分析机制，不代表每个系统已经完整暴露了这些 telemetry：
 
 | 维度 | 指标 | 用途 |
 |---|---|---|
@@ -705,7 +709,7 @@ Feedback Time
 
 这些指标的可比性依赖逻辑表达式、数据版本/分区和 hardware profile。只按 SQL 文本比较运行画像，容易把参数变化、数据演化和硬件差异混在一起，从而把资源变化误判为算法优劣。
 
-### 6.3 从外部 Hash Join 观察降级路径
+#### 从外部 Hash Join 观察降级路径
 
 前述 CockroachDB 外部 Hash Join 的实现展示了一种分区级退路：先尝试分区和恢复 Hash；当递归分区无法继续缩小工作集时，改用外排和 Merge Join。下面只概括这条执行路径，不是跨项目通用状态机，也不表示 TiDB、Trino 或 Doris 具备相同的 Hash-to-Merge fallback。
 
@@ -742,15 +746,15 @@ Feedback Time
 - spill round 和重试是否有终止条件，否则自适应本身可能成为抖动源；
 - 切换原因是否可观测，否则难以区分统计错误、资源压力和分区不收敛。
 
-### 6.4 资源自适应比算法自适应更基础
+#### 资源自适应比算法自适应更基础
 
 如果多个算子都把内存视为固定配额，单算子即使能 spill，也可能发生集体抖动。2025 年 CIDR 的 Paged Memory Management 工作把 Sort、Aggregate、Hash Table 等 stateful operator 的 scratch space 放到统一 page 管理下，探索按成本动态转移内存和 query context switch。它的意义在于：Hash/Sort crossover 本身依赖 `M`，而 `M` 应当是一个可被调度的运行时资源。见 [Resource-Adaptive Query Execution with Paged Memory Management](https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf)。
 
----
+## 学术界的演进：问题从算法胜负走向鲁棒执行
 
-## 7. 学术界的演进：问题从算法胜负走向鲁棒执行
+论文结论随存储介质、数据布局和完整查询环境变化，不能按年份累积成某个算法的永久优势。以下按实验所解决的约束组织研究。
 
-### 7.1 经典阶段：外存模型与参数化选择
+### 经典阶段：外存模型与参数化选择
 
 Graefe 在 1993 年的综述系统化整理了 Sort、Hash、Hybrid Hash、Merge 与磁盘 I/O 的关系。经典外存模型建立了今天仍然有效的框架：内存大小决定 run/partition 数，溢写轮数决定 I/O；但当时的主要瓶颈仍以磁盘页和顺序/随机 I/O 为中心。见 [Query Evaluation Techniques for Large Databases](https://doi.org/10.1145/152610.152611)。
 
@@ -758,15 +762,15 @@ Graefe 在 1993 年的综述系统化整理了 Sort、Hash、Hybrid Hash、Merge
 
 1998 年的 Mid-Query Re-Optimization 则讨论如何在执行中检测次优计划并纠正。见 [Efficient Mid-Query Re-Optimization of Sub-Optimal Query Execution Plans](https://www.vldb.org/dblp/db/conf/sigmod/KabraD98.html)。现代 stage-level AQE 延续了同一思想，只是 barrier 从 materialization point 扩展到了 Shuffle、pipeline 和 spill partition。
 
-### 7.2 多核阶段：硬件改变常数，但没有宣布永久胜者
+### 多核阶段：硬件改变常数，但没有宣布永久胜者
 
 2009 年 Kim 等人同时高度优化 Hash Join 与 Sort-Merge Join。他们当时测得 Hash 更快，但分析认为更宽 SIMD 与更低的单核内存带宽可能让 Sort-Merge 获得优势。见 [Sort vs. Hash Revisited: Fast Join Implementation on Modern Multi-Core CPUs](https://www.vldb.org/pvldb/vol2/vldb09-257.pdf)。
 
-2013 年 Balkesen 等人在共同平台重新实现并对比多种算法，结论是 Radix Hash 在大多数测试中仍更快，Sort-Merge 只在非常大的输入上接近；输入规模、并行度、NUMA、skew 和实现细节都会改变结论。见 [Multi-Core, Main-Memory Joins: Sort vs. Hash Revisited](https://www.vldb.org/pvldb/vol7/p85-balkesen.pdf)。
+2013 年 Balkesen 等人在共同平台重新实现并对比多种算法，结论是 Radix Hash 在大多数测试中仍更快，Sort-Merge 只在非常大的输入上接近；输入规模、并行度（Degree of Parallelism）、NUMA、skew 和实现细节都会改变结论。见 [Multi-Core, Main-Memory Joins: Sort vs. Hash Revisited](https://www.vldb.org/pvldb/vol7/p85-balkesen.pdf)。
 
 两篇论文并不矛盾。它们共同证明：**crossover 会随硬件和实现移动，论文中的胜负不能直接固化成优化器规则。**
 
-### 7.3 真实系统阶段：最漂亮的微基准未必是最好默认值
+### 真实系统阶段：最漂亮的微基准未必是最好默认值
 
 2021 年 Bandle、Giceva 与 Neumann 把 Radix Join 集成到 Umbra，并与优化的 Non-partitioned Hash Join 比较。虽然 Radix Join 在窄 payload、单 Join 微基准上很强，TPC-H 中对最终不会命中的 tuple 做 partition/materialization 的成本却经常抵消收益；加入 Bloom Filter 后改善明显，但 Non-partitioned Hash Join 仍更稳定。见 [To Partition, or Not to Partition, That is the Join Question in a Real System](https://db.in.tum.de/~bandle/papers/bandle-partitionVsNonPartition.pdf)。
 
@@ -776,7 +780,7 @@ Graefe 在 1993 年的综述系统化整理了 Sort、Hash、Hybrid Hash、Merge
 2. join selectivity 与 payload width 是一等变量；
 3. 默认算法应优化“稳定表现”，专用算法只在可判定区域启用。
 
-### 7.4 鲁棒性阶段：优化 Hash 内部结构，也改变选择边界
+### 鲁棒性阶段：优化 Hash 内部结构，也改变选择边界
 
 2024 年的 Unchained Hash Table 将 build-side partitioning、adjacency array、pipelined probes、Bloom Filter 与 software write-combine buffer 组合起来，目标不是某个单点最快，而是同时应对选择性 probe、重复键、并行 build 和 skew。论文报告其在关系查询上平均优于 open addressing，并在含大量重复的图查询上显著改善。见 [Simple, Efficient, and Robust Hash Tables for Join Processing](https://db.in.tum.de/~birler/papers/hashtable.pdf)。
 
@@ -795,9 +799,9 @@ skew-specialized partition
 
 如果执行器具备多种 Hash Table，外层 Hash-vs-Sort 模型就必须先知道“Hash 的哪个实现”参与比较。
 
-### 7.5 2025-2026：决策继续下沉到运行时和内存层级
+### 2025-2026：决策继续下沉到运行时和内存层级
 
-2025 年 Adaptive Factorization 工作把因子化聚合与 Worst-case Optimal Join 集成到 DuckDB，并把是否启用的决定推迟到运行时：Hash build 阶段顺便构造轻量 sketch，再由启发式或模型判断是否值得避免中间结果展开。见 [Adaptive Factorization Using Linear-Chained Hash Tables](https://www.vldb.org/cidrdb/papers/2025/p21-gro.pdf)。它提示我们：**build phase 不只是不可撤销的成本，也可以是低成本采样点。**
+2025 年 Adaptive Factorization 工作把因子化（Factorization）聚合与 Worst-case Optimal Join 集成到 DuckDB，并把是否启用的决定推迟到运行时：Hash build 阶段顺便构造轻量 sketch，再由启发式或模型判断是否值得避免中间结果展开。见 [Adaptive Factorization Using Linear-Chained Hash Tables](https://www.vldb.org/cidrdb/papers/2025/p21-gro.pdf)。它提示我们：**build phase 不只是不可撤销的成本，也可以是低成本采样点。**
 
 2026 年 CIDR 的 CXL Hash Join 研究进一步把问题从“在哪执行”推进到“哪些数据值得移动”：将全部 CXL 数据搬到 DRAM-interleaved tier 并非总是最优，部分搬移可能以更少数据移动获得更均衡的带宽。见 [Hash Joins Meet CXL: A Fresh Look](https://www.vldb.org/cidrdb/2026/hash-joins-meet-cxl-a-fresh-look.html)。
 
@@ -813,13 +817,15 @@ Hash vs Sort
 
 这不是说 Sort 不再重要，而是说明“算法选择”的粒度不断细化，运行时状态与数据移动正成为第一公民。
 
----
+## 如何验证：实验条件、反例与开放问题
 
-## 8. 如何阅读实验：从 crossover point 到 crossover surface
+### 如何阅读实验：从 crossover point 到 crossover surface
 
-### 8.1 单条曲线遗漏了哪些变量
+实验需要同时覆盖算法内核与完整查询，否则可能把物化、交换或排序复用的成本排除在外。可比性应先于速度排名。
 
-判断论文或 benchmark 结论能否外推时，需要检查下列维度是否被覆盖。表中的范围用于说明可能的负载跨度，不是一份产品实施或验收清单：
+#### 单条曲线遗漏了哪些变量
+
+单条输入规模曲线不足以定位 Hash/Sort 的适用边界，因为内存预算、行宽和已有排序可以独立改变最优路径。外推论文或 benchmark 时，应检查下列维度是否被覆盖。表中的范围用于说明可能的负载跨度，不是一份产品实施或验收清单：
 
 | 维度 | 典型变化范围 |
 |---|---|
@@ -850,7 +856,9 @@ best_strategy
       hardware)
 ```
 
-### 8.2 三层 Benchmark 回答不同问题
+#### 三层 Benchmark 回答不同问题
+
+Kernel、Operator 和 Query 实验分别隔离常数项、算子状态和上下游组合，三者不能互相替代。
 
 **Kernel 层**验证实现常数：
 
@@ -875,9 +883,9 @@ best_strategy
 
 微基准决定公式中的基础常数，完整查询决定候选是否值得存在。两者不能互相替代。
 
-### 8.3 Counterfactual：未被选中的计划如何评价
+#### Counterfactual：未被选中的计划如何评价
 
-只记录被选计划，无法知道备选计划会有多快。这也是 cost model 和学习优化器研究中的反事实难题：在相同 snapshot 与 resource class 下比较强制候选，才能把算法差异和环境变化尽量分开。
+只记录被选计划，无法知道备选计划会有多快。这也是 cost model 和学习优化器研究中的反事实（Counterfactual）难题：在相同 snapshot 与 resource class 下比较强制候选，才能把算法差异和环境变化尽量分开。
 
 这类比较可以概括为：
 
@@ -902,9 +910,9 @@ estimated/actual cost vector
 
 这类证据可以帮助研究者区分“候选没生成”“成本排错”“统计错误”和“运行时资源变化”四类问题。但强制执行备选计划也会增加实验成本，且很难完整覆盖生产中的并发与资源状态，因此 counterfactual 数据本身仍有采样偏差。
 
-### 8.4 Benchmark 结论的外推边界
+#### Benchmark 结论的外推边界
 
-阅读实验时，还需要确认作者是否交代了：
+缺少缓存、并发与编译条件的实验无法把算法收益和环境收益分开，需要核对：
 
 - warm/cold cache；
 - CPU frequency 与 NUMA binding；
@@ -917,47 +925,37 @@ estimated/actual cost vector
 
 否则，所谓 crossover 只是某台机器、某次缓存状态下的偶然点。
 
----
+### 常见但危险的简化
 
-## 9. 常见但危险的简化
+仅凭复杂度、NDV 或 spill 支持作选型，会遗漏完整路径的约束。以下逐项给出这些判断失效的机制。
 
-### 9.1 “Hash 是 O(N)，所以默认 Hash”
+#### “Hash 是 O(N)，所以默认 Hash”
 
 忽略了 Hash Table 内存放大、随机访问、spill、skew 与 build side 误判。Hash 可以是很好的默认算法，但默认值来自真实 workload 的稳定性，不是只来自复杂度。
 
-### 9.2 “Merge Join 是流式，所以内存总是小”
+#### “Merge Join 是流式，所以内存总是小”
 
 若输入无序，前置 Sort 本身阻塞且可能外排；重复键组也可能要求缓存。正确比较对象是完整属性路径，不是 Merge 内核。
 
-### 9.3 “spillable 等于没有 OOM 风险”
+#### “spillable 等于没有 OOM 风险”
 
-spill 只解决可完成性。递归分区、磁盘竞争和最慢分区仍可能导致巨大 regret。
+spill 增加了内存不足时继续执行的路径，但不保证一定完成：不可溢写状态、最小工作内存、磁盘空间和恢复缓冲仍可能导致失败。递归分区和磁盘竞争也可能扩大 regret。
 
-### 9.4 “NDV 足够表达 skew”
+#### “NDV 足够表达 skew”
 
 相同 NDV 可以有完全不同的 Top-K 频率。平均分布估计无法预测 hot partition、长 duplicate chain 和 `n:m` expansion。
 
-### 9.5 “Cost 预测越准，计划一定越好”
+#### “Cost 预测越准，计划一定越好”
 
 优化器需要的是候选排序。应优先评价 pairwise accuracy、top-k coverage、P95/P99 regret，而不是只看绝对误差。
 
-### 9.6 “实现更多算法一定更好”
+#### “实现更多算法一定更好”
 
 每增加一种算法，都增加候选生成、属性推导、成本校准、语义测试、spill 与可观测性成本。Trino/Doris 的路线提醒我们：缩小搜索空间也可能是合理设计。新算法应证明它覆盖了现有路径无法稳定处理的区域。
 
----
+### 调研总结与开放问题
 
-## 10. 调研总结与开放问题
-
-源码和论文并没有给出一套统一的 Hash/Sort 决策方法，反而展示了不同系统对问题边界的不同划分：CockroachDB 将属性搜索与分区级降级结合，TiDB 让有序路径和通用 Hash 路径承担不同责任，OceanBase 显式细分多类成本，而 Trino、Doris 将更多工程复杂度集中到 Hash、Distribution 和 spill。它们的差异不是某一条公式可以抹平的，而是工作负载、已有执行架构和维护成本共同作用的结果。
-
-这次调研中，最值得保留的是三点认识：
-
-1. **算法优劣必须在完整属性路径中比较。** 输入是否有序、是否需要 exchange、下游能否复用 Ordering，往往比 Hash 或 Merge 内核的微基准更重要。
-2. **内存与 skew 改变的不只是常数，而是执行形态。** 从内存内执行到递归分区或多轮外排，成本存在明显的不连续性；平均 cardinality 和 NDV 很难表达这种风险。
-3. **运行时自适应的价值来自可控退路，而不是随时改判。** 分区、物化 stage 和重复执行提供了不同的调整边界，但能否复用已完成工作、维持语义并限制失败代价，才是关键。
-
-仍然没有简单答案的问题包括：
+比较算法需要固定语义、输入属性和资源条件；跨算子属性复用、动态内存与恢复成本，使单一阈值难以解释源码中的不同选择。尚待验证的问题包括：
 
 - 当 Ordering 的收益跨越多个算子时，局部成本比较能在多大程度上保留全局优势？
 - 在并发和动态内存分配下，离线测得的 crossover surface 有多少仍然有效？
@@ -965,9 +963,7 @@ spill 只解决可完成性。递归分区、磁盘竞争和最慢分区仍可�
 - 鲁棒计划是否值得牺牲平均性能，取决于怎样的 SLO、负载分布和 regret 定义？
 - 增加一个备选算法，何时真正扩大了稳定执行区域，何时只是增加搜索和维护成本？
 
-因此，Hash 与 Sort 更适合被理解为两类数据重组机制，而不是一场等待永久赢家的算法竞赛。它们的边界随数据、物理属性、资源和硬件移动；本文的目的，是理解这些边界为何移动、各系统如何承担相应责任，以及现有研究还没有解决哪些问题。
-
----
+本文不提出跨系统统一实现。继续研究时，应先固定语义、输入属性、资源与版本，再测候选的端到端耗时和失败路径；没有这些条件，单内核加速比不能作为替换算法的依据。风险评分与运行时切换也需要额外的分布假设和状态协议，不能由一个 crossover 阈值替代。
 
 ## 参考源码
 
@@ -992,6 +988,8 @@ spill 只解决可完成性。递归分区、磁盘竞争和最慢分区仍可�
 
 ## 参考论文
 
+论文中的实验条件决定结论适用范围，以下文献分别研究成本、实现和鲁棒性，不构成跨系统直接性能排名。
+
 - Goetz Graefe, 1993, [Query Evaluation Techniques for Large Databases](https://doi.org/10.1145/152610.152611)
 - Yannis E. Ioannidis et al., 1992, [Parametric Query Optimization](https://www.vldb.org/dblp/db/conf/vldb/IoannidisNSS92.html)
 - Navin Kabra, David J. DeWitt, 1998, [Efficient Mid-Query Re-Optimization of Sub-Optimal Query Execution Plans](https://www.vldb.org/dblp/db/conf/sigmod/KabraD98.html)
@@ -1010,8 +1008,8 @@ spill 只解决可完成性。递归分区、磁盘竞争和最慢分区仍可�
 
 本文讨论“选 Hash 还是选 Sort”，以下几篇分别从算子内部实现、优化器机制与资源维度补齐上下文：
 
-- [深入 Hash Join：从内存哈希表到分区 Spill]({{< relref "2026-08-26-dive-hash-join.md" >}})：本文 §4.3 把 spill 当成一个相变点讨论，那篇把相变前后的哈希表结构与分区恢复拆开细看。
+- [深入 Hash Join：从内存哈希表（Hash Table）到分区 Spill]({{< relref "2026-08-26-dive-hash-join.md" >}})：本文 §4.3 把 spill 当成一个相变点讨论，那篇把相变前后的哈希表结构与分区恢复拆开细看。
 - [深入 Spark Hash Join：从 JoinSelection、HashedRelation 到 AQE 与 Spill 边界]({{< relref "2026-08-25-dive-spark-hash-join.md" >}})：单系统视角下的完整决策链，可与本文 §3.6 的五系统对比表对照阅读。
 - [深入 Calcite VolcanoPlanner：Cost 账本、两种 RuleDriver 与 Trait Enforcement]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}})：本文 §2.3 说“Ordering 是可消费的物理属性”，那篇回答这个属性在 Cascades 搜索里到底如何被强制与传播。
-- [查询并行度的三次决策：从初始分区到 AQE 与历史反馈]({{< relref "2026-09-12-dive-dop.md" >}})：本文 §6.1 把 stage 边界列为一种 adaptive barrier，那篇讨论在这些边界上还能调什么。
+- [查询并行度的三次决策：从初始分区到 AQE 与历史反馈（History-Based Feedback）]({{< relref "2026-09-12-dive-dop.md" >}})：本文 §6.1 把 stage 边界列为一种 adaptive barrier，那篇讨论在这些边界上还能调什么。
 - [从芯片到数据中心：2026 AI Infra 与现代系统技术雷达]({{< relref "2026-09-10-system-ai-infra-hardware-distributed-systems.md" >}})：本文 §4.6 提到硬件会移动 crossover 边界，那篇把 CXL、带宽层级这些变量放到更大的图里。

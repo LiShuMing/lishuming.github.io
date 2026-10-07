@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Bw-Tree：Mapping Table、Delta Chain 与无锁结构变更"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-08-30T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 slug: "dive-bwtree"
 categories:
   - 数据库
@@ -15,13 +15,15 @@ description: "结合 Open BwTree 源码，分析 Mapping Table、Delta Chain、C
 draft: false
 ---
 
-## 1. 背景：为什么还需要一种 B+Tree
+## 问题与边界：用间接寻址替代原地修改
 
-B+Tree 是数据库索引最经典的数据结构之一，但“树结构适合索引”和“传统 B+Tree 的并发实现没有代价”是两回事。
+### 背景：为什么还需要一种 B+Tree
 
-传统 B+Tree 通常原地修改页面，并通过 page latch 保护页内数据和结构变更。随着处理器核数增加，热点根节点、内部节点和缓冲池元数据上的 latch 可能成为共享瓶颈；一次节点分裂还会跨越子节点、父节点乃至根节点，锁顺序、死锁规避和恢复逻辑都会随之复杂化。
+B+Tree 的有序结构支持点查和范围扫描，但原地修改需要协调读写者；热点访问会把页面同步变成并发瓶颈。
 
-微软研究院在 2013 年发表的 [The Bw-Tree: A B-tree for New Hardware](https://www.microsoft.com/research/publication/the-bw-tree-a-b-tree-for-new-hardware/) 提出了一条不同路线：
+传统 B+Tree 通常原地修改页面，并通过 page latch 保护页内数据和结构变更。随着处理器核数增加，热点根节点、内部节点和缓冲池元数据上的 latch 可能成为共享瓶颈；一次节点分裂还会跨越子节点、父节点乃至根节点，锁顺序、死锁（Deadlock）规避和恢复逻辑都会随之复杂化。
+
+微软研究院（Microsoft Research）在 2013 年发表的 [The Bw-Tree: A B-tree for New Hardware](https://www.microsoft.com/research/publication/the-bw-tree-a-b-tree-for-new-hardware/) 提出了一条不同路线：
 
 > 不再原地修改树节点，也不让父节点保存子节点的物理地址；所有更新都先变成不可变 Delta，并通过 Mapping Table 上的一次 CAS 发布。
 
@@ -36,27 +38,20 @@ B+Tree 是数据库索引最经典的数据结构之一，但“树结构适合�
 
 本文研究的源码基线为提交 [`09b7354`](https://github.com/wangziqi2013/BwTree/commit/09b7354d419513ac5648980e875e1a3246be396a)。这是一个适合学习算法与并发协议的研究型实现，而不是可以直接嵌入生产数据库的完整存储引擎。
 
-## 2. 先说结论
+### 实现边界
 
-Bw-Tree 的关键不只是“无锁 B+Tree”，而是把树节点拆成了三个层次：
+Bw-Tree 的关键不只是“无锁（Lock-Free） B+Tree”，而是把树节点拆成了三个层次：
 
 - **逻辑身份**：稳定的 `NodeID`；
 - **物理版本**：Mapping Table 当前指向的 Delta Chain 头部；
 - **可见内容**：读取 Base Node 并重放 Delta 后得到的逻辑页面。
-
-由此产生四个核心结论：
-
-1. **Mapping Table 是地址间接层，也是更新的序列化点。** 父子节点只记录 `NodeID`，页面换地址、整合或结构变化时不需要同步修正所有入边。
-2. **Delta Chain 是页级版本日志。** 单条记录的更新先构造不可变 Delta，再以 CAS 发布；失败者丢弃自己的候选版本并重试。
-3. **结构变更是可被帮助完成的多阶段协议。** Split Delta 可以先让新边界立即可见，再异步把分隔键补进父节点。
-4. **消除 latch 不等于消除复杂性。** 复杂性转移到了链重放、冲突重试、结构变更状态机和内存回收。
 
 还必须补充两个实现边界：
 
 - 论文还讨论了面向闪存的日志结构存储管理器；本地 Open BwTree 仓库实现的是**内存索引数据结构**，没有 WAL、恢复和持久化页面管理，不能把论文完整系统的能力直接归于这份代码。
 - 该实现为处理合并竞态引入 `InnerAbortNode`。仓库 README 明确指出，如果发布 ABORT 的线程永久停顿，其他线程可能无法继续，因此这个具体实现的进展保证需要谨慎表述。它的普通更新路径是 latch-free/CAS 驱动的，但不能无条件宣称所有路径都满足严格 lock-free 或 wait-free。
 
-## 3. 设计坐标：Bw-Tree 与哪些方案竞争
+### 设计坐标：Bw-Tree 与哪些方案竞争
 
 Bw-Tree 不是对所有索引结构的单向替代。它选择的是“有序索引 + 高并发更新 + 间接寻址”这一组权衡。
 
@@ -78,7 +73,9 @@ Bw-Tree 的 Delta Chain 容易让人联想到 Kudu Delta Store 或 LSM-Tree，�
 
 两者都用“先追加、后合并”换取写路径简化，但作用域和系统目标不同。
 
-## 4. 总体架构：逻辑节点与物理版本分离
+## 节点表示：稳定身份与不可变版本
+
+### 总体架构：逻辑节点与物理版本分离
 
 Open BwTree 中，根节点由原子的 `root_id` 标识，父节点和兄弟节点保存的也是 `NodeID`。真正的内存地址由 Mapping Table 解析。
 
@@ -112,7 +109,7 @@ std::array<std::atomic<const BaseNode *>, MAPPING_TABLE_SIZE>
 
 相关定义位于 [`src/bwtree.h`](https://github.com/wangziqi2013/BwTree/blob/09b7354d419513ac5648980e875e1a3246be396a/src/bwtree.h)。
 
-### 4.1 Mapping Table 解决了什么
+#### Mapping Table 解决了什么
 
 如果父节点直接保存子节点地址，那么子节点被重写、搬迁或合并时，父节点也必须跟着更新。Mapping Table 增加一次间接寻址，却换来一个重要性质：
 
@@ -137,9 +134,9 @@ inline bool InstallNodeToReplace(NodeID node_id,
 }
 ```
 
-这里没有显式指定 memory order，因此使用 C++ 原子操作默认的顺序一致性。对一次成功更新而言，这个 CAS 就是新版本对其他线程生效的线性化点。
+这里没有显式指定 memory order，因此使用 C++ 原子操作默认的顺序一致性。对一次成功更新而言，这个 CAS 就是新版本对其他线程生效的线性化点（Linearization Point）。
 
-### 4.2 固定表带来的容量边界
+#### 固定表带来的容量边界
 
 这份实现把 Mapping Table 固定为：
 
@@ -160,7 +157,7 @@ inline void InvalidateNodeID(NodeID node_id) {
 
 因此，当前快照实际上不会完整复用被删除节点的 ID。长期运行时，`next_unused_node_id` 会持续增长，最终触碰固定 Mapping Table 的上限。这不是算法必然限制，而是这个开源实现需要生产化改造的地方。
 
-## 5. 节点模型：Base Node 加不可变 Delta
+### 节点模型：Base Node 加不可变 Delta
 
 每个逻辑节点最终落在一个 Base Node 上，其上可以叠加多个 Delta Node。Delta 保存本次变化和指向旧链头的 `child_node_p`：
 
@@ -204,7 +201,9 @@ Open BwTree 分别为叶子节点和内部节点定义了不同 Delta：
 
 这正是 Bw-Tree 最核心的读写权衡。
 
-## 6. 查找：读取的不是节点，而是节点的逻辑状态
+## 读写路径：重放、CAS 发布与整合
+
+### 查找：读取的不是节点，而是节点的逻辑状态
 
 查找从 `root_id` 开始。`Context` 保存搜索键和一条由 `NodeSnapshot(NodeID, node_p)` 组成的路径。每下探一层，都通过 NodeID 重新读取 Mapping Table 的当前链头。
 
@@ -232,7 +231,7 @@ MappingTable[child]
 - `InnerRemoveNode` 指向的替代节点；
 - 最终 Base Node 中的有序分隔键。
 
-### 6.1 high key 与右兄弟为什么仍然需要
+#### high key 与右兄弟为什么仍然需要
 
 节点分裂不是一次原子地同时更新子节点和父节点。线程可能看到“子节点已经分裂，但父节点还没有新分隔键”的中间状态。
 
@@ -248,7 +247,7 @@ Bw-Tree 借用了 B-link Tree 的关键思想：节点维护 high key 和右兄�
 
 这使“父节点稍旧”仍然可以被导航信息容忍，也是分阶段 Split 能成立的基础。
 
-### 6.2 读者也可能帮助完成结构变更
+#### 读者也可能帮助完成结构变更
 
 普通遍历加载一个 NodeID 后会调用：
 
@@ -258,9 +257,11 @@ Bw-Tree 借用了 B-link Tree 的关键思想：节点维护 high key 和右兄�
 
 因此，Bw-Tree 的读写边界并不绝对：访问者发现未完成结构变更时，可以帮助推进系统状态。帮助机制避免了必须由原线程独占完成整个 SMO，但也让遍历协议明显复杂于普通 B+Tree。
 
-## 7. 插入与删除：CAS 是提交点
+### 插入与删除：CAS 是提交点
 
-### 7.1 插入流程
+单次成功 CAS 发布新的链头，但不负责多键事务提交；失败者必须重新检查共享状态，不能继续发布基于过期链头的修改。
+
+#### 插入流程
 
 `Insert(key, value)` 的主流程可以抽象为：
 
@@ -289,7 +290,7 @@ CAS MappingTable[NodeID]: old_head -> insert_delta
 
 这个实现允许一个 key 对应多个 value，但相同 `(key, value)` 不会重复插入。它保证的是单次索引操作的原子性，不是事务隔离。
 
-### 7.2 删除流程
+#### 删除流程
 
 删除与插入对称：先确认目标存在，再构造 `LeafDeleteNode`，最后 CAS 发布。它不会立刻重写 Base Node，也不会同步释放被覆盖的旧链。
 
@@ -307,7 +308,7 @@ Delete Delta:     delete (k1,v1)
 
 代价则是：删除并不立刻回收空间，后续必须依赖 Consolidation 和 Epoch GC。
 
-## 8. Consolidation：把版本链折叠回 Base Node
+### Consolidation：把版本链折叠回 Base Node
 
 当链深达到 8，`TryConsolidateNode()` 调用 `ConsolidateNode()`。其本质不是“修改原 Base Node”，而是离线构造一个全新的 Base Node：
 
@@ -327,7 +328,7 @@ CAS MappingTable[id]: old chain head -> Base B
 
 叶子节点通过 `CollectAllValuesOnLeaf()` 重放插入和删除，内部节点通过 `CollectAllSepsOnInner()` 收集有效分隔键。源码使用小型有序集合、哈希集合和 Bloom Filter 辅助判重与过滤。
 
-Consolidation 有几个值得注意的性质：
+Consolidation 将读路径缩短与维护成本绑定在一起：
 
 1. **它是机会性的。** CAS 失败不影响索引正确性，只说明有人先发布了更新。
 2. **它缩短读路径。** 多次指针追逐和 Delta 判断被折叠成连续有序数组。
@@ -345,7 +346,9 @@ Consolidation 有几个值得注意的性质：
 
 整合得到 Base Node 后，代码根据逻辑大小判断是否继续触发 split 或 remove/merge。
 
-## 9. Split：先让新边界可见，再修父节点
+## 结构变更：分裂、合并与帮助完成
+
+### Split：先让新边界可见，再修父节点
 
 传统 B+Tree 分裂常常需要同时锁住子页和父页。Bw-Tree 把分裂拆成可观察、可恢复的多个阶段。
 
@@ -380,7 +383,7 @@ Consolidation 有几个值得注意的性质：
 
 根节点是例外，因为根没有父节点。实现通过 `root_id.compare_exchange_strong(old_root, new_root)` 切换逻辑根；失败说明另一个线程已率先改变根，当前线程需要根据新状态重试或帮助完成。
 
-## 10. Merge 与 Remove：最难的并发路径
+### Merge 与 Remove：最难的并发路径
 
 节点低于下限后，代码可能把它移除并合并到左兄弟。相比 split，merge 更难处理：
 
@@ -390,7 +393,7 @@ Consolidation 有几个值得注意的性质：
 
 Open BwTree 为此引入了论文之外值得重点关注的 `InnerAbortNode` 协议。
 
-### 10.1 ABORT 协议
+#### ABORT 协议
 
 合并路径大致如下：
 
@@ -422,7 +425,7 @@ bool ret = InstallNodeToReplace(parent_node_id,
 
 ABORT 的目的不是表示用户事务回滚，而是暂时冻结某个父节点的可提交快照，避免 remove 与父节点并发 split/merge 交错后产生错误判断。
 
-### 10.2 进展保证的代价
+#### 进展保证的代价
 
 这个协议修补了正确性窗口，却引入了新的活性问题：如果线程成功发布 ABORT 后永久停顿，其他线程可能持续遇到 ABORT，无法让父节点恢复正常状态。仓库 [README](https://github.com/wangziqi2013/BwTree/blob/09b7354d419513ac5648980e875e1a3246be396a/README.md) 将此列为已知问题。
 
@@ -442,9 +445,11 @@ ABORT 的目的不是表示用户事务回滚，而是暂时冻结某个父节�
 
 “代码里没有 mutex”不足以自动证明后两者。
 
-## 11. Epoch GC：旧版本何时才能释放
+## 回收与迭代：旧指针何时失效
 
-CAS 替换 Mapping Table 表项，只意味着旧链不再接受新访问，不意味着旧链已经无人引用。一个读线程可能在 CAS 前取得旧指针，此时立刻 `delete` 会造成 use-after-free。
+### Epoch GC：旧版本何时才能释放
+
+CAS 替换 Mapping Table 表项，只意味着之后从该表项加载的访问会取得新链头；已经持有旧指针的线程仍可能继续遍历旧链。一个读线程可能在 CAS 前取得旧指针，此时立刻 `delete` 会造成 use-after-free。
 
 Bw-Tree 因而需要两阶段删除：
 
@@ -458,7 +463,7 @@ Bw-Tree 因而需要两阶段删除：
                     释放旧链内存
 ```
 
-### 11.1 当前启用的是哪套 Epoch 机制
+#### 当前启用的是哪套 Epoch 机制
 
 源码保留了新旧两套 Epoch 实现，但 `USE_OLD_EPOCH` 默认被注释。当前路径由 `BwTreeBase` 维护全局 epoch 和每线程 GC 元数据：
 
@@ -478,7 +483,7 @@ static void RegisterThread() {
 
 每线程 GC 上下文还做了 cache-line 对齐，以减少不同线程更新活跃 epoch 时的 false sharing。
 
-### 11.2 Epoch 的工程约束
+#### Epoch 的工程约束
 
 Epoch 回收没有逐对象引用计数，读路径较轻，但使用者必须遵守严格协议：
 
@@ -489,11 +494,11 @@ Epoch 回收没有逐对象引用计数，读路径较轻，但使用者必须�
 
 `LeafRemoveNode` 和 `InnerRemoveNode` 还携带 `removed_id`，目的是等安全 epoch 后再回收 NodeID。不过，如前文所述，当前 `InvalidateNodeID()` 并未真正把 ID 压回空闲栈，这条复用链路并不完整。
 
-## 12. Iterator：逻辑叶子快照，不是事务快照
+### Iterator：逻辑叶子快照，不是事务快照
 
 Open BwTree 提供 `Begin()`、`Begin(start_key)` 和双向移动的 `ForwardIterator`。迭代器不能长期保存一个可能被回收的叶子链指针，因此它在 Epoch 内把当前逻辑叶子的内容物化到 `IteratorContext` 中，再退出受保护区间。
 
-跨越页面边界时，迭代器使用 high key 和 `LowerBound` 重新定位，而不是假设旧物理页面和兄弟指针永远有效。这也用于处理并发 merge 可能造成的边界重复。
+跨越页面边界时，迭代器使用 high key 和 `LowerBound` 重新定位，而不是假设旧物理页面（Physical Page）和兄弟指针永远有效。这也用于处理并发 merge 可能造成的边界重复。
 
 需要强调：
 
@@ -501,7 +506,9 @@ Open BwTree 提供 `Begin()`、`Begin(start_key)` 和双向移动的 `ForwardIte
 
 如果扫描过程中其他线程继续更新或分裂页面，迭代器跨页时可能观察到更新后的状态。数据库若需要 repeatable read、snapshot isolation 或 serializable，必须在 Bw-Tree 之上结合 MVCC、时间戳或事务层实现。Open BwTree 自己只承诺索引操作原子性，不承担数据库隔离职责。
 
-## 13. 从一条写入看完整生命周期
+## 沿写入生命周期检查正确性
+
+### 从一条写入看完整生命周期
 
 把前面的机制串起来，一条记录从插入到旧版本释放会经历：
 
@@ -527,9 +534,11 @@ Insert(k, v)
 
 这条链路展示了 Bw-Tree 的真正设计中心：它不是取消了同步，而是把同步集中到**版本发布**；不是取消了页面重写，而是把重写延迟到**整合**；不是让结构变更一步完成，而是把它改写成**可解释、可帮助的状态机**。
 
-## 14. 工程实现中的其他细节
+### 工程实现中的其他细节
 
-### 14.1 Header-only 的泛型索引
+泛型接口、辅助容器和线程注册协议共同影响使用边界；只移植树操作而忽略这些配套约束，仍可能破坏回收与并发假设。
+
+#### Header-only 的泛型索引
 
 主体实现集中在近万行的 [`src/bwtree.h`](https://github.com/wangziqi2013/BwTree/blob/09b7354d419513ac5648980e875e1a3246be396a/src/bwtree.h)，通过模板参数接收：
 
@@ -539,7 +548,7 @@ Insert(k, v)
 
 这让算法可以适配自定义键值类型，但比较、相等与哈希语义必须一致，否则 Delta 判重、集合过滤和树顺序可能产生不一致。
 
-### 14.2 辅助数据结构
+#### 辅助数据结构
 
 仓库还包含：
 
@@ -549,7 +558,7 @@ Insert(k, v)
 
 这些组件说明，Delta Chain 的成本不只来自指针跳转，还包括重放时的去重、删除遮蔽和临时集合构造。评估 Bw-Tree 时不能只测 CAS 吞吐，还应测不同链长下的点查、范围扫描、整合频率和内存峰值。
 
-### 14.3 测试与构建基线偏旧
+#### 测试与构建基线偏旧
 
 仓库提供基本功能、混合高并发、压力、迭代器和 benchmark 测试，这是理解协议的重要入口。但构建文件仍硬编码 `g++-5`，使用 C++11、PAPI、jemalloc 和特定平台参数。
 
@@ -560,23 +569,23 @@ Insert(k, v)
 - sanitizer 和现代线程检测工具；
 - 构建系统、持续集成与跨平台配置。
 
-## 15. 正确性应如何理解
+### 正确性应如何理解
 
 分析 Bw-Tree 不能只记住几个类名，还要抓住三个不变量。
 
-### 15.1 发布不变量
+#### 发布不变量
 
 一个新版本只有在 Mapping Table CAS 成功后才可见。CAS 前构造过程不修改共享旧版本；CAS 失败者不能继续提交基于旧链头的结果。
 
-### 15.2 导航不变量
+#### 导航不变量
 
 即使父节点尚未反映子节点 split，high key 和右兄弟仍必须把搜索引导到正确键范围。中间 SMO 状态必须能够被遍历代码识别并帮助完成。
 
-### 15.3 生命周期不变量
+#### 生命周期不变量
 
 从 Mapping Table 移除不等于立即释放。任何可能被旧快照引用的链，都必须等所有相关读者越过安全 epoch 后才能析构。
 
-### 15.4 四种“正确”不能合并成一句无锁
+#### 四种“正确”不能合并成一句无锁
 
 Bw-Tree 讨论中最常见的概念滑移，是从“Mapping Table CAS 成功”直接跳到“数据库事务已经安全提交”。实际上至少有四层相互独立的证明义务：
 
@@ -589,9 +598,9 @@ Bw-Tree 讨论中最常见的概念滑移，是从“Mapping Table CAS 成功”
 
 因此，CAS 是单个索引操作的候选线性化点，却不是事务 Commit Record，也不证明多个索引更新能够原子提交。Epoch 只回答“何时可以释放旧对象”，不回答“事务应该看到哪个版本”。原始论文还包含 Log-Structured Storage Manager，而 Open BwTree 代码聚焦内存索引；把两者分开，才能避免将论文系统的持久化能力错误归因于当前仓库。
 
-生产接入时，数据库事务层还必须决定：唯一性冲突在 CAS 前还是后判定、Abort 如何撤销已发布 Delta、Checkpoint 如何固定 Mapping Table 与 NodeID、恢复时如何重新建立物理地址，以及 Secondary Index 与 Base Table 如何保持提交一致。这些问题并不会因为索引内部 latch-free 而消失。
+生产接入时，数据库事务层还必须决定：唯一性冲突在 CAS 前还是后判定、Abort 如何撤销已发布 Delta、Checkpoint 如何固定 Mapping Table 与 NodeID、恢复时如何重新建立物理地址（Physical Address），以及 Secondary Index 与 Base Table 如何保持提交一致。这些问题并不会因为索引内部 latch-free 而消失。
 
-如果要形式化验证这个实现，CAS 本身反而是最简单的部分。更难的是证明：
+如果要形式化验证（Formal Verification）这个实现，CAS 本身反而是最简单的部分。更难的是证明：
 
 - 每种 Delta 的重放优先级一致；
 - split/merge 的所有中间状态都可导航；
@@ -599,11 +608,15 @@ Bw-Tree 讨论中最常见的概念滑移，是从“Mapping Table CAS 成功”
 - Remove Delta 的重定向在 NodeID 回收前一直有效；
 - Epoch 注册、退出和对象析构覆盖所有裸指针使用区间。
 
-## 16. 局限性与生产化清单
+## 生产化边界与验证顺序
+
+### 局限性与生产化清单
 
 这份 Open BwTree 源码非常适合学习，但若要进入生产系统，需要正视以下问题。
 
-### 16.1 当前实现已知限制
+#### 当前实现已知限制
+
+固定 Mapping Table、未启用的 ID 复用与 Epoch 注册限制了规模和线程模型，不能只通过一次吞吐测试评估可用性。
 
 | 问题 | 影响 |
 | --- | --- |
@@ -616,7 +629,9 @@ Bw-Tree 讨论中最常见的概念滑移，是从“Mapping Table CAS 成功”
 | 构建依赖和工具链较旧 | 需要现代化迁移与重新验证 |
 | 只提供操作原子性 | 事务隔离需要上层系统实现 |
 
-### 16.2 生产化时应补充什么
+#### 生产化时应补充什么
+
+生产接入需要补齐事务、持久化和资源治理；这些是独立工程工作，不会由替换页面 latch 自动获得。
 
 1. **容量管理**：动态扩展或分段 Mapping Table，可靠复用 NodeID，并防止 ABA。
 2. **内存治理**：限制 Delta 链、提供 GC backpressure，监控各线程 epoch 和待回收字节数。
@@ -626,7 +641,11 @@ Bw-Tree 讨论中最常见的概念滑移，是从“Mapping Table CAS 成功”
 6. **可观测性**：统计 CAS 冲突、重试次数、链长分布、整合耗时、SMO 帮助次数和 GC 滞后。
 7. **系统化验证**：加入 ASan、UBSan、TSan、长时间随机并发测试和故障注入。
 
-## 17. 如何阅读这份源码
+### 接入前的验证
+
+接入前应分别测试 CAS 重试、结构变更中的线程停顿和 Epoch 回收滞后，并观察链重放与 Consolidation 的成本。当前实现不提供事务隔离或持久化，ABORT 路径还有进展条件；局部 CAS 发布不能等同于整个索引严格 lock-free，更不能替代数据库提交协议。
+
+## 如何阅读这份源码
 
 建议按“正常数据路径 → 维护路径 → 生命周期”的顺序阅读，而不是从近万行头文件第一行顺序向下：
 
@@ -649,22 +668,6 @@ CAS expected / actual
 Context 中的父子快照
 线程 gc_id / global epoch / last_active_epoch
 ```
-
-## 18. 总结
-
-Bw-Tree 的价值不只在于提供一种“更快的 B+Tree”，而在于展示了一种通用并发设计方法：
-
-1. 用稳定逻辑 ID 隔离对象身份与物理地址；
-2. 用不可变 Delta 表达更新，避免原地写共享页面；
-3. 用单点 CAS 发布版本，把冲突变成可检测的失败；
-4. 用 high key、右兄弟和 help-along 把结构变更拆成可恢复阶段；
-5. 用 Epoch 把逻辑删除与物理释放解耦。
-
-但它并没有让复杂性消失。读放大、Consolidation、SMO 状态机、ABORT 活性问题、NodeID 生命周期和 Epoch GC，共同构成了实现难度。
-
-从 Open BwTree 源码得到的最重要结论是：
-
-> Mapping Table + Delta Chain 让 B+Tree 的共享原地修改转化为版本发布问题；真正决定实现能否落地的，则是结构变更与内存生命周期能否在所有并发交错下保持正确和持续进展。
 
 ## 参考资料
 

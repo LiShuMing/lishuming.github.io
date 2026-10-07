@@ -2,7 +2,7 @@
 title: "【源码】seekdb：AI-Native 数据库的 Change Stream、双层 HNSW 与 COW Sandbox"
 slug: "seekdb-ai-native-source-notes"
 date: 2026-08-26T00:00:00+08:00
-lastmod: 2026-08-30T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - Database Engineering
 tags:
@@ -30,9 +30,11 @@ math: false
 
 这也意味着本文不会把 README 的每一句宣传语直接当作实现结论。比如异步索引不等于提交后零延迟可见；“两层 HNSW”背后还有辅助表、删除 bitmap 和 refresh/rebuild；`FORK` 并不保证每次都是纯 metadata 操作；`MERGE TABLE` 更不是 Git 式三方合并。真正值得学习的是这些边界如何在源码中落地。
 
-## 1. AI-Native 到底应该 Native 什么
+## Agent 状态与数据库内核的分工
 
-LLM 本身是无状态的。一个生产级 Agent 则至少同时维护四类状态：
+### AI-Native 到底应该 Native 什么
+
+单次模型调用不自动提供跨请求的持久记忆；Agent 应用需要另外管理会话、工具和业务状态。本文将这些状态分为四类：
 
 | 状态 | 典型内容 | 数据系统需要保证什么 |
 | --- | --- | --- |
@@ -51,9 +53,9 @@ LLM 本身是无状态的。一个生产级 Agent 则至少同时维护四类状
 
 因此我更愿意把 AI-Native 定义为：**数据库内核是否把 AI workload 的状态生命周期当成第一等问题**。Vector datatype 只是必要条件之一；新鲜度协议、混合检索计划、状态分支、模型 I/O 和资源隔离同样重要。
 
-## 2. 先看清底座：它仍是一套完整数据库内核
+### 先看清底座：它仍是一套完整数据库内核
 
-seekdb 的目录结构已经给出了答案：
+向量能力复用了 SQL、事务、日志和存储链路，而不是独立于关系内核的旁路；目录只能提供索引，后文调用链才用于说明依赖：
 
 ```text
 src/
@@ -90,7 +92,7 @@ src/
 | Embedded API | [`src/observer/embed/`](https://github.com/oceanbase/seekdb/tree/1e9b720c/src/observer/embed) |
 | AI model/embedding | [`src/observer/ai_service/`](https://github.com/oceanbase/seekdb/tree/1e9b720c/src/observer/ai_service)、[`ob_expr_ai_embed.cpp`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/sql/engine/expr/ob_expr_ai/ob_expr_ai_embed.cpp) |
 
-### 2.1 一张图看懂运行时组件
+#### 一张图看懂运行时组件
 
 seekdb 虽然主要面向单机和 Embedded 场景，但源码仍保留了 OceanBase 的 LS（Log Stream）与 Tablet 抽象。理解这些名字后，后面的代码会清楚很多：
 
@@ -132,7 +134,7 @@ seekdb 虽然主要面向单机和 Embedded 场景，但源码仍保留了 Ocean
 
 AI-Native 能力不是另一个旁路 Server，而是在这三类状态之间增加协议。
 
-### 2.2 一次普通 INSERT 到 redo 的源码路径
+#### 一次普通 INSERT 到 redo 的源码路径
 
 先不看向量索引，只跟踪最普通的一次 `INSERT`。Server 模式由 [`ObMPQuery::do_process()`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/observer/mysql/obmp_query.cpp) 调用 `sql_engine_->stmt_query()`；Embedded 模式由 `ObLiteEmbedConn::execute()` 调用 inner SQL connection。两者最终都进入 [`ObSql::handle_text_query()`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/sql/ob_sql.cpp)，经过 plan cache、parser、resolver、optimizer、code generation 和物理算子。
 
@@ -204,7 +206,9 @@ MemTable MVCC node + row callback
 
 Change Stream 不读取 SQL 文本，也不依赖客户端重复发送 vector；它消费的是存储层已经序列化并进入事务日志的 old/new row。这使 `UPDATE`、`DELETE`、rollback 和 crash recovery 能共享同一套事务事实。
 
-## 3. Change Stream：把提交路径与索引路径拆开
+## 写入到检索：Change Stream、HNSW 与 SQL
+
+### Change Stream：把提交路径与索引路径拆开
 
 Agent memory 的典型 workload 不是离线 bulk load 后只读，而是不断写入 conversation、tool result 和新文档，同时持续搜索。若每次 DML 都同步修改一个复杂 HNSW graph，写延迟会被图更新、锁竞争和内存分配放大。seekdb 的关键选择是：**事务提交只负责主存储和 redo，异步 Change Stream 再把已提交变化送进增量索引。**
 
@@ -237,7 +241,7 @@ ObCSPluginAsyncIndex
     advance change_stream_refresh_scn
 ```
 
-### 3.1 Fetcher 不是简单地 tail WAL
+#### Fetcher 不是简单地 tail WAL
 
 [`ObCSFetcher`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/observer/change_stream/ob_change_stream_fetcher.cpp) 读取 Palf log 后，用 `ObCSTxInfo` 按 transaction ID 保存多段 redo。事务在提交前可能跨多条日志，可能 abort，也可能 `ROLLBACK TO SAVEPOINT`。后者不会删除已经写出的 redo，因此 `ObCSTxInfo` 还记录 rollback range，后续通过 `is_row_visible()` 排除已回滚 statement。
 
@@ -279,7 +283,7 @@ handle_commit_log_:
 
 Fetcher 还推进 `change_stream_min_dep_lsn`。checkpoint/log recycle 会读取这个位置，避免 Change Stream 尚未消费的 redo 被提前回收。异步消费者因此反过来约束日志保留：解耦了前台延迟，却没有消除后台积压的存储成本。
 
-### 3.2 并行执行，串行提交
+#### 并行执行，串行提交
 
 [`ObCSDispatcher`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/observer/change_stream/ob_change_stream_dispatcher.cpp) 把 committed redo 解析成 old/new row，按 schema version 组织 batch，再按 key 拆成多个并行 subtask。相同 batch 可以并发构建索引事件，但 [`ObCSWorker`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/observer/change_stream/ob_change_stream_worker.cpp) 必须等待 `next_commit_sn_`，按顺序提交 batch。
 
@@ -358,7 +362,7 @@ if (task_fail) {
 
 `release_batch()` 只有在 commit 成功后才释放 Fetcher 中的 `ObCSTxInfo` 和 redo buffer。若 epoch 改变，Dispatcher 等所有 active batch rollback/cleanup，再把 `dispatch_sn_` 重置到 `next_commit_sn_` 重试。这是一套小型的有序 replay protocol，而不只是线程池。
 
-### 3.3 freshness 是协议，不是形容词
+#### freshness 是协议，不是形容词
 
 主事务 commit 与向量索引可检索之间存在异步窗口。seekdb 用 `change_stream_refresh_scn` 表示 Change Stream 已完整处理到哪里；[`DBMS_INDEX_MANAGER.refresh`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/pl/sys_package/ob_dbms_index_manager.cpp) 最终调用 `ObChangeStreamMgr::wait_refresh_scn()`，等待 watermark 追上当前 safe-visible SCN。
 
@@ -403,7 +407,7 @@ snapshot HNSW rebuild
 
 线上可观测性也应围绕这条协议展开：`commit_scn - refresh_scn`、最老未决事务 LSN、Change Stream Queue Length、Batch Retry/Epoch、Delta HNSW 大小、Refresh Wait Time 和 Rebuild Duration，比一个笼统的“索引延迟”更容易区分日志积压、Worker 失败、图更新变慢和 Snapshot 重建压力。
 
-## 4. 双层 HNSW：固定两层，而不是无限 segment fan-out
+### 双层 HNSW：固定两层，而不是无限 segment fan-out
 
 Change Stream 如何做到小步更新 HNSW，同时不让长期增量碎片拖垮查询？答案是两个逻辑 index instance：
 
@@ -420,7 +424,7 @@ sort_merge_delta_and_snap_vids(...)
 
 最后一层 merge 对两组 candidate 按 distance 排序、去重并截断到 K；若是 iterative filtering 或某些 BQ 模式，则需要保留更多候选再做过滤。与每次 flush 产生一个新 ANN segment 的 LSM-like 设计相比，两层结构把 query fan-out 限制为常数。
 
-### 4.1 从 SQL plan 走到 HNSW 的完整调用链
+#### 从 SQL plan 走到 HNSW 的完整调用链
 
 上面的三行不是一个 SQL UDF 直接调用 vector library。真正的查询路径横跨 optimizer、code generator、DAS iterator 与 adaptor：
 
@@ -478,7 +482,7 @@ hnsw_param.snapshot_           = read_snapshot;
 
 最后两项说明 ANN 查询也没有逃离 SQL transaction snapshot：辅助表扫描、回表与 filter 都拿到同一个 transaction descriptor/read snapshot。内存 graph candidate 只是访问路径，row visibility 仍需数据库层校验。
 
-### 4.2 pre-filter、post-filter 与 adaptive path
+#### pre-filter、post-filter 与 adaptive path
 
 [`ObDASHNSWScanIter::process_adaptor_state_hnsw()`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/sql/das/iter/ob_das_hnsw_scan_iter.cpp) 获取 adaptor query lock 后分成两路：
 
@@ -498,7 +502,7 @@ if (is_pre_filter() || is_in_filter()) {
 
 这比“vector filter 被 push down”更具体：源码中同时存在 filter iterator tree、bitmap/range filter、ANN iterative context 和 base-table lookup。优化器不仅选不选 HNSW，还要决定先缩小集合还是先做近邻搜索。
 
-### 4.3 两路结果如何合并
+#### 两路结果如何合并
 
 adaptor 分别给 `incr_data_->mem_data_rwlock_` 和 `snap_data_->mem_data_rwlock_` 加读锁，调用 VSAG `knn_search()`。查询条件中包含 `query_limit_`、`ef_search`、distance threshold、filter、range-filter 标志和 iterative-search context。
 
@@ -526,7 +530,7 @@ while (result_count < limit && i < delta_count && j < snap_count) {
 
 Change Stream 的 `ObCSPluginAsyncIndex` 会把 insert vector 加到 VSAG incremental index，并更新 index-id/delta metadata；delete（以及最终被上游表达为 delete+insert 的 indexed update）不能只从 graph 中“抹掉一个点”，还要借助持久事件、bitmap 和版本可见性，使旧 VID 不再参与结果。正如前文所述，当前 plugin 本身跳过直接到达的 `DF_UPDATE`，这条转换链仍需要动态测试确认。
 
-### 4.4 refresh 与 rebuild 不是同一件事
+#### refresh 与 rebuild 不是同一件事
 
 [`ob_vector_index_refresh.cpp`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/storage/vector_index/ob_vector_index_refresh.cpp) 展示了两种维护动作：
 
@@ -535,7 +539,7 @@ Change Stream 的 `ObCSPluginAsyncIndex` 会把 insert vector 加到 VSAG increm
 
 所以双层 HNSW 真正解决的是**流式新鲜度与查询 fan-out 的矛盾**：前台写不重建大图，新数据先进小图；查询付出固定两路搜索和合并；后台再把长期增量成本摊入 refresh/rebuild。它没有消灭维护，只是把维护从同步临界路径迁走并做了有界化。
 
-## 5. Hybrid Search：不是客户端拼结果，而是回到 SQL Pipeline
+### Hybrid Search：不是客户端拼结果，而是回到 SQL Pipeline
 
 seekdb 支持两类混合搜索入口。第一类是普通 SQL：
 
@@ -565,7 +569,7 @@ JSON search request
 
 [`ObQueryTranslator`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/sql/hybrid_search/ob_query_translator.cpp) 不是在客户端执行 fusion，而是把 DSL 编译成 SQL，再复用数据库原有的 parser、resolver、optimizer 和 executor。这种路线的意义是只维护一个执行语义：SQL 与 JSON API 的底层 filter、排序、limit、hint 最终都落在相同引擎中。
 
-### 5.1 为什么要“生成 SQL 再解析一次”
+#### 为什么要“生成 SQL 再解析一次”
 
 JSON parser 生成的 `ObQueryReqFromJson` 已经是一棵表达式树，但它不是 optimizer 的 `ObDMLStmt/ObRawExpr`。seekdb 没有再实现一套 JSON-to-plan compiler，而是让 [`ObQueryTranslator::translate()`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/sql/hybrid_search/ob_query_translator.cpp) 顺序打印 SQL 子句：
 
@@ -604,9 +608,11 @@ query_ctx->has_hybrid_search_ = true;
 
 当前源码也暴露了功能边界：`ObHybridSearchExecutor::construct_column_index_info()` 要求 data table 使用 hidden primary key；对于用户显式提供主键的表，这条 JSON Hybrid Search 路径直接返回 `OB_NOT_SUPPORTED`。这并不代表普通 SQL 混合检索也有同样限制，但说明不能把两个入口的能力矩阵混为一谈。
 
-## 6. FORK：从 schema clone 一直到 SSTable/macro block 的 COW
+## 状态分支：FORK 与 MERGE 的实现边界
 
-对于 Agent，sandbox 不是锦上添花。Agent 会执行概率性计划、生成代码、修改结构化状态；如果每次实验都复制一整库，成本太高，如果直接改 main state，风险又太大。seekdb 把 `FORK TABLE` / `FORK DATABASE` 做成异步 DDL：目标库得到一个一致 snapshot，之后源与 fork 都可以独立写入。
+### FORK：从 schema clone 一直到 SSTable/macro block 的 COW
+
+Agent 实验可能修改结构化状态，完整复制数据库会增加成本，直接修改主状态又难以隔离失败。这里讨论的是数据分支，不是代码执行安全沙箱。seekdb 把 `FORK TABLE` / `FORK DATABASE` 做成异步 DDL：目标库得到一个一致 snapshot，之后源与 fork 都可以独立写入。
 
 主流程如下：
 
@@ -707,7 +713,7 @@ macro_block_writer->append_row(row); // 只重写 fork 时可见的数据
 
 所以它确实是 storage-level COW，而非应用层 `SELECT INTO`；但也不能简单说成“fork 永远是瞬时 metadata-only”。跨 snapshot 边界的 SSTable 需要重写，整个操作还有 freeze、per-tablet DAG 和 data complement 阶段。源码测试覆盖了源表/fork 表并发写、snapshot isolation、LOB、partition、vector/full-text index 和 COW 隔离，这些比单个 demo 更能说明实现范围。
 
-## 7. MERGE TABLE 的真实边界：按主键对账，不是 Git 三方合并
+### MERGE TABLE 的真实边界：按主键对账，不是 Git 三方合并
 
 README 使用 Git/Sandbox 类比很自然，但阅读 [`ObMergeTableResolver`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/sql/resolver/cmd/ob_merge_table_resolver.cpp) 后需要加一个关键限定：当前 `MERGE TABLE incoming INTO current` 没有读取 fork 时的共同祖先，也没有对 source、sandbox、base 做 three-way diff。
 
@@ -748,7 +754,9 @@ FOR UPDATE;
 
 因此更准确的使用方式是：把 `FORK` 看成物理存储的可写 snapshot，把 `MERGE TABLE` 看成显式策略驱动的表级导入/对账。若要达到真正 “Git for data”，还需要持久化 lineage/base version、三方 change set、delete/tombstone 语义、schema evolution merge 和可审计的 conflict object。
 
-## 8. Embedded：没有网络 hop，不等于没有 Server 内核
+## 服务边界：Embedded 与 AI Service
+
+### Embedded：没有网络 hop，不等于没有 Server 内核
 
 [`seekdb.h`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/observer/embed/c/seekdb.h) 暴露了 C API：`seekdb_open/connect/execute`，以及 SQLite 风格的 `prepare/step/bind/finalize`。Python 和 Android binding 建立在相同实现之上。
 
@@ -795,7 +803,7 @@ OBSERVER.get_inner_sql_conn_pool().acquire(session, inner_conn);
 
 当前提交还有一个值得注意的工程边界：`ObLiteEmbed::close()` 会 `_Exit(0)`；C wrapper 的 `seekdb_close()` 为避免杀死宿主进程，明确**不调用**它，只释放 API handle，并留下 “graceful embedded shutdown” 待后续实现。另一个限制是 `GCTX.is_inited()` 防止重复 open，数据目录还有 pid lock，因此不能把它理解为在同一进程随意创建多个完全隔离的轻量 instance。
 
-## 9. AI Service：模型治理进入数据库，推理仍可在外部
+### AI Service：模型治理进入数据库，推理仍可在外部
 
 seekdb 的 AI-Native 也不意味着数据库内核自己训练或托管所有模型。[`EndpointType`](https://github.com/oceanbase/seekdb/blob/1e9b720c/src/share/ai_service/ob_ai_model_info.h) 定义了 `DENSE_EMBEDDING`、`SPARSE_EMBEDDING`、`COMPLETION` 和 `RERANK`；`DBMS_AI_SERVICE` 管理 endpoint，元数据包括 URL、access key、provider、request model name、parameters，以及可选 request/response transform function。
 
@@ -835,7 +843,7 @@ Vector index 的 bulk embedding 还有 [`ObEmbeddingTask`](https://github.com/oc
 
 把 endpoint 与 SQL function 放进数据库的价值在于统一 credential、model alias、batching、retry 和数据路径，应用不必先全表拉出文本再逐行发 HTTP。但故障域也被扩展了：外部模型 latency、rate limit、credential 和 response schema 会进入 query/index build 路径。生产系统仍需明确哪些调用是同步 query expression，哪些是异步 index pipeline，并对 endpoint 权限和超时做治理。
 
-### 9.1 推荐的源码阅读顺序
+#### 推荐的源码阅读顺序
 
 seekdb 源码体量很大，从目录第一页顺序读效率很低。若目标是系统理解本文主题，我建议按“主状态 → 派生状态 → 查询 → 分支”的因果顺序：
 
@@ -852,7 +860,7 @@ seekdb 源码体量很大，从目录第一页顺序读效率很低。若目标�
 
 每一阶段最好画出四样东西：入口对象、持久状态、并发/事务边界、失败后从哪里重试。只记类名很快会迷失；持续追踪 `tx_desc`、`schema_version`、`SCN/LSN`、`tablet_id` 这四类 identity，调用链会稳定很多。
 
-### 9.2 七个必须同时成立的系统不变量
+#### 七个必须同时成立的系统不变量
 
 把前面的源码收束起来，seekdb 的实时向量能力依赖至少七条不变量：
 
@@ -866,14 +874,16 @@ seekdb 源码体量很大，从目录第一页顺序读效率很低。若目标�
 
 单看任何一个模块都无法证明端到端正确性。例如 HNSW 返回正确近邻，不代表它包含所有已承诺可见的 transaction；Change Stream 顺序正确，也不代表 query 没有把已删除 snapshot VID 重新带回。AI-Native 特性真正的工程难点正是跨模块不变量。
 
-## 10. 与 BigQuery、Snowflake、Databricks 的方向对照
+## 放回产品与学术路线比较
 
-工业界正在明显收敛到“结构化数据 + 向量 + 模型调用 + 治理”，差异主要在这些能力落在哪一层。
+### 与 BigQuery、Snowflake、Databricks 的方向对照
+
+下列产品资料展示了结构化数据、向量检索和模型调用的不同集成位置；能力名称相似并不表示一致性、隔离或性能条件相同。
 
 | 方向 | 代表能力 | 与 seekdb 的关系 |
 | --- | --- | --- |
 | Warehouse 增加 Vector/AI SQL | [BigQuery Vector Search](https://cloud.google.com/bigquery/docs/vector-search-intro) 与 AI functions | 都希望 vector 与 SQL/filter 共存；BigQuery 更接近云数仓内的托管分析与索引服务 |
-| Search 作为托管服务 | [Snowflake Cortex Search](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-search/cortex-search-overview) | 强调从表数据构建 hybrid search service；控制面和 serving endpoint 更外显 |
+| Search 作为托管服务 | [Snowflake Cortex Search](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-search/cortex-search-overview) | 强调从表数据构建 hybrid search service；控制面（Control Plane）和 serving endpoint 更外显 |
 | Lakehouse 增加在线向量索引 | [Databricks Mosaic AI Vector Search](https://docs.databricks.com/en/generative-ai/vector-search.html) | 可由 Delta table 同步索引；数据/索引/在线 endpoint 仍是清晰分层的 managed resource |
 | 单机事务内核内置检索与沙箱 | seekdb | Change Stream、HNSW、FTS、SQL、tablet COW 与 transaction/log 在同一代码库和一致性域 |
 
@@ -881,7 +891,7 @@ seekdb 源码体量很大，从目录第一页顺序读效率很低。若目标�
 
 对于“预训练数据清洗”，seekdb 具备 SQL、全文、向量和模型函数，可以参与去重、检索与标注，但它并未因此取代 BigQuery/Snowflake/Databricks 这类分布式 scan engine。大规模 columnar scan、shuffle、弹性计算与训练数据 pipeline 仍是 OLAP/lakehouse 的主场。AI-Native database 不应成为忽略 workload shape 的万能标签。
 
-## 11. 与学术路线的联系：新鲜度是 Vector Index 的核心矛盾
+### 与学术路线的联系：新鲜度是 Vector Index 的核心矛盾
 
 seekdb 的两层方案可以放到 ANN 研究脉络中理解：
 
@@ -894,33 +904,35 @@ seekdb 的两层方案可以放到 ANN 研究脉络中理解：
 
 FORK 的研究背景则更接近 database snapshot、MVCC、zero-copy clone 和 storage COW，而不是 ANN。它把 Agent sandbox 的产品概念下沉到 tablet/SSTable/macro block；这个跨层组合，可能比再发明一种 distance function 更符合 “AI state database” 的本质。
 
-## 12. 如果今天从头设计，还缺什么
+## 待补能力与验证范围
 
-源码给我的启发不是“所有 AI database 都应该复制 seekdb”，而是可以列出一份更严格的 blank-slate checklist：
+### 如果今天从头设计，还缺什么
 
-### 12.1 把 freshness 写进 API
+源码中的可见性窗口与分支合并限制形成了后续设计问题。以下是本文提出的能力检查项，不是当前 seekdb 已支持或必须采用的统一架构：
+
+#### 把 freshness 写进 API
 
 查询应该能声明 `eventual`、`read-your-writes`、`as-of watermark` 等检索一致性，而不是让用户猜 refresh 是否完成。watermark、index lag、fallback exact scan 和 cost 应成为 optimizer 可见的 property。
 
-### 12.2 把 retrieval 当作一等算子
+#### 把 retrieval 当作一等算子
 
 Vector ANN、BM25/full-text、graph traversal、scalar filter、rerank 和 model call 应能组成一个 costed plan；optimizer 需要理解 candidate cardinality、recall budget、filter selectivity、模型 latency 与 token cost，而不仅是把 UDF 当黑盒。
 
-### 12.3 原生 lineage-aware branch
+#### 原生 lineage-aware branch
 
 真正的数据 branch 应保存共同祖先和 change set，支持 row/field/schema 三层冲突、delete semantics、branch quota、TTL、审计和可重复 merge。seekdb 的物理 FORK 已经走到 storage 层，但当前 MERGE 仍需要更丰富的版本语义。
 
-### 12.4 多模态不只是一个 VECTOR column
+#### 多模态不只是一个 VECTOR column
 
 图片、音频、文档 chunk、结构化 entity 与它们的多个 embedding version 需要 lineage：由哪个模型、哪个 prompt、哪次解析产生；模型升级后哪些向量过期；原始对象与派生索引如何原子切换。
 
-### 12.5 Agent 安全进入事务与资源模型
+#### Agent 安全进入事务与资源模型
 
 Agent 的 query budget、tool permission、sandbox capability、模型 credential、PII policy 和 prompt-injection provenance 都应该可审计。数据库不能只保证 ACID，还要限制一个自主循环能扫描多少数据、调用多少次模型、保留多久的临时分支。
 
-## 13. 最后的判断
+### 采用前分别验证哪些边界
 
-回到开头的问题：真正 AI-Native 的 engine 长什么样？从 seekdb 当前源码，我得到的答案不是一个全新的 page format，而是一组围绕 Agent state 生命周期的跨层协议：
+跨层依赖可按以下路径检查：
 
 ```text
 continuous transactional writes
@@ -936,12 +948,8 @@ delta HNSW + snapshot HNSW
           └── tablet/SSTable COW sandbox
 ```
 
-seekdb 最有价值的地方，不是证明传统 database kernel 已经过时，反而是证明 AI workload 仍然需要它：transaction、redo、snapshot、schema、SQL optimizer、SSTable 和 compaction，为 vector freshness 与 Agent sandbox 提供了可靠地基。
+采用前分别验证提交后何时可搜、混合检索的过滤语义，以及 FORK/MERGE 的数据范围与冲突处理。异步索引有可见性窗口，双层查询需 merge/bitmap/rebuild，部分 SSTable 需重写；Embedded 的关闭与隔离、外部模型 endpoint 也要单独测试。底层事务复用不能替代这些协议的验证，数据层 COW Sandbox 更不能授权不可信代码访问宿主文件或网络。
 
-它当前的边界也很清楚：异步索引存在可见性窗口；双层查询要付出 merge/bitmap/rebuild 成本；JSON Hybrid Search 对表形态有限制；FORK 某些 SSTable 需要重写；MERGE 不是三方版本合并；Embedded 的 graceful shutdown 与多实例隔离仍不完整；模型 inference 依赖外部 endpoint。
-
-因此我会把 seekdb 定义为：**一款基于成熟 OceanBase 数据库内核、针对 AI Agent 状态与实时混合检索做垂直整合的引擎**。它不是 blank-slate AI kernel，但它提出的问题——新状态何时可搜、结构化与语义检索如何共存、Agent 如何安全试错——比“支持 VECTOR 类型”更接近 AI-Native 的真正含义。
-
-## 14. 阅读与验证边界
+### 阅读与验证边界
 
 本文结论来自 `1e9b720c` 源码静态阅读，重点交叉检查了 Change Stream、vector index adaptor/refresh、Hybrid Search translator、FORK/MERGE、Embedded 与 AI Service，并参考仓库中的 fork-table mysql tests。本文没有完成 seekdb 全量编译、性能 benchmark 或故障注入测试；涉及吞吐、P99 和具体产品版本的数字应以对应 benchmark 环境与官方文档为准，而不由本文的源码阅读直接证明。

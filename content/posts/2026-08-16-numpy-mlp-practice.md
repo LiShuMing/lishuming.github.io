@@ -1,6 +1,7 @@
 ---
 title: "【LLM】NumPy实践：从向量化到手写两层 MLP 与反向传播"
 date: 2026-08-16T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - AI Infra
 tags:
@@ -15,15 +16,9 @@ math: true
 notebook: true
 ---
 
-在[《从 GPU 到 LLM 微调：一条面向 RTX 5070 Ti 的实践学习路线》]({{< relref "2026-08-15-gpu-to-llm-finetuning-roadmap.md" >}})中，除了基本的numpy理论学习之外，还希望能够完成：
+两层 MLP（Multilayer Perceptron）把 shape、广播、矩阵乘和梯度放进同一个可检查的训练过程。本文沿[GPU 到 LLM 微调学习路线]({{< relref "2026-08-15-gpu-to-llm-finetuning-roadmap.md" >}})，只用 NumPy 完成双月牙分类：从标准化到稳定 softmax，再手写 `forward → loss → backward → update`，用梯度检查（Gradient Checking）与训练曲线定位错误。
 
-1. 能判断 shape、broadcasting 和矩阵乘是否合法；
-2. 能把逐样本 Python 循环改写为向量化计算；
-3. 能实现稳定的 softmax、cross-entropy 和两层 MLP；
-4. 不依赖 autograd 写出 `forward → loss → backward → update`；
-5. 能用梯度检查和训练曲线证明实现是正确的。
-
-[《深入 NumPy：从 ndarray 内存模型到科学计算与张量生态》]({{< relref "2026-08-16-numpy-internals.md" >}})已经完成了 ndarray、strides、广播、dtype、向量化与 BLAS/LAPACK 的理论铺垫。本文不再重复 API，而是把这些概念放进一个可以运行、可以失败、也可以验证的项目：**只用 NumPy 训练一个两层 MLP，对双月牙数据进行分类。**
+[NumPy 内存模型与张量生态]({{< relref "2026-08-16-numpy-internals.md" >}})已介绍 ndarray、strides、dtype、广播和 BLAS/LAPACK；这里保留实际代码与检查步骤，不再重复 API 说明。
 
 本文对应的 Notebook 已保存执行结果，也可以直接在浏览器里修改参数、重启 Kernel 和重新运行。浏览器版本基于 Pyodide/WASM，适合验证算法和数值结果；文中的耗时只代表本次本地 CPU 执行，不应拿来评价本机 OpenBLAS、MKL 或 GPU 性能。
 
@@ -59,6 +54,8 @@ notebook: true
 为了让 Notebook 能独立运行，也为了把随机数、索引、广播和统计量真正串起来，本实现基于纯 NumPy 实现。
 
 ## 二、数据准备：标准化本身也是一次 shape 练习
+
+标准化只能使用训练集统计量，否则验证集信息会进入训练；保留特征轴的 shape 才能让广播作用在预期维度。
 
 ### 逐行构造双月牙
 
@@ -104,6 +101,8 @@ def make_moons_numpy(n_samples=1200, noise=0.22, seed=42):
 8. **⑪⑫** 同一个 `order` 同时索引 `x` 和 `y`。如果分别打乱，代码仍能运行，但标签已经与样本错位，是一种不会立即报错的数据错误。
 
 ### 逐类切分，避免类别比例漂移
+
+分层切分保持各类别的样本比例，但不能消除数据分布偏差。实现时需要对每类索引独立打乱再分配。
 
 ```python
 def stratified_split(x, y, val_ratio=0.25, seed=42):
@@ -163,7 +162,7 @@ train std:  [1. 1.]
 
 ## 三、向量化：先证明结果相同，再讨论速度
 
-阶段一要求分别用循环和 NumPy 计算 10,000 个 128 维样本到一个查询向量的欧氏距离。逐样本版本是：
+向量化减少 Python 层调用，但可能增加临时数组，需要先检查数值一致性，再比较时间与内存。本实验计算 10,000 个 128 维样本到一个查询向量的欧氏距离：
 
 ```python
 distance = np.empty(points.shape[0])                  # ① 预分配 (10000,)
@@ -201,6 +200,8 @@ $$
 
 ### 参数初始化逐行拆解
 
+权重尺度影响激活和梯度的量级，因此不能在学习率对照中同时改变初始化。
+
 ```python
 def init_params(input_dim, hidden_dim, output_dim, seed=42):
     rng = np.random.default_rng(seed)                    # ① 初始化可复现
@@ -223,6 +224,8 @@ def init_params(input_dim, hidden_dim, output_dim, seed=42):
 
 ### forward 的六行分别做什么
 
+前向计算需要保留反向依赖的中间值；检查缓存与参数的 shape，才能让矩阵求导落到正确轴上。
+
 ```python
 def forward(x, params):
     z1 = x @ params.w1 + params.b1       # ① (B,D)@(D,H)+(H,) -> (B,H)
@@ -238,7 +241,7 @@ def forward(x, params):
     )
 ```
 
-**①** 是第一层仿射变换，`b1` 由 `(H,)` 广播到 `(B,H)`；**②** 如果省略 ReLU，两层矩阵乘仍可合并成一个线性变换，无法学习弯曲边界；**③** 把隐藏特征投影为每个类别的未归一化分数；**④** 只在类别轴归一化；**⑤** 说明手写反向传播需要主动保存输入和中间激活，而 autograd 会替框架用户维护这部分状态。
+**①** 是第一层仿射变换，`b1` 由 `(H,)` 广播到 `(B,H)`；**②** 如果省略 ReLU，两层矩阵乘仍可合并成一个线性变换，无法学习弯曲边界；**③** 把隐藏特征投影为每个类别的未归一化分数；**④** 只在类别轴归一化；**⑤** 说明手写反向传播（Backpropagation）需要主动保存输入和中间激活，而 autograd 会替框架用户维护这部分状态。
 
 对应的 shape 是：
 
@@ -358,7 +361,7 @@ b2 (2,)    (2,)
 
 ## 六、梯度检查：让 backward 具备可证伪性
 
-代码能运行、loss 能下降，都不能严格证明梯度实现正确。有限差分用参数两侧的 loss 估算数值梯度：
+代码能运行、loss 能下降，都不能严格证明梯度实现正确。有限差分（Finite Difference）用参数两侧的 loss 估算数值梯度：
 
 $$
 \frac{\partial L}{\partial \theta}
@@ -419,7 +422,7 @@ gradient check max abs error: 1.51e-11
 
 ## 七、训练循环与实验结果
 
-训练循环之前，Notebook 先把“打乱并切成 batch”封装成生成器：
+训练对照需要固定数据划分、初始化和 batch 顺序，否则学习率差异可能与随机因素混杂。Notebook 先封装打乱与分批逻辑：
 
 ```python
 def iterate_minibatches(x, y, batch_size, rng):
@@ -526,7 +529,7 @@ for learning_rate in learning_rates:
 
 ## 八、从 NumPy 迁移到 PyTorch
 
-完成这个项目后，PyTorch 的核心对象不再神秘：
+PyTorch 将本实验中的状态管理与求导步骤封装为对象，但仍需正确处理梯度累积（Gradient Accumulation）和参数更新时机：
 
 | NumPy 项目中的显式工作 | PyTorch 中的对应机制 |
 |---|---|
@@ -545,6 +548,8 @@ for learning_rate in learning_rates:
 
 ## 九、如何复现实验
 
+网页交互入口依赖额外的 JupyterLite 构建，不是 Hugo 单独生成的页面。仓库部署流程在 Hugo 后执行 `jupyter lite build`，将浏览器运行时输出到 `public/lab`；仅运行 Hugo 本地预览时，应使用下方 Notebook 下载入口，或另外完成该构建。
+
 点击文首的“在文章内加载 Notebook”，或者在新窗口打开。首次启动需要下载浏览器 Python 运行时；之后可以执行 `Restart Kernel and Run All Cells`。浏览器版适合验证算法，不适合判断本机 OpenBLAS/MKL、SIMD 和线程性能。
 
 也可以下载 `numpy-two-layer-mlp.ipynb` 后在本地运行：
@@ -558,15 +563,6 @@ jupyter lab numpy-two-layer-mlp.ipynb
 
 Notebook 的模型实现不依赖 scikit-learn。建议第一次选择 `Restart Kernel and Run All Cells`，确认所有 Cell 在干净状态下可以顺序执行。
 
-## 十、阶段一复盘
+## 十、迁移边界
 
-到这里，阶段一的理论和项目实践形成了闭环：
-
-- ndarray、内存布局、广播和 dtype：由理论文章建立心智模型；
-- shape、标准化和向量化：由数据与距离计算实验验证；
-- softmax、cross-entropy 和数值稳定性：由前向传播验证；
-- 矩阵梯度和链式法则：由手写 backward 验证；
-- 实现正确性：由有限差分梯度检查验证；
-- 训练行为：由 loss、accuracy、学习率对照和决策边界验证。
-
-这还不是“学会深度学习”，但已经足以进入 PyTorch 阶段。下一步不是忘掉这些细节，而是观察框架如何把参数注册、计算图、梯度累积、优化器和设备迁移系统化，并继续追问：哪些机制只是减少样板代码，哪些机制真正改变了执行方式与性能边界。
+迁移到 PyTorch 前，应在相同输入与参数下对齐前向结果和梯度，再比较训练曲线。有限差分只检查抽样参数附近的一致性，loss 下降和当前数据集的准确率也不能证明所有输入上的正确性。本实验覆盖小型全连接网络，不验证复杂网络、分布式训练或 GPU 性能。

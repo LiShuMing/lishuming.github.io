@@ -2,7 +2,7 @@
 title: "【Paper】数据库系统论文精读：从现代硬件到工业自治"
 slug: "database-paper-reading-notes"
 date: 2026-08-23T20:21:00+08:00
-lastmod: 2026-08-29T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - 数据库
 tags:
@@ -31,6 +31,8 @@ toc: true
 
 ## 阅读索引
 
+这些工作优化的是不同责任边界，比较时应先对齐问题和语义，而不是按加速倍数排序。索引中的阅读状态沿用原稿记录，不表示本文重跑了各论文实验。
+
 | 方向 | 论文 | 会议 / 年份 | 状态 | 我关注的核心问题 |
 |---|---|---:|---|---|
 | 数据结构 / 范围索引 | [Bf-Tree](#bf-tree现代硬件上的超内存范围索引) | PVLDB 2024 | 精读 | 缓存页是否必须与磁盘页等大？ |
@@ -39,7 +41,7 @@ toc: true
 | 文件系统 / 资源池化 | [Tectonic](#tectonic从专用存储烟囱走向-eb-级统一底座) | FAST 2021 | 精读 | 如何让 Blob 与数仓共享同一个 EB 级存储池，同时保持隔离？ |
 | 分布式 OLTP / PostgreSQL | [Aurora Limitless](#aurora-limitless让-postgresql-兼容-oltp-横向扩展) | SIGMOD Companion 2026 | 精读 | 如何把单 Writer Aurora 扩展成 Router + Shard，同时保留事务语义？ |
 | 执行引擎 / Remote Shuffle | [FuxiShuffle](#fuxishuffle把数据交换变成自适应可恢复的服务) | SIGMOD Companion 2026 | 精读 | Shuffle 服务如何同时选择介质、调度时机、数据布局和恢复策略？ |
-| 云数仓 / 自治基础设施 | [Redshift Re-invented](#redshift-re-invented先建立能够反馈的系统底座) | SIGMOD 2022 | 精读 | 存算分离、遥测与弹性基础设施为何是自治优化的前提？ |
+| 云数仓 / 自治基础设施 | [Redshift Re-invented](#redshift-re-invented先建立能够反馈的系统底座) | SIGMOD 2022 | 精读 | 存算分离（Storage–Compute Disaggregation）、遥测与弹性基础设施为何是自治优化的前提？ |
 | 优化器 / 增量统计 | [Redshift Incremental Stats](#redshift-增量统计把全表-analyze-变成可合并状态) | PVLDB 2026 | 精读 | 如何用可合并 Sketch 持续维护 CBO 统计？ |
 | 优化器 / Learned Optimizer | [LOAM](#loam当统计缺失环境未知且不能在线试错) | SIGMOD 2026 Industry | 精读 | 缺少统计且环境变化时，如何安全比较候选计划？ |
 | 优化器 / HBO | [Ultron](#ultron记住-aqe-的修正让下一次少走弯路) | PVLDB 2026 | 精读 | 如何把 AQE 的运行时修正变成下一次优化的历史？ |
@@ -50,11 +52,11 @@ toc: true
 
 这里的阅读状态分为四级：**待读、粗读、精读、源码 / 复现**。后续增加论文时，先更新索引，再在对应分类下补充正文；对尚未确认的判断保留为问题，不把推测写成事实。
 
----
-
 ## 数据结构：现代硬件上的范围索引
 
 ### Bf-Tree：现代硬件上的超内存范围索引
+
+Bf-Tree 将缓存对象与磁盘页粒度分开，试图减少热点小范围访问的读取与驻留成本；代价是更复杂的缓存与恢复管理。
 
 #### 论文信息
 
@@ -139,9 +141,9 @@ Key
 
 #### 并发、持久化与恢复
 
-Bf-Tree **不是无锁索引**。内部节点使用 Optimistic Latch Coupling：读者通过版本号判断遍历期间节点是否发生变化，写者获取排他锁。它减少了读路径上的锁开销，但并不等于所有更新都只依赖 CAS，也不等于系统是 lock-free。
+Bf-Tree **不是无锁（Lock-Free）索引**。内部节点使用 Optimistic Latch Coupling：读者通过版本号判断遍历期间节点是否发生变化，写者获取排他锁。它减少了读路径上的锁开销，但并不等于所有更新都只依赖 CAS，也不等于系统是 lock-free。
 
-原型当前依赖操作系统线程交错 I/O，官方设计文档把更完善的用户态异步 I/O 列为后续方向。因此不能把 `io_uring` 或 `libaio` 描述成论文已有实现。
+原型当前依赖操作系统线程交错 I/O，官方设计文档把更完善的用户态（User Space）异步 I/O 列为后续方向。因此不能把 `io_uring` 或 `libaio` 描述成论文已有实现。
 
 在持久化方面，系统提供 WAL、快照和恢复流程：
 
@@ -180,7 +182,7 @@ Bf-Tree **不是无锁索引**。内部节点使用 Optimistic Latch Coupling：
 | LeanStore | 通用 Buffer Manager 的寻址成本 | Pointer Swizzling | B-Tree 风格更新 | 页面置换与指针状态管理复杂 |
 | Bf-Tree | 缓存与变脏粒度 | 可变长 mini-page 映射局部记录 | mini-page 聚合后合并磁盘页 | 变长空间管理与恢复复杂 |
 
-LeanStore 和 Bf-Tree 经常会被放在一起讨论，但它们并非简单替代关系。LeanStore 用 Pointer Swizzling 降低页表查找和间接寻址成本；Bf-Tree 则主要改变缓存对象的粒度。一个优化“如何找到已缓存页”，另一个优化“到底应该缓存多少页内数据”。
+LeanStore 和 Bf-Tree 经常会被放在一起讨论，但它们并非简单替代关系。LeanStore 用 Pointer Swizzling 降低页表（Page Table）查找和间接寻址成本；Bf-Tree 则主要改变缓存对象的粒度。一个优化“如何找到已缓存页”，另一个优化“到底应该缓存多少页内数据”。
 
 至于 RocksDB、TiKV 是否“吸收了 Bf-Tree 思想”，目前不应直接下结论。跳表、无锁读、Block Cache 和 Write Buffer Manager 在这些系统中有各自更早的演化历史。更有价值的研究方式是逐项比较机制、提交时间与解决的问题，而不是看到 CAS 或分层缓存就建立继承关系。
 
@@ -188,9 +190,9 @@ LeanStore 和 Bf-Tree 经常会被放在一起讨论，但它们并非简单替�
 
 Bf-Tree 最有价值的地方，不是给出了一个宣称同时胜过 B+ Tree 和 LSM-tree 的最终答案，而是把一个长期默认的系统边界重新打开：**I/O 页、持久化页和缓存页不一定是同一个抽象。**
 
-这种思路对数据库内核很有启发。我们经常围绕 Block Cache 命中率调参数，却很少追问“Block 是否就是正确的缓存单位”。在列存、向量索引、对象存储缓存中，同样存在类似问题：查询真正需要的是列段、Zone Map、Posting List 的局部，还是整个远程对象？
+这种思路对数据库内核很有启发。我们经常围绕 Block Cache 命中率调参数，却很少追问“Block 是否就是正确的缓存单位”。在列存、向量索引、对象存储（Object Storage）缓存中，同样存在类似问题：查询真正需要的是列段、Zone Map、Posting List 的局部，还是整个远程对象？
 
-但它也提醒我：抽象越贴近 workload，效率通常越高，系统复杂度也越容易从通用层转移到专用层。判断一个新结构能否进入生产，不能只看前台吞吐，还要看快照、恢复、空间碎片、写入尾延迟、SSD 寿命和运维可观测性。
+但它也提醒我：抽象越贴近 workload，效率通常越高，系统复杂度也越容易从通用层转移到专用层。判断一个新结构能否进入生产，不能只看前台吞吐，还要看快照、恢复、空间碎片、写入尾延迟（Tail Latency）、SSD 寿命和运维可观测性。
 
 #### 待继续验证
 
@@ -198,13 +200,15 @@ Bf-Tree 最有价值的地方，不是给出了一个宣称同时胜过 B+ Tree 
 - 用相同硬件与数据分布比较 Bf-Tree、LeanStore 和 RocksDB，而不是只比较论文数字；
 - 分析记录大小变化后，细粒度缓存收益与元数据开销的交叉点；
 - 研究异步 I/O 加入后，线程模型、latch 持有时间和请求合并策略会怎样变化；
-- 将这一思想映射到列存与向量检索：缓存粒度应由物理页决定，还是由查询语义决定？
-
----
+- 将这一思想映射到列存与向量检索：缓存粒度应由物理页（Physical Page）决定，还是由查询语义决定？
 
 ## 工业架构：从元数据扩展到共享存储
 
+拆分权威状态能够扩展服务节点，却会把一致性、事务和恢复成本转移到共享层。HopsFS、PolarFS 与 Tectonic 分别展示了不同拆分边界。
+
 ### HopsFS：用 NewSQL 扩展层级文件系统元数据
+
+HopsFS 将权威元数据交给事务数据库，使 NameNode 可以横向扩展，但路径访问与子树操作仍需有序协调。
 
 #### 论文信息
 
@@ -215,7 +219,7 @@ Bf-Tree 最有价值的地方，不是给出了一个宣称同时胜过 B+ Tree 
 
 #### 为什么读这篇论文
 
-HDFS 把完整命名空间、文件到 Block 的映射以及 DataNode 状态放在 Active NameNode 内存中。这给系统带来了两个很鲜明的特点：
+HDFS 把完整命名空间（Namespace）、文件到 Block 的映射以及 DataNode 状态放在 Active NameNode 内存中。这给系统带来了两个很鲜明的特点：
 
 - 路径解析与元数据操作是本机内存访问，单次请求很快；
 - 元数据容量、RPC 吞吐和全局锁最终受一台 NameNode 的内存与 CPU 限制。
@@ -335,7 +339,7 @@ HDFS 并没有因为 NewSQL 元数据方案出现而停止演化，也不应简�
 
 #### 我的判断
 
-HopsFS 最重要的启发不是“文件系统应该使用 MySQL”，而是：**元数据服务也可以被当作一个高并发 OLTP 系统来设计。** 路径是索引访问，文件操作是事务，目录热点是数据倾斜，Subtree Operation 是跨分片长事务。
+HopsFS 最重要的启发不是“文件系统应该使用 MySQL”，而是：**元数据服务也可以被当作一个高并发 OLTP 系统来设计。** 路径是索引访问，文件操作是事务，目录热点是数据倾斜（Data Skew），Subtree Operation 是跨分片长事务。
 
 它复用了数据库的复制、恢复和事务能力，却没有逃避领域语义。相反，真正困难的工作正是把目录树的层级锁、Block 状态机和故障恢复准确映射到数据库原语。
 
@@ -352,6 +356,8 @@ HopsFS 最重要的启发不是“文件系统应该使用 MySQL”，而是：*
 ---
 
 ### PolarFS：面向云数据库的共享存储
+
+PolarFS 用用户态 I/O 与共享存储降低路径开销，同时需要自行管理队列、复制与故障恢复。
 
 #### 论文信息
 
@@ -400,9 +406,9 @@ PolarFS 由四个核心组件组成：
 - **libpfs**：链接进数据库进程的轻量级用户态文件系统库；挂载时加载目录、文件与块映射，常规读写通过 `pfs_pread`、`pfs_pwrite` 完成；
 - **PolarSwitch**：部署在计算节点的路由进程，缓存 Chunk 位置，将请求转发到正确的 ChunkServer，并在 Leader 变化时重试；
 - **ChunkServer**：部署在存储节点，每个实例管理独立 NVMe，并绑定专用 CPU Core，通过 SPDK 访问设备；
-- **PolarCtrl**：控制面，负责元数据与集群管理，论文实现使用 MySQL 保存元数据，不进入常规数据 I/O 的关键路径。
+- **PolarCtrl**：控制面（Control Plane），负责元数据与集群管理，论文实现使用 MySQL 保存元数据，不进入常规数据 I/O 的关键路径。
 
-`libpfs` 与 PolarSwitch 之间使用共享内存 Ring Buffer 和轮询通信，减少进程间系统调用与拷贝。PolarSwitch 缓存位置元数据，因此 PolarCtrl 短时不可用时，已有数据路径仍可继续工作。
+`libpfs` 与 PolarSwitch 之间使用共享内存 Ring Buffer 和轮询通信，减少进程间系统调用（System Call）与拷贝。PolarSwitch 缓存位置元数据，因此 PolarCtrl 短时不可用时，已有数据路径仍可继续工作。
 
 #### 数据组织：Volume、Chunk 与 Block
 
@@ -425,9 +431,9 @@ PolarFS 在关键数据路径使用两类硬件能力：
 - 计算节点与存储节点、存储副本之间使用 RDMA；
 - ChunkServer 使用 SPDK 在用户态以轮询方式驱动 NVMe。
 
-RDMA 将数据传入预注册内存，SPDK 避免传统内核块设备路径中的中断与多次上下文切换。它们的共同目标不是让软件消失，而是让数据移动更直接、执行模型更可控。
+RDMA 将数据传入预注册内存，SPDK 避免传统内核块设备路径中的中断与多次上下文切换（Context Switch）。它们的共同目标不是让软件消失，而是让数据移动更直接、执行模型更可控。
 
-“全链路零拷贝、零上下文切换”是过度概括。实际系统仍有请求描述符处理、队列操作、协议状态机、日志复制和必要的数据组织成本。更准确的说法是：**PolarFS 在关键数据路径中尽量减少内核穿越、上下文切换和冗余拷贝。**
+“全链路零拷贝（Zero-Copy）、零上下文切换”是过度概括。实际系统仍有请求描述符处理、队列操作、协议状态机、日志复制和必要的数据组织成本。更准确的说法是：**PolarFS 在关键数据路径中尽量减少内核穿越、上下文切换和冗余拷贝。**
 
 轮询也不是免费午餐。它用持续占用 CPU Core 换取更稳定的低延迟。在云环境中，这进一步引出资源隔离、空闲功耗和高负载下 Poller 调度公平性问题。
 
@@ -504,6 +510,8 @@ PolarFS 的价值既在性能，也在它证明了 Shared-Storage 数据库可�
 ---
 
 ### Tectonic：从专用存储烟囱走向 EB 级统一底座
+
+Tectonic 通过统一存储池复用不同负载的资源，代价是把隔离、修复与元数据协调集中到共享系统。
 
 #### 论文信息
 
@@ -595,7 +603,7 @@ Tectonic 把文件系统元数据拆为三个逻辑层：
 - 已确认的写必须已经更新可见的 Block 元数据；
 - 失败遗留的孤儿对象或延迟删除由后台 GC 收敛。
 
-HopsFS 更像把文件系统操作放进 NewSQL 事务，Tectonic 则把元数据拆得更细，依靠单写者、幂等步骤和异步修复跨越事务边界。后者牺牲了通用跨分片原子性，换取更彻底的哈希分片和 EB 级扩展。
+HopsFS 更像把文件系统操作放进 NewSQL 事务，Tectonic 则把元数据拆得更细，依靠单写者、幂等（Idempotency）步骤和异步修复跨越事务边界。后者牺牲了通用跨分片原子性，换取更彻底的哈希分片和 EB 级扩展。
 
 #### 多租户隔离：调度的资源应当是瓶颈本身
 
@@ -659,11 +667,11 @@ Tectonic 并没有给出所谓“现代分布式文件系统的终极拓扑”�
 - TrafficGroup 的供给计算如何处理 SSD、HDD 与网络等多维资源；
 - AI 训练从文件接口迁移到 Blob 接口后，数据加载、缓存和 Checkpoint 路径发生了什么变化。
 
----
-
 ## 分布式 OLTP：在 PostgreSQL 语义上横向扩展
 
 ### Aurora Limitless：让 PostgreSQL 兼容 OLTP 横向扩展
+
+Aurora Limitless 将路由和分片执行分开，但跨分片语义仍需协调提交与恢复，不能仅按计算节点数量估算扩展性。
 
 #### 论文信息
 
@@ -789,11 +797,11 @@ Aurora Limitless 最值得学习的是一种渐进式分布式数据库路线：
 - Global Unique Constraint、Secondary Index 与 Foreign Key 跨 Shard 时的真实边界；
 - 与 Citus、Vitess、CockroachDB、Aurora DSQL 在兼容性、隔离级别和跨 Region 能力上的逐项比较。
 
----
-
 ## 执行引擎：Remote Shuffle 的自适应与容错
 
 ### FuxiShuffle：把数据交换变成自适应、可恢复的服务
+
+独立 Shuffle 服务让中间数据生命周期不再完全依附计算进程，但数据传输与服务故障成为新的依赖。
 
 #### 论文信息
 
@@ -935,13 +943,13 @@ FuxiShuffle 最有价值的地方，是把“Shuffle 策略”从 Job 启动前�
 - Incremental Recovery 在多个 Writer 同时重跑、Partition Scheme 改变时的 Checksum 证明；
 - 与 Celeborn、Uniffle 在开源可复现实验上的同硬件比较。
 
----
-
 ## 工业查询优化：从代价模型到反馈闭环
+
+历史信息只有能关联到本次候选、且知道何时失效，才能改善优化决策。下面从统计维护逐步讨论预测、复用和风险控制。
 
 ### 引言：优化器真正缺少的不是另一个模型
 
-经典查询优化器建立在一个很优雅的抽象上：统计信息描述数据，代价模型预测执行成本，搜索器在候选计划中选择代价最低者。
+经典查询优化器（Query Optimizer）建立在一个很优雅的抽象上：统计信息描述数据，代价模型（Cost Model）预测执行成本，搜索器在候选计划中选择代价最低者。
 
 ```text
 Statistics + Cost Model + Search Space
@@ -950,7 +958,7 @@ Statistics + Cost Model + Search Space
              Best Plan
 ```
 
-这里需要先区分“优化器框架”和“反馈来源”。Volcano/Cascades 解决的是如何用规则、物理属性与 Memo 组织候选搜索：逻辑等价表达式归入同一 Group，Transformation Rule 扩展等价空间，Implementation Rule 产生物理算子，代价模型再做剪枝。后来的 Learned Optimizer、HBO 与自治调优通常没有抛弃这套搜索骨架，而是在基数、代价、候选排序、历史状态或验证环节补充新的信号。
+这里需要先区分“优化器框架”和“反馈来源”。Volcano/Cascades 解决的是如何用规则、物理属性（Physical Property）与 Memo 组织候选搜索：逻辑等价表达式归入同一 Group，Transformation Rule 扩展等价空间，Implementation Rule 产生物理算子，代价模型再做剪枝。后来的 Learned Optimizer、HBO 与自治调优通常没有抛弃这套搜索骨架，而是在基数、代价、候选排序、历史状态或验证环节补充新的信号。
 
 这个抽象没有过时，但工业环境不断击穿它的边界：
 - 统计信息会过期，数据湖中的列统计可能根本不存在；
@@ -964,9 +972,11 @@ Statistics + Cost Model + Search Space
 
 本节围绕八项工业数据库工作展开。它们分别来自 MaxCompute、Amazon Redshift、Databricks、OceanBase、Microsoft SQL Server 与 Oracle，看起来涉及学习型优化器、增量统计、参数化查询、索引、数据布局和计划稳定性，实际上都在回答同一个问题：如何构造一条可信的优化闭环。
 
-本节不是摘要合集。阅读重点是四件事：系统观察到了什么，如何把观测表示成可复用状态，如何修改决策，以及如何验证修改不会造成不可接受的回退。
+比较按四个环节展开：观测信号、可复用状态、决策修改，以及回归验证。
 
 ### 阅读地图与结论
+
+八项工作分别改善观测、预测、复用和验证，阅读时需要对齐决策对象而非将它们都归为替换 CBO。
 
 #### 八项工作的定位
 
@@ -998,6 +1008,8 @@ Statistics + Cost Model + Search Space
 9. **优化的终点不是选出一次更快的计划，而是让系统在变化中稳定收敛。** 这也是本节最核心的主线。
 
 ### 一个统一视角：Observe、Represent、Decide、Verify
+
+观测、表示、决策与验证承担不同证明责任；有执行记录不等于预测准确，有预测收益也不等于线上安全。
 
 可以把八项工作统一成下面的控制闭环：
 
@@ -1032,6 +1044,8 @@ Statistics + Cost Model + Search Space
 传统 CBO 主要覆盖 Represent 与 Decide。本节这些工作真正新增的是 Observe 与 Verify，并把四者连接成持续运行的系统。
 
 ### Redshift Re-invented：先建立能够反馈的系统底座
+
+执行反馈需要可定位的工作负载与控制接口，系统底座决定自动调优能够观察和修改哪些状态。
 
 #### 论文信息
 
@@ -1075,7 +1089,7 @@ Redshift Managed Storage（RMS）的关键是重写状态归属：数据和事�
 
 #### 执行器优化仍然重要
 
-存算分离并没有让单机执行效率变得不重要。Redshift 仍然大量使用代码生成，并针对 CPU Cache Miss 显式生成 Prefetch。其思路是让哈希表 Probe 或 Bloom Filter 访问提前发出内存预取，再用 L1 Cache 中的小型循环缓冲隐藏访存延迟。
+存算分离并没有让单机执行效率变得不重要。Redshift 仍然大量使用代码生成，并针对 CPU Cache Miss 显式生成 Prefetch。其思路是让哈希表（Hash Table） Probe 或 Bloom Filter 访问提前发出内存预取，再用 L1 Cache 中的小型循环缓冲隐藏访存延迟。
 
 Vectorized Execution 与 Code Generation 解决的是相邻但不同的问题：前者让一组固定 Kernel 按列式 Batch 工作，用摊薄解释器开销和更规则的数据访问换取稳定执行；后者根据当前表达式、数据类型与算子 Pipeline 生成专用机器码，减少虚函数分派、中间结果和无效分支，但会产生编译延迟与代码缓存压力。工业系统通常不是二选一：常见算子使用成熟向量化 Kernel，热点表达式或 Pipeline 再通过 Codegen 专门化，并用编译缓存摊薄冷启动。
 
@@ -1087,7 +1101,7 @@ AQUA 则不是普通远程块存储接口，而是把过滤与聚合等计算靠
 
 #### 自治组件为什么能够出现
 
-论文还介绍了 Automatic Table Optimization、AutoWLM 与自动物化视图等能力：
+论文还介绍了 Automatic Table Optimization、AutoWLM 与自动物化视图（Materialized View）等能力：
 
 - ATO 根据列访问、谓词选择率和 Join 图推荐 Distribution Key 与 Sort Key；
 - AutoWLM 根据计划特征预测执行时间、内存与编译时间，动态控制并发；
@@ -1097,6 +1111,8 @@ AQUA 则不是普通远程块存储接口，而是把过滤与聚合等计算靠
 
 
 ### Redshift 增量统计：把全表 ANALYZE 变成可合并状态
+
+可合并统计状态可以减少反复全表扫描，但精度、更新与删除处理仍需按统计目标分别设计。
 
 #### 论文信息
 
@@ -1184,6 +1200,8 @@ Full Sketch Bootstrap 的逐行成本高于旧的 Sample ANALYZE。系统最终�
 
 ### LOAM：当统计缺失、环境未知且不能在线试错
 
+学习模型试图补充传统估计缺失的信号，部署收益仍取决于训练覆盖、推理成本和回退机制。
+
 #### 论文信息
 
 - 论文：[Learned Query Optimizer in Alibaba MaxCompute: Challenges, Analysis, and Solutions](https://arxiv.org/abs/2602.07336)
@@ -1203,7 +1221,7 @@ LOAM 的出发点不是“神经网络比 CBO 更聪明”，而是 MaxCompute �
 
 #### Plan Explorer：先限制搜索空间的风险
 
-MaxCompute 暴露 75 个可调 Flag，涉及执行模式、Join、Shuffle、Spool、Filter 与并行度等。论文实验只选择其中 6 个相对安全、容易产生多样计划的 Flag；同时借鉴 Lero，对至少三个输入的子查询缩放估计基数，以影响计划结构。
+MaxCompute 暴露 75 个可调 Flag，涉及执行模式、Join、Shuffle、Spool、Filter 与并行度（Degree of Parallelism）等。论文实验只选择其中 6 个相对安全、容易产生多样计划的 Flag；同时借鉴 Lero，对至少三个输入的子查询缩放估计基数，以影响计划结构。
 
 这说明 30% 的最高收益不能理解为“模型任意生成了全新计划”。LOAM 的上限首先受 Plan Explorer 限制：候选集合中没有好计划，再准确的排序器也无能为力。
 
@@ -1261,6 +1279,8 @@ LOAM 先用规则过滤训练数据不足、表生命周期太短或计划结构
 LOAM 最值得吸收的不是一个最高数字，而是三个生产化原则：**显式建模不可控环境、用领域自适应代替危险试跑、先筛选值得部署的租户。**
 
 ### Ultron：记住 AQE 的修正，让下一次少走弯路
+
+跨次复用运行期修正可以减少重复试错，但只在查询与数据环境仍可比时成立，历史失效需要单独处理。
 
 #### 论文信息
 
@@ -1353,6 +1373,8 @@ Ultron 的主要限制包括：
 
 ### ScalePQO：一个模板一个模型，也是一种不可扩展
 
+参数化查询优化不仅需要选择计划，还要控制模型训练和维护规模；模板增加会使逐模板方案的固定成本累积。
+
 #### 论文信息
 
 - 论文：[Towards Industrial-Scale Parametric Query Optimization](https://www.vldb.org/pvldb/vol19/p4303-mo.pdf)
@@ -1405,6 +1427,8 @@ ScalePQO 集成在 OceanBase 上，在六组工作负载中相对原生优化器
 但论文明确假设底层数据分布相对稳定，主要处理 Parameter Distribution Drift。数据本身发生倾斜或统计变化时，即使参数分布不变，计划相对性能也会改变。Embedding Mean Pooling 可能丢掉多峰分布，K-Means 也不一定是最佳聚类算法；最终质量仍受 Candidate Enumeration 上限约束。
 
 ### LLM 索引调优：最好的一次回答不是可部署系统
+
+索引建议必须计入维护、空间与回归风险；模型输出只能生成候选，收益仍需 What-if 或实测验证。
 
 #### 论文信息
 
@@ -1473,6 +1497,8 @@ DTA 在多查询场景整体更稳定。LLM 偶尔仍能找到 DTA 没枚举到�
 
 ### AutoLiquid：推荐聚簇键不难，自动应用才难
 
+聚簇建议只有覆盖重写成本与后续负载变化时才值得实施，自动应用需要收益阈值与停止条件。
+
 #### 论文信息
 
 - 论文：[AutoLiquid](https://vldb.org/2026/program.html)
@@ -1507,7 +1533,7 @@ scan telemetry
 
 #### 存算分离为什么是验证器的一部分
 
-在传统存算一体系统中，验证新布局可能意味着复制整表或抢占线上节点。Lakehouse 的持久数据与计算资源解耦后，可以临时分配计算、读取相同 Snapshot 的抽样数据并评估候选，而不必先修改生产表。
+在传统存算一体系统中，验证新布局可能意味着复制整表或抢占（Preemption）线上节点。Lakehouse 的持久数据与计算资源解耦后，可以临时分配计算、读取相同 Snapshot 的抽样数据并评估候选，而不必先修改生产表。
 
 这与 LOAM 的“不能在线执行危险计划”形成有趣对照：查询计划可能在一次执行中耗费巨大资源，因而 LOAM 用 Domain Adaptation 避免试跑；数据布局改变更慢，但可在独立计算上对样本做 Shadow Verification，AutoLiquid 因而选择“验证后提交”。验证策略取决于系统能否廉价隔离副作用。
 
@@ -1518,6 +1544,8 @@ scan telemetry
 当前公开摘要没有足够信息证明早期草稿中的以下说法：一定使用 Hilbert Curve、具体 Overlap Ratio 阈值、文件冲突选择算法或写放大数字。因此本节不把它们作为既定实现。可以确认的是候选来自 Scan Telemetry，决策经过 Sampled Shadow Verification，且系统遵循 Verify-Before-Commit。
 
 ### Oracle Real-Time SPM：先让新计划发生，再阻止它继续发生
+
+计划回退需要区分首次退化与后续重复执行；观察到退化后限制复用，不等于首个用户请求没有承担损失。
 
 #### 论文信息
 
@@ -1566,6 +1594,8 @@ SPM 的状态落在 SQL Management Base 中，包含 SQL Signature、Accepted / 
 
 ### 横向比较：八种系统到底在学习什么
 
+八项工作复用的对象不同，因此维护成本和失效条件也不同；统计状态、计划选择与物理布局不能共用一个笼统的“学习准确率”。
+
 #### 决策闭环对照
 
 | 系统 | 观察值 | 持久状态 | 修改动作 | 安全机制 | 冷启动行为 |
@@ -1609,6 +1639,8 @@ runtime sees unexpected reality?
 问题不再是“CBO 还是 AI”，而是如何定义优先级、置信度、失效条件和回退路径。
 
 ### 从论文中抽象出的生产设计原则
+
+将反馈放入规划关键路径会增加延迟和依赖，因此采集、训练与验证需尽量异步，在线决策同时保留可退回的路径。
 
 #### 让知识靠近决策，但让收集远离关键路径
 
@@ -1658,9 +1690,9 @@ LLM Index Tuning 的 Best-of-Five 很亮眼，但 Worst Response 决定能否自
 
 LOAM 的 Explorer 与 Cost Predictor、ScalePQO 的 Candidate Set 与 Rank Model、AutoLiquid 的 Heuristic 与 Shadow Verification 都遵循这种分工。LLM 直接端到端输出最终索引之所以危险，正是把三个角色压在一个高方差模型上。
 
-### Future ：优化器正在变成一个有记忆的控制系统
+### 适用边界：历史状态何时可以参与决策
 
-这些论文共同展示了一次重要迁移：优化器从“每次编译都从 Catalog 重新推理”的无状态组件，演进成持续吸收执行结果的有状态控制系统。
+执行反馈扩大了优化器的输入，但不会自动取代编译期统计与代价搜索。文中的增量统计、HBO 和计划管理分别复用不同状态，需要独立定义有效期与失败回退。
 
 但“有记忆”会引入新的系统问题：
 
@@ -1671,13 +1703,13 @@ LOAM 的 Explorer 与 Cost Predictor、ScalePQO 的 Candidate Set 与 Rank Model
 - 多租户之间能否共享知识而不泄漏计划结构与数据分布？
 - 新模型带来的收益是否超过训练、存储、推理和验证成本？
 
-因此，下一代优化器的关键接口可能不只是：
+若把这些机制抽象成接口，传统输入可以写成：
 
 ```text
 optimize(logical_plan, catalog_statistics) -> physical_plan
 ```
 
-而更接近：
+一个用于讨论的扩展接口可以写成下式；这是本文归纳，不是任何论文或系统已统一采用的 API：
 
 ```text
 optimize(
@@ -1694,7 +1726,7 @@ optimize(
 
 最终，我并不认为这些工作宣告了传统 CBO 的终结。恰恰相反，它们在给 CBO 补上长期缺失的感知、记忆和安全机制：增量统计让 Catalog 更及时，Learned Model 补偿缺失信号，HBO 记住运行时纠错，Plan Baseline 和 Shadow Verification 管理探索风险。
 
-> **工业查询优化的未来，不是找到一个永远正确的模型，而是构造一个即使模型会错，也能持续学习、稳定收敛并限制损失的系统。**
+历史复用只有在身份、失效和回退条件明确时才适合进入关键路径；Shadow Verification 也有额外执行成本，不能保证发现所有回退。上线前应按目标负载测量命中率、规划开销与最坏回退，而不是将各论文最大收益叠加。
 
 ### 参考资料
 
@@ -1711,8 +1743,6 @@ optimize(
 - [Oracle: Overview of SQL Plan Management](https://docs.oracle.com/en/database/oracle/oracle-database/26/tgsql/overview-of-sql-plan-management.html)
 - [Oracle Optimizer Blog: What Is Real-Time SQL Plan Management?](https://blogs.oracle.com/optimizer/what-is-realtime-spm)
 
----
-
 ## 四篇存储论文放在一起看
 
 Bf-Tree、HopsFS、PolarFS 与 Tectonic 分别研究索引、元数据、共享存储和统一文件系统，却遵循相似的推理路径：
@@ -1724,18 +1754,7 @@ Bf-Tree、HopsFS、PolarFS 与 Tectonic 分别研究索引、元数据、共享�
 | PolarFS | NVMe、RDMA、多队列并发 | 通用内核路径与严格日志串行足够高效 | 用户态数据路径与冲突感知的提交顺序 | Polling、元数据、复制协议与资源隔离 |
 | Tectonic | EB 级容量与异构 workload 具有互补资源需求 | 每种 workload 都需要独立存储系统 | 分层元数据、扁平 Chunk Store 与租户策略 | 跨层修复、重客户端与多租户 QoS |
 
-它们共同说明：
-
-> **硬件只提供能力，软件决定能力是否会被旧抽象抵消。**
-
-但“绕过一层”不会消灭复杂度。Bf-Tree 绕过固定页 Buffer Pool 后，需要自己管理可变长缓存；HopsFS 移除单 NameNode 权威状态后，需要把层级锁映射为数据库事务；PolarFS 绕过通用内核 I/O 后，需要自己管理队列、内存和故障；Tectonic 合并专用存储后，需要承担跨层修复与多租户隔离。系统设计真正困难的地方，不是找到一个更短的 Fast Path，而是同时建立一条正确、可恢复、可观测的 Slow Path。
-
-这也是我后续阅读数据库论文时会持续追问的主线：
-
-1. 论文优化的瓶颈是真实硬件瓶颈，还是基准测试构造出的瓶颈？
-2. 它移除了什么串行点，又把一致性成本放到了哪里？
-3. 前台吞吐之外，恢复、后台任务与尾延迟是否仍然成立？
-4. 这个设计适合成为通用基础设施，还是只适合特定 workload 的专用层？
+这些工作没有消除复杂度，而是改变了它的归属：细粒度缓存需要合并与恢复，元数据外置需要事务协调，用户态 I/O 需要队列和故障管理，资源池化需要修复与租户隔离。阅读后续论文时，应同时检查快路径和恢复路径，核对收益来自什么负载、移除了哪个串行点，以及后台成本是否进入测量。
 
 ## 后续补充模板
 
@@ -1778,4 +1797,4 @@ Bf-Tree、HopsFS、PolarFS 与 Tectonic 分别研究索引、元数据、共享�
 - 可以连接到下一篇论文的问题。
 ```
 
-这篇笔记会沿着“数据结构、执行引擎、查询优化、存储系统、分布式协议、云原生架构与自治系统”逐步扩展。每增加一篇论文，都应该让已有问题得到一部分回答，或产生一个更准确的新问题。
+新增条目必须保留论文版本、基线与实验条件；缺少全文核对或复现的结论应明确标记。不同硬件、数据分布和故障假设下的性能数字不能直接横向排序。

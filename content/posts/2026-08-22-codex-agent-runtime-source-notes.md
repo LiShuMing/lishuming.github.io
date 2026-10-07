@@ -1,6 +1,7 @@
 ---
 title: "【源码】OpenAI Codex：源码理解、实验与 develop 笔记"
 date: 2026-08-22T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - AI Engineering
 tags:
@@ -23,7 +24,7 @@ math: false
 
 OpenAI 的文章 [Codex as a platform: build on the open agent harness](https://developers.openai.com/blog/codex-as-a-platform) 又让我想重新认识一下 Harness 工程的内部。文章把可复用部分称为 agent harness：它负责维护上下文、调用工具、暴露进度、处理失败、执行审批，并把工作延续到后续 turn。
 
-Codex 更接近一个运行在本机的 agent runtime：TUI、非交互 CLI 和 IDE 只是不同的交互面；App Server 提供统一控制面；`codex-core` 管理 thread、turn、模型请求、工具调用、审批和上下文；协议层把持续发生的事件送回客户端；沙箱和执行策略决定 agent 到底可以对机器做什么。
+Codex 更接近一个运行在本机的 agent runtime：TUI、非交互 CLI 和 IDE 只是不同的交互面；App Server 提供统一控制面（Control Plane）；`codex-core` 管理 thread、turn、模型请求、工具调用、审批和上下文；协议层把持续发生的事件送回客户端；沙箱和执行策略决定 agent 到底可以对机器做什么。
 
 同时要注意，我们在电脑上用到的 Codex 产品和 `openai/codex` 开源仓库不是同一个边界。官方文章确认 App、CLI 和 IDE Extension 使用同一个开源 Harness，但也明确说模型访问和托管服务是独立层。仅凭这个仓库，不能反推出桌面产品的云端同步、运行环境和企业合规实现。
 
@@ -44,17 +45,11 @@ Codex 更接近一个运行在本机的 agent runtime：TUI、非交互 CLI 和 
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-这次源码扫读，希望弄明白两件事情：
+下文沿一次用户输入追踪 App Server 与核心循环，检查上下文压缩、工具并发、subagent 和 Prefix Cache 的边界，再用协议实验确定可验证的开发入口。源码分析与实验结果分开记录，不把模块存在当成端到端验证。
 
-- Harness 工程编码的整体框架：一次 prompt 或任务，从工程层面如何被推进并最终结束；
-- Agent 工程如何支持并优化同 LLM 的交互：Context 压缩与长上下文、工具并发、subagent 管理，以及怎样尽量构造对 Prefix Cache 友好的 prompt。
+## 本机环境
 
-
-本文不是完整的模块手册，而是一次个人学习过程的整理。我更关心四个问题：一次用户输入如何穿过系统、边界为什么这样划分、安全限制在哪里生效，以及如果要开始 develop，第一刀应该切在哪里。
-
-## 1. 本机环境
-
-本次阅读发生在一台 WSL2 x86_64 机器上：
+平台差异会改变沙箱与进程执行路径，因此环境是源码结论的前提。下表保留原稿的 WSL2 实验记录，本轮文稿修订没有重跑这些构建实验：
 
 | 项目 | 本机状态 |
 | --- | --- |
@@ -93,9 +88,11 @@ codex/
 
 仓库自己的 `AGENTS.md` 甚至明确提醒贡献者“抵抗把新代码加进 `codex-core` 的诱惑”。这说明 core 膨胀已经不是理论风险，而是维护者正在主动处理的架构压力。
 
-## 2. 整体架构
+## 从客户端请求到 Agent 回合
 
-把几十个 crate 压缩成一张图，大致是下面这样：
+### 整体架构
+
+客户端、控制面和核心执行层通过协议隔离状态；同一套会话能力可以服务不同交互入口，而不必把模型调用复制到各客户端：
 
 ```text
                     用户 / IDE / 自动化
@@ -130,7 +127,7 @@ codex/
 
 第二，App Server 不是只给 VS Code 准备的附加服务。当前 TUI 和 Exec 也通过共享的 `app-server-client` 启动 in-process App Server。也就是说，同一个控制面同时服务进程内 typed channel 和进程外 JSON-RPC/WebSocket 边界。
 
-### 从 `codex` 命令开始追控制流
+#### 从 `codex` 命令开始追控制流
 
 主程序入口位于 `codex-rs/cli/src/main.rs`。`codex-cli` 实际上是一个 multitool dispatcher：
 
@@ -155,7 +152,7 @@ codex
 
 这是一种比较健康的入口设计。参数解析没有直接长成 agent runtime，CLI 只是 composition root。
 
-### TUI 和 Exec 为什么都经过 App Server
+#### TUI 和 Exec 为什么都经过 App Server
 
 继续追 `codex-exec` 会看到一条很清楚的路径：
 
@@ -176,11 +173,11 @@ TUI 的 `app_server_session.rs` 也使用相同的 `ClientRequest::ThreadStart` 
 - TUI、Exec 和 IDE 对 thread/turn 生命周期的理解一致；
 - in-process 与 remote transport 可以共享上层 session 逻辑；
 - App Server API 不再是无人使用的外围协议，而是被主产品路径持续验证；
-- 背压、初始化握手、shutdown 和 server request resolution 有统一实现。
+- 背压（Backpressure）、初始化握手、shutdown 和 server request resolution 有统一实现。
 
 这更像数据库里把 SQL frontend、RPC 和执行引擎之间的 contract 固定下来：协议边界一旦成为主路径，长期漂移会少很多。
 
-### 一次用户输入到底怎样运行
+#### 一次用户输入到底怎样运行
 
 以 `codex exec "解释这个仓库"` 为例，可以把主要控制流整理成：
 
@@ -212,11 +209,13 @@ App Server 收到 `thread/start` 后并不是简单 new 一个对象。它先从
 
 这个“response + notification”看起来有些重复，但两者语义不同：response 回答请求是否成功，notification 告诉订阅者系统状态发生了变化。多个客户端、恢复会话、远程 transport 出现后，这种区分会比函数返回值可靠。
 
-## 3. 基本概念
+### 基本概念
 
-### Agent Loop：任务如何推进，又如何结束
+Thread、Turn 与 Item 约束状态的归属和生命周期；模型、工具和客户端事件都需要沿这些标识关联，才能解释暂停、取消与恢复。
 
-我最想先弄明白的问题是：一条任务如何拆解，Agent Loop 如何调用，又在什么条件下结束？
+#### Agent Loop：任务如何推进，又如何结束
+
+Agent Loop 必须区分模型采样、工具执行与回合终止，否则一次工具返回可能被误当成整个任务完成。下面沿消息与控制流检查这些边界。
 
 先说一个容易误解的结论：Codex Harness 里没有一个把任意 prompt 硬编码成 DAG 的“任务拆解算法”。拆不拆、拆成哪些步骤、是否调用 `update_plan`、是否启动 subagent，主要由模型根据 instructions、当前上下文和可见工具决定。Harness 不替模型规划任务，它负责把模型的决定可靠地执行、记录，再把结果送回模型。
 
@@ -248,7 +247,7 @@ RegularTask::run
 
 同一轮多个工具调用则是另一种并行。Responses 请求声明 `parallel_tool_calls`，返回的 tool future 被放入 `FuturesOrdered`。`ToolCallRuntime` 用读写锁做准入：声明支持并行的 handler 取得读锁，可以彼此并行；不支持并行的 handler 取得写锁，与其他调用互斥。最后按调用顺序 drain 结果，避免“执行完成顺序”污染“模型看到的工具输出顺序”。这比简单 `join_all` 更谨慎，因为 shell、审批和有状态 MCP 并不天然可并发。
 
-### `Thread`、`Turn` 和 `Item`
+#### `Thread`、`Turn` 和 `Item`
 
 我最初把 Codex 想成一个 request/response 程序：输入 prompt，等待模型返回文本。源码实际采用的是持续事件模型：
 
@@ -268,9 +267,9 @@ RegularTask::run
 
 Agent 并不是“调用一次大模型的函数”，而是一台以事件推进的状态机。
 
-### Queue 与 Channel：解耦什么，为什么还会背压
+#### Queue 与 Channel：解耦什么，为什么还会背压
 
-这里的问题是：为什么需要 Queue 和 Channel，它们究竟在解耦什么，为什么有界队列又会产生背压？这确实涉及计算机系统设计的本质。
+Queue 与 Channel 解耦生产者和消费者的推进速度，但有限容量会把慢消费者的压力传回生产者；无界缓存只是把等待转化为内存增长。
 
 Codex 至少存在三类需要错开的节奏：用户提交 `Op` 与 core 执行的节奏、模型/工具产生事件与 TUI 渲染的节奏、App Server 请求与异步 notification 的节奏。如果都改成同步函数调用，慢消费者会占住生产者调用栈，审批这种“服务端发请求、客户端再回答”的反向调用还可能形成递归等待。Channel 在这里同时建立了：
 
@@ -279,7 +278,7 @@ Codex 至少存在三类需要错开的节奏：用户提交 `Op` 与 core 执�
 - **并发边界**：不同 Tokio task 可以独立调度、取消和 shutdown；
 - **顺序 contract**：同一 channel 内事件按约定顺序被观察。
 
-但 queue 只把速度不匹配变成了缓冲，并没有消灭它。有界队列容量为 `N`，满后 producer 必须等待，这就是背压。好处是内存有上限，坏处是如果 A 等 B、B 又因为队列满而等 A，就会死锁。
+但 queue 只把速度不匹配变成了缓冲，并没有消灭它。有界队列容量为 `N`，满后 producer 必须等待，这就是背压。好处是内存有上限，坏处是如果 A 等 B、B 又因为队列满而等 A，就会死锁（Deadlock）。
 
 最新 `app-server-client` 正好留下了一个很有价值的修正：command queue 和 embedded runtime 仍是有界的，但 facade 到 TUI/Exec 的本地 consumer event queue 改成了**无界**。原因不是开发者忘了内存风险，而是典型调用顺序可能是“先发 request 并等待 response，之后才读启动 notifications”；如果 worker 向一个已满的有界事件队列 `await send`，它就无法继续取到排在 notifications 后面的 response，于是双方循环等待。
 
@@ -294,8 +293,8 @@ caller 等 response
 
 这里让我想到数据库 change stream 或 replication log：buffer、顺序、可靠性、背压和关闭协议从来不是纯性能参数，它们共同定义业务正确性。
 
-### Context、Compaction 与 Prefix Cache
-> TODO: 更加细化地结合源码地了解。不同的harness工程这里到底有哪些不同？有无理论的优化空间。
+#### Context、Compaction 与 Prefix Cache
+上下文压缩与服务端前缀缓存（Prefix Cache）作用不同：前者改变模型看到的历史，后者尝试复用相同前缀的计算。本文只追踪 Codex 请求路径，没有完成跨 Harness 的压缩质量或缓存命中率对照。
 
 长任务并不是把所有历史无条件拼接到 prompt。每个 sampling step 会从 `ConversationHistory` 生成适合当前模型模态的输入；环境、权限、skills、插件和 world state 以结构化 contextual fragments 注入，world state 只在发生变化时记录新的 patch。上下文接近 token limit 时，`run_turn` 会在首轮采样前或中途执行 compaction，再带着压缩后的 history 继续，而不是直接结束当前任务。
 
@@ -307,7 +306,7 @@ caller 等 response
 
 这里要避免过度解读：`prompt_cache_key` 只是帮助服务端路由缓存，稳定 key 也不等于一定 cache hit。Prefix Cache 是否命中还取决于实际 token 前缀是否一致；临时改 instructions、工具列表或前部上下文，都会让缓存收益下降。源码同时记录 `cached_input_tokens` 和 `cache_write_input_tokens`，说明正确的验证方式不是凭感觉，而是观察每轮 usage 数据。
 
-### Sandbox：策略、平台实现与审批
+#### Sandbox：策略、平台实现与审批
 
 Codex 需要执行 shell、写文件、连接 MCP、运行补丁，这使安全边界无法只靠一句 prompt 保证。源码把安全拆成多层：
 
@@ -358,7 +357,7 @@ core 内部的 `SandboxPolicy` 还多一个 `external-sandbox`，表示进程已
 
 当前工作区沙箱只允许写仓库和临时目录，因此命令以 `Read-only file system` 失败。扩大权限后，同一条测试才开始下载锁定依赖并编译。这个失败不是麻烦的噪声，它恰好说明“工作区可写”不等于“整个 home 可写”，而工具链缓存也是需要显式授权的副作用。
 
-### 持久化：为什么存，具体存什么
+#### 持久化：为什么存，具体存什么
 
 需要持久化的不是“模型当前在想什么”，而是进程退出后仍需恢复、回放、查询或审计的状态。最新源码又向前抽象了一层：`codex-thread-store` 成为 thread 的 storage boundary，提供 local 与 in-memory 实现；本地实现再使用 `codex-rollout` JSONL 保存 canonical history，并在可用时用 `codex-state` SQLite 保存可查询 metadata。
 
@@ -378,11 +377,11 @@ SQLite 则保存 thread id、rollout path、创建/更新时间、source、cwd�
 
 对我来说，这是 Codex 源码里最像数据库系统的一部分：写路径保留事件事实，读路径维护索引，backfill 和 rollout migration 则负责修复历史演进后的派生状态。
 
-> TODO: Rollout只用户backup/rollup还是在每次turn的时候会用来回溯，当做记忆context使用？
+持久化记录、恢复会话与每轮模型输入不能视为同一份完整数据：恢复路径如何选择记录、输入构造如何过滤或压缩，需分别追踪。仅看到 Rollout 写入不能证明每次采样都会重读全部历史。
 
-### Skills、Plugins、Apps 和 MCP
+#### Skills、Plugins、Apps 和 MCP
 
-这些扩展机制名字很多，容易在第一次阅读时混在一起。我目前的理解是：
+扩展机制需要按输入与权限边界区分：提供指令、注册工具和连接外部服务并不是同一种操作。本文按仓库中的职责归纳如下：
 
 - Skills 主要向模型注入可发现的工作流和本地说明；
 - Plugins 把 skills、apps、MCP 等能力组织成可安装单元；
@@ -394,7 +393,9 @@ SQLite 则保存 thread id、rollout path、创建/更新时间、source、cwd�
 
 因此扩展系统并不只是“多注册几个工具”。它会穿过 config、protocol、core、App Server 和 UI 多层，这也是新功能很容易顺手被塞进 `codex-core` 的原因。
 
-## 4. 源码实验
+## 源码实验
+
+协议测试可以验证消息边界，却不能证明完整 Agent 的行为与安全性。下列实验结果沿用原稿记录，失败原因和未覆盖范围一并保留。
 
 ### 建立 crate 地图
 
@@ -443,12 +444,13 @@ test result: ok. 140 passed; 0 failed; finished in 0.06s
 
 第二，测试本身只有 0.06 秒，绝大多数时间花在第一次获取和编译依赖。大型 Rust monorepo 的日常反馈速度高度依赖缓存、crate 边界和测试选择；“只跑一个轻量 crate”在冷环境里也不一定轻。
 
+## 从实验结果选择开发入口
 
-## 5. 如果开始 develop，我会从哪里下手
+### 如果开始 develop，我会从哪里下手
 
 我不会第一步就改 agent loop 或 TUI 大文件，而会按可观察性和边界清晰度推进。
 
-### 第一步：做一个只读协议变化
+#### 第一步：做一个只读协议变化
 
 例如为 App Server v2 增加一个小型诊断字段或查询能力：
 
@@ -461,7 +463,7 @@ test result: ok. 140 passed; 0 failed; finished in 0.06s
 
 这条路径能快速熟悉协议生成、实验性 API gating 和 server dispatch，同时副作用较小。
 
-### 第二步：追踪一个完整 Turn
+#### 第二步：追踪一个完整 Turn
 
 给现有 tracing 增加或核对 thread id、turn id、tool call id 的贯通关系，然后从：
 
@@ -471,7 +473,7 @@ turn/start -> Op::UserTurn -> model stream -> tool call -> TurnCompleted
 
 验证一个 ID 是否能跨 App Server、core 和 event processor 串起来。对异步系统而言，可观察性通常比新增功能更适合作为第一次贡献。
 
-### 第三步：做一个有界的工具实验
+#### 第三步：做一个有界的工具实验
 
 增加一个无副作用或只读工具，观察它如何：
 
@@ -483,11 +485,11 @@ turn/start -> Op::UserTurn -> model stream -> tool call -> TurnCompleted
 
 这能把 tool、protocol、core 和 UI 串起来，又不必一开始处理复杂沙箱语义。
 
-### 第四步：再碰审批与沙箱
+#### 第四步：再碰审批与沙箱
 
 安全相关修改需要同时验证 policy、协议、平台实现和失败模式。这里不适合凭“看起来更方便”改默认值，也不能只测 happy path。至少要覆盖：允许、拒绝、升级、超时、客户端掉线和命令分段后的实际权限。
 
-## 6. 我建议的源码阅读路线
+### 我建议的源码阅读路线
 
 如果重新开始一次，我会按下面的顺序阅读：
 
@@ -548,15 +550,11 @@ turn/start -> Op::UserTurn -> model stream -> tool call -> TurnCompleted
 
 ## 结语
 
-读完第一轮源码后，我对 Codex 的理解从“会调用工具的 AI CLI”变成了：
-
-> Codex 是一个以 Thread/Turn/Item 为领域模型、以事件流驱动、通过 App Server 暴露统一控制面、在本机安全执行副作用并持久化会话状态的 agent runtime。
-
-它最值得学习的地方不只是怎样调用模型，而是怎样把一个不确定、流式、会产生副作用的 agent，放进相对清晰的协议、权限和生命周期边界中。
-
-这次我只完成了架构地图、关键控制流和最小协议测试。下一步真正有价值的工作，是选择一条足够小的 develop 路径，做出变更、补齐协议与测试，再从运行事件反过来验证自己对系统边界的理解。源码只有在能被实验推翻或证实时，才真正从“读过”变成“理解过”。
+原稿实验只覆盖架构梳理与最小协议测试，不构成平台安全或桌面产品实现的验证。继续开发时，先增加一个只读诊断字段，检查请求、事件、错误和断连处理；涉及审批与沙箱的改动，另行覆盖拒绝、取消及恢复路径。
 
 ## 本次阅读的本地入口
+
+补充复核固定在本地提交 [`d36a3ead3c896d0552207763ef483262bce9ac73`](https://github.com/openai/codex/tree/d36a3ead3c896d0552207763ef483262bce9ac73)：`exec/src/lib.rs` 使用 InProcessAppServerClient，`core/src/session/turn.rs` 与 `core/src/context_manager/history.rs` 分离回合推进和历史管理，`core/src/client.rs` 构造 `prompt_cache_key`。这是本轮核对的路径，不是原稿 WSL2 实验的版本证明。
 
 - `codex-rs/README.md`
 - `codex-rs/cli/src/main.rs`

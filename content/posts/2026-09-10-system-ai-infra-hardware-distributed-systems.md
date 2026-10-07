@@ -1,7 +1,7 @@
 ---
 title: "【调研】从芯片到数据中心：2026 AI Infra 与现代系统技术雷达"
 date: 2026-09-10T00:00:00+08:00
-lastmod: 2026-09-10T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 slug: "system-ai-infra-hardware-distributed-systems-2026"
 categories:
   - 系统
@@ -22,9 +22,7 @@ draft: false
 
 ## 引言：系统的边界正在移动
 
-过去很长一段时间里，系统工程师理解性能的基本单位是“单机”。我们从 CPU 微架构、NUMA、缓存和内存层次出发，向下观察 SSD 与网络协议栈，向上连接数据库执行引擎和分布式计算框架。
-
-到了 2026 年，这套视角已经不够完整。
+异构设备与分层内存使数据位置直接参与性能决策，单看芯片算力无法判断端到端收益。本文选择 2026 年会议材料和公开系统文档，讨论计算、内存、网络与状态管理之间的约束；会议原型、厂商规格和生产部署经验分别标注，不把它们视为同等证据。
 
 AI 工作负载把软件重新拉回到硬件约束最强的位置：HBM 容量决定模型并行与批处理空间，GPU 互连决定 MoE All-to-All 的上限，NIC 与交换网络决定 scale-out 的有效带宽，CXL 又在本地 DRAM 与网络远端内存之间插入一个新的时延、容量和故障域。与此同时，LLM 推理把 KV Cache、continuous batching、prefill/decode、抢占与迁移变成了新的“执行引擎问题”。
 
@@ -49,7 +47,7 @@ Application / Agent / SQL
                    Rack / Cluster
 ```
 
-真正发生的变化，是**性能优化的基本单位从单核、单卡、单机逐渐扩展到整个机架乃至数据中心；运行时则从硬件的被动使用者，变成跨计算、内存、网络和存储做资源编排的主动参与者**。
+对上述负载，跨设备搬运与状态放置进入了执行路径，评估范围因而需要超出单核或单卡。是否扩展到机架级调度，仍取决于具体瓶颈与部署规模。
 
 本文试图回答三个问题：
 
@@ -57,18 +55,13 @@ Application / Agent / SQL
 2. 这些变化如何传导到 AI Serving、数据库和分布式运行时？
 3. 如何建立一套可持续更新、又不被发布会参数淹没的技术雷达？
 
-## 核心判断
+## 性能口径：时延域与跨层成本
 
-先给出全文的核心结论。
+### 比较口径
 
-1. **FLOPS 不再是足够的性能语言。** HBM 容量与带宽、封装、互连拓扑、功耗和冷却共同决定可用算力。
-2. **服务器正在变成异构分布式系统，机架正在变成新的 scale-up 计算机。** CPU、GPU、DPU、CXL 内存和 NVMe 之间已经存在显著不同的访问语义。
-3. **CXL 增加的不是一块“便宜 DRAM”，而是一个新的内存层级。** 软件必须显式处理放置、迁移、共享、争用和故障。
-4. **AI Serving 正在收敛为一种状态密集型执行引擎。** KV Cache 类似 buffer pool，但 token 自回归依赖、GPU 批处理和 TTFT/ITL SLO 又使它不同于传统数据库。
-5. **数据搬运正在取代算术成为主要成本。** 从 HBM、NVLink、CXL、RDMA 到 NVMe，每跨越一个边界，都要重新计算收益。
-6. **下一代 optimizer 不只选择算子，也要选择设备、拓扑、内存层级和执行时机。** 传统标量 cost 需要演进为受约束的多维决策。
+本轮比较以端到端数据路径为单位：记录数据在哪里、通过什么链路移动、哪些阶段可以重叠，以及状态失效后如何恢复。CXL、集合通信（Collective Communication）和 Serving 的共同约束是容量与供给，不是每个系统都需要同一套异构架构。
 
-## 1. 用“时延域”重新认识现代系统
+### 用“时延域”重新认识现代系统
 
 现代机器并不存在一块同质的“内存”和一张透明的“网络”。更准确的理解方式，是把资源看成一组嵌套的时延域与带宽域。
 
@@ -103,7 +96,7 @@ Application / Agent / SQL
 
 这张表隐含了全文最重要的方法论：**不要问某项硬件“快不快”，而要问某个工作集放到该层级以后，端到端执行计划是否更优。**
 
-一个更接近现实的算子成本可以写成：
+为了检查遗漏项，可以用以下式子分解成本。各项必须先统一单位；这是分析账本而非可直接预测耗时的公式。计算与传输存在重叠时，端到端延迟还需按关键路径计算，不能简单相加：
 
 \[
 C_{op} = C_{compute} + C_{move} + C_{queue} + C_{sync} + C_{spill} + C_{recovery}
@@ -117,11 +110,15 @@ C_{move} = \sum_{e \in path} \left(L_e + \frac{Bytes_e}{BW_e \cdot Util_e}\right
 
 路径、利用率与并发量都会变化，这也是为什么静态峰值带宽很少能直接预测应用性能。
 
-## 2. 计算：从“更快的芯片”走向封装与系统协同
+## 硬件路径：计算、内存、网络与存储
 
-### 2.1 算力增长的约束已经转移
+### 计算：从“更快的芯片”走向封装与系统协同
 
-AI 加速器的竞争看起来仍以算力为中心，实际约束却已经扩展到：
+提高计算密度会同步增加供数、互连和散热需求，因此计算单元不能脱离封装与系统条件评价。
+
+#### 算力增长的约束已经转移
+
+芯片算力只有在内存供给、互连与功耗约束同时满足时才能兑现。评估对象因此需要包括：
 
 ```text
 Compute Die
@@ -151,7 +148,9 @@ Power Delivery / Cooling
 | 能源 | 每 token、每 query、每训练 step 的能耗是多少？ |
 | 可编程性 | compiler、kernel 和 profiler 能否释放硬件能力？ |
 
-### 2.2 Hot Chips 2026 释放的信号
+#### Hot Chips 2026 释放的信号
+
+会议议程能证明厂商正在讨论哪些架构问题，不能证明相应产品在目标工作负载中的收益。以下方向依据官方议程归纳，性能仍需独立实验。
 
 [Hot Chips 2026 官方议程](https://hc2026.hotchips.org/)把 CPU、GPU、AI 加速、网络、存储和先进封装放在同一个体系结构会议里。议程中的 NVIDIA Vera CPU、NVIDIA Rubin GPU、AMD MI400 系列、Intel Diamond Rapids、Fujitsu MONAKA、Arm chiplet server SoC，以及面向 AI/HPC 的 NIC，呈现出几个比单项参数更稳定的方向：
 
@@ -174,7 +173,9 @@ Useful Throughput
     )
 ```
 
-### 2.3 对数据库执行引擎的启示
+#### 对数据库执行引擎的启示
+
+GPU 卸载只有在计算收益超过传输、启动和格式转换成本时才改善查询，尤其需要检查相邻算子的驻留位置。
 
 传统执行引擎会关注 IPC、cache miss、branch miss 和 NUMA。异构系统还需要增加：
 
@@ -186,9 +187,11 @@ Useful Throughput
 
 换句话说，GPU offload 不是给算子贴一个 `GPU=true` 标签，而是重新划分整条 pipeline 的数据驻留边界。
 
-## 3. 内存：CXL 带来的不是容量，而是新的系统语义
+### 内存：CXL 带来的不是容量，而是新的系统语义
 
-### 3.1 CXL 应当被看成分层内存
+CXL 扩展容量同时改变访问时延与共享边界，应用不能把新增容量等同于本地 DRAM。放置与迁移策略决定哪些工作集能受益。
+
+#### CXL 应当被看成分层内存
 
 CXL 通过 `CXL.io`、`CXL.cache` 和 `CXL.mem` 把设备、主机和内存连接起来。Linux 文档已经将 CXL memory device、decoder、region、DAX 等对象暴露为可管理的系统结构；[CXL 3.0 规范](https://computeexpresslink.org/wp-content/uploads/2024/02/CXL-3.0-Specification.pdf)进一步定义了 fabric 与 memory pooling 相关能力，[Linux CXL 驱动文档](https://docs.kernel.org/driver-api/cxl/linux/cxl-driver.html)则展示了这些能力如何落到操作系统设备模型。
 
@@ -199,7 +202,7 @@ CXL 通过 `CXL.io`、`CXL.cache` 和 `CXL.mem` 把设备、主机和内存连�
 3. **共享：** 多主机或多租户如何分配、隔离并回收池化容量？
 4. **故障：** device、link、switch 或 fabric 失效时，状态如何恢复？
 
-因此，应用如果完全通过通用 `malloc` 看待 CXL 内存，就丢失了最重要的物理属性。更合理的接口应当逐步暴露：
+因此，应用如果完全通过通用 `malloc` 看待 CXL 内存，就丢失了最重要的物理属性（Physical Property）。更合理的接口应当逐步暴露：
 
 ```text
 allocate(size,
@@ -210,7 +213,9 @@ allocate(size,
          migration_policy)
 ```
 
-### 3.2 LiteSwitch：把 CXL stall 变成可调度资源
+#### LiteSwitch：把 CXL stall 变成可调度资源
+
+隐藏 CXL 访存停顿需要同时具备可运行线程和低成本切换机制，单纯增加内存容量不提供这一能力。
 
 [LiteSwitch（OSDI 2026）](https://www.usenix.org/conference/osdi26/presentation/li-nanqinqin)指出，在其研究背景与平台上，CXL memory latency 通常达到本地内存的 3 倍或以上。论文没有试图把 CXL 伪装成本地 DRAM，而是通过软硬件协同识别 CXL-induced stall，并在 20ns 以内切换到另一个 ready thread；当每核有足够可运行线程时，实验最多恢复了 80% 因 CXL 时延损失的性能。
 
@@ -229,7 +234,9 @@ LiteSwitch 增加的视角：
 
 但论文结论有明确边界：没有足够 ready work、切换破坏 cache locality、或者工作负载本身带宽饱和时，增加线程并不会自动带来同样收益。
 
-### 3.3 Octopus：拓扑本身就是内存池设计
+#### Octopus：拓扑本身就是内存池设计
+
+内存池共享程度与低延迟点对点通信存在拓扑取舍，Octopus 通过稀疏连接与 island 分组折中二者。
 
 [Octopus（NSDI 2026）](https://www.usenix.org/conference/nsdi26/presentation/zhong)挑战了“所有服务器必须通过高端交换机完整连接所有 CXL pooling device”的默认假设。它用低端口数设备构建稀疏 CXL topology，以 island 组织低时延通信，同时在 pooling efficiency 与 server overlap 之间取舍。
 
@@ -245,7 +252,9 @@ LiteSwitch 增加的视角：
 - 当前 link 的拥塞和故障状态；
 - 迁移数据与迁移计算，哪一种更便宜。
 
-### 3.4 数据库和 AI 系统如何使用 CXL
+#### 数据库和 AI 系统如何使用 CXL
+
+访问热度和复用方式决定数据是否适合远端层级；错误迁移热状态可能用容量收益换来访存延迟。下表是待负载验证的放置假设。
 
 较自然的使用方式不是把所有对象随机溢出到 CXL，而是按复用频率和访问模式分层：
 
@@ -259,9 +268,13 @@ LiteSwitch 增加的视角：
 
 最终，buffer manager、KV cache manager 和 memory tier manager 会越来越像同一个问题的不同实例：维护状态、估计未来复用、选择驻留层级、触发迁移，并在压力下做 admission 与 eviction。
 
-## 4. 网络：集合通信已经进入执行计划
+### 网络：集合通信已经进入执行计划
 
-### 4.1 从“网络足够快”到“通信需要被编译”
+通信完成时间取决于流量分布与拓扑争用，而不只是总字节数。集合通信（Collective Communication）需要与计算阶段及路由条件共同安排。
+
+#### 从“网络足够快”到“通信需要被编译”
+
+总字节数除以带宽无法表达 incast 和链路共享，因此只能作为无争用近似。传统模型常写为：
 
 传统数据系统经常把网络成本抽象为：
 
@@ -285,7 +298,9 @@ At what concurrency?
 How to react to skew and congestion?
 ```
 
-### 4.2 FAST：MoE All-to-All 的拓扑感知调度
+#### FAST：MoE All-to-All 的拓扑感知调度
+
+MoE 路由倾斜会制造不均匀收发，静态通信模板可能让少数路径限制整个阶段。FAST 对服务器内再平衡与跨服务器调度分别处理。
 
 [FAST（NSDI 2026 技术议程）](https://www.usenix.org/conference/nsdi26/technical-sessions)针对 MoE 的 All-to-All(v) 通信处理三类现实问题：token 分布倾斜、两级 fabric 以及 incast。其基本思路是先在 server 内进行 rebalancing，再把 scale-out 传输组织为更均衡的一对一调度，并在 H200 与 MI300X 集群上评估。
 
@@ -298,7 +313,7 @@ How to react to skew and congestion?
 
 数据库的 exchange、shuffle 和 distributed join 面临同样的结构。区别只是数据单元从 token 变成 partition/batch，代价依旧来自 skew、incast、拓扑和背压。因此，未来 exchange operator 很可能也会包含更强的 topology-aware routing 与在线重平衡。
 
-### 4.3 InfiniBand、RoCE 与 Ethernet：不存在脱离环境的赢家
+#### InfiniBand、RoCE 与 Ethernet：不存在脱离环境的赢家
 
 选择网络技术时，不应只比较线速。需要把以下因素放入同一个工程模型：
 
@@ -314,9 +329,11 @@ How to react to skew and congestion?
 
 “IB 还是 Ethernet”不是一个只靠协议名称能回答的问题。真正决定结果的是 workload、拓扑、交换机缓冲、拥塞控制、NIC 能力和运维成熟度的组合。
 
-## 5. 存储与内核 I/O：设备变快以后，软件开销重新显形
+### 存储与内核 I/O：设备变快以后，软件开销重新显形
 
-### 5.1 更快的 SSD 暴露了 I/O 路径成本
+设备延迟下降后，提交与完成路径的固定软件开销占比上升，优化对象需要从介质延伸到线程与队列管理。
+
+#### 更快的 SSD 暴露了 I/O 路径成本
 
 当 NVMe 设备时延持续下降，系统调用、中断、上下文切换、block layer、文件系统和 queue management 在总时延中的占比会上升。此时优化重点从“让设备更快”变成“让 CPU 以更低代价驱动设备”。
 
@@ -335,7 +352,9 @@ Hybrid:
 
 polling 降低唤醒时延，却会持续消耗 CPU；interrupt 节省 CPU，却带来调度和尾时延成本。不存在对所有负载都最优的固定模式。
 
-### 5.2 UnICom：把 I/O completion 策略变成动态决策
+#### UnICom：把 I/O completion 策略变成动态决策
+
+轮询与中断分别消耗 CPU 周期和唤醒开销，适用性随负载变化。UnICom 通过内核中的完成调度机制处理这种取舍。
 
 [UnICom（FAST 2026）](https://www.usenix.org/conference/fast26/presentation/pan)观察到，在高性能 SSD 与 CXL SSD 场景中，I/O software overhead 最多可占其测试总时延的约 50%。论文通过 TagSched、TagPoll 和 SKIP 等机制，在 polling 与 interrupt 之间动态调度 completion，并与 ext4、BypassD、io_uring 等基线比较。
 
@@ -348,7 +367,9 @@ polling 降低唤醒时延，却会持续消耗 CPU；interrupt 节省 CPU，却
 - CPU 饱和时继续 busy poll 反而损害查询吞吐；
 - io_uring、direct I/O 和 userspace storage 必须按端到端路径评估，而非单测 syscall 数量。
 
-### 5.3 NVMe-oF：存储解耦也是网络调度问题
+#### NVMe-oF：存储解耦也是网络调度问题
+
+存算解耦把存储队列与网络路径耦合起来，因此仅优化 SSD 不能消除链路干扰。该研究将路径选择、带宽分配和队列调度联合考虑。
 
 [Co-Designing Traffic Control with NVMe-oF（NSDI 2026）](https://www.usenix.org/conference/nsdi26/presentation/wang-chendong)比较了 switched 与 switchless SAN。论文把 disaggregated storage 的流控分解为 path selection、bandwidth allocation 和 queue scheduling，并结合小规模实机原型与大规模模拟评估。
 
@@ -367,9 +388,13 @@ Disaggregated Storage
 
 当 compute 与 storage 解耦，query optimizer 如果仍然只估计扫描字节数，就遗漏了路径争用、并发 I/O、缓存命中与尾时延。remote scan 的物理属性至少应包含 storage node、network locality、replica choice 和 admission state。
 
-## 6. AI Serving：一种状态密集型执行引擎
+## 运行时决策：AI Serving 与数据库
 
-### 6.1 它为什么越来越像数据库
+### AI Serving：一种状态密集型执行引擎
+
+LLM 服务需要持续保存与迁移请求状态，调度决策不能只看 GPU kernel 的瞬时利用率。KV Cache 容量和请求级延迟目标共同限制可接纳并发。
+
+#### 它为什么越来越像数据库
 
 LLM Serving 并不只是“调用一次 GPU kernel”。一次请求会经历 admission、tokenization、prefix lookup、prefill、KV allocation、decode scheduling、sampling、streaming 和回收，且每一步都受到容量与 SLO 约束。
 
@@ -390,7 +415,9 @@ LLM Serving 并不只是“调用一次 GPU kernel”。一次请求会经历 ad
 
 但二者并不等价。decode 是自回归过程，每一步依赖前面的 token；KV Cache 会随序列增长；不同请求输出长度难以预知；GPU 的高效执行依赖 batch；TTFT（首 token 时延）和 ITL（token 间时延）又约束调度器不能只最大化吞吐。
 
-### 6.2 PagedAttention：把 KV Cache 变成虚拟内存问题
+#### PagedAttention：把 KV Cache 变成虚拟内存问题
+
+按块分配 KV Cache 可以减少连续分配造成的浪费，但仍需维护逻辑块到物理块的映射与共享生命周期。
 
 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)借鉴操作系统 paging，将每个请求逻辑上连续的 KV Cache 切成固定大小 block，使物理显存可以非连续分配，并支持 block 粒度的共享与回收。
 
@@ -407,7 +434,7 @@ Physical GPU blocks
 
 需要注意，PagedAttention 解决的是 KV 内存管理的一部分，不等于完整的调度最优。block size、attention kernel、prefix 命中率、batch composition 和 offload 路径仍需联合优化。
 
-### 6.3 KV Cache 已经形成多级存储层次
+#### KV Cache 已经形成多级存储层次
 
 KV Cache 的管理正在从单 GPU 内存池扩展为层次化状态系统：
 
@@ -434,7 +461,7 @@ Remote KV store / object storage
 
 因此，简单的 LRU 往往不够。更有信息量的策略会同时考虑 prefix popularity、block size、remaining tokens、tenant priority、transfer bandwidth 和 recomputation cost。
 
-### 6.4 Prefill/Decode 解耦：分阶段执行，而非免费加速
+#### Prefill/Decode 解耦：分阶段执行，而非免费加速
 
 prefill 和 decode 的资源形态不同：prefill 通常具有更高的并行计算密度，decode 更受 KV 带宽、并发序列和逐 token 调度影响。把两者部署到独立 worker pool，可以分别扩缩容和选择并行策略。
 
@@ -451,7 +478,7 @@ Prefill Router → Prefill Worker
 Decode Router  → Decode Worker → token stream
 ```
 
-解耦的收益来自独立扩缩容、减少长 prefill 对 decode 的干扰，以及为两个阶段选择不同硬件/并行度；代价则是 KV transfer、额外路由、状态一致性和故障恢复。Dynamo 文档也明确指出：小模型、短 prompt、低并发或缺乏高速 KV transfer fabric 时，aggregated deployment 更简单且常常更快。
+解耦的收益来自独立扩缩容、减少长 prefill 对 decode 的干扰，以及为两个阶段选择不同硬件/并行度（Degree of Parallelism）；代价则是 KV transfer、额外路由、状态一致性和故障恢复。Dynamo 文档也明确指出：小模型、短 prompt、低并发或缺乏高速 KV transfer fabric 时，aggregated deployment 更简单且常常更快。
 
 所以正确问题不是“要不要 P/D 分离”，而是：
 
@@ -459,7 +486,9 @@ Decode Router  → Decode Worker → token stream
 Benefit_{separation} > Cost_{KV\ transfer} + Cost_{routing} + Cost_{imbalance}
 \]
 
-### 6.5 2026 年的三个 Serving 信号
+#### 年的三个 Serving 信号
+
+抢占、冷启动和跨模型复用针对不同成本，不能把它们的加速比分别相乘当成系统总收益。以下结果均限定于对应论文的实验。
 
 2026 年 NSDI 的几项工作分别击中了调度、冷启动和跨模型状态复用：
 
@@ -469,9 +498,11 @@ Benefit_{separation} > Cost_{KV\ transfer} + Cost_{routing} + Cost_{imbalance}
 
 三项工作共同说明：Serving 的核心状态不只包括 model weight，还包括动态 KV、队列位置、执行进度和可复用中间结果；运行时优化的关键，是让这些状态可以被识别、迁移、共享和恢复。
 
-## 7. 数据库执行引擎将如何被重写
+### 数据库执行引擎需要补充哪些资源决策
 
-### 7.1 从算子选择扩展到资源与拓扑选择
+跨设备执行会让数据驻留位置参与算法选择；若忽略传输，同一个算子的局部加速可能拖慢整条查询。
+
+#### 从算子选择扩展到资源与拓扑选择
 
 经典 optimizer 的物理决策主要是 join order、join algorithm、aggregation method、distribution 和 sort property。异构系统要求把 device、memory tier 与 topology 也纳入 physical property：
 
@@ -493,9 +524,9 @@ PhysicalProperty {
 
 本文与上一篇[《Hash、Sort，还是 Hybrid：现代执行引擎如何选择数据重组策略》]({{< relref "2026-09-10-dive-hash-sort-strategy.md" >}})的关系是：上一篇讨论算法选择，这一篇进一步说明，算法必须和实际资源层级一起选择。
 
-### 7.2 标量 cost 不足以表达现实约束
+#### 标量 cost 不足以表达现实约束
 
-传统优化器常把不同代价折成一个标量：
+线性加权能给可行计划排序，却不能自动表达容量和服务等级的硬约束；例如内存超限需要改变执行路径，而不只是增加一个固定分数。常见的成本表达是：
 
 \[
 Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
@@ -503,7 +534,7 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 
 但在现代系统中，很多约束不能被线性权重安全替代：HBM 容量超限会 spill，NIC 饱和会产生非线性排队，TTFT 超过门槛意味着请求失去 goodput，故障域集中又会改变可用性。
 
-更合理的形式是先做可行性约束，再在可行解中优化多维目标：
+一种研究表达是先约束可行性，再比较延迟、成本与能耗；下式不是现成求解器，带宽安全值与故障风险也必须有可测量定义：
 
 \[
 \begin{aligned}
@@ -517,9 +548,9 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 \end{aligned}
 \]
 
-这会把 optimizer 变成“编译器 + 资源调度器”的结合体。静态计划仍然重要，但 runtime feedback、re-optimization 和 admission control 会成为物理规划的一部分。
+这种建模增加了搜索维度，也要求更新资源状态；当负载稳定、设备单一时，其维护成本可能超过收益。本文将它视为待验证的设计方向，不宣称已有优化器都采用这一形式。
 
-### 7.3 Buffer Pool、KV Cache 与状态管理正在汇合
+#### Buffer Pool、KV Cache 与状态管理正在汇合
 
 数据库 buffer pool 与 KV Cache 的对象语义不同，但管理问题高度相似：
 
@@ -531,9 +562,11 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 
 数据库领域长期积累的 admission control、cost model、cache replacement、spill 与 checkpoint 思想，可以迁移到 AI runtime；反过来，AI Serving 对 GPU block 管理、连续组批和跨层 KV transfer 的实践，也会推动传统执行引擎重新审视显存与异构内存管理。
 
-### 7.4 VLDB 2026 展示的交叉方向
+#### VLDB 2026 展示的交叉方向
 
-[VLDB 2026 Conference Awards](https://vldb.org/2026/conference-awards.html)中，最佳工业论文 OmniTable 面向 PB 级 LLM 数据整理与探索；最佳论文提名中包括分析数据库标量函数的 GPU 加速，以及“How to Write to SSDs”；FastCompose 则关注 query execution 的 compilation cold start。
+会议论文能提供具体问题和实验案例，但奖项本身不能证明方案适合某个生产系统。以下仅据官方奖项页面说明研究主题。
+
+[VLDB 2026 Conference Awards](https://vldb.org/2026/conference-awards.html)中，最佳工业论文 OmniTable 面向 PB 级 LLM 数据整理与探索；最佳研究论文荣誉提名（Best Research Paper Honorable Mention）包括分析数据库标量函数的 GPU 加速，以及“How to Write to SSDs”；FastCompose 则关注 query execution 的 compilation cold start。
 
 这些论文不能单独证明整个数据库领域已经转向 AI Infra，但它们提供了清晰的交叉信号：
 
@@ -542,11 +575,13 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 - 存储介质行为依然会反向塑造数据结构和写入协议；
 - 系统设计越来越难按“数据库、AI、操作系统、网络”分别优化。
 
-## 8. Linux 与系统软件：硬件能力最终要通过内核落地
+## Linux 与系统软件：硬件能力最终要通过内核落地
 
 发布会宣布的硬件能力，只有进入内核、驱动、runtime 和可观测工具以后，才真正成为可编程系统能力。2026 年值得持续追踪的 Linux 主题包括：
 
-### 8.1 异构内存管理
+### 异构内存管理
+
+放置策略依赖内核暴露的拓扑和迁移接口，runtime 无法仅凭容量统计判断访问成本。
 
 - CXL device、decoder、region 与 DAX 的管理接口；
 - NUMA balancing、page migration 与 tiering；
@@ -556,14 +591,18 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 
 阅读入口可从 [Linux CXL documentation](https://docs.kernel.org/driver-api/cxl/)和 [DAMON documentation](https://docs.kernel.org/mm/damon/)开始。关键不是记住 sysfs 名称，而是理解：内核知道哪些 locality，runtime 又能获取和控制到什么程度。
 
-### 8.2 调度与隔离
+### 调度与隔离
+
+共享硬件上的局部性能提升可能损害其他租户，因此应同时检查调度、配额和压力信号。
 
 - CPU scheduler 如何处理异构 core、短任务和 latency-sensitive workload；
 - cgroup v2 的 CPU、memory、I/O 与 device isolation；
 - PSI 等 pressure signal 是否能进入 runtime admission；
 - GPU、NIC 和 accelerator 是否拥有与 CPU 对等的资源治理能力。
 
-### 8.3 I/O 与数据路径
+### I/O 与数据路径
+
+绕过部分内核路径不会自动消除系统管理成本，内存注册、权限和回收仍需由具体组件负责。
 
 - io_uring 与传统 AIO 的适用边界；
 - XDP/eBPF、DPDK 与 kernel networking 的取舍；
@@ -572,14 +611,16 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 
 判断一项“kernel bypass”技术时，应检查完整生命周期：注册内存、建立连接、异常回退、资源回收、容器隔离和故障恢复。fast path 很短，不代表系统总成本很低。
 
-## 9. 2026—2028 技术雷达
+## 评估方法：证据、优先级与部署边界
 
-与给每项技术打星相比，更实用的做法是按照 `Adopt / Trial / Assess / Watch` 分层，并给出进入下一阶段所需的证据。
+### 技术评估优先级与证据门槛
+
+采用优先级应取决于目标负载和已有基础设施，不是对行业成熟度的统一排名。以下 `Adopt / Trial / Assess / Watch` 是本文的条件化建议：即使标为 Adopt，也需满足表中的适用前提。
 
 | 层级 | 技术方向 | 当前判断 | 应验证的关键问题 |
 | --- | --- | --- | --- |
 | Adopt | HBM-aware batching 与容量规划 | 已是 AI runtime 基础能力 | OOM、碎片与 SLO 是否纳入统一监控？ |
-| Adopt | Topology-aware collective | 多 GPU/多机训练推理必需 | 实际流量是否匹配 rail/NIC 布局？ |
+| Adopt | Topology-aware collective | 通信占比较高且拓扑不均匀时优先验证 | 实际流量是否匹配 rail/NIC 布局？ |
 | Adopt | NVMe async I/O 与分层缓存 | 数据系统成熟方向 | tail latency 和 CPU overhead 是否同时改善？ |
 | Trial | Prefill/Decode disaggregation | 长 prompt、高并发场景有潜力 | KV transfer 是否抵消阶段解耦收益？ |
 | Trial | KV-aware routing / prefix cache | agent/RAG 工作负载价值较高 | 命中率、租户隔离与一致性如何？ |
@@ -593,11 +634,13 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 
 技术雷达不是采购清单。`Trial` 表示值得用真实 workload 做小规模实验，`Assess` 表示需要持续验证系统边界，`Watch` 则表示方向重要但尚不足以进入当前关键路径。
 
-## 10. 如何建立不被信息流淹没的阅读体系
+### 如何组织资料与验证证据
 
-### 10.1 先区分证据层级
+调研应保存问题、条件和验证记录，而不只保存链接；否则后续无法判断结论变化来自版本、硬件还是负载。
 
-信息源应当按用途分层，而不是混在一张书签列表里。
+#### 先区分证据层级
+
+规格上限、论文原型和实际部署回答不同问题，不能相互替代。资料应按可支持的结论分层：
 
 | 层级 | 典型来源 | 适合回答什么 | 主要风险 |
 | --- | --- | --- | --- |
@@ -621,9 +664,9 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 - [PVLDB](https://www.vldb.org/pvldb/)和 [SIGMOD](https://sigmod.org/)：跟踪数据库执行、优化、存储与 AI for data；
 - [arXiv](https://arxiv.org/)：按问题订阅，而不是泛读全部更新。
 
-### 10.2 按问题阅读，不按产品阅读
+#### 按问题阅读，不按产品阅读
 
-阅读 CPU/GPU 或服务器分析时，不要把目标设为记忆型号。用工程问题驱动更有效：
+围绕目标负载组织资料，才能比较不同产品对同一瓶颈的影响。可从以下可测量问题开始：
 
 - 为什么同一个 hash table 在两代 CPU 上差异巨大？
 - 为什么 SIMD filter 没有获得线性加速？
@@ -634,7 +677,9 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 
 这些问题会把阅读自然连接到 cache topology、memory-level parallelism、TLB、queueing、data movement 和 scheduler，而不是停留在产品参数。
 
-### 10.3 建立固定节奏
+#### 建立固定节奏
+
+阅读计划需要留下复现和归档时间，否则只能积累结论而不能核对适用条件。以下时长是个人安排示例，不是效率测量结果。
 
 **每日 10—20 分钟：** 浏览论文 feed、Linux/项目更新和少量工程新闻，只做筛选，不追求读完。
 
@@ -658,9 +703,9 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 更新 cost model / design / radar
 ```
 
-## 11. 做系统设计时应反复追问的十二个问题
+### 做系统设计时应反复追问的十二个问题
 
-面对任何一项 AI Infra 或现代硬件方案，可以用下面的问题过滤营销语言：
+方案只有在目标数据路径上改善瓶颈且满足故障与隔离要求，才具备采用依据。评审可以按以下问题收集证据：
 
 1. 工作集真正受 compute、capacity、bandwidth 还是 latency 限制？
 2. 数据当前在哪里，执行后又要去哪里？
@@ -677,23 +722,11 @@ Cost = w_c C_{cpu} + w_i C_{io} + w_n C_{network}
 
 这些问题适用于 CXL、GPU offload、DPU、disaggregated serving，也适用于数据库的 hash/sort/join、shuffle 和 remote scan。
 
-## 结语：运行时正在成为新的系统架构
+### 结语：先测跨层成本，再扩大设计范围
 
-从芯片到数据中心，2026 年最值得关注的并不是某一个处理器、某一种互连或某一个 Serving 框架，而是系统边界的连续移动：
+异构与解耦方案只有在目标负载上证明净收益，才值得进入关键路径。评估应先记录数据驻留、跨层字节数、等待时间和状态恢复成本，再决定采用 GPU 卸载、CXL 分层或 Prefill/Decode 解耦。
 
-```text
-芯片内部：core → chiplet → package
-机器内部：CPU → GPU → DPU → CXL/NVMe
-机架内部：node → fabric → pooled resource
-数据中心：cluster → disaggregated infrastructure
-软件内部：operator → runtime → topology-aware optimizer
-```
-
-当数据跨越越来越多的时延域，运行时就不能继续假设硬件是同质而透明的。它必须知道状态在哪里、路径是否拥塞、哪个阶段受限、何时应该迁移、何时应该重算，以及一次局部加速是否真的改善了端到端 SLO。
-
-对数据库和 AI Infra 工程师而言，未来最重要的能力也许不是熟悉更多产品名称，而是建立一种稳定的跨层推理方式：从 workload 出发，沿着计算、内存、网络与存储的数据路径寻找真实瓶颈，再把硬件事实反馈给编译器、optimizer 和 scheduler。
-
-**现代系统优化的本质，正在从“让某个组件更快”，转向“让数据在正确的时间出现在正确的位置，并由正确的计算资源处理”。**
+本文的技术优先级不是采购建议，论文中的最高加速比也不是容量规划参数。短请求、低并发、低复用或故障隔离要求较高的系统，可能更适合较少层级、较少迁移的架构。上线前至少保留同硬件基线、尾延迟（Tail Latency）与资源成本对照，以及可观测的回退路径。
 
 ## 参考资料
 

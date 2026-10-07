@@ -1,6 +1,7 @@
 ---
 title: "【翻译】面向未来数据库的现代硬件：2026 回看"
 date: 2026-08-09T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - 数据库
 tags:
@@ -23,18 +24,20 @@ draft: false
 
 我们正处在数据库硬件快速演进的时期：网络、存储和计算都在变化，其中任何一项都可能改写数据库的最优架构。把这些变化放在一起看，未来十年很可能出现真正有意义的架构迁移；但这些硬件能否被大多数数据库开发者获得，仍然是一个疑问。
 
-> **2026 回看：** LLM 并不是硬件趋势之外的另一个答案。更准确地说，生成式 AI 成了硬件演进的强力需求方：它推动 GPU/TPU、HBM、高速互联和存储带宽扩张，又通过 RAG、向量检索和智能体记忆把这些能力传导到数据库。原文的核心问题——“硬件能力能否成为普通数据库开发者可依赖的公共基础设施”——因此比 2024 年更加重要。
+> **译文与评述的边界：** 英文引文及对应译文保留原作者 2024 年的观点；“2026 回看”是结合所列公开资料的补充分析，不表示所有产品能力已在本文环境验证。硬件支持、云实例开放和数据库实际采用是三个不同阶段，不能由其中一个推断另两个。
 
 ---
 
 ## 网络（NETWORKING）
 
+数据库网络优化必须区分协议处理开销与链路传输时间：前者可能通过卸载减少，后者仍受拓扑和带宽限制。以下为原作者基于 VoltDB 等案例的分析，不应将其中的 CPU 占比外推到所有数据库。
+
 > From a recent [talk by Stonebraker in HPTS 2024](https://muratbuffalo.blogspot.com/2024/09/hpts24-day-1-part-1.html), some benchmarking with VoltDB saw that ~60% of their server-side cycles went to the TCP/IP stack. VoltDB is already a database architecture whose goal was to remove as much not-query-processing work from serving requests as possible, so this is the extreme case. However, it still makes a valid point that the computational overhead of TCP is not small, and will become ever more noticeable as network bandwidth increases. This isn’t a new observation though, and there’s an escalating series of proposed solutions.
 {.quote-en lang="en"}
 
-根据 Stonebraker 在 [HPTS 2024 的演讲](https://muratbuffalo.blogspot.com/2024/09/hpts24-day-1-part-1.html)，VoltDB 的一项基准测试显示，服务端约 60% 的 CPU 周期消耗在 TCP/IP 协议栈上。VoltDB 本就以尽量消除请求路径中与查询无关的工作为目标，因此这是一个极端案例；但它仍说明 TCP 的计算开销并不小，而且随着网络带宽增长会越来越显眼。对此，业界已经提出了一系列逐步激进的方案。
+根据 Stonebraker 在 [HPTS 2024 的演讲](https://muratbuffalo.blogspot.com/2024/09/hpts24-day-1-part-1.html)，VoltDB 的一项基准测试（Benchmark）显示，服务端约 60% 的 CPU 周期消耗在 TCP/IP 协议栈上。VoltDB 本就以尽量消除请求路径中与查询无关的工作为目标，因此这是一个极端案例；但它仍说明 TCP 的计算开销并不小，而且随着网络带宽增长会越来越显眼。对此，业界已经提出了一系列逐步激进的方案。
 
-对于存算分离系统，是否由网络主导开销要看负载：大范围扫描往往受网络带宽约束，小查询则更在意往返延迟、排队和协议栈的 CPU 成本。不能笼统地把所有 Scan I/O 都归结为网络，但数据搬运确实常是存算分离的关键成本。
+对于存算分离（Storage–Compute Disaggregation）系统，是否由网络主导开销要看负载：大范围扫描往往受网络带宽约束，小查询则更在意往返延迟、排队和协议栈的 CPU 成本。不能笼统地把所有 Scan I/O 都归结为网络，但数据搬运确实常是存算分离的关键成本。
 
 > One proposed solution is to replace TCP with another protocol that runs over UDP instead. QUIC is the frequently chosen example. However, this is misled.[1] [“It is a grossly inaccurate simplification, but at its simplest level, QUIC is simply TCP encapsulated and encrypted in a User Datagram Protocol (UDP) payload.”](https://blog.apnic.net/2022/11/03/comparing-tcp-and-quic/) The CPU overhead of [TCP and QUIC is also remarkably similar](https://www.fastly.com/blog/measuring-quic-vs-tcp-computational-efficiency). Diverging further from TCP and specializing in specific environments would be needed to materialize notable improvements, and there are papers like [Homa](https://networking.harshkapadia.me/files/homa/research-papers/its-time-to-replace-tcp-in-the-datacenter-v2.pdf) showing some improvements in datacenter environments. But even with a better protocol, the better optimization potential lies in reducing the overhead of the kernel networking stack.
 {.quote-en lang="en"}
@@ -51,7 +54,7 @@ draft: false
 > Thus another solution is to remove the kernel as the middleman between the NIC and the application. Frameworks such as [Data Plane Development Kit (DPDK)](https://www.dpdk.org/) permit userspace to poll the network card for packets, removing the overhead of interrupts, and keeping all the processing in userspace means no transitions into and out of the kernel. DPDK has also seen struggles in adoption, as it requires exclusive control of a NIC. One thus needs to have two NICs per host, one for DPDK and one for the OS and every other process. Marc Richards put together a nice [Linux Kernel vs DPDK benchmark](https://talawah.io/blog/linux-kernel-vs-dpdk-http-performance-showdown/), that ends with DPDK offering a 50% increase in throughput, followed by an enumeration of the slew of drawbacks one accepts to gain that 50%. It seems to be a tradeoff most databases aren’t interested in, and even ScyllaDB has mostly dropped its investment into it.
 {.quote-en lang="en"}
 
-另一条路是让内核退出网卡与应用之间的数据路径。[DPDK](https://www.dpdk.org/) 允许用户态轮询网卡，减少中断和用户态/内核态切换。不过，DPDK 通常要独占网卡，主机往往还要为操作系统和其他进程准备另一块网卡。Marc Richards 的 [Linux 内核与 DPDK 基准测试](https://talawah.io/blog/linux-kernel-vs-dpdk-http-performance-showdown/)测得约 50% 的吞吐提升，同时也列出了获得这部分性能所付出的复杂性。多数数据库并不愿接受这种权衡，ScyllaDB 后来也基本停止了在这一方向上的投入。
+另一条路是让内核退出网卡与应用之间的数据路径。[DPDK](https://www.dpdk.org/) 允许用户态（User Space）轮询网卡，减少中断和用户态/内核态（Kernel Space）切换。不过，DPDK 通常要独占网卡，主机往往还要为操作系统和其他进程准备另一块网卡。Marc Richards 的 [Linux 内核与 DPDK 基准测试](https://talawah.io/blog/linux-kernel-vs-dpdk-http-performance-showdown/)测得约 50% 的吞吐提升，同时也列出了获得这部分性能所付出的复杂性。多数数据库并不愿接受这种权衡，ScyllaDB 后来也基本停止了在这一方向上的投入。
 
 > Newer hardware presents an interesting new option: removing the CPU from the networking path. [RDMA (Remote Direct Memory Access)](https://www.naddod.com/blog/easily-understand-rdma-technology) offers verbs, a limited set of operations (essentially read, write, and 8-byte CAS) that can be performed entirely from within the NIC, with no CPU interaction. Cutting out the CPU means close to 1us of latency for a remote read, versus the >100us latency of TCP.
 >
@@ -82,14 +85,16 @@ RDMA 这种低延迟、高吞吐的网络原语会改变数据库的设计边界
 
 ### 2026 回看：网络
 
+基础设施卸载与应用可编程性是两种能力。下面的云产品案例能说明前者的部署，却不能直接证明租户获得了任意 RDMA 或 DPU 编程接口。
+
 - **已经兑现：基础设施卸载成为云厂商默认能力。** [Azure Boost](https://learn.microsoft.com/en-us/azure/azure-boost/overview) 和 [Google Titanium](https://cloud.google.com/titanium) 都把虚拟化、网络或存储处理移到专用硬件。这支持了原文关于 DPU/SmartNIC 价值的判断，但这些卡大多由云平台控制，并不是租户可以随意编程的数据库协处理器。
 - **部分兑现：AI 集群扩大了低延迟网络的供给。** AWS EFA 仍以带 OS-bypass 的 [SRD](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/efa.html) 为核心；Google 的 A3 Ultra 等 AI 实例已经公开提供 [RoCE 网络](https://cloud.google.com/compute/docs/accelerator-optimized-machines)。也就是说，高速互联比 2024 年更容易租到，但通常与 GPU/HPC 实例、特定拓扑和调度系统绑定，并没有普遍下沉到普通数据库实例。
 - **LLM 带来的修正：网络首先服务于加速器集群。** 训练与分布式推理让 RDMA/RoCE、集体通信和 GPUDirect 获得强商业驱动力；数据库能间接受益，但“任意 OLTP 服务可依赖单边 RDMA verbs”依然不是主流云的通用抽象。
-- **仍然成立：数据搬运比协议名字更重要。** QUIC 没有消除 CPU 与内存拷贝成本。数据库优化的重点继续向批量化、零拷贝、异步 I/O、压缩，以及把计算放到数据所在位置迁移。
-
----
+- **仍然成立：数据搬运比协议名字更重要。** QUIC 没有消除 CPU 与内存拷贝成本。数据库优化的重点继续向批量化、零拷贝（Zero-Copy）、异步 I/O、压缩，以及把计算放到数据所在位置迁移。
 
 ## 存储（STORAGE）
+
+设备容量收益往往以写入约束或主机管理成本为代价；顺序写、数据寿命分组和垃圾回收策略决定新设备能否降低总成本。以下保留原文对不同介质与接口的比较。
 
 > There are advances in storage devices that aim to improve the total cost of ownership for storage devices in specialized use cases. Manufacturers cleverly noted that one can read narrower stripes of magnetized HDD platters than the minimum stripe width than an HDD can write, and so one can overlap tracks to leave the minimal readable width.
 >
@@ -132,14 +137,16 @@ SmartSSD 进一步允许在 SSD 内执行任意计算。[《Query Processing on 
 
 ### 2026 回看：存储
 
+标准纳入某项能力只是采用链路的起点；设备实现、驱动暴露与数据库数据布局仍需匹配。以下按这三个层次区分进展。
+
 - **已经兑现：FDP 从提案走向标准。** [NVMe 2.1 的修订说明](https://nvmexpress.org/wp-content/uploads/NVM-Express-Revision-Changes-2025.03.31.pdf)已把 FDP 列为可选能力；[NVM Express 的说明](https://nvmexpress.org/nvmeflexible-data-placement-fdp-blog/)明确把目标定为接近 1.0 的写放大系数。相比要求应用彻底改写 I/O 模型的 ZNS，FDP 的兼容性路径更有现实吸引力。但“进入标准”不等于“普通云盘已经透传”，原文关于可获得性的担忧依旧成立。
 - **需要补入的新主线：CXL 与内存中心架构。** Optane 消失后，“持久内存”没有按原路径复活，但 CXL 把问题改写为内存扩展、分层和池化。[CXL 规范](https://computeexpresslink.org/cxl-specification/)已覆盖内存池与设备共享；2025 年的论文 [Databases in the Era of Memory-Centric Computing](https://research.google/pubs/databases-in-the-era-of-memory-centric-computing/)也直接讨论了数据库如何使用解耦内存。它更可能先扩展冷数据、buffer pool 和大索引容量，而不是无代价替代本地 DRAM。
-- **LLM 强化了“容量与带宽同等重要”。** embedding、向量索引、文档语料和模型检查点都扩大了存储量；而 RAG 的线上路径要求把相关数据快速送到 CPU/GPU。压缩、量化、冷热分层、对象存储与本地 NVMe 缓存因此比“单块盘的峰值 IOPS”更重要。
+- **LLM 强化了“容量与带宽同等重要”。** embedding、向量索引、文档语料和模型检查点都扩大了存储量；而 RAG 的线上路径要求把相关数据快速送到 CPU/GPU。压缩、量化、冷热分层、对象存储（Object Storage）与本地 NVMe 缓存因此比“单块盘的峰值 IOPS”更重要。
 - **尚未兑现：SmartSSD 没有成为通用数据库平台。** 计算存储仍受编程模型、可观测性、升级、安全隔离和云端透传限制。更常见的落地方式仍是由云厂商在服务内部完成过滤、压缩或索引构建下推，而不是把可编程 SSD 直接交给租户。
 
----
-
 ## 计算（COMPUTE）
+
+事务处理与分析处理需要不同的加速路径：短事务重视控制流、同步与访问延迟，批量分析更容易利用数据并行。原文据此分别讨论两类负载。
 
 > OLTP and OLAP spend their compute time on significantly different types of work, so we’ll address the potential advances for each separately.
 {.quote-en lang="en"}
@@ -187,9 +194,9 @@ Spanner 引入 [TrueTime](https://sookocheff.com/post/time/truetime/)后，时�
 #### 2026 回看：事务处理
 
 - **Unikernel 的论点成立，产品形态却未成为主流。** 数据库确实需要更强的 I/O、内存和调度控制，但云上更常见的落地是轻量虚拟机、容器、用户态存储栈与云厂商 DPU，而不是让每个数据库团队维护一套专用 Unikernel。
-- **机密计算的重要性上升。** LLM/RAG 把企业私有文档、提示词和检索结果送入推理链路，保护“使用中的数据”比 2024 年更迫切。不过飞地的内存限制、系统调用边界、证明链和调试成本仍会影响数据库设计。
+- **机密计算的重要性上升。** LLM/RAG 把企业私有文档、提示词和检索结果送入推理链路，保护“使用中的数据”比 2024 年更迫切。不过飞地的内存限制、系统调用（System Call）边界、证明链和调试成本仍会影响数据库设计。
 - **精确时钟仍是小众但真实的竞争力。** 它对地理分布式事务有直接价值，却与 LLM 没有强因果关系；不应把所有硬件演进都解释为 AI 驱动。
-- **HTM 仍未复兴。** 到目前为止，更值得数据库工程投入的是无锁算法、乐观并发控制、分区和批处理，而不是押注新的通用 HTM。
+- **HTM 仍未复兴。** 到目前为止，更值得数据库工程投入的是无锁（Lock-Free）算法、乐观并发控制（Optimistic Concurrency Control）、分区和批处理，而不是押注新的通用 HTM。
 
 ### 分析处理（ANALYTICAL PROCESSING）
 
@@ -217,11 +224,11 @@ Spanner 引入 [TrueTime](https://sookocheff.com/post/time/truetime/)后，时�
 - **向量检索成为数据库的标准工作负载之一。** [pgvector](https://github.com/pgvector/pgvector) 已支持 HNSW、IVFFlat、半精度向量、稀疏向量和量化等能力；这说明 LLM 带来的变化不只是“出现一种新数据库”，而是向量类型、ANN 索引和混合过滤进入现有数据库与搜索系统。
 - **CPU/GPU 混合比 GPU 全托管更现实。** [NVIDIA cuVS](https://docs.nvidia.com/cuvs/home/) 的实践包括在 GPU 上构建索引、转换后在 CPU 上查询；[Amazon OpenSearch Service](https://docs.aws.amazon.com/opensearch-service/latest/developerguide/gpu-acceleration-vector-index.html)也采用按需把向量索引构建卸载到 GPU 的方式。这恰好印证了原文的限制：加速器本地内存昂贵且有限，数据搬运和利用率决定经济性。
 - **原文对“内存带宽最终成为瓶颈”的判断更强了。** LLM 时代真正稀缺的不只是 FLOPS，还有 HBM 容量/带宽、互联带宽和能耗。对数据库而言，列式布局、压缩、低精度表示、批处理与算子融合的重要性继续上升。
-- **需要修正的观点：集成 GPU 的关键不只是 OpenCL。** 实际生态更可能围绕 CUDA、ROCm、SYCL、Vulkan/计算着色器以及数据库自身的可移植执行层演进。硬件存在只是第一步，编译器、算子库、数据格式和查询优化器才决定数据库能否稳定使用它。
-
----
+- **需要修正的观点：集成 GPU 的关键不只是 OpenCL。** 实际生态更可能围绕 CUDA、ROCm、SYCL、Vulkan/计算着色器以及数据库自身的可移植执行层演进。硬件存在只是第一步，编译器、算子库、数据格式和查询优化器（Query Optimizer）才决定数据库能否稳定使用它。
 
 ## 云端可用性（CLOUD AVAILABILITY）
+
+硬件存在不等于租户可依赖它；实例接口、驱动权限和服务定价会决定数据库能否使用相关能力。以下关于厂商开放程度的叙述属于原文发表时的观察。
 
 > To finally address the depressing elephant in the room, none of these hardware advancements matter if they’re not accessible. For today’s systems, that means in the cloud, and the cloud doesn’t offer the forefront of hardware advancements to its customers.
 {.quote-en lang="en"}
@@ -278,9 +285,8 @@ AI 的爆发为高效计算带来了充足预算，GPU 已经遍布公有云，�
 
 ### 2026 回看：云端可用性与总判断
 
-- **原文最重要的判断已经部分兑现：云厂商采用了新硬件，但优先把它封装成平台能力。** Azure Boost、Google Titanium、AWS Nitro/EFA，以及按需 GPU 向量索引构建，都说明专用硬件正在进入云；然而用户得到的通常是更快、更稳定的 VM 或托管服务，而不是可编程 DPU、完整 NVMe 指令集或任意 RDMA 原语。
-- **LLM 打破了一部分“没有应用就不部署”的循环。** AI 训练和推理提供了足够大的确定性需求，推动高速网络、GPU、HBM 和高性能存储先行部署。数据库可搭便车，但这些资源经常以昂贵的 AI/HPC SKU 出现，未必改善普通 OLTP 的成本结构。
-- **软件可移植性比裸硬件暴露更关键。** 真正扩散最快的不是某一块 SmartSSD 或 FPGA，而是能把异构硬件隐藏在 SQL、向量索引、对象存储 API、托管服务和通用库之后的软件层。数据库不应把正确性绑定到单一云厂商的私有硬件，适合把硬件加速做成可探测、可回退的执行路径。
-- **截至 2026 年的结论：原文方向基本正确，但节奏不均匀。** DPU/SmartNIC、RDMA/RoCE、GPU 向量处理和 FDP 在前进；通用 SmartSSD、HTM、面向普通实例的完整 RDMA 与高级 NVMe 原语仍未普及。新增的关键变量是 CXL/内存池化，以及 LLM 把“数据库 + 检索 + 推理”变成一条端到端数据路径。
+云平台将新硬件包装成服务，降低了设备管理成本，也限制了租户的底层控制。Azure Boost、Google Titanium、AWS Nitro/EFA，以及按需 GPU 向量索引构建，说明硬件能力已经进入部分云产品；用户获得的往往是 VM 或托管接口，而不是可编程 DPU、完整 NVMe 指令集或任意 RDMA 原语。这些案例不能代替对各云实例规格的逐项调查。
 
-如果把 2024 年的文章压缩为一句今天仍适用的话：**数据库架构会随延迟、带宽、容量和每字节搬运成本的变化而重写；LLM 改变了这些硬件的投资优先级，却没有消除数据系统必须面对的物理约束。**
+LLM 训练和推理为高速网络、GPU、HBM 与高性能存储提供了需求，但资源常以 AI/HPC SKU 出售，未必降低普通 OLTP 的成本。本文所列资料显示，DPU/SmartNIC、RDMA/RoCE、GPU 向量处理和 FDP 的采用在推进；通用 SmartSSD、HTM、普通实例上的完整 RDMA 与高级 NVMe 原语仍受可用性限制。CXL/内存池化，以及检索与推理组成的端到端路径，又增加了软件需要处理的边界。
+
+选型时应先测量目标负载的 CPU、I/O 与通信占比，再确认实例开放的原语和软件回退路径。SQL、索引、对象存储 API 与通用库可以隔离部分硬件差异，但不能消除跨设备成本。高利用率的专用集群可能摊薄移植投入；无法控制设备、驱动和网络的普通租户，不宜把正确性或可用性绑定到这些能力。

@@ -2,7 +2,7 @@
 title: "【源码】异步化框架：从 Seastar、stdexec 与 brpc 源码理解调度"
 slug: "seastar-stdexec-brpc-async-execution"
 date: 2026-08-16T10:00:00+08:00
-lastmod: 2026-08-23T12:40:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 draft: false
 categories:
   - C++
@@ -25,7 +25,7 @@ toc: true
 
 这段经历留下了一个一直没有完全回答的问题：Seastar 的性能究竟来自 Future、Reactor，还是 thread-per-core？如果 C++26 已经引入 `std::execution`，为什么还需要 Seastar？Rust 有 Tokio，brpc 又能让同步 RPC 写法获得很高并发，这些方案到底在解决同一个问题，还是只是看起来相似？
 
-为此，我重新阅读了本地三份源码：
+原稿阅读采用以下三份源码快照；结论以这些版本为边界。文中 `main`/`master` 链接是文件导航入口，核对具体行为时需切回表中提交；本轮未将旧快照结论自动扩展到当前分支：
 
 | 项目 | 本文源码快照 | 核心定位 |
 | --- | --- | --- |
@@ -33,13 +33,11 @@ toc: true
 | [NVIDIA stdexec](https://github.com/NVIDIA/stdexec) | `nvhpc-26.05-244-ge92245d5` | C++26 `std::execution` 的实验性参考实现与扩展 |
 | [Apache brpc](https://github.com/apache/brpc) | `1.16.0-47-g771de31e` | RPC 框架，以及支撑同步编程的 M:N bthread runtime |
 
-读完后的结论可以先放在这里：
+比较从四个问题展开：状态由谁拥有，任务能否迁移，阻塞影响多大范围，过载和取消怎样收敛。先对齐责任层次，再讨论接口和吞吐，才能避免把协议、应用架构和 RPC runtime 当成同类产品。
 
-> Seastar、stdexec 与 brpc 不在同一个抽象层竞争。stdexec 定义异步工作的协议和组合方式；Seastar 通过数据分片、核绑定和 Reactor 规定整个应用如何运行；brpc 则用可迁移的栈式 bthread，把等待隐藏在同步接口背后。
+## 先区分协议、调度与应用架构
 
-真正的区别不是 `then`、`co_await` 还是 `join` 哪个写起来更漂亮，而是谁拥有数据、任务能否迁移、阻塞会伤害多大范围，以及系统如何在过载时继续保持边界。
-
-## 异步化：它不等于“用户态调度”
+### 异步化：它不等于“用户态调度”
 
 异步最小的语义只有一件事：**发起操作与观察完成相互解耦**。
 
@@ -54,13 +52,13 @@ readiness / completion event
 resume continuation / coroutine / fiber / receiver
 ```
 
-这里可能有用户态 scheduler，也可能根本没有。Linux AIO、`io_uring`、DMA 或 GPU stream 都可以让操作异步完成；一个最普通的线程池同样可以把阻塞调用包装成异步任务。反过来，存在用户态调度也不代表底层 I/O 是异步的：fiber 内调用阻塞 syscall，仍然会阻塞承载它的内核线程。
+这里可能有用户态（User Space） scheduler，也可能根本没有。Linux AIO、`io_uring`、DMA 或 GPU stream 都可以让操作异步完成；一个最普通的线程池同样可以把阻塞调用包装成异步任务。反过来，存在用户态调度也不代表底层 I/O 是异步的：fiber 内调用阻塞 syscall，仍然会阻塞承载它的内核线程。
 
 异步化可以归结为三个动作：
 
 - **时间解耦**：发起操作不等于操作已经完成，发起者通过 Future、callback、Receiver 或唤醒事件观察结果。
 - **延迟隐藏**：等待 I/O、网络或设备期间，有限的 CPU 执行单元可以推进其他 ready work。它没有消灭延迟，而是减少资源因等待而空闲的时间。
-- **速率匹配**：通过有界队列、批处理、并发限制与背压连接速度不同的组件。“让快的不等慢的”只能维持短期；长期输入速率高于处理速率时，系统最终仍要排队、拒绝或降级。
+- **速率匹配**：通过有界队列、批处理、并发限制与背压（Backpressure）连接速度不同的组件。“让快的不等慢的”只能维持短期；长期输入速率高于处理速率时，系统最终仍要排队、拒绝或降级。
 
 因此需要区分三个经常混用的词：
 
@@ -75,38 +73,38 @@ resume continuation / coroutine / fiber / receiver
 | 层次 | 典型机制 | 被解耦的对象 | 必须正视的代价 |
 | --- | --- | --- | --- |
 | 硬件 | OoO、store buffer、DMA、GPU stream | 指令、写入、数据搬运、设备执行 | 依赖关系、内存顺序、队列容量 |
-| 内核与 I/O | epoll、io_uring、AIO、page cache writeback | readiness、I/O 请求与完成、持久化 | syscall、上下文切换、durability |
+| 内核与 I/O | epoll、io_uring、AIO、page cache writeback | readiness、I/O 请求与完成、持久化 | syscall、上下文切换（Context Switch）、durability |
 | 语言与 runtime | callback、coroutine、Sender/Receiver、actor、fiber | 控制流、执行上下文与完成通知 | 状态保存、调度、取消、生命周期 |
-| 数据库与存储 | group commit、LSM flush/compaction、异步物化视图 | 前台事务与后台维护 | 一致性、写放大、积压与背压 |
+| 数据库与存储 | group commit、LSM flush/compaction、异步物化视图（Materialized View） | 前台事务与后台维护 | 一致性、写放大、积压与背压 |
 | 分布式系统 | MQ、异步复制、Saga | 服务时间线与故障域 | 重复、乱序、补偿、RPO |
 
 这些机制可以互相类比，却不能混为一谈。
 
-### 硬件层：隐藏依赖延迟
+#### 硬件层：隐藏依赖延迟
 
 乱序执行允许 CPU 在一条指令等待数据时执行其他无依赖指令；store buffer 让退休后的 store 与缓存一致性传播解耦；DMA 让设备搬运数据时 CPU 继续计算；CUDA stream 把 host 提交与 device 执行拆开。
 
 这里的共同点是 latency hiding，而不是软件意义上的 Future。store buffer 也不是简单“异步刷新到 L1/L2”：它参与一致性协议与内存顺序，memory fence 用于约束可观察顺序，而不同架构的模型并不相同。
 
-### 内核层：readiness 与 completion 不是一回事
+#### 内核层：readiness 与 completion 不是一回事
 
 `epoll`/`kqueue` 主要通知“现在可以尝试非阻塞读写”，属于 readiness model；`io_uring` 通过 Submission Queue 与 Completion Queue 表达 operation completion。批量提交、registered buffer 和 SQPOLL 可以减少 syscall 与切换，但普通 `io_uring` 路径并不保证零 syscall，更不会普遍“彻底消除上下文切换”。
 
 Page cache 又展示了另一种边界：`write()` 返回通常只说明数据进入内核缓存，不等于已经持久化；`fsync()`、设备 cache 和文件系统语义共同决定 durability。异步化把完成拆成了多个阶段，也迫使接口明确“完成到底指什么”。
 
-### 语言层：保存暂停点，并决定谁来恢复
+#### 语言层：保存暂停点，并决定谁来恢复
 
 callback 保存后续函数，stackless coroutine 保存编译器生成的 frame，stackful fiber 保存调用栈，Sender 的 Operation State 保存组合后的运行期状态。它们都在回答“暂停以后如何继续”，但恢复线程由 runtime、awaiter 或 scheduler 决定，C++ coroutine 并不保证回到原线程。
 
 Actor mailbox 与带缓冲 channel 能暂时解耦生产者和消费者，但 mailbox/channel 仍有容量与流控问题；Go channel 在无缓冲、缓冲区已满或没有接收者时都可能阻塞。
 
-### 数据库层：把前台路径与后台维护分开
+#### 数据库层：把前台路径与后台维护分开
 
 Group commit 不是“事务不等 fsync”：在同步持久化配置下，一组事务通常共同等待一次日志刷盘，只是摊薄了单次 fsync 成本；async commit 才会用更弱的持久性换延迟。LSM-tree 把 MemTable flush 和 compaction 放到后台，但后台速度跟不上写入时仍要触发 write stall。异步物化视图则明确牺牲 freshness，换取主写入链路解耦。
 
 WAL、MVCC 本身并不天然异步；关键是系统在哪个完成点回复客户端，以及后台任务落后时如何施加背压。
 
-### 分布式层：时间解耦会转化为一致性问题
+#### 分布式层：时间解耦会转化为一致性问题
 
 消息队列可以削峰，但不能吸收无限流量；ack、重试与消费进度会带来重复和乱序。异步复制缩短主节点写延迟，同时扩大故障时可能丢失的数据窗口。Saga 也不是 2PC 的直接替代品：它用业务补偿和中间状态可见性换取长事务的可推进性，语义已经发生变化。
 
@@ -122,7 +120,7 @@ WAL、MVCC 本身并不天然异步；关键是系统在哪个完成点回复客
 
 Seastar 同时实现了这五层；brpc 主要围绕 RPC 实现后四层，并用栈式 bthread 保留同步控制流；stdexec 重点标准化前三层与“调度器的接口”，但不提供一个唯一的 Reactor 或线程池策略。
 
-### C++20 已有 Coroutine，为什么还需要 stdexec
+#### C++20 已有 Coroutine，为什么还需要 stdexec
 
 C++20 coroutine 解决的是**控制流如何暂停和恢复**。编译器把包含 `co_await`、`co_return` 的函数转换为 coroutine frame 和状态机，并提供 `promise_type`、Awaiter 等定制钩子。但标准只提供语言机制，没有提供：
 
@@ -144,7 +142,9 @@ C++20 coroutine 解决的是**控制流如何暂停和恢复**。编译器把包
 
 两者是互补关系。底层组件可以返回 Sender，复杂的分支和循环可以用 coroutine 表达；stdexec 的 Sender 也可以通过适配进入 `co_await`。Seastar 同样证明了这一点：增加 coroutine 后，底层仍然是原有 Reactor、Future 与 scheduling group。
 
-## 三种架构对比
+### 三种架构对比
+
+三者不处于同一抽象层，不能仅用异步 API 名称排序：Seastar 约束应用数据布局，stdexec 定义组合协议，brpc 提供 RPC 与栈式并发运行时。
 
 | 维度 | Seastar | stdexec / `std::execution` | brpc / bthread |
 | --- | --- | --- | --- |
@@ -157,11 +157,13 @@ C++20 coroutine 解决的是**控制流如何暂停和恢复**。编译器把包
 | 完成通道 | value 或 exception；取消多为 API 级协议 | `set_value / set_error / set_stopped` | RPC Controller、错误码、done callback、bthread stop/join |
 | 阻塞容忍度 | 极低：阻塞一个 shard 就阻塞该核所有任务 | 取决于 scheduler | 较高：阻塞一个 worker 后其他 worker 仍可推进，但不是无限 |
 | 资源治理 | scheduling group、I/O queue、semaphore、SMP service group | 标准协议不规定公平性和背压 | worker 数、并发限制、tag、ExecutionQueue |
-| 典型价值 | 尾延迟、缓存局部性、数据库/存储引擎 | 库边界、组合、异构执行、可替换后端 | RPC 服务、遗留同步代码、多核负载均衡 |
+| 典型价值 | 尾延迟（Tail Latency）、缓存局部性、数据库/存储引擎 | 库边界、组合、异构执行、可替换后端 | RPC 服务、遗留同步代码、多核负载均衡 |
 
-这张表中最值得注意的是：**stdexec 的 scheduler 与 Seastar/brpc 的 scheduler 不是同等重量的对象**。前者是一个轻量、值语义的协议入口；后两者背后则是已经做出线程、队列、I/O 和数据所有权选择的运行时。
+这里需要区分对象责任：**stdexec 的 scheduler 与 Seastar/brpc 的 scheduler 不是同等重量的对象**。前者是一个轻量、值语义的协议入口；后两者背后则是已经做出线程、队列、I/O 和数据所有权选择的运行时。
 
-## Seastar：以数据所有权约束调度
+## 三条实现路径：数据分片、完成协议与可迁移栈
+
+### Seastar：以数据所有权约束调度
 
 [Seastar 的 shared-nothing 设计](https://seastar.io/shared-nothing/) 不是简单的“每核一个线程”。它先把应用视为同一进程内的多个 shard：
 
@@ -176,7 +178,7 @@ CPU 2: reactor + allocator + task queues + data shard 2 + I/O queues
 
 这也是数据库视角下最熟悉的一点：Seastar 不是只优化 Task Scheduler，而是把 **partitioning key 一直延伸到了 CPU core**。数据放置与计算放置被绑定之后，调度器不再需要随时寻找“哪个线程空闲”，而是先回答“这份状态归谁所有”。
 
-### Reactor 主循环：任务与 I/O 在同一颗核上共同推进
+#### Reactor 主循环：任务与 I/O 在同一颗核上共同推进
 
 在 [`src/core/reactor.cc`](https://github.com/scylladb/seastar/blob/master/src/core/reactor.cc) 中，`reactor::do_run()` 的主循环反复做两件事：
 
@@ -194,7 +196,7 @@ while (true) {
 }
 ```
 
-代码细节比这个简化版本复杂得多：timer、网络、磁盘后端、跨核消息、idle handler 和 interrupt mode 都是 poller。但主干非常稳定：**完成事件把 continuation 放回 ready queue，Reactor 在同一线程上执行它，直到主动让出或到达可抢占检查点。**
+代码细节比这个简化版本复杂得多：timer、网络、磁盘后端、跨核消息、idle handler 和 interrupt mode 都是 poller。但主干非常稳定：**完成事件把 continuation 放回 ready queue，Reactor 在同一线程上执行它，直到主动让出或到达可抢占（Preemption）检查点。**
 
 Seastar 不是内核意义上的抢占式线程调度。`task_queue::run_tasks()` 每执行一个 task 后检查 `scheduler_need_preempt()`；默认 `task-quota-ms` 为 0.5ms，但它只能在框架设置的检查点生效。一个没有 `co_await`、没有 future 边界、也不调用 `maybe_yield()` 的长 CPU 循环，仍可以独占整个 shard。
 
@@ -202,7 +204,7 @@ Seastar 不是内核意义上的抢占式线程调度。`task_queue::run_tasks()
 
 > 用户代码获得了无锁的 shard-local 世界，同时承诺不阻塞 Reactor，并主动把长计算切成可调度片段。
 
-### Future：它是完成句柄，不是抽象 Scheduler
+#### Future：它是完成句柄，不是抽象 Scheduler
 
 Seastar 的 [`future.hh`](https://github.com/scylladb/seastar/blob/master/include/seastar/core/future.hh) 允许写出：
 
@@ -235,7 +237,7 @@ co_await future   ─┘
 
 Future 与 coroutine 是控制流表达，Reactor 才是执行引擎。
 
-### Scheduling Group：公平不是线程数，而是资源份额
+#### Scheduling Group：公平不是线程数，而是资源份额
 
 一个核上同时存在 foreground query、compaction、streaming 和 maintenance。即使所有任务都不阻塞，没有资源隔离也会产生尾延迟。
 
@@ -245,7 +247,7 @@ I/O 侧还有独立的 priority class 与 I/O queue。CPU shares 和 I/O shares 
 
 这对数据库尤其重要：异步化只会让系统更容易制造并发，**不会自动产生背压**。如果入口无限创建 Future，内存、I/O queue 和下游服务仍会先被淹没。
 
-### 跨核不是普通函数调用
+#### 跨核不是普通函数调用
 
 [`smp.hh`](https://github.com/scylladb/seastar/blob/master/include/seastar/core/smp.hh) 中的 `smp_message_queue` 使用有界 SPSC queue 批量传递 work item；`smp::submit_to(cpu, fn)` 在目标 shard 执行函数，再把完成结果送回调用 shard。
 
@@ -255,11 +257,13 @@ co_await seastar::smp::submit_to(owner_shard, [key] {
 });
 ```
 
-`smp_service_group` 进一步限制目标 shard 上的非本地请求并发。源码注释甚至要求嵌套 service group 调用形成 DAG，否则可能产生 ABBA 类死锁。
+`smp_service_group` 进一步限制目标 shard 上的非本地请求并发。源码注释甚至要求嵌套 service group 调用形成 DAG，否则可能产生 ABBA 类死锁（Deadlock）。
 
 这说明 shared-nothing 并不是“完全没有共享”。底层仍使用同一物理内存和跨核队列；它真正做的是把共享从任意对象读写，收敛成少数明确、可计量的消息边界。
 
-### Seastar 的收益与代价
+#### Seastar 的收益与代价
+
+固定数据所有权减少共享锁与缓存迁移，但热点需要在分片和请求路由层解决，不能指望线程池自动摊平。
 
 收益是：
 
@@ -278,7 +282,7 @@ co_await seastar::smp::submit_to(owner_shard, [key] {
 
 Seastar 的快，根本上来自约束，而不是 Future 语法本身。
 
-## stdexec：标准化完成协议，而不是规定 Runtime
+### stdexec：标准化完成协议，而不是规定 Runtime
 
 [P2300R10](https://wg21.link/P2300R10) 已进入 C++26 工作草案，目标是为 C++ 建立一套可组合的异步执行词汇。NVIDIA stdexec 的 README 将自己定义为参考实现，同时明确提示项目仍是 experimental，并会跟随标准演进。
 
@@ -292,7 +296,7 @@ Operation State        connect 后形成的运行期状态与所有权树
 Scheduler              生成一个“在该执行资源上完成”的 schedule sender
 ```
 
-### 从源码看 Sender 的两阶段生命
+#### 从源码看 Sender 的两阶段生命
 
 stdexec 的中心不是 `then()`，而是：
 
@@ -312,7 +316,7 @@ stdexec::start(op);                            // 2. 真正启动
 
 这说明 Sender 不是 Future handle。它更像一份可变换的执行计划；Operation State 才是这次执行的实例。
 
-#### 为什么不直接采用 Seastar 的 Future/Promise
+##### 为什么不直接采用 Seastar 的 Future/Promise
 
 原因首先不是 template 减少了几个对象，而是两者服务的边界不同。
 
@@ -349,7 +353,7 @@ Sender expression tree          Operation State tree
                            set_value / set_error / set_stopped
 ```
 
-### Completion Signatures：把异步完成写进类型系统
+#### Completion Signatures：把异步完成写进类型系统
 
 同步函数有返回类型和异常约定，传统 callback API 往往把这些信息拆散。Sender 用 completion signatures 描述所有合法终止：
 
@@ -371,7 +375,7 @@ stdexec::completion_signatures<
 - `let_value`：根据上游值动态返回另一个 Sender，相当于异步 flat-map；
 - `when_all`：组合多个 operation 的值、失败与停止关系。
 
-### 一个完整例子，以及 API 为什么显得复杂
+#### 一个完整例子，以及 API 为什么显得复杂
 
 下面的例子在同一个 stdexec 线程池上并发构造两个结果，合并它们，并把异常恢复为默认值：
 
@@ -425,7 +429,7 @@ business code           使用命名 Sender、pipeline 或 co_await
 
 当业务包含大量循环、分支和 early return 时，coroutine 通常更易读；当逻辑是 fork/join、跨执行资源切换或可静态优化的数据流时，Sender pipeline 更自然。两者混用比强迫所有代码使用一种语法更合理。
 
-### Scheduler：一个位置句柄，而不是调度策略本身
+#### Scheduler：一个位置句柄，而不是调度策略本身
 
 [`__schedulers.hpp`](https://github.com/NVIDIA/stdexec/blob/main/include/stdexec/__detail__/__schedulers.hpp) 对 Scheduler 的核心要求很小：它是可比较、可移动的值类型，并能通过 `schedule(scheduler)` 返回一个 Sender。这个 Sender 启动后，在目标执行上下文中调用 receiver。
 
@@ -456,7 +460,9 @@ auto result = stdexec::sync_wait(std::move(work)); // consumer 连接并启动
 
 > Sender/Receiver 协议能够描述并组合异构执行，stdexec 仓库的 nvexec 证明了 CUDA 后端可以适配；C++26 核心协议本身并不实现 GPU runtime。
 
-### starts_on 与 continues_on：不要把“在哪开始”和“在哪继续”混为一谈
+#### starts_on 与 continues_on：不要把“在哪开始”和“在哪继续”混为一谈
+
+启动位置与完成后的位置是两个独立决策；只移动后续 continuation，不会自动把之前的操作搬到目标调度器。
 
 - `starts_on(scheduler, sender)`：让一个 Sender 在指定 scheduler 上启动。
 - `continues_on(sender, scheduler)`：把上游完成后的 continuation 转移到目标 scheduler。
@@ -470,7 +476,7 @@ auto request =
 
 执行位置是数据流的一部分，这正是 stdexec 比 `std::future` 更完整的地方。但 scheduler hop 也不是免费的：它通常意味着入队、同步和 cache locality 变化。接口可组合不代表任意切换执行上下文都合理。
 
-### “零开销”需要更克制地理解
+#### “零开销”需要更克制地理解
 
 Sender expression 与 Operation State 通常可以静态展开，避免每个节点都使用虚函数、type erasure 或共享堆状态。这为 compiler fusion、内联和自定义存储留下了空间。
 
@@ -484,7 +490,9 @@ Sender expression 与 Operation State 通常可以静态展开，避免每个节
 
 更准确的判断是：stdexec 不强制 `std::future` 式共享状态，并允许库作者把 allocation policy 暴露在 environment 和 operation lifetime 中。
 
-### stdexec 缺少什么
+#### stdexec 缺少什么
+
+完成协议不决定线程池、I/O 或资源配额，因此采用 stdexec 并不意味着应用已有完整运行时。
 
 它刻意不规定：
 
@@ -497,7 +505,7 @@ Sender expression 与 Operation State 通常可以静态展开，避免每个节
 
 Environment、domain 和自定义 Scheduler 提供了承载这些策略的位置，但策略本身仍要由 runtime 和应用实现。stdexec 是一套“异步 ABI 以上、业务框架以下”的协议层，而不是另一个 Seastar。
 
-## Apache brpc：用可迁移的栈保留同步控制流
+### Apache brpc：用可迁移的栈保留同步控制流
 
 [brpc](https://brpc.apache.org/docs/overview/) 面对的是另一类工程现实：大量 RPC 服务存在同步接口、遗留库和不可预测的 handler，很难要求整条调用链都变成 non-blocking callback。
 
@@ -516,7 +524,7 @@ RPC / timer / I/O completion
         work stealing
 ```
 
-### 从源码看 work stealing 与栈式切换
+#### 从源码看 work stealing 与栈式切换
 
 [`TaskGroup`](https://github.com/apache/brpc/blob/master/src/bthread/task_group.h) 是每个 worker 的线程本地调度组，内部有 `WorkStealingQueue` 和 remote queue；[`TaskControl`](https://github.com/apache/brpc/blob/master/src/bthread/task_control.h) 管理所有 worker，并提供 `steal_task()`。
 
@@ -535,7 +543,7 @@ sched_to(current_group, next_tid);     // 保存当前栈并切换到目标 bthr
 
 与 Seastar 的 continuation 不同，bthread 保存的是一整段同步调用栈。它消耗更多栈空间与上下文切换成本，却让循环、异常路径、深层函数和 RAII 保持普通同步写法。
 
-### I/O Reactor 与用户代码之间的关系
+#### I/O Reactor 与用户代码之间的关系
 
 Linux 下 [`EventDispatcher`](https://github.com/apache/brpc/blob/master/src/brpc/event_dispatcher_epoll.cpp) 在 `epoll_wait` 中取得 edge-triggered 事件，再调用 input/output event callback。网络响应最终唤醒等待的 bthread，或触发异步 `done->Run()`。
 
@@ -556,7 +564,7 @@ if (cntl.Failed()) {
 
 也可以传入 closure 使用异步接口。brpc 的调用在 `CallMethod` 时已经发起，不像 Sender 还要等待 `start`。
 
-### 阻塞兼容不是阻塞免费
+#### 阻塞兼容不是阻塞免费
 
 如果 bthread 调用的是 bthread-aware 等待原语，只挂起当前 bthread。如果它直接进入阻塞 syscall 或 pthread primitive，则承载它的 pthread worker 也会被阻塞；其他 worker 可以偷走 ready task，但当所有 worker 都阻塞时，RPC 收发同样无法继续。
 
@@ -564,7 +572,9 @@ if (cntl.Failed()) {
 
 官方 [`异步接口还是 bthread`](https://github.com/apache/brpc/blob/master/docs/cn/bthread_or_not.md) 提供了一个很实用的判断：`QPS × latency` 近似系统中的平均并发请求数。若它远大于 CPU 核数，等待占比高，异步调用能节省大量挂起栈；若与核数同量级，优先保留同步代码的可读性往往更合理。
 
-### brpc 的设计取舍
+#### brpc 的设计取舍
+
+保留同步控制流降低了迁移既有 RPC 代码的成本，但栈内存和可迁移状态的同步由此成为运行时成本。
 
 brpc 选择：
 
@@ -575,25 +585,27 @@ brpc 选择：
 
 代价是：
 
-- shared mutable state 仍需锁或无锁结构；
+- shared mutable state 仍需锁或无锁（Lock-Free）结构；
 - task 迁移会带来 cache 与 NUMA 成本；
 - 每个挂起 bthread 仍需 stack 和 TaskMeta；
 - pthread TLS 与 bthread migration 有语义陷阱；
 - 它解决的是高性能 RPC 服务，不是通用异构执行协议。
 
-## 调度的本质差异：局部性、均衡与通用性
+## 从状态所有权解释调度和接口差异
 
-把三者放在一起，最根本的不是 API，而是三个互相拉扯的目标。
+### 调度的本质差异：局部性、均衡与通用性
 
-### Seastar：优先局部性与可预测性
+三者在局部性、负载均衡与协议复用之间分配不同责任：固定 shard 减少共享访问，可迁移任务便于均衡，而通用协议把调度策略留给后端。
+
+#### Seastar：优先局部性与可预测性
 
 任务不随意迁移，数据属于固定 shard。负载均衡主要在请求分片、数据分区和 admission control 阶段完成。它愿意接受热点与跨 shard 编程复杂度，以换取 cache locality 和稳定尾延迟。
 
-### brpc：优先动态均衡与兼容性
+#### brpc：优先动态均衡与兼容性
 
 bthread 可以在不同 worker 上继续，空闲 worker 从其他 run queue 偷任务。它愿意承担共享同步、栈和迁移成本，以容纳复杂同步 handler 和不均匀请求。
 
-### stdexec：优先协议通用性
+#### stdexec：优先协议通用性
 
 Sender 不承诺运行在哪，Scheduler 也不承诺采用哪种队列。它把 placement policy 延迟到具体 backend：可以实现 pinned scheduler，也可以实现 work-stealing pool，还可以表示 GPU stream。
 
@@ -610,11 +622,13 @@ Sender 不承诺运行在哪，Scheduler 也不承诺采用哪种队列。它把
 
 因此不存在一个“stdexec 调度算法”可以直接和 Seastar 的 vruntime 或 brpc 的 work stealing 比性能。应该比较的是同一 workload 下的具体 Scheduler 实现、I/O backend、状态布局和资源治理。
 
-## 接口差异：三种写法对应三种状态所有权
+### 接口差异：三种写法对应三种状态所有权
 
 同一个“读取两份数据后合并”的逻辑，可以看到完全不同的状态表示。
 
-### Seastar Future：结果驱动 continuation
+#### Seastar Future：结果驱动 continuation
+
+Future 保存完成状态并触发后续 continuation，示例中的合并要等两个输入都完成后才能进行。
 
 ```cpp
 return seastar::when_all_succeed(read_left(), read_right())
@@ -628,7 +642,9 @@ return seastar::when_all_succeed(read_left(), read_right())
 - 结果或 exception 向下传播；
 - shard affinity 由当前 Reactor 与 API 约定维持。
 
-### stdexec Sender：先构图，再物化执行
+#### stdexec Sender：先构图，再物化执行
+
+Sender 描述组合关系，连接 Receiver 后形成运行状态，再由启动操作推进；描述计算并不等于它已经执行。
 
 ```cpp
 auto merged =
@@ -645,7 +661,9 @@ auto result = stdexec::sync_wait(std::move(merged));
 - `start` 后沿三种 completion channel 推进；
 - 执行位置来自 Sender attributes、receiver environment 与 scheduler。
 
-### brpc bthread：栈拥有控制流
+#### brpc bthread：栈拥有控制流
+
+bthread 用栈保存暂停点，允许顺序写出依赖操作，但等待原语必须与运行时协作才能只挂起当前 bthread。
 
 ```cpp
 left_value left;
@@ -673,23 +691,25 @@ return merge(std::move(left), std::move(right));
 | stdexec Sender | 静态表达式 + Operation State | 可组合、可定制、效果类型化 | 类型复杂度、编译成本、runtime 仍需自选 |
 | brpc bthread | TaskMeta + 独立 stack | 同步控制流、RAII、遗留兼容 | 栈成本、迁移/TLS、共享同步 |
 
-## 取消、错误和生命周期：异步系统真正难的部分
+## 取消与背压：让未完成工作有界
 
-“任务能被调度”只是开始。生产系统更关心请求超时后谁停止、资源何时释放、子任务是否变成孤儿。
+### 取消、错误和生命周期：异步系统真正难的部分
 
-### stdexec：协议级三通道
+请求结束不等于所有子任务已经停止；取消传播与资源释放必须分别建模，否则超时后仍可能访问已经销毁的状态。
+
+#### stdexec：协议级三通道
 
 `set_value`、`set_error`、`set_stopped` 是互斥终止。Receiver environment 可提供 stop token，组合算法可以传播停止。`scope` 一类结构化并发工具要求父作用域等待子 operation 结束。
 
 但 stop 仍然是协作式的：底层 operation 必须观察 token，并正确完成为 stopped。协议表达了取消，不代表所有硬件与 syscall 都可瞬间撤销。
 
-### Seastar：组件化取消与显式排空
+#### Seastar：组件化取消与显式排空
 
 Seastar Future 原生主要是 value/exception。取消通常由 `abort_source`、timeout wrapper 或具体 I/O API 实现；`gate` 保证关闭服务时等待所有 in-flight operation，semaphore 控制并发资源。
 
 这套方式很工程化，但取消语义不是每条 Future 类型中的统一第三通道。调用者必须知道所用 API 是否支持 abort、超时后底层工作是否仍在继续。
 
-### brpc：RPC 生命周期优先
+#### brpc：RPC 生命周期优先
 
 `brpc::Controller` 管理 deadline、错误、retry 与 cancellation，异步调用以 closure 完成；bthread 自身有 stop/interruption/join，但 stop 同样不是强制抢占任意用户代码。
 
@@ -697,7 +717,7 @@ Seastar Future 原生主要是 value/exception。取消通常由 `abort_source`�
 
 > 取消不是“把线程杀掉”，而是从请求根节点传播意图，让每个资源拥有者停止产生新工作、结束已有操作，并最终完成生命周期汇合。
 
-## 背压不是异步框架的副产品
+### 背压不是异步框架的副产品
 
 异步接口很容易把“线程没有阻塞”误认为“系统仍然健康”。实际上，一百万个等待中的 Future、Operation State 或 bthread，只是用不同内存形式保存了一百万份未完成工作。
 
@@ -723,9 +743,11 @@ admission -> bounded concurrency -> fair scheduling
 
 ## 能否让 Seastar 或 brpc 接入 stdexec
 
-理论上完全可以，但不是给类加一个 `schedule()` 方法就结束。
+接入 stdexec 需要把原框架的启动、完成与取消语义映射到 Sender/Receiver 协议；只包装 `schedule()` 无法保证 Operation State 在回调结束前存活。以下是适配设计检查项，不是已完成的集成。
 
 ### Seastar Scheduler 适配需要处理
+
+跨 shard 投递必须同时约束对象存活与完成回调位置，否则协议适配会引入跨核访问风险。
 
 - schedule sender 必须把 Operation State 安全投递到目标 shard；
 - completion 要回到哪个 shard，必须有明确语义；
@@ -738,6 +760,8 @@ admission -> bounded concurrency -> fair scheduling
 
 ### brpc Sender 适配需要处理
 
+RPC 通常在调用时启动，而 Sender 组合需要明确启动点；适配还必须把取消与 Controller 生命周期对齐。
+
 - `CallMethod` 是 hot operation，必须推迟到 Operation State 的 `start()`；
 - Controller、request、response 与 closure 必须由 Operation State 持有；
 - timeout/cancel 要映射成 error 还是 stopped，需要稳定约定；
@@ -746,28 +770,11 @@ admission -> bounded concurrency -> fair scheduling
 
 适配的价值在于让 brpc RPC 进入通用 pipeline，而不是把 brpc 重新实现成 stdexec runtime。
 
-## 对异步执行的再理解
+## 选型边界与验证顺序
 
-重新阅读三份源码后，我不再把异步简单理解为“用户态调度”或“用少量线程承载大量任务”。更完整的理解是：
+完成协议、状态表示与调度放置需要分别选择。Future、Operation State、coroutine frame 与 bthread stack 都保存“暂停后如何继续”的状态，但不会自动解决背压和生命周期。
 
-1. **异步是一种完成协议。** 发起者不等待完成，结果通过 continuation、receiver、coroutine resume 或 fiber wakeup 交付。
-2. **状态机是一种内存布局。** callback object、Operation State、coroutine frame 和 bthread stack，都在保存“暂停后如何继续”。
-3. **调度是一种放置决策。** 它决定 ready work 在哪个核、哪个队列、哪个优先级和哪个资源域运行。
-4. **数据所有权决定调度自由度。** Seastar 用固定 ownership 限制迁移；brpc 用共享地址空间允许 work stealing；stdexec 不替应用做这个决定。
-5. **背压决定系统是否能活过峰值。** 能创建无限异步任务不是能力，而是风险。
-6. **取消与生命周期决定系统是否正确。** 没有结构化收敛的后台任务，最终会变成资源泄漏和 shutdown race。
-
-因此，Seastar 与 stdexec 最本质的区别可以压缩成一句话：
-
-> stdexec 试图标准化“异步工作如何被描述和组合”，Seastar 则规定“整台机器上的数据和工作应当如何被放置和推进”。
-
-brpc 则提供第三个答案：
-
-> 当现实代码无法全链路 non-blocking 时，用 M:N 栈式线程保留同步思维，再通过 work stealing 和异步 I/O 提高整体并发。
-
-这三条路线没有绝对胜负。它们分别优化协议复用、硬件局部性与工程可维护性。真正专业的选择，不是追逐某个最新异步语法，而是先确认 workload：等待发生在哪里、状态由谁拥有、任务是否允许迁移、过载如何被限制、取消如何收敛。
-
-对数据库与大数据引擎而言，这些问题远比 `future.then`、`co_await` 或 Sender pipeline 的表面差异更接近系统本质。
+存在不可控阻塞库时，不宜直接将其放入 Seastar Reactor；需要跨后端组合时，stdexec 仍需具体调度器；选择 bthread 则应测量栈内存、同步和 worker 阻塞的代价。先用目标请求验证 ownership、任务迁移、过载限制与取消收敛，再比较吞吐。
 
 ## 参考资料
 

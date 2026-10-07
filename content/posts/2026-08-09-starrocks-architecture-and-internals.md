@@ -1,6 +1,7 @@
 ---
 title: "【源码】StarRocks 实现原理与源码深度分析：从 CBO、Pipeline 到湖仓一体"
 date: 2026-08-09T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - 数据库
 tags:
@@ -13,15 +14,15 @@ description: "基于 StarRocks 源码，系统分析 FE/BE 架构、CBO、MPP Pi
 draft: false
 ---
 
-**StarRocks 是一款开源的高性能实时 OLAP 引擎**，主打毫秒级查询响应、高并发分析、实时数据更新，同时支持数据湖查询和湖仓一体架构。
+StarRocks 将查询规划集中在 FE，把列式批处理和节点内调度放在 BE/CN，并通过不同存储路径承接内表与数据湖查询。性能取决于这些层如何共同减少扫描、数据搬运和等待，而不是由“实时 OLAP”这一产品定位保证。
 
-本文不是 Feature 清单，而是一份从源码反推系统设计的技术分析：先建立 FE、BE/CN 与存储层的边界，再沿一条 SQL 的生命周期进入 CBO、Fragment 和 Pipeline，最后分析主键模型、Runtime Filter、数据湖、物化视图与 Shared-Data。希望读者看完后不仅知道 StarRocks “有什么”，也能回答这些能力“落在哪些模块、如何协作、代价是什么”。
+本文先明确 FE、BE/CN 与存储层的边界，再从表模型进入 SQL 规划和 Pipeline 执行，最后比较数据湖、物化视图（Materialized View）与 Shared-Data 的状态管理。阅读重点是调用路径、数据归属和失败边界；功能存在与目标负载获得收益需要分别验证。
 
 ## 一：StarRocks 概览
 
-**极速**：采用 MPP 分布式执行框架，配置 CBO 优化器，采用列存数据格式，并实现全面的向量化；
+StarRocks 通过列式存储（Columnar Storage）、批量执行和分布式计划组织分析查询；这些机制减少数据访问和逐行调用，但不能消除统计误差与数据倾斜（Data Skew）。
 
-**统一**：一套系统解决多维分析、高并发查询、预计算、实时分析查询等场景；使用 StarRocks 来统一数据湖和数据仓库，将高并发和实时要求性很高的业务放在 StarRocks 中分析，把数据湖上的分析使用 StarRocks 外表查询，统一使用 StarRocks 管理湖仓数据。
+内表与外表复用 SQL 与优化器，但存储代价不同：内表便于控制索引和布局；直接查询数据湖减少数据复制，却需要承担远程文件枚举、删除文件处理与缓存未命中的开销。
 
 ```text
 实时写入：Kafka / Flink ─┐
@@ -31,16 +32,6 @@ draft: false
                                         └── 联邦查询 ──▶ Hive / Iceberg / Hudi
                                                         MySQL / Elasticsearch / ...
 ```
-
-### 分析结论先行
-
-从源码结构看，StarRocks 的高性能不是来自某个孤立算子，而是以下几层共同作用：
-
-1. **FE 把复杂性前置到规划期**：语义分析、规则改写、基于 Memo 的代价搜索、物化视图改写和 Fragment 构建都集中在 FE，BE/CN 收到的是可直接实例化的物理执行 DAG。
-2. **BE/CN 以列式 `Chunk` 和 PipelineDriver 为执行核心**：算子按批处理数据，Driver 在用户态协作调度；阻塞、依赖和背压成为调度器可感知的状态，而不是简单地“一算子一线程”。
-3. **数据模型直接进入存储实现**：Duplicate、Aggregate、Primary Key 并非只有 DDL 语义差异。尤其主键表需要 Primary Index、DelVector、版本发布和 Compaction 协同，写放大与读放大之间存在明确取舍。
-4. **湖仓一体依赖统一优化器，而不是统一存储格式**：内表与外表共享逻辑计划、CBO 和大部分执行算子，但元数据枚举、文件裁剪、删除文件处理与 I/O 由 Connector 分层适配。
-5. **Shared-Data 改写了状态管理方式**：对象存储中的版本化 Tablet Metadata 和 Txn Log 成为持久状态，本地缓存只负责加速；Warehouse 则把一份共享数据映射到相互隔离的计算资源。
 
 ### 源码分析基线与方法
 
@@ -82,7 +73,7 @@ StarRocks (2021.06) — 从 Doris 分支，独立开源项目
 **关键发展节点**：
 - **2021年6月**：正式开源（Apache 2.0），GitHub Star 10k\+
 - **2022年**：发布 V2.0，引入 CBO 优化器、Pipeline 引擎
-- **2023年**：发布 V3.0，引入存算分离架构、异步物化视图
+- **2023年**：发布 V3.0，引入存算分离（Storage–Compute Disaggregation）架构、异步物化视图
 - **2024年**：发布 V3.1/V3.2/V3.3，完善存算分离完善及节约成本；
 - **2025年**：发布V3.4/V3.5/V4.0，聚焦于AI变更、增量MV、商业化；
 
@@ -92,7 +83,7 @@ StarRocks (2021.06) — 从 Doris 分支，独立开源项目
 
 | 版本 | 发布时间 | 核心 Feature | 技术价值 |
 |------|------------|--------------|------------|
-| **V1.0** | 2021 H2 | 全向量化执行引擎、MPP 架构 | 奠定高性能基础，向量化覆盖所有核心算子 |
+| **V1.0** | 2021 H2 | 全向量化执行（Vectorized Execution）引擎、MPP 架构 | 奠定高性能基础，向量化覆盖所有核心算子 |
 | **V2.0** | 2022 H2 | CBO 优化器、Pipeline 引擎、Primary Key 表 | 引入 Cascades 风格优化器，Pipeline 化执行 |
 | **V3.0** | 2023 H2 | 存算分离架构、异步物化视图、湖仓一体 | 架构级重构，支持 Shared-Data 模式 |
 | **V3.1~3.5** | 2024~2025 | Group Commit、File Bundling、Warehouse 管理 | 存算分离功能完善，云原生能力增强 |
@@ -104,6 +95,8 @@ StarRocks (2021.06) — 从 Doris 分支，独立开源项目
 
 ### 商业化生态
 
+商业产品与开源内核的能力边界需要分别核对，不能由厂商宣传或托管服务接口推断当前仓库实现。
+
 | 实体                                                                                                      | 角色    | 说明                                |
 | ------------------------------------------------------------------------------------------------------- | ----- | --------------------------------- |
 | **StarRocks 开源社区**                                                                                      | 开源项目  | Apache 2.0 协议，GitHub star 数 11k\+ |
@@ -112,15 +105,13 @@ StarRocks (2021.06) — 从 Doris 分支，独立开源项目
 | **阿里云 EMR Serverless**                                                                                  | 云服务集成 | StarRocks 作为 EMR 可选组件，提供托管服务      |
 | **火山引擎/腾讯云/华为云**                                                                                        | 云服务集成 | 其他三方商业化平台；                        |
 
----
-
 ## 二：架构解析
+
+FE 与 BE/CN 的分工把全局规划和本地执行分开；部署模式改变数据归属与恢复路径，而不只是更换一类进程。
 
 ### 整体架构
 
-StarRocks 采用经典的 FE \+ BE/CN 架构：
-- 部署简单，只有两个类型的进程，不依赖其他三方系统；
-- FE/BE常驻进程，
+FE 与 BE/CN 是常驻进程。FE 管理元数据与规划，BE/CN 承接执行；Shared-Nothing 与 Shared-Data 的主要区别在数据持久化、缓存和恢复路径，不能概括为完全没有外部依赖。
 
 ```text
 Shared-Nothing（存算一体）              Shared-Data（存算分离）
@@ -137,7 +128,7 @@ Shared-Nothing（存算一体）              Shared-Data（存算分离）
                                      └─────────────────────┘
 ```
 
-从工程边界看，FE 更接近控制面，BE/CN 更接近数据面，但二者不是传统数据库中“SQL 层/存储层”的简单切分：
+从工程边界看，FE 更接近控制面（Control Plane），BE/CN 更接近数据面，但二者不是传统数据库中“SQL 层/存储层”的简单切分：
 
 | 组件 | 核心职责 | 关键源码 |
 |------|----------|----------|
@@ -151,7 +142,7 @@ Shared-Nothing（存算一体）              Shared-Data（存算分离）
 
 这里有一个容易混淆的点：**FE 本身也能执行极少数可短路的查询，但正常 OLAP 查询仍由 BE/CN 执行。** `StmtExecutor.handleQueryStmt()` 会先判断 `canExecuteInFe`，否则构造 `DefaultCoordinator` 并部署 Fragment。也就是说，“FE 是纯元数据进程”是便于理解的近似，而不是绝对实现约束。
 
-### **Shared-Nothing 架构（存算一体）**
+### Shared-Nothing 架构（存算一体）
 
 **特点**：
 - 每个 BE 节点拥有独立的计算和存储资源
@@ -167,7 +158,7 @@ Shared-Nothing（存算一体）              Shared-Data（存算分离）
 - 存储容量受限于单机磁盘
 - 无法独立扩展计算和存储
 
-### **Shared-Data 架构（存算分离）**
+### Shared-Data 架构（存算分离）
 
 **特点**：
 - 计算节点（CN）无状态，可弹性伸缩
@@ -187,7 +178,12 @@ Shared-Data 下的 CN “无状态”同样是一种逻辑描述：CN 不拥有�
 
 ## 三：数据模型与存储
 
+表模型决定更新、聚合与重复数据的语义，进而约束索引、版本和 Compaction 的实现。应先确定这些语义，再选择分区分桶与存储布局。
+
 ### 数据组织层级
+
+Partition、Tablet 和 Rowset 分别承担数据划分、调度与版本数据组织的责任；混淆这些层会导致错误估计分桶、更新与合并的成本。
+
 ```text
 FE 元数据层
 Table（OlapTable）
@@ -300,7 +296,10 @@ Compaction 重写数据并回收失效版本
 | Aggregate | 按 Key 聚合，Compaction 继续合并 | 读取已预聚合状态 | 写入/合并需执行聚合语义，不适合任意回撤 |
 | Primary Key | Primary Index Upsert + DelVector | 读取最新版本并过滤旧行 | 索引、版本发布和 Compaction 成本更高 |
 
-### **产品特点**
+### 产品特点
+
+MPP、CBO 与向量化分别作用于分布式组织、候选选择与批内执行，性能分析需要沿完整路径拆分贡献。
+
 - [MPP 分布式执行框架](https://docs.starrocks.io/zh/docs/introduction/Features/#mpp-%E5%88%86%E5%B8%83%E5%BC%8F%E6%89%A7%E8%A1%8C%E6%A1%86%E6%9E%B6)
 - [全面向量化执行引擎](https://docs.starrocks.io/zh/docs/introduction/Features/#%E5%85%A8%E9%9D%A2%E5%90%91%E9%87%8F%E5%8C%96%E6%89%A7%E8%A1%8C%E5%BC%95%E6%93%8E)
 - [存算分离](https://docs.starrocks.io/zh/docs/introduction/Features/#%E5%AD%98%E7%AE%97%E5%88%86%E7%A6%BB)
@@ -387,7 +386,7 @@ BE/CN 的 [`FragmentExecutor`](https://github.com/StarRocks/starrocks/blob/0fd27
 
 
 
-### **CBO 优化器**
+### CBO 优化器
 
 StarRocks 参考 Cascades/Columbia Optimizer 思想，从零设计并实现了基于代价的优化器 CBO（Cost-Based Optimizer）。优化器针对全面向量化执行引擎做了深度定制，内部实现公共表达式复用、相关子查询重写、Lateral Join、Join Reorder、Join 分布式执行策略选择和低基数字典优化等能力。
 
@@ -397,14 +396,14 @@ StarRocks 参考 Cascades/Columbia Optimizer 思想，从零设计并实现了�
 
 | 阶段 | 关键动作 | 作用 |
 |------|----------|------|
-| RuleBaseOptimize | 子查询改写、谓词下推、列裁剪、分区裁剪、UK/FK 裁剪、MV 早期改写等 | 缩小搜索空间并规范逻辑树 |
+| RuleBaseOptimize | 子查询改写、谓词下推（Predicate Pushdown）、列裁剪、分区裁剪、UK/FK 裁剪、MV 早期改写等 | 缩小搜索空间并规范逻辑树 |
 | Memo 初始化 | 将逻辑表达式放入 `Memo` 的 Group/GroupExpression | 复用等价表达式，避免重复搜索 |
-| CostBaseOptimize | `TaskScheduler` 驱动转换/实现规则，派生统计信息和物理属性 | 搜索 Join 顺序、分布方式和算子实现 |
+| CostBaseOptimize | `TaskScheduler` 驱动转换/实现规则，派生统计信息和物理属性（Physical Property） | 搜索 Join 顺序、分布方式和算子实现 |
 | Physical/Dynamic Rewrite | 低基数字典、Runtime Filter、GLM 等物理树改写与最终校验 | 把跨算子优化落实到可执行计划 |
 
-Memo 的核心价值是把“逻辑等价性”和“物理实现”分开：同一个 Group 可以同时保存不同 Join 顺序或等价表达式，再针对 `Distribution`、`Order` 等 `PhysicalPropertySet` 计算最低成本实现。最终 `extractBestPlan()` 从根 Group 提取满足所需属性的物理树。代价模型依赖行数、列统计和网络/内存估计，因此统计信息失真仍可能导致错误 Join 顺序；SPM 和 Query Feedback 正是在这个边界上提供稳定或纠偏能力。
+Memo 的核心价值是把“逻辑等价性”和“物理实现”分开：同一个 Group 可以同时保存不同 Join 顺序或等价表达式，再针对 `Distribution`、`Order` 等 `PhysicalPropertySet` 计算最低成本实现。最终 `extractBestPlan()` 从根 Group 提取满足所需属性的物理树。代价模型（Cost Model）依赖行数、列统计和网络/内存估计，因此统计信息失真仍可能导致错误 Join 顺序；SPM 和 Query Feedback 正是在这个边界上提供稳定或纠偏能力。
 
-#### **Colocate属性**
+#### Colocate属性
 
 类似于hologres的`tablet_group`的概念。在建表的时候，可以指定`colocate_with`来确定该表的ColocateGroup，<span style="color: rgb(28, 30, 33);">，同一 CG 内的表需遵循相同的 Colocation Group Schema（CGS），即表对应的分桶副本具有一致的分桶键、副本数量和副本放置方式。如此可以保证同一 CG 内，所有表的数据分布在相同一组 BE 节点上。当 Join 列为分桶键时，计算节点只需做本地 Join，从而减少数据在节点间的传输耗时，提高查询性能。因此，Colocate Join，相对于其他 Join，例如 Shuffle Join 和 Broadcast Join，可以有效避免数据网络传输开销，提高查询性能。</span>
 
@@ -436,11 +435,11 @@ Classic MPP：所有 Group 同时执行，调度灵活，但峰值内存可能�
 Grouped Execution：分组、分批调度 Bucket，以并发度换取可控内存和更低调度开销。
 ```
 
-#### **全局字典编码**
+#### 全局字典编码
 
 全局字典是 StarRocks 针对低基数 VARCHAR 列的查询优化技术。
 
-**核心思想**：利用存储文件中的字典编码，用整数运算替代字符串比较和聚合、Join，更好地利用FixedLengthInt Column的性能优势；
+**核心思想**：利用存储文件中的字典编码（Dictionary Encoding），用整数运算替代字符串比较和聚合、Join，更好地利用FixedLengthInt Column的性能优势；
 
 **支持的列类型**：varchar/array(varchar)/struct(varchar)等；
 
@@ -456,9 +455,9 @@ Segment 局部字典码
        └── PhysicalDecodeOperator ──▶ VARCHAR 输出
 ```
 
-这项优化的边界也值得注意：字典必须与数据版本兼容；高基数、频繁出现新值或不支持字典改写的表达式会降低收益甚至使字典失效。因此它是由优化器按列选择的物理优化，而不是把所有字符串永久编码成统一 ID。
+这项优化受字典作用域限制：字典必须与数据版本兼容；高基数、频繁出现新值或不支持字典改写的表达式会降低收益甚至使字典失效。因此它是由优化器按列选择的物理优化，而不是把所有字符串永久编码成统一 ID。
 
-#### **UK/FK 约束优化**
+#### UK/FK 约束优化
 
 StarRocks 利用 UK（Unique Key）和 FK（Foreign Key）约束进行查询优化。
 
@@ -470,15 +469,13 @@ StarRocks 利用 UK（Unique Key）和 FK（Foreign Key）约束进行查询优�
 
 UK/FK 在这里首先是**优化器契约**。如果约束只声明但数据并不满足，基于约束的裁剪可能破坏语义，因此生产使用时必须保证数据质量，不能把它理解成数据库会自动替用户验证的强约束。
 
-#### **Runtime Filter**
+#### Runtime Filter
 
-Runtime Filter 是 StarRocks 最重要的运行时优化机制之一，在没有AQE(多阶段Plan调整)调整的情况下，RuntimeFilter在RuntimeFilter阶段自适应地优化Query Plan。
+Runtime Filter 将执行期间得到的键范围用于过滤后续输入，通常不改变 Join 拓扑；它不等同于 AQE 在阶段边界重新选择物理计划。
 - Local RuntimeFilter (Broadcast Join)
 - Global Runtime Filter（Multi-Partition RF）：跨 Partition 的全局 Runtime Filter；可采用分区化布局降低假阳性并支持分布式合并；
-- TopN Runtime Filter
-- TopN算子产生， 下推到存储层减少IO扫描；
-- 当 Aggregate \+ TopN 时，Group By Key 产生 TopN Runtime Filter；
-- （TODO）将 Min/Max 谓词下推到 Scan Operator，利用 ZoneMap/Index 过滤减少扫描数据量
+- TopN Runtime Filter：由 TopN 的动态边界产生过滤条件；是否可下推取决于排序键、表达式及存储路径，不能由出现 TopN 算子就断言发生了 I/O 裁剪。
+- Min/Max 范围裁剪：本文快照的 [`runtime_range_pruner.hpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_range_pruner.hpp) 已将运行时 Min/Max 转成索引过滤范围，不能继续笼统标为 TODO。范围裁剪也不表示任意 Runtime Bloom 都能在 Page 读取前生效。
 - BitSet Runtime Filter
     - 一种 Bloom Filter 的紧凑替代布局；当 Key 范围适合位图表示，且大小足以驻留 Cache、显著小于 Bloom Filter 时使用。
 
@@ -499,10 +496,10 @@ Hash Join Build Drivers
 
 [`RuntimeFilterLayout`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/RuntimeFilterLayout.java) 会根据 Broadcast、Shuffle、Bucket/Colocate 以及 Pipeline 多分区模式选择 Singleton、Pipeline Shuffle、Global 1-Level/2-Level 等布局。Filter 并非越大越好：构建、合并、网络广播和 Probe 计算都有成本，所以实现中还要处理等待超时、选择率更新、Always-True 降级等问题。
 
-#### **全局延迟物化（GLM）**
+#### 全局延迟物化（GLM）
 
 **核心思想**：
-- 在 Join/Sort 等操作中，延迟物化非必需列，只传递 RowID 和必要列，直到最终需要时才 Fetch 完整行数据。
+- 在 Join/Sort 等操作中，延迟物化（Late Materialization）非必需列，只传递 RowID 和必要列，直到最终需要时才 Fetch 完整行数据。
 - 通过统一的row\_id，支持了iceberg/内表的全局延迟物化；
 
 **收益**：
@@ -529,7 +526,10 @@ Scan B：B.a + B.row_position ─┘                         │
 
 在 BE/CN 侧，内表 Lake Connector 与 Hive/Iceberg 路径分别根据 Thrift 中的 `enable_global_late_materialization` 开启 Lazy Read。GLM 的收益取决于“被延迟列宽度 × 中间结果行数”是否足以覆盖 RowID 传递和随机 Lookup 成本；宽表、Join 后强过滤、TopN/Limit 场景通常更有利，返回大比例数据时则未必占优。
 
-#### **Prepared Statement**
+#### Prepared Statement
+
+参数化入口与计划复用不是同一能力，需要沿 PREPARE/EXECUTE 路径检查哪些阶段被复用、哪些仍会重新执行。
+
 ```
 PREPARE 阶段:
   SQL 文本 → Parser → AST(含 Parameter 节点) → Analyzer → 仅返回元数据(不生成执行计划)
@@ -559,7 +559,7 @@ StarRocks支持行列混存（[StarRocks 行列混存表](https://docs.starrocks
 
 实现上，`StmtExecutor.generateExecPlan()` 会从 `PrepareStmtContext` 取出已保存的计划，并检查表和分区版本是否仍允许复用；`ShortCircuitPlanner`/`ShortCircuitOptimizer` 为可支持的点查生成更短的规划路径。如果 Schema、分区或相关元数据变化导致缓存前提失效，系统必须重新规划。因此 Prepared Statement 的性能来源不是“跳过所有校验”，而是把稳定点查中的大部分优化器工作摊销到首次执行。
 
-#### **SQL Plan Manager**
+#### SQL Plan Manager
 
 <span style="color: rgb(28, 30, 33);">SQL Plan Manager 允许用户将查询计划绑定到查询上，从而防止查询计划因系统状态变化（主要是数据更新和统计信息更新）而改变，从而稳定查询性能。其工作流程如下：</span>
 1. <span style="color: rgb(28, 30, 33);">**创建 Baseline**</span><span style="color: rgb(28, 30, 33);">：使用</span>  `CREATE BASELINE`  <span style="color: rgb(28, 30, 33);">命令将查询计划绑定到指定的查询 SQL；</span>   
@@ -590,18 +590,20 @@ StarRocks支持行列混存（[StarRocks 行列混存表](https://docs.starrocks
 
 ### 执行引擎
 
-#### **向量化执行引擎**
+列式 Chunk 减少逐行调用，PipelineDriver 按依赖与可运行状态推进算子；批处理效率与并发调度需要分别观察。
+
+#### 向量化执行引擎
 
 传统数据库采用火山模型（Volcano Model），逐行处理数据。向量化执行改为批量处理（Batch Processing），一次处理数千行，充分利用 CPU 缓存和 SIMD 指令。
 - 向量化执行框架
 - 存储向量化
 - 表达式计算向量化
 
-#### **Pipeline 执行引擎**
+#### Pipeline 执行引擎
 
 延伸阅读：[StarRocks Pipeline 执行引擎详解](https://zhuanlan.zhihu.com/p/573181686)
 
-StarRocks V2.0 引入 Pipeline 执行引擎，替代原有的 Volcano 模型。Pipeline 引擎可以理解为具备用户态 `yield` 语义的协作式调度：传统模型依赖 OS 在线程之间切换，而 PipelineDriver 在算子阻塞、等待依赖、时间片耗尽或产生背压时主动归还执行权，从而降低高并发下的线程数和上下文切换成本。需要注意，当前主干实现的核心是 Driver 状态机与调度队列，并不是“每个 Driver 对应一个 C++ 语言协程”。
+StarRocks V2.0 引入 Pipeline 执行引擎，替代原有的 Volcano 模型。Pipeline 引擎可以理解为具备用户态 `yield` 语义的协作式调度：传统模型依赖 OS 在线程之间切换，而 PipelineDriver 在算子阻塞、等待依赖、时间片耗尽或产生背压时主动归还执行权，从而降低高并发下的线程数和上下文切换（Context Switch）成本。需要注意，当前主干实现的核心是 Driver 状态机与调度队列，并不是“每个 Driver 对应一个 C++ 语言协程”。
 
 ```text
 传统线程调度                              Pipeline 协作式调度
@@ -638,13 +640,13 @@ GlobalDriverExecutor
 
 
 
-##### **Event-Driven Schedule**
+##### Event-Driven Schedule
 - 在多核模式下，解决Poller线程CPU打满的问题；
 - 每个 Pipeline 由多个 Operator 组成，按事件驱动调度
 
 Event-Driven 的关键不是增加轮询线程，而是让 Pipeline 初始化和 Driver 唤醒依赖事件完成。例如 Hash Join Probe 要等待 Build 完成，自适应 DOP 的下游 Pipeline 要等待采样状态确定；事件完成后才创建或激活对应 Driver，避免未满足依赖的任务反复进入 ready queue。
 
-##### **自适应 DOP（Degree of Parallelism）**
+##### 自适应 DOP（Degree of Parallelism）
 - 默认的`pipeline_dop`为机器核数的一半，但数据量比较少，在并发场景下pipeline本身的调度开销也比较大；
 - 因此在不改变DAG pipeline调度的情况下，通过runtime的stats信息，自适应性的将上游数据路由到指定dop的下游算子；
 
@@ -658,11 +660,11 @@ Event-Driven 的关键不是增加轮询线程，而是让 Pipeline 初始化和
 
 `adjusted_dop = clamp(floor_power_of_2(rows / rows_per_driver), 1, upstream_dop)`。这种设计不会改变 Fragment DAG，只是在 Pipeline 边界插入 CollectStats Sink/Source，并延迟下游 Driver 初始化；它优化的是小数据场景中过度并行产生的调度和内存开销。
 
-#### **Join 优化**
+#### Join 优化
 
 StarRocks 的 Join 算法经历了两个主要版本的演进。
 
-##### **Hash Table种类：**
+##### Hash Table种类：
 - **v1: Bucket-Chain Hash Table: Balancing Vectorized Execution with Bandwidth-Optimized Storage**
     - 这是 StarRocks 初期的 Hash Join 实现，核心设计目标是在向量化执行和存储带宽之间取得平衡。
 - **v2:  Linear-Chained Hash Table： Adaptive Factorization Using Linear-Chained Hash Tables**
@@ -680,7 +682,7 @@ StarRocks 的 Join 算法经历了两个主要版本的演进。
 
 这类“自适应”发生在 Hash Table 已获得真实 Build 数据之后，比只依据 FE 统计信息更可靠；但它仍局限在算子内部，不会重新选择 Join 顺序或把 Broadcast Join 改成 Shuffle Join。换言之，CBO 决定宏观物理计划，Join Runtime 根据真实 Key 分布选择微观数据结构。
 
-##### **基于Fixed Length Hash处理String Join Key**
+##### 基于Fixed Length Hash处理String Join Key
 
 **问题**：字符串列作为 Join Key 时，每次比较都需要访问字符串内容，内存访问模式差，缓存命中率低。
 
@@ -700,7 +702,7 @@ StarRocks 的 Join 算法经历了两个主要版本的演进。
 
 `join_key_constructor.hpp` 在 Build 和 Probe 两侧使用同一套固定长度序列化逻辑，保证 Key 的字节布局一致。优化收益来自连续内存与整数比较，但只适用于序列化后能安全落入有限宽度的 Key 组合；超长字符串或复杂可变长组合仍需走 Slice/序列化 Key 路径。
 
-##### **Partitioned Hash Join**
+##### Partitioned Hash Join
 
 **问题**：当 Build 侧数据过大（超过内存限制）时，无法一次性构建 Hash Table，需要将数据分区处理。
 
@@ -710,35 +712,37 @@ StarRocks 的 Join 算法经历了两个主要版本的演进。
 
 [`ChunksPartitioner`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/partition/chunks_partitioner.h) 负责按分区表达式计算 Hash、缓存各 Partition 的 Chunk，并在达到批量阈值后交给消费者。Partitioned Hash Join 的本质是用一次本地重分区把“大而不可控的 Hash Table”拆成多个可独立 Build/Probe 的工作集；收益是限制峰值内存和支持 Spill，代价是额外 Hash、数据搬运以及分区倾斜风险。
 
-##### **Coroutine Probe**
+##### Coroutine Probe
 
 延伸阅读：[StarRocks Hash Join Coroutine Probe](https://zhuanlan.zhihu.com/p/666465496)
 
 **问题**：传统的 Probe 过程是同步的，当 Probe 侧数据量大时，会长时间占用 CPU 且无法响应 Backpressure。同时，在 One-to-Many 场景下（一个 Probe 行匹配多个 Build 行），单次 Probe 可能产出大量结果，导致内存峰值。
 
-这里的 Coroutine 是 Join Probe 内部使用的 C++20 协程，与前文 PipelineDriver 的协作式调度不是同一层机制。`HashTableProbeState` 保存多个 coroutine handle 和输出游标，让多个独立 Probe 流交错推进，以重叠随机内存访问延迟；当 One-to-Many 输出达到 Chunk 上限时，协程可以挂起，下次从同一链位置继续，而不需要一次物化全部匹配行。它改善的是 Hash Table 访问的内存级并行度和输出节流，不改变 Join 的逻辑语义。
+这里的 Coroutine 是 Join Probe 内部使用的 C++20 协程，与前文 PipelineDriver 的协作式调度不是同一层机制。`HashTableProbeState` 保存多个 coroutine handle 和输出游标，让多个独立 Probe 流交错推进，以重叠随机内存访问延迟；当 One-to-Many 输出达到 Chunk 上限时，协程可以挂起，下次从同一链位置继续，而不需要一次物化全部匹配行。它改善的是 Hash Table 访问的内存级并行度（Degree of Parallelism）和输出节流，不改变 Join 的逻辑语义。
 
-#### **Aggregate**
+#### Aggregate
 
 StarRocks 在聚合算子上做了大量优化：
 
-##### **自适应预聚合**
+##### 自适应预聚合
 - 在 Partial Aggregate 阶段，自适应输出 Partial/Final 结果，根据Runtime数据聚合状态&系统内存状况动态调整聚合策略，是否pre-aggregate/force-aggregate/passthrough。
 
-##### **基于 Meta信息优化Simple聚合函数函数**
+##### 基于 Meta信息优化Simple聚合函数函数
 - 利用列的 Min/Max或者count信息，优化count/min/max聚合函数；在Clickbench下有很好的性能收益；
 
-##### **Aggregate \+ Limit 优化**
+##### Aggregate \+ Limit 优化
 - Group By Keys 产生 Runtime Filter，下推到 Scan Operator
 - 利用 Index 过滤减少扫描数据量
 
-##### **Aggregate \+ TopN 优化**
+##### Aggregate \+ TopN 优化
 - Step1: 当 Group By Key 与 Order By Key 相同时，将 TopN 下推到 Partial Aggregate，减少 Final Blocking Aggregate 再做 TopN 的开销
 - Step2: TopN Runtime Filter 将 Min/Max 谓词下推到 Scan Operator，减少IO开销
 
-#### **Sort 优化**
+#### Sort 优化
 
-##### **German String（StringView / ColumnViewer）**
+排序成本包含键比较与数据搬运，因此字符串表示和键编码会改变比较器之外的开销。
+
+##### German String（StringView / ColumnViewer）
 - <span style="color: rgb(33, 37, 41);">StarRocks 没有端到端地替换现有字符串 Column，而是在 Full Sort 等构建临时排序列的路径中使用 StringView 风格布局：短字符串直接内联，长字符串在 View 中保存长度、Prefix 和 Buffer 位置，利用内联 Prefix 减少比较时的随机内存访问和 Cache Miss。</span>
 
 ```text
@@ -771,7 +775,7 @@ StarRocks 在聚合算子上做了大量优化：
 
 原始材料没有标注耗时单位与完整测试配置，因此这组数据只能说明优化具有明显的 Query 相关性：Q1/Q3/Q6 收益较高，Q2 基本持平，Q5/Q7 反而回退。工程上应由代价或适用条件控制该表示，而不能把微基准中的最佳值外推为所有 Sort 的固定收益。
 
-##### **Merge Path Parallel Merge Sort**
+##### Merge Path Parallel Merge Sort
 - 参考 DuckDB 的并行归并排序实现：[DuckDB：并行外部排序](https://duckdb.org/2021/08/27/external-sorting)
 - 使用 Merge Path 算法实现高效并行归并，解决global sort时单点性能问题；
 
@@ -839,7 +843,7 @@ StarRocks 将 Iceberg 作为湖上能力的重点：从最初读取 Iceberg 数�
 
 以 Iceberg 为例，`IcebergMetadata` 负责表与 Snapshot 语义，`IcebergRemoteSourceTrigger`/异步 RemoteFile Source 负责逐步产生文件任务，`IcebergScanNode` 再构造分布式 Scan Range。对于元数据量很大的表，异步或分布式规划的关键价值是避免 FE 必须一次性枚举并持有所有文件，而不是把 CBO 本身搬到 BE。Iceberg V2 的 Position/Equality Delete、V3 Row Lineage 和增量范围还会改变 Scan 输出列与删除合并逻辑，因此“支持 Iceberg”远不只是能读 Parquet。
 
-### **MV**
+### MV
 
 MV在StarRocks承载了透明加速(通用index)、ETL Pipeline、数据建模等功能，同时是商业化时差异化的关键Feature之一。
 
@@ -908,8 +912,6 @@ Query Logical Plan
 改写侧在 CBO 中由 [`MvRewritePreprocessor`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/MvRewritePreprocessor.java) 准备候选集，再由单表/多表 MV 规则处理谓词包含关系、列映射、聚合 Roll-up、Join 等价和分区补偿。改写成功后还会重新执行谓词下推与分区裁剪，因为 `UNION` 补偿会生成新的 Scan 分支。
 
 由此可见，MV 的主要风险不是“刷新慢”一个维度：候选 MV 过多会增加优化器搜索成本；分区映射错误会影响新鲜度；统计信息过期可能让命中 MV 的计划仍然不优；嵌套 MV 则需要限制改写层数，避免组合爆炸。
-
-
 
 ## 六：存算分离
 
@@ -1000,6 +1002,8 @@ CN ── LocationProvider ───────┤
 
 ### AutoScaling
 
+计算资源扩缩容需要考虑排队、缓存和任务迁移，资源数量变化不保证吞吐即时线性增长。
+
 #### Multi Warehouse
 - 支持多个 Warehouse（计算集群）
 - 不同 Warehouse 独立资源，互不影响
@@ -1009,25 +1013,34 @@ CN ── LocationProvider ───────┤
 `WarehouseManager.acquireComputeResource()` 通过 `ComputeResourceProvider` 为查询选择 Warehouse 内的计算资源，Coordinator 后续只在该资源对应的 CN 集合中放置 Fragment Instance。因而 Warehouse 隔离主要发生在**计算与调度域**，底层对象数据仍可共享；这正是 Loading、Ad-hoc 和 BI 可以互不争抢 CPU/内存但读取同一份数据的基础。
 
 #### CPU-Based/Queue-Based Auto Scaling
+
+CPU 与排队长度反映不同的拥塞状态，基于队列的策略仍需区分资源不足、依赖等待和单任务倾斜。
+
 - 从基于 CPU 利用率的 AutoScaling 改为基于队列的Auto Scaling
 - 队列深度更准确地反映实际负载
 - 避免 CPU 利用率的滞后性
 
 #### 多 AZ 部署
+
+跨可用区部署需要把容灾收益与网络延迟、缓存重复及流量成本一起评价；下面属于架构方向，不是本文的故障演练结果。
+
 - 从单 Warehouse 多 CN 扩展到多 Cluster， 支持跨可用区（Availability Zone）部署
 - 容错：单 AZ 故障不影响服务
 - 减少跨 AZ 流量：优先本 AZ 读取，同时支持跨 Cluster 的数据共享；
 
----
-
 ## 七：可观测性与AI Native
 
-### **可观测性**
+计划和执行画像提供可核对的性能证据；AI 辅助解释只有能指向这些证据时，才能用于诊断，不能替代执行验证。
+
+### 可观测性
 
 StarRocks 在可观测性方面提供了完善的工具链：
 - [StarRocks 查询规划与调优](https://docs.starrocks.io/docs/best_practices/query_tuning/query_planning/)
 
-#### **Profile**
+#### Profile
+
+算子级指标能够定位时间和数据量消耗，但需要区分并行累计时间与查询墙钟时间，不能直接求和。
+
 - 详细的算子级指标：执行时间、CPU 时间、内存使用、数据扫描量、Shuffle 数据量
 - 每个算子内部的子指标都可以在文档中找到详细说明
 - 支持 Web UI 可视化 Profile 分析
@@ -1080,7 +1093,10 @@ Profile 的数据流同样对应前面的执行层级：每个 Operator 把 Coun
 
 
 
-#### **Explain**
+#### Explain
+
+Explain 展示计划结构和估计，只有带执行结果的分析才包含实测证据，两者不能互相替代。
+
 - `EXPLAIN`：展示规划后的物理 Fragment、算子、分布方式和估算信息，而非优化器内部完整逻辑树
 - `EXPLAIN VERBOSE` / `EXPLAIN COSTS`：展示更详细的 Slot、表达式、统计信息与 CBO Cost
 - `EXPLAIN ANALYZE`：真正执行查询，并把真实运行统计映射回物理计划，可用于定位算子瓶颈
@@ -1132,16 +1148,21 @@ Profile 的数据流同样对应前面的执行层级：每个 Operator 把 Coun
                                         predicate: 45:s_store_name = 'ese'
 ```
 
-#### **运行时监控**
+#### 运行时监控
+
+集群指标用于识别持续拥塞和资源压力，单条查询问题还需关联计划与 Profile。
+
 - 提供了运行时详尽的metrics信息，可以提供Prometheus监控报警：
     - 查询级别监控：QPS、延迟、错误率
     - 节点级别监控：CPU、内存、磁盘、网络
 
 ---
 
-### **AI Native**
+### AI Native
 
-#### **AI-Agent**
+AI 接口与智能运维属于不同集成层，需要分别检查数据访问权限、模型成本和输出验证。
+
+#### AI-Agent
 
 StarRocks 已推出 [StarRocks AI Agent](https://ai-agent.starrocks.com/)，主要是协助DBA、RD排查问题：
 
@@ -1152,22 +1173,25 @@ StarRocks 已推出 [StarRocks AI Agent](https://ai-agent.starrocks.com/)，主�
 | **文档搜索** | 基于 RAG 的文档检索 |
 | **Table 优化** | 表结构设计建议（Partition、Distribution 等） |
 
-#### **运维 Agent**
+#### 运维 Agent
+
+运维建议必须能追溯到指标和日志；自动变更还需授权、限额和回退，以下能力描述不等于已验证的自治运维。
+
 - 自动监控线上异常
 - 计算节点 CPU/Mem/Disk 异常检测
 - 自动告警和根因分析
 
 ## 八：性能 Benchmark & 竞对分析
 
-瞄准一个好的对手，也是致胜的关键；
-- 聚焦海外市场Customer Facing场景
-- 极致性能、Data Freshness
+Benchmark 必须对应负载和资源条件，才能支持选型。面向用户的分析服务需要同时记录延迟、并发和数据新鲜度，不能由单查询最快耗时推断服务能力。
 
-### **单表场景**
+### 单表场景
 
-##### **ClickBench**
+单表扫描主要检验读取、过滤与聚合路径，不能据此证明多表 Join 或分布式数据交换的性能。
 
-ClickBench 是目前最权威的 OLAP 基准测试：[ClickBench 官网](https://benchmark.clickhouse.com/)
+##### ClickBench
+
+ClickBench 提供一组公开的分析查询，但不能覆盖事务、更新与所有分布式负载：[ClickBench 官网](https://benchmark.clickhouse.com/)
 
 **StarRocks 的优化点**：
 - **Count 走 Meta Scan**：`SELECT COUNT(*)` 直接读取 Tablet Meta，避免全表扫描
@@ -1175,18 +1199,18 @@ ClickBench 是目前最权威的 OLAP 基准测试：[ClickBench 官网](https:/
     - MPP 架构即使针对单机也需要 Shuffle（数据拷贝），可以 Bypass 不走 Localhost 网络
     - 单机引擎（DuckDB/ClickHouse）通过并行 Hash Table 优化，StarRocks 也在追赶
 
-##### **SSB / SSB Flat**
+##### SSB / SSB Flat
 
-SSB（Star Schema Benchmark）和 SSB Flat 是经典的数仓基准测试。
+SSB（Star Schema Benchmark）和 SSB Flat 是经典的数仓基准测试（Benchmark）。
 
 StarRocks 在 SSB 上的优势主要来自：
 - 向量化执行引擎
 - Colocate Join（避免 Shuffle）
 - Runtime Filter
 
-### **TPC-H / TPC-DS**
+### TPC-H / TPC-DS
 
-**内表场景**：StarRocks 相比 Snowflake 有 ~3X 的性能优势，主要来自：
+**内表场景**：原始分享材料报告了相对 Snowflake 约 3X 的结果，本文没有复现，也没有足够数据把倍数归因到单一机制。可检查的因素包括：
 - 聚合下推到 Scan 层
 - Runtime Filter 减少中间结果
 - CTE Reuse 避免重复计算
@@ -1207,7 +1231,7 @@ StarRocks 在 SSB 上的优势主要来自：
 
 | 竞品 | 定位 | 特点 | 与 StarRocks 对比 |
 |------|------|------|--------------------|
-| **ClickHouse** | 单机之王 | 可观测性生态好，迭代快（200\+ commits/天），存算分离/湖上数据/MV 快速发展 | StarRocks 在分布式场景更强，CH 在单机场景领先 |
+| **ClickHouse** | 列式分析数据库 | 需按版本检查部署模式、数据湖与 MV 能力 | 应用相同资源和查询集比较，不能概括为单机或分布式的绝对领先 |
 | **Trino** | 湖上引擎 | 湖上生态完善，Failover 能力强 | StarRocks 湖上性能追赶中，内表优势明显 |
 | **Snowflake** | 云数仓 | SaaS 模式，生态完善 | StarRocks 开源 \+ 性能优势，Snowflake 生态优势 |
 | **Databricks** | 湖仓一体 | Delta Lake 生态，AI 集成 | StarRocks 在 Iceberg 生态追赶，Delta 支持较弱 |
@@ -1244,8 +1268,6 @@ StarRocks 在 SSB 上的优势主要来自：
 | Connector | [`ConnectorMetadata.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/connector/ConnectorMetadata.java) | Catalog SPI、分区与 Remote Files |
 | Shared-Data | [`tablet_manager.h`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/lake/tablet_manager.h) | Metadata、Txn Log、Location、Cache、Compaction |
 
-### 总结：StarRocks 的工程取舍
+### 选型边界与验证顺序
 
-StarRocks 最值得学习的不是某一个 Benchmark 数字，而是它把 OLAP 系统的关键矛盾拆到不同层解决：CBO 负责全局搜索，Runtime Filter 和自适应数据结构吸收统计误差，PipelineDriver 管理节点内并发，主键索引用空间换实时更新，MV 用额外存储与刷新成本换透明加速，Shared-Data 再用版本化元数据和 Cache 换弹性。
-
-这些机制也对应明确边界：CBO 依赖统计信息；Runtime Filter 无法替代 Join Reorder；Pipeline 降低调度开销但不能消除数据倾斜；主键表需要承担索引和 Compaction 成本；MV 必须同时保证等价性与新鲜度；对象存储提供弹性，却把本地 I/O 问题转化为元数据、请求次数和 Cache 问题。理解这些边界，比记住 Feature 名称更接近源码分析的真正价值。
+采用前先固定新鲜度、并发和恢复要求，再用对应版本的计划与 Profile 核对瓶颈。CBO 依赖统计信息，Runtime Filter 不能替代 Join Reorder，Pipeline 不能消除倾斜；主键表承担索引与 Compaction 成本，MV 需要等价性与新鲜度同时成立，Shared-Data 还需测量元数据请求和 Cache 未命中。源码机制可以解释这些取舍，不能替代容量测试。

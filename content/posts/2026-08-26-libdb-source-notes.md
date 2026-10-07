@@ -2,7 +2,7 @@
 title: "【源码】libdb：从 B-Tree 页、WAL 与 MVCC 理解嵌入式 OLTP 引擎"
 slug: "libdb-source-notes"
 date: 2026-08-26T00:00:00+08:00
-lastmod: 2026-08-30T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - Database Engineering
 tags:
@@ -24,11 +24,9 @@ math: false
 
 这次我选择从 [libdb](https://github.com/berkeleydb/libdb) 学习。它是 Berkeley DB 5.3.x 的社区分支，是一个链接进应用进程的嵌入式事务型 Key/Value 引擎，不是独立数据库 Server。本文基于本地 `master` 分支的 `v5.3.34`，源码提交为 [`c4811dc87`](https://github.com/berkeleydb/libdb/commit/c4811dc87)。这个边界很重要：当前分支已经把 `DB_TXN_SNAPSHOT` 改造成 Serializable Snapshot Isolation（SSI），还包含 cache cooling、B-Tree root snapshot 和异步 I/O 等社区改造，不能把所有行为都归到 Oracle 最后的 5.3.28。
 
-我最终形成的核心认识是：
+下文沿 `DB->put` 追踪页格式、锁、日志和提交，再进入版本读取与 SSI。需要核对的不只是函数是否调用成功，还包括何时允许写数据页、何时对外承诺提交，以及崩溃后怎样恢复这个承诺。
 
-> OLTP 存储引擎不是“B-Tree 加一个 WAL”，而是一组围绕单条记录生命周期互相制约的协议：页格式决定更新粒度，锁决定谁能进入，MVCC 决定读哪个版本，WAL 决定何时能落数据页，事务提交决定何时对外承诺，恢复则证明这个承诺在进程崩溃后仍然成立。
-
-## 1. 先确定 libdb 是什么
+## 先确定 libdb 是什么
 
 libdb 对外提供 `DB_ENV`、`DB`、`DBC` 和 `DB_TXN` 等 C API handle。应用自己创建线程、接收请求并调用这些 handle；一次读写通常就在调用者线程内同步完成。核心代码没有一个类似 MySQL `mysqld` 的常驻 SQL 请求调度层。
 
@@ -64,12 +62,12 @@ application threads / processes
 | B-Tree 搜索、写入与分裂 | `src/btree/bt_search.c`、`bt_cursor.c`、`bt_put.c`、`bt_split.c` |
 | 磁盘页格式 | `src/dbinc/db_page.h` |
 | buffer pool 与 MVCC | `src/mp/mp_fget.c`、`mp_fput.c`、`mp_mvcc.c`、`src/dbinc/mp.h` |
-| 锁与死锁检测 | `src/lock/lock.c`、`lock_deadlock.c`、`src/dbinc/lock.h` |
+| 锁与死锁（Deadlock）检测 | `src/lock/lock.c`、`lock_deadlock.c`、`src/dbinc/lock.h` |
 | 事务生命周期 | `src/txn/txn.c`、`txn_chkpt.c`、`txn_rec.c` |
 | WAL 读写与恢复分发 | `src/log/log_put.c`、`log_get.c`、`src/db/db_dispatch.c` |
 | 复制与日志补洞 | `src/rep/rep_record.c`、`rep_log.c`、`rep_util.c` |
 
-### 1.1 三层对象：handle、shared region 与持久文件
+### 三层对象：handle、shared region 与持久文件
 
 libdb 是嵌入式 library，但“嵌入式”不等于只有一组进程内 C struct。它的运行状态可以分为三层：
 
@@ -104,7 +102,7 @@ application process
 - `DB_TXN->commit()` 销毁了进程内 transaction handle，不代表与它相关的所有 shared metadata 立刻消失；MVCC page version 或 SSI SIREAD marker 可能继续引用 `TXN_DETAIL`；
 - `DB->put()` 在调用者线程执行，不代表没有跨进程并发；逻辑锁、transaction region 与 mpool region 正是在协调不同线程/进程。
 
-### 1.2 `DB_ENV->open()` 为什么有严格初始化顺序
+### `DB_ENV->open()` 为什么有严格初始化顺序
 
 [`src/env/env_open.c`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/env/env_open.c) 先用 `__env_attach()` 创建或加入 environment。若是加入已有 environment，当前 handle 的 `DB_INIT_*` flags 会被底层 environment 实际配置覆盖，而不是任由进程以不一致的子系统集合 attach。
 
@@ -137,7 +135,9 @@ if (DB_RECOVER)    __db_apprec(...);
 
 这反而让 libdb 很适合学习 OLTP Storage Engine：没有分布式调度和复杂 SQL plan 遮挡，一次点写怎样走到底层非常直接。
 
-## 2. 一次 `DB->put` 如何走进 B-Tree
+## 从 DB->put 到页面修改
+
+### 一次 `DB->put` 如何走进 B-Tree
 
 `src/db/db_method.c` 在创建 `DB` handle 时把 `dbp->put` 绑定到 `__db_put_pp`。调用链可以压缩成：
 
@@ -157,7 +157,7 @@ DB->put
        -> commit / abort local transaction
 ```
 
-### 2.1 public wrapper 负责的远不止参数检查
+#### public wrapper 负责的远不止参数检查
 
 `DB` handle 在 [`__db_init()`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/db/db_method.c) 中安装 public method table：
 
@@ -211,7 +211,7 @@ ret = dbc_n->am_put(dbc_n, key, data, flags, &offpage_dup_pgno);
 
 第三，写入不是“搜索一次然后原地塞入”。`__bamc_put()` 先通过 `__bam_search()` 找叶子，`__bam_iitem()` 返回 `DB_NEEDSPLIT` 时，代码会释放不再可靠的 pinned page 和短期锁，调用 `__bam_split()`，然后回到 `split:` 标签重新搜索、重试插入。结构修改后的旧路径不能被继续信任，这是并发 B-Tree 实现里非常具体的一条规则。
 
-### 2.2 `__bamc_put()` 是一个可重试状态机
+#### `__bamc_put()` 是一个可重试状态机
 
 [`src/btree/bt_cursor.c`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/btree/bt_cursor.c) 中的核心控制流可以缩减为：
 
@@ -240,7 +240,7 @@ split 后必须释放 search stack 上的 page pin 和 lock，原因有两层：
 
 `__bam_split()` 会返回一个可作为下一次搜索起点的 parent `root_pgno`，但启用 record numbering 时仍从真实 root 重走，因为沿途 subtree record count 都可能需要调整。这是 correctness 优先于 shortcut 的具体例子。
 
-### 搜索为何区分 lock 与 latch
+#### 搜索为何区分 lock 与 latch
 
 在 `__bam_search()` 中，逻辑 lock 与 buffer latch 同时存在，但生命周期不同：
 
@@ -250,7 +250,7 @@ split 后必须释放 search stack 上的 page pin 和 lock，原因有两层：
 
 源码注释明确区分了“遍历内部节点的短期锁”和“数据项所在页需要随事务持有的锁”。B-Tree 向下走时还采用 lock coupling：拿到 child 的保护后才能释放 parent。把这三类机制都称为“锁”会很容易误读性能问题。
 
-### 2.3 `__bam_search()` 同时维护路径、锁与 buffer pin
+#### `__bam_search()` 同时维护路径、锁与 buffer pin
 
 [`__bam_search()`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/btree/bt_search.c) 在每一层 page 上按 item 类型设置 binary-search stride：B-Tree leaf 的 key/data 占两个 slot，所以 `adjust=P_INDX`；internal page 每个 `BINTERNAL` 占一个 slot，所以使用 `O_INDX`。找到 internal separator 后取 child page number：
 
@@ -285,7 +285,7 @@ if (LSN(live_root) != snap_lsn) {
 
 这是一种“乐观选路、悲观验证”。它减少 hot root 上的共享 refcount/latch 写，却没有削弱结构正确性：任何无法证明 snapshot 仍有效的情况都退回原搜索路径。
 
-## 3. 行存具体长什么样：一个从两端生长的 slotted page
+### 行存具体长什么样：一个从两端生长的 slotted page
 
 libdb 不理解 SQL column，也没有固定 tuple schema。对核心引擎来说，key 和 data 都只是 `DBT` 中的一段 bytes；应用负责序列化“行”。但这些 bytes 落盘后不是简单连续 append，而是组织在页内。
 
@@ -322,7 +322,7 @@ high address
 
 `P_INP()` 找到 offset array，`HOFFSET()` 标记高地址一侧第一个可用 byte，`P_ENTRY()` 用 offset 找到具体 item。这样移动变长记录时只需调整 offset，不需要让上层 cursor 保存裸指针。
 
-### B-Tree leaf：key 和 value 是一对 slot
+#### B-Tree leaf：key 和 value 是一对 slot
 
 `P_LBTREE` 叶子页中 `inp[0]` 是 key、`inp[1]` 是 data，之后每两个 slot 表示下一条记录。普通短 key/value 使用 `BKEYDATA`：
 
@@ -347,7 +347,7 @@ typedef struct _bkeydata {
 
 `DB_HEAP` 也是行式页，但身份从 key 变成 `(pgno, indx)` 形式的 RID。`HEAPPG` 维护 offset table 与 free-space map；超大 record 可以由 `HEAPSPLITHDR` 串起多个 piece。它更接近传统 heap file，而 B-Tree 是“主数据就存放在索引叶子”的 clustered organization。
 
-### 3.1 一次 replace 如何同时修改 WAL、page LSN 与 slot
+#### 一次 replace 如何同时修改 WAL、page LSN 与 slot
 
 理解 slotted page 不能只看 struct，还要看 mutation 顺序。[`__bam_iitem()`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/btree/bt_put.c) 先计算 key/data 是 inline `BKEYDATA` 还是 `BOVERFLOW`，再计算这次操作的净新增空间：
 
@@ -385,17 +385,19 @@ __bam_ritem_nolog(dbc, page, index, NULL, data, type);
 
 这里形成了一条关键不变量：**先生成包含 old/new 差异与 old page LSN 的日志，再修改 page，并让 page header 指向新 log LSN**。日志此时可以只在 log buffer 中，不要求每次 item mutation 都 fsync；但 data page 真正刷盘前，mpool 必须确保它的 page LSN 对应 WAL 已经持久化。
 
-### 3.2 overflow 不是另一种 value type，而是一条 page chain
+#### overflow 不是另一种 value type，而是一条 page chain
 
 当 key/value 超过 `ovflsize` 时，leaf slot 只保存 `BOVERFLOW {pgno, tlen}`。`__bam_ovput()` 分配一个或多个 overflow page，把大对象拆成链；更新/删除时 `__db_goff()`、`__db_doff()` 负责读取或回收链。
 
 这会让一次逻辑 put 展开为多个物理动作：page allocation、overflow data、leaf pointer，必要时再加 B-Tree split。事务 undo 必须按 previous-LSN chain 逆序撤销这些动作，不能只恢复 leaf slot。也正因如此，后文的 logical CDC 无法把每条 WAL record 直接等价成一条业务 KV event。
 
-### 行存的代价
+#### 行存的代价
 
 行存并不是天然优于列存。读取一条记录需要的字段通常都在同一 value 附近，点查和小范围更新很合适；但扫描十亿行只计算一个 column 时，libdb 仍然要让应用解码每个 value，无法像 column store 那样只读所需列、使用 column encoding 和向量化批处理。
 
-## 4. 事务不是一个对象，而是一条跨子系统协议
+## 事务与快照：日志、MVCC 和 SSI 的共同约束
+
+### 事务不是一个对象，而是一条跨子系统协议
 
 `__txn_begin()` 同时创建进程内的 `DB_TXN` handle 和共享 transaction region 中的 `TXN_DETAIL`。后者保存 `txnid`、`last_lsn`、`begin_lsn`、`read_lsn`、`visible_lsn`、状态、父事务以及 MVCC/SSI 引用计数。
 
@@ -418,7 +420,7 @@ commit record + durability policy
 publish MVCC visibility, release locks, free txn resources
 ```
 
-### 4.1 `DB_TXN`、`TXN_DETAIL` 与 locker 各自负责什么
+#### `DB_TXN`、`TXN_DETAIL` 与 locker 各自负责什么
 
 [`__txn_begin()`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/txn/txn.c) 先分配 process-local `DB_TXN`，设置 commit sync policy、isolation、parent/child list、cursor list；[`__txn_begin_int()`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/txn/txn.c) 再在 transaction region 的 system mutex 下分配 `TXN_DETAIL`：
 
@@ -444,7 +446,7 @@ txn->locker->td_off = region_offset(td);
 
 commit/abort 的清理顺序因此受引用关系约束。例如 `__txn_end()` 必须先处理 SIREAD、释放 locker，再从 active transaction list 移除/free `TXN_DETAIL`；反过来会让 lock cleanup 解引用已经释放的 detail。
 
-### Atomicity：abort 沿事务日志链向后 undo
+#### Atomicity：abort 沿事务日志链向后 undo
 
 每条事务日志记录都通过 previous LSN 串到同一事务的上一条记录。`__txn_abort()` 调用 `__txn_undo()`，后者从 `last_lsn` 反向读取日志，再由 `__db_dispatch(..., DB_TXN_ABORT)` 分派到 access method 的 recovery function。例如 B-Tree 的 replace、split 和 page adjust 都有对应生成日志及 recover 代码。
 
@@ -465,7 +467,7 @@ while (!IS_ZERO_LSN(key_lsn)) {
 
 因此 abort 不是扔掉一块 private write set。非 MVCC 和部分结构修改已经可能进入共享 buffer，必须由日志把它们恢复到事务之前的状态。
 
-### Durability：commit 的完成点由 sync policy 决定
+#### Durability：commit 的完成点由 sync policy 决定
 
 默认事务被标记为 `TXN_SYNC`。顶层事务 commit 时，`__txn_commit()` 先关闭 cursor、处理 lock/event，再写 `__txn_regop_log(... TXN_COMMIT ...)`。日志 flags 来自事务的 durability 配置：
 
@@ -506,11 +508,11 @@ commit record 的返回 LSN 同时写入 `visible_lsn`。对 MVCC page version �
 
 child transaction 的 commit 不等同于 durable top-level commit：它把 child log relationship 记到 parent，并把 in-memory non-durable logs 合并进 parent；parent 最终 abort 仍可逆序撤销 child。这是 nested transaction 与独立 transaction 的根本区别。
 
-### Consistency：它一半来自引擎，一半来自应用
+#### Consistency：它一半来自引擎，一半来自应用
 
 libdb 能保证 B-Tree 结构、页 LSN、事务原子性和隔离级别，但它不知道“余额不能为负”或“订单金额等于明细之和”。应用必须在同一 `DB_TXN` 内读取、验证并更新相关 key，或者借助 secondary database callback 维护派生索引。
 
-### Recovery：redo committed history，undo loser transactions
+#### Recovery：redo committed history，undo loser transactions
 
 环境以 `DB_RECOVER` 打开时，恢复代码读取 checkpoint 和 WAL，构造 transaction list，再通过 `__db_dispatch` 让各 access method 的 recovery routine 做 forward roll 或 backward roll。页上的 `PAGE.lsn` 用来判断某条日志是否已经体现在该页中，避免重复应用。
 
@@ -542,13 +544,13 @@ if (UNDO && page_lsn == record_lsn) {
 
 可以把恢复理解为 ACID 的最终验收：如果 commit 已经对应用返回，崩溃后必须能 redo；如果事务没有完成，崩溃后必须能 undo。
 
-## 5. MVCC 在 libdb 中是“页版本链”，不是行上的 begin/end timestamp
+### MVCC 在 libdb 中是“页版本链”，不是行上的 begin/end timestamp
 
-我过去接触较多的是把版本信息放在 row/segment 上的系统，因此 libdb 的 MVCC 实现很值得注意：它的主要版本单位是 buffer pool 中的 **page image**。
+libdb 主要以 buffer pool 中的 **page image** 保存版本，而不是给每行附加起止时间戳；同页修改与长快照因此会影响页面复制和历史驻留成本。
 
 使用 snapshot read 需要两个开关：数据库以 `DB_MULTIVERSION` 打开，事务以 `DB_TXN_SNAPSHOT` 开始。当前社区分支中后者总是 SSI，不再提供 public plain-SI mode。
 
-### 5.1 snapshot 不是在 `txn_begin()` 时立即拍下来的
+#### snapshot 不是在 `txn_begin()` 时立即拍下来的
 
 snapshot transaction 第一次访问 multiversion page 时，[`__memp_fget()`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/mp/mp_fget.c) 才通过 `__log_current_lsn_int()` 初始化 `TXN_DETAIL.read_lsn`。这是 **lazy snapshot acquisition**，而不是在 `__txn_begin()` 中立即记录时间点。nested transaction 还会先向上找到 ultimate parent，共享同一 snapshot：
 
@@ -587,7 +589,7 @@ BH_VISIBLE := version has no owner
 
 [`src/dbinc/mp.h`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/dbinc/mp.h) 中的 `BH_VISIBLE` 会分两次读取 `visible_lsn.file/offset`。如果它恰好和 commit 并发，只读到一半的 LSN 会被视为“未来”，因此宁可暂时不可见，也不会错误读到尚未进入 snapshot 的版本。这是一个很小但非常关键的并发不变量。
 
-### 5.2 写入为何是整页 copy-on-write
+#### 写入为何是整页 copy-on-write
 
 写事务 dirty 一个不属于自己的 multiversion buffer 时，`makecopy` 被置为 true。代码分配新 `BH`，复制完整 page image，用 `__memp_bh_settxn()` 记录 owner，然后把新版本插到 version chain 的 newest 端：
 
@@ -629,13 +631,13 @@ old snapshot
 
 这不只是“占一点 transaction metadata”，而是会消耗 buffer header、临时磁盘与额外 I/O；应用层必须限制长事务，而不是期待 mpool 无限吸收版本。
 
-### 5.3 MVCC 解决了什么，没有解决什么
+#### MVCC 解决了什么，没有解决什么
 
 page version chain 让 reader 不必用普通 read lock 阻塞 writer，并给同一事务稳定 snapshot。但 plain snapshot isolation 仍允许 write skew：两个事务读到相同旧状态，随后更新不同 key，彼此没有 write-write conflict，却共同破坏约束。
 
 当前 fork 在 MVCC 上叠加了 SSI。
 
-## 6. SSI：用 SIREAD 与 rw-antidependency 捕获 write skew
+### SSI：用 SIREAD 与 rw-antidependency 捕获 write skew
 
 当前 [`RFC 0003`](https://github.com/berkeleydb/libdb/blob/c4811dc87/rfc/0003-ssi-serializable-snapshot-isolation.md) 实现的是 Cahill 的 Serializable Snapshot Isolation。核心不是给 snapshot read 重新加会阻塞 writer 的普通读锁，而是记录“我读过这里”的 `DB_LOCK_SIREAD` marker。
 
@@ -680,7 +682,7 @@ SIREAD marker 不能在 reader commit 时立即消失，因为 concurrent writer
 
 当前实现还有清楚的限制：conflict tracking 是 page granularity，热点页会产生 false positive 和更高 abort rate；SSI transaction 不能进入 `prepare()`/2PC；HA/replication qualification 仍在推进。因此“支持 serializable”不等于所有负载下都已经低成本。
 
-### 6.1 普通锁管理：兼容矩阵、等待公平性与死锁图
+#### 普通锁管理：兼容矩阵、等待公平性与死锁图
 
 SSI 的 SIREAD 不应和普通 logical lock 混在一起理解。[`DB_LOCKOBJ`](https://github.com/berkeleydb/libdb/blob/c4811dc87/src/dbinc/lock.h) 的三条队列代表三种不同状态：
 
@@ -713,11 +715,15 @@ request
 
 所以 storage engine 只负责打破环，不会替应用重放业务逻辑。应用收到 `DB_LOCK_DEADLOCK` 后必须 abort 整个 transaction，再以有界退避重试；只重试最后一个 `put` 会破坏原事务语义。
 
-## 7. 并发场景分别要求 Query Engine 与 Storage Engine 做什么
+## 应用边界：并发、复制与 CDC
+
+### 并发场景分别要求 Query Engine 与 Storage Engine 做什么
 
 libdb 没有核心 SQL Query Engine，但从它的调用边界反而能更清楚地区分两层责任。
 
-### Query/Application 层必须承担的责任
+#### Query/Application 层必须承担的责任
+
+嵌入式引擎不知道业务事务边界，调用方必须定义哪些操作一起提交、哪些失败需要整体重试。
 
 1. **确定事务边界。** 哪些读写必须一起 commit，哪些失败码需要整体 retry；
 2. **尽早缩小访问集合。** key lookup 与短 cursor range 可以减少持锁时间，长扫描会放大版本保留与 conflict；
@@ -728,7 +734,9 @@ libdb 没有核心 SQL Query Engine，但从它的调用边界反而能更清楚
 
 完整 SQL 引擎还会利用 optimizer 选择 index/range、在 executor 中避免锁内做昂贵表达式，并维护 operator cancel/timeout。但 libdb 只看得到最终 key/cursor 操作，因此这些决策必须在上层完成。
 
-### Storage Engine 必须承担的责任
+#### Storage Engine 必须承担的责任
+
+存储层必须协调逻辑锁、页面保护与日志顺序，不能把这些内部不变量交给每个调用方重复维护。
 
 1. **逻辑 lock 与物理 latch 分离**，避免事务长期持有 buffer mutex；
 2. **定义 lock compatibility 与等待队列**，支持 NOWAIT、timeout 和 locker priority；
@@ -736,17 +744,17 @@ libdb 没有核心 SQL Query Engine，但从它的调用边界反而能更清楚
 4. **控制共享热点。** lock table 与 mpool hash bucket 做 partition，但 root、hot leaf、buffer refcount 仍可能成为 cache-line 竞争点；
 5. **保证结构修改可重试。** split 后释放旧 stack、重新 search，而不是持有整棵树的全局锁；
 6. **提供 crash-safe 顺序。** page flush 前先 flush page LSN 对应 WAL；
-7. **管理版本与背压。** 长 snapshot 导致 version chain 和 freezer I/O 增长时，不能假设内存无限。
+7. **管理版本与背压（Backpressure）。** 长 snapshot 导致 version chain 和 freezer I/O 增长时，不能假设内存无限。
 
 当前 fork 的 B-Tree root snapshot 很能说明并发优化的方向：普通只读 lookup 可以从 `DB` handle 的 private root copy 选出第一个 child，并用 live root LSN 做前后验证，减少所有线程对 live root 的 pin/latch/refcount 写竞争；不满足条件或验证失败就回退到原路径。这是一种保守的 optimistic read，而不是把整个 B-Tree 改成 lock-free。
 
-## 8. WAL、复制与 CDC：三者不能画等号
+### WAL、复制与 CDC：三者不能画等号
 
 libdb 提供 `DB_ENV->log_cursor()`，返回的 `DB_LOGC->get()` 可以用 `DB_FIRST`、`DB_NEXT`、`DB_SET` 等方式按 LSN 遍历日志。复制层也确实以 log stream 为核心：master 发送 `REP_LOG`，client 的 `__rep_apply()` 检查 `ready_lsn`、处理 gap、暂存乱序记录并推进日志。
 
 这很像 CDC 的底座，但还不是现代意义上开箱即用的 logical CDC。
 
-### 8.1 一条 WAL record 如何被序列化
+#### 一条 WAL record 如何被序列化
 
 WAL record 由 access method 定义。例如：
 
@@ -787,9 +795,9 @@ __log_put(env, record_lsnp, &logrec, flags | DB_LOG_NOCOPY);
 
 如果 database/transaction 配置为 non-durable，record 可能不立刻进入持久 log，而是挂在 `txnp->logs`，并把返回 LSN 标为 `NOT_LOGGED`。这不是“仍然 durable 但少一次 fsync”，而是另一条明确的故障语义。
 
-WAL 首先是一组让 recovery routine 能 redo/undo **物理页与访问方法操作** 的协议。一个业务 `put` 可能产生 data replace、overflow page、split 和 metadata update 多条日志；反过来，一条 split log 也不代表一条业务 row change。
+WAL 首先是一组让 recovery routine 能 redo/undo **物理页（Physical Page）与访问方法操作** 的协议。一个业务 `put` 可能产生 data replace、overflow page、split 和 metadata update 多条日志；反过来，一条 split log 也不代表一条业务 row change。
 
-### 8.2 物理复制如何处理乱序与缺口
+#### 物理复制如何处理乱序与缺口
 
 复制接收路径不是收到 `REP_LOG` 就直接 append：
 
@@ -819,7 +827,7 @@ receive missing records -> ready reaches L60
 
 这说明物理复制依赖的是 **连续 WAL prefix**，不是“消息大致有序即可”。只有 gap 闭合后，乱序到达的 permanent record 才能成为本地已经处理的 durable prefix。它保护的是日志/页语义一致，而不是业务事件 schema。
 
-### 8.3 如果要在它上面构建 CDC
+#### 如果要在它上面构建 CDC
 
 一个可靠 consumer 至少需要：
 
@@ -845,7 +853,7 @@ DB_LOGC from durable LSN
 
 对于新应用，如果强依赖业务级 CDC，我会优先考虑在同一 transaction 中写 outbox database，由应用按 key/value contract 消费；或者在调用 `DB->put/del` 的上层生成事件。直接解码物理 WAL 更适合复制、审计工具或对 libdb log format 有强控制的系统。
 
-## 9. 从 OLAP/BigData 视角看，哪些能力以前不够显眼
+### 从 OLAP/BigData 视角看，哪些能力以前不够显眼
 
 下面的比较不是说所有 OLAP 都没有这些能力，而是说 analytical-first 系统通常不会把它们放在最核心、最频繁的单行路径上。
 
@@ -854,7 +862,7 @@ DB_LOGC from durable LSN
 | 单条 key update 立即可见并可回滚 | 以 immutable file、batch/mini-batch publish 或 partition overwrite 为主 |
 | 每个事务有 isolation、lock set、undo chain | 更关注 task retry、snapshot publish 和 job-level atomicity |
 | lock wait、deadlock detection、victim retry | 通过单写、分区 ownership、乐观提交或 coarse metadata lock 避免细粒度等待图 |
-| commit 可选择 sync/nosync durability | 写入通常跨网络、对象存储和副本，完成点由分布式 commit/publish 定义 |
+| commit 可选择 sync/nosync durability | 写入通常跨网络、对象存储（Object Storage）和副本，完成点由分布式 commit/publish 定义 |
 | crash recovery 需要 redo winner、undo loser | immutable data 常只需选择已提交 manifest/version，较少原地 undo 数据页 |
 | 长 cursor 与 concurrent update 共享同一页 | scan 多为 snapshot，写入生成新 file/segment，旧版本由 GC 回收 |
 | XA/2PC、nested transaction、per-record lock | 更常见跨 stage DAG、checkpoint、exactly-once sink 或 catalog transaction |
@@ -862,7 +870,7 @@ DB_LOGC from durable LSN
 
 libdb 让我看到，传统 OLTP 所谓“低延迟”并不只是 page cache hit。它要求在一次很短的 API 调用里完成 lock、WAL serialization、page mutation、可能的 split、commit flush 和错误分类，同时还要允许其他线程继续推进。
 
-### 反过来，libdb 核心缺少哪些 OLAP 能力
+#### 反过来，libdb 核心缺少哪些 OLAP 能力
 
 libdb 也不应该被想象成一个小型通用数据库。核心层没有：
 
@@ -876,9 +884,11 @@ libdb 也不应该被想象成一个小型通用数据库。核心层没有：
 
 所以正确的比较不是“行存比列存快”或“嵌入式比 Server 简单”，而是两类系统优化了不同的单位：libdb 优化一条 key/value 与一个事务的完成路径，OLAP 系统优化一个 column batch、一个 fragment 或一个 distributed query 的总吞吐。
 
-## 10. 当前源码中的性能方向
+## 性能路径与后续实验
 
-这个社区分支不只是在保存历史版本。源码和 RFC 能看到三条明确方向：
+### 当前源码中的性能方向
+
+社区分支通过缓存与 I/O 路径调整降低访问开销，但源码存在某条路径不证明所有负载都受益。以下区分实现机制与仍需 benchmark 的效果：
 
 1. **减少 hot read path 的共享写。** cache cooling 避免每次访问都更新全局 LRU，root snapshot 减少 live root 的 pin/latch；
 2. **把阻塞 I/O 从前台挪走。** `src/os/os_aio*.c` 已提供 io_uring、POSIX AIO、kqueue 和 IOCP 相关 backend，buffer pool 侧保留 WAL-before-data 的约束；
@@ -894,11 +904,13 @@ make -j4 LIBS='-lrt -lpthread'
 
 静态核心库和 `db_archive`、`db_printlog`、`db_recover`、`db_verify` 等工具构建成功。直接执行 `make -j4` 时，configure 虽然探测到 POSIX AIO 位于 `librt`，生成的 link command 却没有带 `-lrt`，导致 `aio_read/aio_write/aio_return` unresolved；显式传入 `LIBS` 后通过。这个结果只证明当前 Linux/GCC 环境下 core build 可完成，不等于 SSI、复制和并发回归套件已经全部验证。
 
-## 11. 如何按架构路径继续读源码
+### 如何按架构路径继续读源码
 
 如果从 `src/` 目录名逐个看，很容易得到许多局部知识，却不知道正确性在哪里闭环。我更推荐按下面六条路径阅读，每条都以一个可观察问题结束。
 
-### 路径一：先走通一条非分裂写入
+#### 路径一：先走通一条非分裂写入
+
+非分裂写入可以隔离普通修改路径，先核对页锁、WAL 和 page LSN，再引入结构变更。
 
 ```text
 src/db/db_method.c::__db_init
@@ -912,11 +924,13 @@ src/db/db_method.c::__db_init
 
 阅读目标是回答：public contract 在哪里结束，B-Tree dispatch 在哪里开始；cursor 保存了什么；哪一步先 log、哪一步再改 page、哪一步更新 `PAGE.lsn`。
 
-### 路径二：故意让 leaf 空间不足
+#### 路径二：故意让 leaf 空间不足
 
 从 `__bam_iitem()` 的 `DB_NEEDSPLIT` 返回，继续读 `__bam_split()`、search stack release 和 retry label。对照 `src/dbinc/db_page.h` 的 `NUM_ENT/P_INP/P_ENTRY` 宏，回答 split 后为什么不能继续使用旧 `(pgno, index)`，parent separator 和 sibling link 各由哪条日志保护。
 
-### 路径三：让两个事务争用同一对象
+#### 路径三：让两个事务争用同一对象
+
+竞争实验能够区分逻辑锁等待与短期页面 latch，必须记录持有者、等待者和事务重试行为。
 
 ```text
 __db_lget
@@ -930,19 +944,19 @@ __db_lget
 
 这条路径要把“等待”和“死锁”分开：前者是 compatibility 的正常结果，后者是 waits-for graph 中的 cycle。再对照 `DB_LOCK_NOTGRANTED` 与 `DB_LOCK_DEADLOCK` 的返回位置，确认应用应在哪里 abort/retry。
 
-### 路径四：让 snapshot 跳过一个新版本
+#### 路径四：让 snapshot 跳过一个新版本
 
 从 `__memp_fget()` 设置 `read_lsn` 开始，跟 `BH_VISIBLE` 选择版本、`makecopy` 创建新 `BH`、`__memp_si_rwconflict()` 建 edge，最后到 `__txn_commit()` 的 pivot check。这条路径把 MVCC、SSI 和 transaction region 串成一个整体，比只读 RFC 更容易理解。
 
-### 路径五：从一条 log 同时向两个方向走
+#### 路径五：从一条 log 同时向两个方向走
 
 向前看 `__log_put_record_int()` 如何编码 record、推进 transaction LSN、回填 page LSN；向后看 `__txn_undo()` 和 `__db_dispatch()` 如何按 `prev_lsn` 找 recovery function。然后从 `__db_apprec()` 看相同 recovery routine 如何在 backward/forward pass 中分别 UNDO/REDO。
 
-### 路径六：把本地 WAL 换成网络乱序 WAL
+#### 路径六：把本地 WAL 换成网络乱序 WAL
 
 从 `__rep_process_message_int()` 进入 `__rep_apply()`，分别模拟 `incoming < ready`、`== ready`、`> ready` 三个分支。读完应该能解释：复制为什么要临时 DB、何时更新 `waiting_lsn`、gap 闭合后怎样 drain，以及为什么这些机制仍不等于 logical CDC。
 
-### 贯穿所有路径的十条不变量
+#### 贯穿所有路径的十条不变量
 
 最后不要只记函数名，可以用下面这些问题检查是否真正读懂：
 
@@ -959,17 +973,6 @@ __db_lget
 
 这些不变量把目录之间的关系压缩成了系统设计：B-Tree 维护结构，mpool 维护 page identity/version，lock manager 维护等待关系，txn 维护生命周期，log/recovery 维护崩溃前后等价，replication 再把同一套 WAL 顺序延伸到另一台机器。
 
-## 12. 这次源码学习后的理解
+### 尚待执行的验证
 
-沿着 `DB->put` 向下读，比按目录逐个背模块有效得多。一个 API 把我带过了 cursor、B-Tree search、slotted page、overflow、lock/latch、WAL、commit 和 recovery，再从 snapshot read 延伸到 page version chain 与 SSI。
-
-最终我会用下面几句话概括 libdb：
-
-- 它是嵌入式 access-method library，应用线程就是它的执行线程；
-- “行”是应用序列化的 bytes，存储层用 slotted page、B-Tree leaf 或 heap RID 组织；
-- 普通事务以 lock + WAL + recovery 获得 ACID，MVCC 用 buffer page copy-on-write 提供 snapshot；
-- 当前 fork 再用 SIREAD 和 rw-antidependency detection 把 snapshot 提升到 SSI；
-- WAL 天然适合恢复与物理复制，但 logical CDC 还需要事务重组、身份、schema 和 retention contract；
-- OLTP 与 OLAP 的差异不只在 row/column layout，更在提交单位、并发协议、恢复方式和资源治理边界。
-
-下一步如果继续 dive，我会选两个可执行实验：第一，用两个 SSI transaction 复现 write skew 和 `DB_SNAPSHOT_CONFLICT`；第二，生成 insert/update/split/commit 日志，用 `db_printlog` 和 `DB_LOGC` 对照一次业务写入究竟展开成多少物理 record。只有把源码控制流和实际日志一一对应，才算真正理解了这套事务引擎。
+下一步如果继续 dive，我会选两个可执行实验：第一，用两个 SSI transaction 复现 write skew 和 `DB_SNAPSHOT_CONFLICT`；第二，生成 insert/update/split/commit 日志，用 `db_printlog` 和 `DB_LOGC` 对照一次业务写入究竟展开成多少物理 record。这两项实验尚待执行，不能由静态阅读宣称 SSI 冲突和崩溃恢复已通过本地验证；接入应用时还需测试事务重试、日志保留与故障恢复。

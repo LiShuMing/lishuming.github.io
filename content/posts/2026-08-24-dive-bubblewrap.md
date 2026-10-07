@@ -1,7 +1,7 @@
 ---
 title: "【源码】Bubblewrap：五千行 C 代码如何构建 Linux 用户态沙箱"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-08-30T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 slug: "dive-bubblewrap"
 categories:
   - AI Infra
@@ -33,24 +33,17 @@ AI Agent 可以读写文件、执行 Shell、调用编译器，甚至运行来�
 本文基于 `~/xwork/bubblewrap` 的当前源码，重点回答：
 
 1. Bubblewrap 与 Docker、runc、systemd-nspawn 的边界是什么？
-2. 普通用户如何借助 User Namespace 获得“只在命名空间内有效”的管理能力？
+2. 普通用户如何借助 User Namespace 获得“只在命名空间（Namespace）内有效”的管理能力？
 3. 为什么文件系统构建需要两次 `pivot_root`？
 4. 为什么简单的 Bind Mount 加只读标记，会扩展成数百行 `mountinfo` 处理？
 5. 外部 Monitor、沙箱 PID 1 与目标程序为什么需要三个进程角色？
 6. Bubblewrap 已经做了什么，安全策略调用方还必须补充什么？
 
-## 核心结论
+## 策略执行器的范围与入口
 
-1. **Bubblewrap 是策略执行器，不是安全策略本身。** 它负责可靠地建立 Namespace、挂载树与权限边界；哪些目录、Socket、设备和网络应该暴露，完全由调用参数决定。
-2. **User Namespace 是非特权容器能力的根。** 普通用户可以在新 User Namespace 中获得仅对该 Namespace 资源有效的 Capability，再用它创建 Mount、PID、Network 等隔离视图。
-3. **安全性来自多层收敛，而不是单一 Chroot。** `PR_SET_NO_NEW_PRIVS`、User/Mount Namespace、`pivot_root`、`nosuid/nodev/ro`、Capability Bounding Set、Seccomp 和 FD 清理共同组成边界。
-4. **两次 `pivot_root` 解决的是旧根可达性。** 第一次提供同时访问 `oldroot` 和 `newroot` 的搭建环境；第二次把 `/newroot` 提升为真正根目录，并彻底拆掉旧挂载树。
-5. **SetupOp 是全项目最重要的中间表示。** CLI 参数先编译为有序操作链表，进入 Mount Namespace 后再执行，实现了解析、校验与特权操作的阶段分离。
-6. **进程监管本身也是安全协议。** Monitor、沙箱 PID 1 与目标进程通过 `eventfd`、`signalfd`、Pipe 和 Credential Socket 传递状态，避免僵尸进程、退出码竞态和不可信 PID。
-7. **默认应 Fail-Closed。** 当前新增的 `--not-a-security-boundary` 只适用于明确不把本次调用当作安全边界的场景；即便启用，Namespace、`pivot_root`、Capability Drop 等关键失败仍会终止。
-8. **Namespace 不是虚拟机。** 沙箱仍共享宿主 Linux Kernel；D-Bus、Wayland/X11、设备、宿主目录和网络一旦被暴露，就会成为策略的一部分。
+### 源码版本与分析范围
 
-### 源码分析基线
+以下分析固定在该开发快照，讨论策略落实与进程监管，不等于完成恶意负载安全审计。
 
 | 项目属性 | 当前源码 |
 |----------|----------|
@@ -67,13 +60,15 @@ AI Agent 可以读写文件、执行 Shell、调用编译器，甚至运行来�
 | 文件 | 行数 | 主要职责 |
 |------|------|----------|
 | [`bubblewrap.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bubblewrap.c) | 3,255 | 参数解析、Namespace、挂载编排、权限与进程树 |
-| [`utils.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/utils.c) | 1,085 | FD、路径、内存、进程与通用系统调用封装 |
+| [`utils.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/utils.c) | 1,085 | FD、路径、内存、进程与通用系统调用（System Call）封装 |
 | [`bind-mount.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bind-mount.c) | 607 | Bind Mount、`mountinfo` 与递归 Remount |
 | [`network.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/network.c) | 199 | 最小 rtnetlink 客户端与 Loopback 配置 |
 
-## 项目定位与历史
+### 项目定位与历史
 
-### 从 xdg-app helper 独立出来的低层组件
+Bubblewrap 的低层定位把资源策略交给调用方，因此可以嵌入不同上层系统，也要求上层承担配置正确性的责任。
+
+#### 从 xdg-app helper 独立出来的低层组件
 
 仓库的第一个 Commit 由 Alexander Larsson 于 2016 年 2 月提交。README 记录了更完整的代码血缘：
 
@@ -91,7 +86,7 @@ Bubblewrap 最初继承了桌面应用沙箱中的低层能力，随后把应用
 
 名字也直接表达了这个定位：`bwrap` 作为目标应用的父进程“包裹”它，并在外部形成一层保护结构，类似气泡膜 Bubble Wrap。
 
-### 它和容器运行时有什么不同
+#### 它和容器运行时有什么不同
 
 现代 Docker/runc 已经支持 Rootless 场景，因此不能简单地把两者区别归纳为“一个非特权、一个只能 Root”。更准确的区别是抽象层次：
 
@@ -108,7 +103,7 @@ Bubblewrap 最初继承了桌面应用沙箱中的低层能力，随后把应用
 
 systemd-nspawn 更接近“启动一个轻量系统容器”；Bubblewrap 更接近“为一个进程临时改写世界观”。
 
-### 两种“安全边界”不能混淆
+#### 两种“安全边界”不能混淆
 
 [`SECURITY.md`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/SECURITY.md) 区分了两个问题。
 
@@ -125,7 +120,7 @@ systemd-nspawn 更接近“启动一个轻量系统容器”；Bubblewrap 更接
 
 同一个二进制既能构建强约束沙箱，也能只用来调整文件系统布局。安全属性属于“Bubblewrap 能力 + 调用参数 + Kernel + 外部接口”的组合。
 
-## 整体架构：一条声明式沙箱编译流水线
+### 整体架构：一条声明式沙箱编译流水线
 
 Bubblewrap 最终只生成一个 `bwrap` 可执行文件，入口是 [`main()`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bubblewrap.c)。整体可以理解为一条小型编译流水线：
 
@@ -172,9 +167,13 @@ raw_clone(CLONE_NEWNS | ...)
 - **解析阶段不执行挂载。** 用户意图先变成数据结构；
 - **特权操作完成后不可回头。** 旧根被卸载、Capability 被丢弃、Seccomp 被应用，后续阶段只能继续收敛。
 
-## SetupOp：把命令行编译为挂载计划
+## 准备阶段：编译挂载计划，取得局部权限
 
-### 数据结构
+### SetupOp：把命令行编译为挂载计划
+
+参数先转换为有序 SetupOp，再统一执行；这样可以集中校验，但操作顺序本身仍属于策略语义。
+
+#### 数据结构
 
 几十个 CLI 选项最终被归一为 [`SetupOp`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bubblewrap.c)：
 
@@ -221,7 +220,7 @@ struct _SetupOp {
 
 `setup_newroot()` 在新的 Mount Namespace 中顺序执行链表。操作顺序是用户可观察语义：后一个 Mount 可以覆盖前一个路径，`--chmod` 也只能作用于已经存在的目标。
 
-### 解析与执行分离的价值
+#### 解析与执行分离的价值
 
 这种设计带来四个收益：
 
@@ -232,7 +231,9 @@ struct _SetupOp {
 
 这与数据库中的“SQL → Logical Plan → Physical Execution”非常相似：先把声明式输入变成中间表示，再在满足前置条件的环境中执行。
 
-### 修饰符只对下一个操作生效
+#### 修饰符只对下一个操作生效
+
+一次性修饰符限定到后续一个操作，解析器需要在消费后重置状态，否则权限意图会误传给其他挂载。
 
 例如：
 
@@ -253,7 +254,7 @@ bwrap \
 
 这避免了修饰符作用域模糊，也阻止错误配置被静默接受。
 
-### FD 优先于路径
+#### FD 优先于路径
 
 `--args`、`--file`、`--bind-data` 与 `--seccomp` 都可以从 FD 获取输入。FD 有两个优势：
 
@@ -262,9 +263,11 @@ bwrap \
 
 `--args` 允许读取 NUL 分隔参数，并以 `MAX_ARGS = 9000` 限制递归展开规模，避免恶意输入导致无限解析或整数边界问题。
 
-## 权限模型：只在必要阶段持有必要能力
+### 权限模型：只在必要阶段持有必要能力
 
-### 入口先永久禁止 Exec 提权
+构造挂载树需要临时管理能力，运行目标程序则应收敛这些能力；准备阶段与 Exec 阶段的权限必须分开追踪。
+
+#### 入口先永久禁止 Exec 提权
 
 `acquire_privs()` 首先拒绝历史 Setuid 与意外 File Capability 配置：
 
@@ -288,7 +291,7 @@ prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
 
 `NO_NEW_PRIVS` 一旦设置就不能撤销。后续 `execve()` 即使遇到 Setuid 程序或 File Capability，也不能获得新的权限；非特权 Seccomp Filter 也依赖这一前提。
 
-### User Namespace 中的 Root 不是宿主 Root
+#### User Namespace 中的 Root 不是宿主 Root
 
 普通用户运行时，Bubblewrap 会自动启用新的 User Namespace。典型 UID 映射是：
 
@@ -307,7 +310,7 @@ Capability
   → 是否允许 Mount/Namespace 管理操作
 ```
 
-### UID/GID Map 的写入顺序
+#### UID/GID Map 的写入顺序
 
 `write_uid_gid_map()` 依次处理：
 
@@ -321,7 +324,7 @@ uid_map
 
 当第一层 Namespace 需要把真实用户映射成 UID 0，同时又要保留目标 Sandbox UID 映射时，代码还读取 Kernel `overflowuid/overflowgid`，避免 Namespace 外部无映射文件的属主意外与 Sandbox Root 冲突。
 
-### 两级 User Namespace 是条件性技巧
+#### 两级 User Namespace 是条件性技巧
 
 草率概括 Bubblewrap 时，经常会说它“总是创建两级 User Namespace”，这并不准确。第二级只在以下情况之一出现：
 
@@ -355,7 +358,7 @@ UserNS #1
 
 它不是“写完配置就相信”，而是运行时验证安全不变量。
 
-### Capability 的三层收敛
+#### Capability 的三层收敛
 
 Bubblewrap 同时处理：
 
@@ -367,9 +370,13 @@ Bubblewrap 同时处理：
 
 创建新 User Namespace 后，Kernel 会重新给予该 Namespace 范围内的 Bounding 能力，因此源码会再次调用 `drop_cap_bounding_set()`。最终 `drop_privs(true)` 只保留命令行明确请求的 Capability；普通非 Root 场景默认不保留能力。
 
-## Mount Namespace：从空白根目录开始构造世界
+## 构造文件系统：新根、操作顺序与子挂载
 
-### 第一步：阻断反向挂载传播
+### Mount Namespace：从空白根目录开始构造世界
+
+新的挂载视图只隔离路径可见性，不会自动隔离已经继承的 FD；构建新根时需要同时处理旧挂载和进程资源。
+
+#### 第一步：阻断反向挂载传播
 
 Bubblewrap 总会创建新的 Mount Namespace，并先执行：
 
@@ -386,7 +393,7 @@ Slave Mount 可以接收上游传播，但当前 Namespace 内的新挂载与卸
 - 完成 `pivot_root` 后不再需要按原路径访问；
 - Tmpfs 会在最后一个引用退出后自动清理。
 
-### 两次 `pivot_root`
+#### 两次 `pivot_root`
 
 完整过程可以画成：
 
@@ -429,7 +436,7 @@ tmpfs@/tmp
 
 第二次 Pivot 将 `/newroot` 提升为真正的 `/`。`pivot_root(".", ".")` 看似违反“旧根应位于新根之下”的直觉，但 Kernel 实际检查的是旧根是否能从新根访问；runc 与 LXC 也使用同类技巧。
 
-### Source Path 为什么提前解析
+#### Source Path 为什么提前解析
 
 `resolve_symlinks_in_ops()` 在 Chroot/Pivot 完成前、切换回真实 UID 后调用：
 
@@ -439,9 +446,11 @@ tmpfs@/tmp
 
 对 `--bind-fd`，源码还在 Mount 后比较 Source FD 与目标的 Device/Inode，检测“解析 `/proc/self/fd/N` 到真正 Mount”之间的替换竞态。
 
-## `setup_newroot()`：顺序执行文件系统计划
+### `setup_newroot()`：顺序执行文件系统计划
 
-### Bind、Tmpfs 与 Overlay
+同一目标路径上的操作顺序会改变最终可见资源，`setup_newroot()` 因此必须按计划依次落实并检查失败。
+
+#### Bind、Tmpfs 与 Overlay
 
 `setup_newroot()` 逐个消费 SetupOp：
 
@@ -457,7 +466,9 @@ Symlink / Chmod / Hostname
 
 Overlay Mount 参数由 `StringBuilder` 拼装，Source 路径通过 `strappend_escape_for_mount_options()` 转义逗号、反斜线等控制字符，避免路径被解释成新的 Mount Option。遇到 `ELOOP` 时还会转换成“Overlay 目录不能重叠”的领域错误。
 
-### `/proc`：共享 PID 与隔离 PID 走不同路径
+#### `/proc`：共享 PID 与隔离 PID 走不同路径
+
+`/proc` 暴露的进程视图依赖 PID Namespace，不能在不同进程隔离模式下无条件复用同一挂载处理。
 
 ```text
 新 PID Namespace
@@ -478,7 +489,7 @@ Overlay Mount 参数由 `StringBuilder` 拼装，Source 路径通过 `strappend_
 
 正常非特权用户本来不应拥有危险写权限，这一层属于纵深防御。
 
-### `/dev`：只构建最小设备视图
+#### `/dev`：只构建最小设备视图
 
 `--dev /dev` 不会把整个宿主 `/dev` 暴露进去，而是：
 
@@ -491,7 +502,7 @@ Overlay Mount 参数由 `StringBuilder` 拼装，Source 路径通过 `strappend_
 
 这体现了 Allowlist 思路：应用需要哪些设备，就明确加入哪些设备。
 
-### `--bind-data`：用匿名化 Mount 承载内容
+#### `--bind-data`：用匿名化 Mount 承载内容
 
 数据从 FD 复制进 `mkstemp` 临时文件，随后 Bind Mount 到目标并立即 `unlink` 临时路径：
 
@@ -504,9 +515,11 @@ FD Data
 
 文件内容仍由 Mount 引用，但沙箱无法从其他路径重新找到临时文件。这种做法把内容生命周期绑定到 Mount，而不是可见文件名。
 
-## 为什么 Bind Mount 需要六百行代码
+### 为什么 Bind Mount 需要六百行代码
 
-### Bind 时传入的安全标记不会自动递归生效
+只读或 `nosuid` 要求必须覆盖实际子挂载，不能只检查顶层路径；挂载树解析与递归 Remount 用于落实这类约束。
+
+#### Bind 时传入的安全标记不会自动递归生效
 
 Linux Bind Mount 的历史行为是：
 
@@ -527,7 +540,7 @@ mount(src, dest, MS_BIND | MS_REC)
 
 默认 Bind 强制 `nosuid`，非 Device Bind 还强制 `nodev`。只读 Bind 则额外增加 `MS_RDONLY`。
 
-### `parse_mountinfo()` 是一个小型树解析器
+#### `parse_mountinfo()` 是一个小型树解析器
 
 [`parse_mountinfo()`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bind-mount.c) 的步骤包括：
 
@@ -539,7 +552,7 @@ mount(src, dest, MS_BIND | MS_REC)
 
 覆盖检测很重要。Linux 允许多个 Mount 叠在同一路径上；对已经被上层 Mount 遮住的旧节点执行安全操作既没有意义，也可能导致错误判断。
 
-### 与 Kernel 使用同一份路径字符串
+#### 与 Kernel 使用同一份路径字符串
 
 大小写不敏感文件系统可能让 Kernel 在 `mountinfo` 中记录的路径大小写不同于调用参数。Bubblewrap 不直接用用户字符串匹配，而是：
 
@@ -552,9 +565,9 @@ open(resolved_dest, O_PATH)
 
 这是系统编程中非常重要的习惯：遇到 Kernel 视图与用户输入可能不一致时，以 Kernel 已确认的对象身份为准。
 
-### `--not-a-security-boundary` 的精确边界
+#### `--not-a-security-boundary` 的精确边界
 
-当前 HEAD 新增了：
+本文固定提交提供了以下选项；不能据此假定所有发行版都支持：
 
 ```text
 --not-a-security-boundary
@@ -574,7 +587,9 @@ Seccomp 安装失败
 
 这个选项面向 xdg-dbus-proxy、Steam Runtime 等“只想调整文件系统布局，并不把本次调用视为隔离边界”的场景。如果调用方确实依赖 `ro/nodev/nosuid` 建立安全边界，就不能启用它。
 
-## 进程树：Monitor、PID 1 与目标程序
+## 进入目标进程：监管、网络与权限收敛
+
+### 进程树：Monitor、PID 1 与目标程序
 
 启用 PID Namespace 且未使用 `--as-pid-1` 时，典型进程关系是：
 
@@ -597,7 +612,7 @@ monitor_child()              宿主侧无特权监管进程
 | Sandbox PID 1 | 回收所有后代，持有 Lock/Sync FD |
 | Target | 应用最终 Capability 与 Seccomp 后 `execvp()` |
 
-### `child_wait_fd`：父子启动栅栏
+#### `child_wait_fd`：父子启动栅栏
 
 `raw_clone()` 之后，Child 先阻塞读取 `child_wait_fd`。Parent 完成 Namespace 信息读取、权限丢弃和状态输出后，写入 Eventfd 放行 Child。
 
@@ -607,7 +622,7 @@ monitor_child()              宿主侧无特权监管进程
 - Child 不会在 Parent 尚未完成安全收敛时提前进入 Setup；
 - Parent 失败时 Child 不会继续运行不完整沙箱。
 
-### `event_fd`：把 PID 2 的真实退出码交给 Monitor
+#### `event_fd`：把 PID 2 的真实退出码交给 Monitor
 
 Sandbox PID 1 必须继续回收其他后代，因此 Target 退出时不能立即退出。它把：
 
@@ -619,7 +634,7 @@ exit_status + 1
 
 Monitor 每次 `poll()` 后先读 Eventfd，再处理 SIGCHLD。因为 Target 退出后 PID 1 也可能很快退出；如果先处理 PID 1 的 SIGCHLD，就可能丢失真正的应用退出码。
 
-### `signalfd`：把信号纳入同步 IO
+#### `signalfd`：把信号纳入同步 IO
 
 Monitor 阻塞 SIGCHLD，再通过 `signalfd` 将其转换为可 Poll 的 FD：
 
@@ -629,13 +644,13 @@ poll(signalfd, eventfd)
 
 相比异步 Signal Handler，这种设计无需考虑异步信号安全函数，也能在同一事件循环中处理状态通道与子进程退出。
 
-### 外部 PID Namespace 中的可信 PID
+#### 外部 PID Namespace 中的可信 PID
 
 指定 `--pidns` 时，进入目标 PID Namespace 需要额外 Fork，Monitor 最初拿到的 PID 可能只是中间进程。Bubblewrap 使用带 `SO_PASSCRED` 的 Unix Socketpair，通过 `SCM_CREDENTIALS` 把最终 PID 交回 Monitor。
 
 PID 不是普通消息字段，而是 Kernel 随消息附带的 Credential。Monitor 信任 Kernel 认证结果，不信任 Child 自报的数据。
 
-### `setup_finished_pipe`：区分 Setup、Exec 与正常退出
+#### `setup_finished_pipe`：区分 Setup、Exec 与正常退出
 
 配合 `--json-status-fd`，Pipe 用字节数编码状态：
 
@@ -647,7 +662,7 @@ PID 不是普通消息字段，而是 Kernel 随消息附带的 Credential。Mon
 
 成功 `execve()` 后，写端因为 `O_CLOEXEC` 自动关闭。这个小协议让调用方能够区分“应用正常退出”与“沙箱根本没有启动成功”。
 
-## Network Namespace：只提供 Loopback
+### Network Namespace：只提供 Loopback
 
 新的 Network Namespace 初始只有 Down 状态的 `lo`。[`network.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/network.c) 没有引入 libnl，而是实现最小 rtnetlink 客户端：
 
@@ -662,9 +677,11 @@ Bubblewrap 不创建 Veth、不配置 NAT，也不管理 DNS。需要联网时�
 
 这再次体现项目边界：提供 Namespace 机制，不扩展成完整网络管理器。
 
-## Seccomp 与执行前的最后收敛
+### Seccomp 与执行前的最后收敛
 
-### Seccomp Program 通过 FD 输入
+系统调用过滤需要在目标执行前安装，但它不替代路径授权、能力丢弃或资源配额；三者控制不同风险。
+
+#### Seccomp Program 通过 FD 输入
 
 `--seccomp` 与 `--add-seccomp-fd` 从 FD 读取 Classic BPF：
 
@@ -677,7 +694,7 @@ Bubblewrap 不创建 Veth、不配置 NAT，也不管理 DNS。需要联网时�
 
 FD 输入避免执行临界点再次按路径打开规则文件。多个 Seccomp Program 按链表顺序依次安装。
 
-### 应用时机尽可能靠近 `execvp`
+#### 应用时机尽可能靠近 `execvp`
 
 目标进程路径中：
 
@@ -694,7 +711,7 @@ FD 输入避免执行临界点再次按路径打开规则文件。多个 Seccomp
 
 Sandbox PID 1 也会单独安装 Seccomp，再进入 `wait()` 循环，避免 Reaper 成为未受限制的旁路进程。
 
-### TTY 是容易遗漏的外部接口
+#### TTY 是容易遗漏的外部接口
 
 如果沙箱与调用者共享终端，恶意进程可能通过 `TIOCSTI` 向父终端注入字符。Bubblewrap 提供：
 
@@ -702,9 +719,9 @@ Sandbox PID 1 也会单独安装 Seccomp，再进入 `wait()` 循环，避免 Re
 --new-session → setsid()
 ```
 
-README 要求：如果 Seccomp 没有禁止 `TIOCSTI`，通用沙箱应启用 `--new-session`。CVE-2017-5226 正是“Namespace 已经隔离，但终端控制面仍然共享”的典型教训。
+README 要求：如果 Seccomp 没有禁止 `TIOCSTI`，通用沙箱应启用 `--new-session`。CVE-2017-5226 正是“Namespace 已经隔离，但终端控制面（Control Plane）仍然共享”的典型教训。
 
-### 生命周期绑定
+#### 生命周期绑定
 
 `--die-with-parent` 使用：
 
@@ -714,9 +731,13 @@ prctl(PR_SET_PDEATHSIG, SIGKILL);
 
 让 Bubblewrap 或上层调用者退出时，目标进程不会变成失控孤儿。PID 1 持有的 Lock File 与 Sync FD 也利用“进程退出自动关闭 FD”的 Kernel 生命周期完成清理。
 
-## C 语言工程实践
+## 调用方仍需承担的安全责任
 
-### 用 Cleanup Attribute 模拟 RAII
+### C 语言工程实践
+
+资源清理和错误传播会影响隔离是否完整建立；提前退出路径与正常路径需要使用同一套所有权约定。
+
+#### 用 Cleanup Attribute 模拟 RAII
 
 [`utils.h`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/utils.h) 定义：
 
@@ -734,7 +755,7 @@ cleanup_fd int fd = -1;
 
 离开作用域时自动 `free` 或 `close`。`steal_pointer()` 则显式转移所有权并把原指针置空。这让大量多分支系统调用代码不必维护 `goto cleanup` 阶梯。
 
-### 错误是类型，不只是字符串
+#### 错误是类型，不只是字符串
 
 `bind_mount()` 返回 `bind_mount_result`，同时用 `failing_path` 标记具体失败位置。上层再由 `die_with_bind_result()` 统一决定：
 
@@ -745,7 +766,7 @@ cleanup_fd int fd = -1;
 
 安全工具不能把“启动失败”都压缩成一个 `EPERM`。调用方需要知道是 Kernel 不支持 User Namespace、Mount Flag 无法落实，还是文件路径不存在。
 
-### 默认 Fail-Closed，例外必须显式
+#### 默认 Fail-Closed，例外必须显式
 
 大多数系统调用失败都直接 `die()`，避免在部分完成的安全状态中继续运行。真正允许降级的场景必须同时满足：
 
@@ -757,7 +778,7 @@ cleanup_fd int fd = -1;
 
 这比“遇到不支持就尽量继续”的兼容性策略更适合安全基础设施。
 
-### 编译期警告也是安全边界
+#### 编译期警告补充实现检查
 
 [`meson.build`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/meson.build) 开启了大量严格警告：
 
@@ -773,9 +794,11 @@ cleanup_fd int fd = -1;
 
 对 C 系统程序而言，整数转换、格式字符串、隐式声明和枚举漏处理都会直接触及安全边界，把它们升级成构建错误比依赖人工 Review 更可靠。
 
-## Bubblewrap 没有替调用方解决什么
+### Bubblewrap 没有替调用方解决什么
 
-### 共享 Kernel
+Namespace 共享宿主内核，且暴露的资源仍可承载外部权限，所以调用方必须补齐资源限制与威胁模型（Threat Model）。
+
+#### 共享 Kernel
 
 Namespace 隔离的是资源视图，不是 Kernel。Sandbox 仍然共享：
 
@@ -784,9 +807,9 @@ Namespace 隔离的是资源视图，不是 Kernel。Sandbox 仍然共享：
 - Filesystem 与网络协议栈；
 - Kernel 漏洞攻击面。
 
-需要对不可信 Native Code 建立更强边界时，还要评估虚拟机、MicroVM、用户态 Kernel 或远程隔离执行。
+需要对不可信 Native Code 建立更强边界时，还要评估虚拟机、MicroVM、用户态（User Space） Kernel 或远程隔离执行。
 
-### 被 Bind 进去的资源就是能力
+#### 被 Bind 进去的资源就是能力
 
 以下对象一旦暴露，可能绕过“文件系统看起来很干净”的直觉：
 
@@ -802,15 +825,15 @@ Namespace 隔离的是资源视图，不是 Kernel。Sandbox 仍然共享：
 
 所以安全策略不能只列“禁止路径”，还要把 Socket、FD、Environment、Device 和 Network 当作 Capability。
 
-### Seccomp 策略由调用方提供
+#### Seccomp 策略由调用方提供
 
 Bubblewrap 能加载 Seccomp，却不内置一套适用于所有应用的系统调用 Allowlist。编译器、浏览器、数据库、AI Agent 所需系统调用差异很大；错误的通用策略要么无法运行，要么几乎没有限制。
 
-### 资源限制不属于核心职责
+#### 资源限制不属于核心职责
 
 Bubblewrap 不负责完整 Cgroup 策略。CPU、Memory、PID、IO 与执行时间上限需要由 systemd、容器平台或调用方补充。
 
-### 先写 Threat Model，再拼命令行
+#### 先写 Threat Model，再拼命令行
 
 Bubblewrap 官方 README 对安全边界的表述非常克制：它负责构造沙箱，保护强度由调用参数决定。换句话说，一条看起来很长的 `bwrap` 命令并不自动构成威胁模型。用于 AI Agent 时，至少要先写清四类信任关系：
 
@@ -825,9 +848,13 @@ Bubblewrap 官方 README 对安全边界的表述非常克制：它负责构造�
 
 最后，`--disable-userns` 也不只是一个加固小选项。如果载荷能够继续创建嵌套 User Namespace，它就获得了更大的 Kernel Namespace 攻击面。是否允许嵌套 Namespace 应进入策略，而不是由被执行程序自行决定。这里的判断与项目的 [Sandbox security 说明](https://github.com/containers/bubblewrap#sandbox-security) 一致：Bubblewrap 是低层机制，安全模型属于调用它的上层系统。
 
-## 面向 AI Agent Sandbox 的设计启示
+### 面向 AI Agent Sandbox 的设计启示
 
-### 策略层与机制层分开
+Agent 的命令和仓库内容都可能触发副作用，授权必须在机制层兑现，不能依赖模型自行遵守路径说明。
+
+#### 策略层与机制层分开
+
+策略层决定可访问资源，机制层负责强制执行；将两层分开才能独立检查授权决策与隔离结果。
 
 ```text
 Agent Policy
@@ -849,7 +876,7 @@ Mechanism
 
 Bubblewrap 证明了机制层可以很小；真正复杂的是把用户意图转换成正确策略。
 
-### 使用 FD 表达已授权资源
+#### 使用 FD 表达已授权资源
 
 如果调用方已经完成路径解析和权限审批，优先传递打开的 FD，而不是让沙箱启动阶段重新解析字符串路径。FD 同时表达：
 
@@ -860,7 +887,7 @@ Bubblewrap 证明了机制层可以很小；真正复杂的是把用户意图转
 
 Bubblewrap 的 `--bind-fd`、`--args`、`--seccomp`、Eventfd 与 Credential Socket 都体现了这一思路。
 
-### 不变量必须运行时验证
+#### 不变量必须运行时验证
 
 适合验证的安全不变量包括：
 
@@ -875,11 +902,13 @@ Producer PID 来自 Kernel Credential
 
 只写配置、不验证结果，会把 Kernel 版本差异、Mount 传播和竞态问题留给生产环境。
 
-### 可观测性不能破坏安全性
+#### 可观测性不能破坏安全性
 
 `--info-fd`、`--json-status-fd` 与退出码协议提供结构化状态，但不要求在沙箱内开放额外控制 Socket。Agent Sandbox 同样应优先使用单向 FD、事件流和宿主侧审计，而不是为了调试暴露高权限服务。
 
-## 一次典型调用的完整时序
+## 用完整调用与故障测试验证边界
+
+### 一次典型调用的完整时序
 
 以下命令只用于展示组成方式，并不代表适用于任意不可信程序的完整安全策略：
 
@@ -942,7 +971,7 @@ main()
         └── execvp()
 ```
 
-## 如何验证这类沙箱实现
+### 如何验证这类沙箱实现
 
 Bubblewrap 的 [`tests/test-run.sh`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/tests/test-run.sh) 不只验证“命令能运行”，还覆盖安全不变量：
 
@@ -950,7 +979,7 @@ Bubblewrap 的 [`tests/test-run.sh`](https://github.com/containers/bubblewrap/bl
 |----------|------|
 | Namespace | User/PID/Network Namespace 创建与复用 |
 | UserNS 禁用 | 沙箱内递归 `unshare` 必须失败 |
-| Capability | Add/Drop 与 PID 1 能力集合 |
+| Capability | Add/Drop 与 PID 1 能力集（Capabilities）合 |
 | 生命周期 | `--die-with-parent` |
 | 状态协议 | `--info-fd`、`--json-status-fd` |
 | Mount | Bind、Readonly、设备、Overlay 与路径转义 |
@@ -971,43 +1000,11 @@ Compatibility：Kernel 不支持时明确失败或按策略降级
 
 仅比较 `bwrap` 退出码不足以证明隔离正确，还需要在沙箱内主动尝试越界操作，并从宿主侧确认没有留下 Mount、进程和 FD。
 
-## 总结
+### 部署前的验证边界
 
-Bubblewrap 最值得学习的不是某个冷门系统调用，而是它对边界的拆分：
+部署前逐项验证 Mount、FD、Socket、进程回收、Seccomp、Cgroup 与超时，并检查网络、Secret 管理和审计授权。只读根目录不能抵消宿主 Socket 或可写 FD 带来的权限。
 
-```text
-调用方负责 Security Policy
-Bubblewrap 负责可靠落实 Policy
-Linux Kernel 提供隔离原语
-Monitor 负责生命周期与状态
-测试负责证明关键不变量
-```
-
-五千余行 C 代码之所以能支撑 Flatpak 等复杂上层系统，依靠的不是功能堆叠，而是持续收窄职责：
-
-1. 用 SetupOp 把参数编译成有序计划；
-2. 用 User Namespace 获取局部管理能力；
-3. 用双重 `pivot_root` 建立不可回退的新根；
-4. 用递归 Remount 落实 `ro/nodev/nosuid`；
-5. 用 Capability 与 `NO_NEW_PRIVS` 收敛权限；
-6. 用 PID 1、Eventfd 与 Signalfd 管理进程生命周期；
-7. 用 Seccomp 完成 Exec 前的最后限制；
-8. 用 Fail-Closed 与运行时验证守住安全不变量。
-
-对 AI Agent Sandbox 而言，Bubblewrap 是很好的机制层样本，但不能被误解为“一条命令自动获得安全”。真正的产品级边界还需要：
-
-```text
-Bubblewrap
-  + 精确 Mount/FD/Socket 策略
-  + Seccomp
-  + Cgroup 与超时
-  + 网络代理或隔离
-  + Secret 管理
-  + 审计与授权
-  + 必要时更强的 VM 边界
-```
-
-安全不是某个选项，而是一组可以解释、可以验证、失败时默认收敛的系统不变量。
+若威胁模型包含宿主内核被利用的风险，共享内核的 Namespace 不足以覆盖该风险，应评估 VM 等更强隔离。本文分析 Bubblewrap 的机制，不为任意调用参数或不可信程序提供安全保证。
 
 ## 关键源码阅读索引
 

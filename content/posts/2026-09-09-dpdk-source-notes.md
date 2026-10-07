@@ -2,7 +2,7 @@
 title: "【源码】DPDK：从 PCIe、DMA 与 Descriptor 到 PMD 快路径"
 slug: "dpdk-source-notes"
 date: 2026-09-09T00:00:00+08:00
-lastmod: 2026-09-09T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 categories:
   - Systems
 tags:
@@ -20,15 +20,13 @@ toc: true
 math: false
 ---
 
-第一次接触 DPDK 时，我记住的是一串 API：`rte_eal_init`、`rte_pktmbuf_pool_create`、`rte_eth_rx_burst`。但会调用这些函数，并不等于理解 DPDK。只要继续追问几个问题，API 记忆很快就不够用了：网卡究竟把包 DMA 到哪里？CPU 为什么能用虚拟地址访问同一块数据？descriptor、mbuf 和 packet buffer 分别归谁所有？为什么一个普通函数调用最后会落到特定网卡的 SIMD 收包实现？
+DPDK 的性能依赖队列所有权、批处理、内存局部性和设备可见性共同成立，而不是某个 API 单独实现“零拷贝（Zero-Copy）”。应用接管收发队列后，也接管了 mbuf 生命周期、轮询 CPU 和故障处理责任；因此理解快路径需要从 DMA 地址、descriptor 状态与 PMD 回调之间的契约入手。
 
-这次我按 `dive-dpdk.md` 的路线，从硬件契约向上阅读源码，而不是从 API 向下背文档。本文基于官方 DPDK 仓库 `main` 分支提交 [`d55ccd4e6d`](https://github.com/DPDK/dpdk/commit/d55ccd4e6de64e3f797f60de9e81f1d60f849775)。`git describe` 为 `v26.07-8-gd55ccd4e6d`，源码中的 `VERSION` 是 `26.11.0-rc0`。因此它是 **v26.07 之后 8 个提交、已经进入 26.11 开发周期的快照**，不是正式的 26.11 release。
+本文分析官方仓库提交 [`d55ccd4e6d`](https://github.com/DPDK/dpdk/commit/d55ccd4e6de64e3f797f60de9e81f1d60f849775)。`git describe` 为 `v26.07-8-gd55ccd4e6d`，`VERSION` 为 `26.11.0-rc0`：这是开发快照，不是正式 26.11 发布版。下文以 Linux EAL、PCI/VFIO 和 ixgbe 为主要路径；具体网卡与 PMD 的能力、内存布局和屏障要求需单独核对。
 
-读完以后，我对 DPDK 的核心认识变成了：
+## 接管数据路径：硬件与地址边界
 
-> DPDK 是一个把网卡 queue、DMA memory 和专用 CPU worker 交给用户态程序管理的数据面运行时。它的性能不是来自某一个“零拷贝 API”，而是来自一组互相配合的不变量：固定 ownership、批处理、每核私有状态、NUMA locality、短控制路径，以及 descriptor 可见性与 doorbell 顺序。
-
-## 1. 先画清边界：DPDK 不是更快的 socket
+### 先画清边界：DPDK 不是更快的 socket
 
 传统 Linux 网络栈必须服务通用目标：不同协议、进程隔离、调度、公平性、动态路由和安全策略。一次收包通常经过 IRQ/NAPI、内核 driver、`sk_buff`、协议栈、socket queue，再由系统调用交给应用。DPDK 选择了另一组约束：由用户态 PMD 直接轮询 NIC queue，把 worker 固定在 CPU 上，以 busy polling 换掉中断和调度，以 burst 换掉 per-packet 固定开销。
 
@@ -45,9 +43,9 @@ application → PMD → TX descriptor → DMA ──────┘
 
 这不意味着 Linux 路径“设计得慢”，而是两个系统承担的职责不同。DPDK 应用需要自己处理 CPU 隔离、queue 映射、内存生命周期、协议功能、可观测性和故障恢复。它适合 NFV、负载均衡、vSwitch、存储网络和 packet processing；并不自动适合所有普通网络服务。
 
-## 2. 最底层契约：PCIe、MMIO、DMA 与 descriptor
+### 最底层契约：PCIe、MMIO、DMA 与 descriptor
 
-理解 DPDK，首先要把“控制设备”和“搬运数据”分开。
+CPU 通过 MMIO 配置设备，NIC 通过 DMA 搬运数据，descriptor 将两条路径连接起来；把寄存器访问当成数据拷贝，会误解收发队列的工作量。
 
 - **PCIe 配置空间**描述设备身份、能力和 BAR。
 - **BAR/MMIO**让 CPU 通过内存读写语义访问网卡寄存器。
@@ -71,9 +69,9 @@ poll DD bit         │                              │
 
 这里有两个经常混在一起的对象：descriptor ring 是硬件 ABI 的一部分；`rte_mbuf` 是 DPDK 软件元数据。网卡不认识 `rte_mbuf *`，只认识 descriptor 中的 DMA 地址。
 
-## 3. VA、PA、IOVA、IOMMU 与 VFIO
+### VA、PA、IOVA、IOMMU 与 VFIO
 
-同一块内存同时面对两个地址空间：CPU 用虚拟地址，设备发 DMA 时用 I/O 虚拟地址。
+同一块内存同时面对两个地址空间：CPU 用虚拟地址（Virtual Address），设备发 DMA 时用 I/O 虚拟地址。
 
 ```text
 CPU load/store:  VA   ── MMU ──→ PA
@@ -93,15 +91,19 @@ Linux EAL 的 VFIO 路径最终用 `VFIO_GROUP_SET_CONTAINER` 把 group 加入 c
 IOVA 有两种常见模式：
 
 - IOVA-as-VA：IOVA 数值可与进程 VA 相同，由 IOMMU 再映射到 PA。
-- IOVA-as-PA：设备使用物理地址语义。
+- IOVA-as-PA：设备使用物理地址（Physical Address）语义。
 
 `rte_eal_init()` 会综合 bus 要求、构建配置、物理地址是否可用和 IOMMU 状态选择模式。这里最需要避免的误解是：**IOVA-as-VA 只说明数值可相同，不表示 VA 等于 PA。**
 
-### Hugepage 真正解决什么
+#### Hugepage 真正解决什么
 
 Hugepage 首先扩大 TLB reach。假设工作集为 1 GiB，4 KiB page 需要 262144 个页映射，2 MiB hugepage 只需 512 个。它还给 EAL 提供了更可控的 pinned/DMA memory、memseg 组织和 NUMA placement。是否物理连续取决于 page size、分配方式和 IOMMU 映射，不能把 hugepage 简化成“为了拿一整块连续物理内存”。
 
-## 4. `rte_eal_init()`：把进程变成数据面 runtime
+## 初始化：从 EAL 到设备队列
+
+### `rte_eal_init()`：把进程变成数据面 runtime
+
+设备访问和快路径运行依赖初始化时建立的内存、线程及总线状态。EAL 负责提供这些运行条件，应用仍需配置端口与队列。
 
 [`rte_eal_init()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/eal/linux/eal.c) 不只是解析 `-l` 和 `-n`。按当前 Linux 实现，它大致完成：
 
@@ -123,17 +125,17 @@ arguments / logging
 
 这个顺序说明 EAL 同时扮演 hardware discovery、memory manager、thread runtime 和 process coordination layer。先 scan 是为了收集 bus/driver 对 IOVA 的约束；先建好 memory/VFIO，之后 probe PMD 时才能映射 BAR 和 DMA memory。
 
-### lcore 不是另一种硬件线程
+#### lcore 不是另一种硬件线程
 
 `lcore` 是 EAL 对逻辑执行资源的抽象。Linux 实现仍创建 pthread，再把它 pin 到配置的 CPU set，并把 socket/core/role/state 保存在 `lcore_config[]`。
 
 worker 的运行机制也不是每次 launch 新建线程。[`rte_eal_remote_launch()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/eal/common/eal_common_launch.c) 把函数和参数发布给已有 worker，唤醒它的 pipe；worker 在 [`eal_thread_loop()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/eal/common/eal_common_thread.c) 中取函数执行，再回到 WAIT 状态。函数指针发布使用 release/acquire ordering，保证 worker 醒来后看见完整任务参数。
 
-### primary/secondary 的边界
+#### primary/secondary 的边界
 
 EAL 可以让 secondary process 重新映射 primary 的 shared configuration 和 hugepage memory，并通过 Unix socket multi-process channel 同步 hotplug、malloc 等操作。但它们不是两份独立内存；地址映射和 DPDK 版本必须兼容。`--in-memory` 会关闭基于共享文件的 secondary 支持。对初学者而言，先掌握单进程多 lcore；多进程是部署与隔离能力，不是 RX/TX 快路径的必要条件。
 
-## 5. 从 PCI device 到 ixgbe PMD
+### 从 PCI device 到 ixgbe PMD
 
 EAL 初始化中的 `rte_bus_scan()` 和 `rte_bus_probe()` 分工明确。PCI scan 枚举设备；probe 遍历 driver 的 PCI ID 表，检查 IOVA 要求，需要时映射 PCI resource，然后调用匹配 driver 的 probe callback。
 
@@ -167,7 +169,11 @@ rte_bus_probe
 
 ethdev 不是另一个真正搬包的 driver。它提供统一配置 API 和 fast-path dispatch；真正读写硬件 descriptor 的仍是 PMD。
 
-## 6. `rte_mbuf`：packet 的软件控制块
+## 包的存储与所有权：mbuf、mempool 与 ring
+
+### `rte_mbuf`：packet 的软件控制块
+
+mbuf 保存软件元数据，packet buffer 保存负载，NIC 使用的 descriptor 又是独立结构；区分三者才能判断地址、长度和所有权来自哪里。
 
 [`struct rte_mbuf`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/mbuf/rte_mbuf_core.h) 最值得按 cache line 阅读。关键字段的关系如下：
 
@@ -190,7 +196,9 @@ rte_mbuf metadata
 
 源码把 RX 热字段集中在前部，尽量让常见解析少触碰 cache line。所谓“zero-copy”也应准确理解：DPDK 避免在内核和应用之间再复制 packet bytes；CPU 仍要读取 header，转发时 NIC 仍通过 DMA 读取 packet data，multi-stage pipeline 还可能产生 cache-line ownership transfer。
 
-## 7. `rte_mempool`：固定对象、每核缓存与所有权
+### `rte_mempool`：固定对象、每核缓存与所有权
+
+固定大小对象池减少通用分配器开销，每核缓存减少共享池访问，但缓存也会占用暂时不能被其他核使用的空闲对象。
 
 [`rte_pktmbuf_pool_create()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/mbuf/rte_mbuf.c) 不是逐个 `malloc` mbuf。它创建 fixed-size object pool，初始化 pool-private mbuf layout，再对每个对象调用 mbuf initializer。backend 常由 ring 或其他 mempool ops 管理，而前面还有 per-lcore cache。
 
@@ -221,7 +229,7 @@ NIC PCIe root on Node 0
 
 只 pin core，却把 mbuf pool 放在远端 NUMA node，仍会把每包路径变成跨 socket memory traffic。
 
-## 8. `rte_ring`：无锁不等于没有顺序
+### `rte_ring`：无锁不等于没有顺序
 
 [`struct rte_ring`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/ring/rte_ring_core.h) 把 producer 和 consumer 状态放在不同的 cache-aligned 区域，避免双方频繁写同一 cache line。逻辑 index 以 `uint32_t` 单调回绕，仅访问数组时用 mask 映射到容量范围。
 
@@ -237,7 +245,11 @@ consumer 必须在 tail 可见以后才读取 slot；acquire/release ordering �
 
 ring 还支持 SP/SC、MP/MC、RTS、HTS，以及 fixed bulk 和 variable burst。若拓扑已保证唯一 producer/consumer，SP/SC 可以消除不必要竞争；若猜错了并发模型，得到的不是一点性能损失，而是正确性问题。
 
-## 9. 最小程序如何落到 PMD
+## 一次收发：从应用循环到 RX/TX 描述符
+
+### 最小程序如何落到 PMD
+
+最小转发程序的意义是验证收包、交接和发送闭环，而不是给出通用调优值。示例参数需要结合描述符需求、在途包与 PMD 限制理解。
 
 [`examples/skeleton/basicfwd.c`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/examples/skeleton/basicfwd.c) 是最合适的入口。当前例子使用 1024 个 RX/TX descriptor、8191 个 mbuf、250 个 mempool cache 和 32 包 burst：
 
@@ -256,7 +268,9 @@ rte_eal_init
 
 例子还会检查 NIC socket 与 polling lcore socket 是否一致。这条 warning 揭示了 DPDK API 的风格：它允许不理想配置继续工作，把 topology policy 留给应用。
 
-### ethdev fast-path dispatch
+#### ethdev fast-path dispatch
+
+运行时收包通过配置阶段选定的函数指针进入 PMD，避免每包重新判断全部设备能力。inline wrapper 仍保留必要的端口和回调边界。
 
 [`rte_eth_rx_burst()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/ethdev/rte_ethdev.h) 是 inline wrapper，核心逻辑近似：
 
@@ -268,9 +282,11 @@ nb_rx = p->rx_pkt_burst(qd, rx_pkts, nb_pkts);
 
 [`eth_dev_fp_ops_setup()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/lib/ethdev/ethdev_private.c) 在设备配置阶段，把 PMD callback 和每个 queue 的 private pointer 复制到 cache-aligned `rte_eth_fp_ops`。所以快路径不必层层查询 generic device object：给定 port/queue 后，直接取 queue data，调用已选择的 PMD 函数。
 
-这也是为什么 PMD 可以同时提供 scalar、bulk、SSE、AVX2、AVX-512 等实现：控制面只在配置或启动时选择一次，packet loop 中不需要反复判断硬件能力。
+这也是为什么 PMD 可以同时提供 scalar、bulk、SSE、AVX2、AVX-512 等实现：控制面（Control Plane）只在配置或启动时选择一次，packet loop 中不需要反复判断硬件能力。
 
-## 10. ixgbe RX：从 DD bit 到可消费 mbuf
+### ixgbe RX：从 DD bit 到可消费 mbuf
+
+RX 必须在确认设备完成写入后读取包信息，并在交还描述符前提供替换 buffer。否则应用可能读取未完成数据，或让 NIC 重用仍被消费的内存。
 
 以 [`ixgbe_recv_pkts()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/drivers/net/intel/ixgbe/ixgbe_rxtx.c) 的通用 scalar path 为例，一次收包实际做了：
 
@@ -299,7 +315,9 @@ RX queue setup 在 [`ixgbe_dev_rx_queue_setup()`](https://github.com/DPDK/dpdk/b
 
 [`ixgbe_set_rx_function()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/drivers/net/intel/ixgbe/ixgbe_rxtx.c) 会依据 scatter、LRO、offload、queue threshold、CPU SIMD width 等条件选择 scattered、bulk、vector 或 scalar 路径。“调用 `rte_eth_rx_burst`”因此不是承诺某个固定实现，而是进入当前设备配置允许的最短实现。
 
-## 11. ixgbe TX：ownership 在什么时候转移
+### ixgbe TX：ownership 在什么时候转移
+
+只有 TX burst 已接受的 mbuf 才转交 PMD，未接受部分仍由应用负责。设备完成发送前不能提前释放在途 buffer。
 
 [`ixgbe_xmit_pkts()`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/drivers/net/intel/ixgbe/ixgbe_rxtx.c) 做的是反向过程：
 
@@ -323,7 +341,9 @@ TX ownership 的边界以返回值为准。`rte_eth_tx_burst()` 接受的 mbuf �
 
 `ixgbe_set_tx_function()` 同样根据 offload、multi-segment 假设和 SIMD 能力选择 vector/simple/full-featured 路径。offload 不是无条件免费：复杂功能可能需要 context descriptor，也可能把队列从最简 SIMD path 推回功能更完整但更长的实现。
 
-## 12. RSS：网卡完成的 hash partition
+## 并行与批处理：RSS、流水线、卸载和 burst
+
+### RSS：网卡完成的 hash partition
 
 多 queue 不会自动带来扩展性，还需要把 flow 稳定地映射到 queue。RSS 通常对选定 header 字段计算 Toeplitz hash，再用 redirection table（RETA）把 hash bucket 映射到 RX queue：
 
@@ -342,7 +362,7 @@ RSS 解决的是并行分区，不保证均衡。少数 elephant flow、输入 k
 
 从数据库角度看，RSS 很像 NIC 执行的 hash shuffle：hash key 决定 partition，RETA 类似可调的 bucket-to-worker map，queue 是 partition buffer，lcore 是消费 worker。
 
-## 13. Run-to-Completion 还是 Pipeline
+### Run-to-Completion 还是 Pipeline
 
 [`l2fwd`](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/examples/l2fwd/main.c) 的核心结构是 Run-to-Completion（RTC）：一个 lcore 轮询分配给自己的 port/queue，在本核完成改包和发送。它的优势是 packet ownership 很少跨核，cache locality 好，延迟路径短。
 
@@ -366,7 +386,7 @@ RX Core → ring → Parse/Lookup Workers → ring → TX Core
 - pipeline 必须明确 ring 满时谁 drop、谁 retry、谁负责 free mbuf。
 - 任何拓扑都应让 queue、core、mempool 和 state 尽量位于同一 NUMA node。
 
-## 14. Offload 与 `rte_flow`：控制面下推，快路径绕开 CPU
+### Offload 与 `rte_flow`：控制面下推，快路径绕开 CPU
 
 checksum、VLAN、TSO、RSS 多为 fixed-function offload。应用通过 port/queue configuration 或 mbuf `ol_flags` 声明需求，PMD 转成 descriptor bits 和 hardware registers。
 
@@ -386,26 +406,9 @@ rte_flow_validate/create(port, attr, pattern, actions)
 
 SmartNIC/DPU 和 GPUDirect 继续移动这条边界：前者把 classify/crypto/virtual switching 等更多逻辑移入设备，后者试图减少 `NIC → host DRAM → CPU → GPU` 的 staging。它们改变的是 ownership、failure domain 和 data movement，不是把软件复杂度消掉。
 
-## 15. DPDK 与 XDP/AF_XDP：不是简单替代关系
+### 为什么 burst 快，但不是越大越好
 
-XDP 在 Linux driver 的早期 RX 点运行 eBPF，可在构造完整 `sk_buff` 前完成 pass/drop/redirect；AF_XDP 再用 UMEM 和 RX/TX/FILL/COMPLETION rings 把 packet 交给用户态。DPDK 自己甚至包含 [`net_af_xdp` PMD](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/drivers/net/af_xdp/rte_eth_af_xdp.c)，说明两者并非互斥阵营。
-
-从该 PMD 可以看到两种 RX 路径：copy mode 从 UMEM packet 拷入 mbuf；zero-copy mode 让可映射的 mbuf/mempool memory 直接成为 UMEM。zero-copy 是否成立取决于 kernel、NIC driver、queue 和 memory layout，不能仅凭使用 AF_XDP 就宣称零拷贝。
-
-| 维度 | 原生 PCI PMD 的 DPDK | XDP / AF_XDP |
-|---|---|---|
-| 设备控制 | 用户态 PMD 直接管理 queue | Linux driver 管设备，XDP/AF_XDP 接入 |
-| kernel integration | 弱，需要另建控制/协议能力 | 强，可与 Linux network stack/eBPF 配合 |
-| zero-copy | DMA buffer 是核心模型 | AF_XDP ZC 依赖 driver 与配置，也有 copy mode |
-| dedicated core | 常见 | 视 busy-poll 和负载而定 |
-| 可编程位置 | 用户态 packet loop / NIC flow | driver early path 的 eBPF + 用户态 |
-| 典型取舍 | 极致、可控的数据面 | Linux-native 部署、容器、安全和渐进接入 |
-
-如果系统必须保留 Linux routing、namespace、cgroup 与 eBPF 运维体系，XDP/AF_XDP 往往更自然；若应用愿意接管设备并围绕专用 queue/core 构建完整 dataplane，原生 PMD 的控制更直接。
-
-## 16. 为什么 burst 快，但不是越大越好
-
-把一次 burst 的固定成本记为 `C_f`，每包实际处理记为 `C_p`，批次为 `N`，近似单包成本是：
+增大 burst 可以摊薄每次调用的固定成本，却可能增加排队与批次处理延迟。只考虑固定开销与逐包工作量时，令二者分别为 `C_f` 和 `C_p`，批次大小为 `N`，近似单包成本是：
 
 ```text
 C_packet ≈ C_f / N + C_p
@@ -427,7 +430,26 @@ C_packet ≈ C_f / N + C_p
 
 `testpmd` 是执行这套矩阵的实验室，而不是最终应用模板。它在 `app/test-pmd` 中提供 `io`、`mac`、`rxonly`、`txonly`、`csum` 等 forwarding engine，并能查看 queue stats、RSS、offload 与 flow rule。正确用法是一次只改变一个变量，保留 EAL 参数、port topology、packet generator 和运行时长。
 
-## 17. 把 DPDK 映射回数据库执行引擎
+## 选型边界：内核旁路与数据库数据路径
+
+### DPDK 与 XDP/AF_XDP：不是简单替代关系
+
+XDP 在 Linux driver 的早期 RX 点运行 eBPF，可在构造完整 `sk_buff` 前完成 pass/drop/redirect；AF_XDP 再用 UMEM 和 RX/TX/FILL/COMPLETION rings 把 packet 交给用户态。DPDK 自己甚至包含 [`net_af_xdp` PMD](https://github.com/DPDK/dpdk/blob/d55ccd4e6de64e3f797f60de9e81f1d60f849775/drivers/net/af_xdp/rte_eth_af_xdp.c)，说明两者并非互斥阵营。
+
+从该 PMD 可以看到两种 RX 路径：copy mode 从 UMEM packet 拷入 mbuf；zero-copy mode 让可映射的 mbuf/mempool memory 直接成为 UMEM。zero-copy 是否成立取决于 kernel、NIC driver、queue 和 memory layout，不能仅凭使用 AF_XDP 就宣称零拷贝。
+
+| 维度 | 原生 PCI PMD 的 DPDK | XDP / AF_XDP |
+|---|---|---|
+| 设备控制 | 用户态 PMD 直接管理 queue | Linux driver 管设备，XDP/AF_XDP 接入 |
+| kernel integration | 弱，需要另建控制/协议能力 | 强，可与 Linux network stack/eBPF 配合 |
+| zero-copy | DMA buffer 是核心模型 | AF_XDP ZC 依赖 driver 与配置，也有 copy mode |
+| dedicated core | 常见 | 视 busy-poll 和负载而定 |
+| 可编程位置 | 用户态 packet loop / NIC flow | driver early path 的 eBPF + 用户态 |
+| 典型取舍 | 极致、可控的数据面 | Linux-native 部署、容器、安全和渐进接入 |
+
+如果系统必须保留 Linux routing、namespace、cgroup 与 eBPF 运维体系，XDP/AF_XDP 往往更自然；若应用愿意接管设备并围绕专用 queue/core 构建完整 dataplane，原生 PMD 的控制更直接。
+
+### 把 DPDK 映射回数据库执行引擎
 
 DPDK 和向量化数据库共享的不是表面上的“batch API”，而是对固定开销、数据局部性和 ownership 的相同态度。
 
@@ -448,35 +470,51 @@ DPDK 和向量化数据库共享的不是表面上的“batch API”，而是对
 
 更深的一层是 fast/slow path 分离。DPDK 在设备启动时选择 PMD callback，把能力检查留在控制面；数据库也应在 plan/codegen 阶段解决 type、nullability、encoding 和 implementation selection，让 hot loop 少做重复判断。
 
-## 18. 七天源码学习与实验路线
+## 实验、检查项与源码阅读路线
 
-这套路线不是每天“读一个库”，而是每天闭合一条因果链。
+### 七天源码学习与实验路线
 
-### Day 1：硬件路径
+实验应按硬件连通、内存映射、所有权正确性、性能调优的依赖顺序推进。以下七步是建议路线，不表示本文已完成这些测量；需要隔离的测试网卡和可重复流量源。
+
+#### Day 1：硬件路径
+
+NIC 与 CPU 的 NUMA 关系限定了后续性能比较的基线，先确认拓扑才能解释跨节点流量。
 
 执行 `lspci -nn/-vv`、`numactl --hardware`，画出 NIC BDF、PCIe root 和 NUMA node。阅读网卡 descriptor 定义和 queue register，回答“谁写 descriptor、谁推进 head/tail、哪一步是 MMIO”。远程机器不要解绑承载 SSH/管理面的 NIC。
 
-### Day 2：EAL、Hugepage 与 VFIO
+#### Day 2：EAL、Hugepage 与 VFIO
+
+CPU 地址与设备 DMA 地址必须指向同一组合法映射，否则收发错误无法靠应用层逻辑修复。
 
 检查 `/proc/meminfo`、IOMMU group 和 `dpdk-devbind.py --status`，跟一次 `rte_eal_init()`。画出 `VA → PA` 与 `IOVA → PA` 两条翻译，确认 memory 是在什么 socket 分配、何时映射给设备。
 
-### Day 3：最小 dataplane
+#### Day 3：最小 dataplane
+
+最小程序应先证明所有权处理正确，尤其要覆盖只发送部分 burst 的情况。
 
 精读并运行 `basicfwd`，从 `rte_eth_rx_burst` 跟到 PMD callback。自己实现 `RX → 修改 MAC → TX`，专门处理 partial TX 和 port/queue validation。
 
-### Day 4：mbuf、mempool、ring
+#### Day 4：mbuf、mempool、ring
+
+对象分配与跨核传递引入不同成本，分别观察字段、缓存与发布顺序才能定位来源。
 
 打印 mbuf 核心字段，构造 multi-segment packet；改变 burst 和 mempool cache size。阅读 ring 的 head reservation、slot copy、tail publish，解释 SP/SC 为什么可以更短。
 
-### Day 5：RSS、多核与 NUMA
+#### Day 5：RSS、多核与 NUMA
+
+多核收益依赖队列均衡和内存局部性，单纯增加 worker 数无法保证扩展。
 
 运行 l2fwd/l3fwd，记录 queue-to-lcore mapping 和每 queue counters。改变 RETA、core affinity 和 mempool socket，做 local/remote 2×2 对照；再实现一个 ring-based pipeline，与 RTC 比较 cycles 和延迟。
 
-### Day 6：testpmd 与 offload
+#### Day 6：testpmd 与 offload
+
+声明 offload 成功不等于流量实际使用了对应硬件路径，需要计数器和包内容共同验证。
 
 固定 packet/burst/queue 矩阵，分别运行 `io/mac/csum` forwarding mode，观察 checksum、RSS、VLAN、TSO 对 PMD selection 和吞吐的影响；安装简单 `rte_flow` queue/drop/count rule 并验证硬件计数器。
 
-### Day 7：完整追踪一个 PMD
+#### Day 7：完整追踪一个 PMD
+
+PMD 的描述符协议由具体设备决定，选定一块实际硬件后再贯穿 probe、配置和收发路径。
 
 按实际硬件选择 `mlx5`、`ice` 或 `ixgbe`，只追：
 
@@ -492,9 +530,9 @@ PCI probe
 
 不要试图线性读完整 driver。最终用 flame graph 和 cycles-per-packet breakdown 验证自己认为的热点，而不是把源码行数当作重要性。
 
-## 19. 阅读源码时应抓住的系统不变量
+### 阅读源码时应抓住的系统不变量
 
-到这里，DPDK 可以浓缩成十条检查表：
+丢包、数据损坏与吞吐下降应先按所有权和可见性不变量排查，再调整 burst 等性能参数。检查项如下：
 
 1. NIC descriptor 中是 IOVA，不是 `rte_mbuf *`。
 2. CPU 通过 VA 访问 buffer；IOMMU 负责设备 IOVA 到 PA 的翻译和隔离。
@@ -505,13 +543,13 @@ PCI probe
 7. ring 必须先写 slot 再发布 tail，MP producer 不能越过前序 reservation。
 8. queue 最好单 lcore 消费，mempool 和 state 与 NIC/core NUMA-local。
 9. offload capability、configuration 和实际选中的 PMD path 是三件不同的事。
-10. 吞吐提升必须同时检查 drop、alloc failure、queue skew、尾延迟和 CPU cost。
+10. 吞吐提升必须同时检查 drop、alloc failure、queue skew、尾延迟（Tail Latency）和 CPU cost。
 
 这些不变量比 API 列表更耐版本变化。换成 ice、mlx5，descriptor layout 和 doorbell 细节会变；换成 AF_XDP，设备管理边界会变；但 DMA visibility、ownership、batching、locality 与 backpressure 仍然是问题核心。
 
-## 20. 源码阅读地图与最终理解
+### 源码阅读地图与最终理解
 
-推荐顺序是从最短闭环进入，再逐步下钻：
+从最小转发程序逐层追踪回调，可以把初始化配置与实际收发行为对应起来；直接通读 EAL 容易遗漏这种联系。建议阅读顺序如下：
 
 ```text
 examples/skeleton/basicfwd.c
@@ -538,9 +576,11 @@ PCI/VFIO 让用户态安全接管设备
   → MMIO doorbell 把一批工作交给 NIC
 ```
 
-这条路径没有魔法，也没有一个单独的“性能开关”。任何一环破坏 locality、引入共享写、错误处理 ownership、过早敲 doorbell，都会重新把 fixed cost 放回每一个 packet。理解 DPDK 的标志，不是背出多少 `rte_*` 函数，而是看到吞吐或延迟变化时，能沿 queue、descriptor、DMA、cache line、NUMA、PCIe 和 CPU cycles 一层层提出可验证的问题。
+采用这条路径前，需要确认应用能承担专用 CPU、设备管理和协议功能的成本。低负载、依赖完整内核网络语义或严格功耗预算的服务，不宜仅为降低单包开销迁移到持续忙轮询。调优时固定网卡、包长、队列映射和流量模式，同时记录吞吐、丢包、尾延迟及 CPU 消耗；本文的示例参数不是适用于所有硬件的推荐配置。
 
 ## 参考资料
+
+实现细节以固定提交为准，在线指南可能随版本更新。阅读其他版本时应重新核对接口和 PMD 限制。
 
 - [DPDK 源码，本次阅读提交](https://github.com/DPDK/dpdk/tree/d55ccd4e6de64e3f797f60de9e81f1d60f849775)
 - [DPDK Programmer's Guide](https://doc.dpdk.org/guides/prog_guide/)

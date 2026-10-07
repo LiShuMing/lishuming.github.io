@@ -2,7 +2,7 @@
 title: "【实验】Personal Knowledge Lab : 本地多模态Context索引系统搭建"
 slug: "personal-knowledge-lab-local-multimodal-rag"
 date: 2026-08-22T19:30:00+08:00
-lastmod: 2026-08-22T19:30:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 draft: false
 categories:
   - AI Infra
@@ -24,9 +24,7 @@ math: true
 
 这也是我尝试做 `personal-knowledge-lab` 的起点：用 Vibe Coding 搭建一个面向自己照片和文档的本地知识实验室。原始文件留在 Windows 目录并保持只读，索引、缩略图、任务状态和日志存放在 WSL；搜索能够组合中文描述、物体、OCR、时间、地点和人物，结果还要解释“为什么找到这张照片”。
 
-项目目前没有达到我对搜索质量的预期，也因此暂时搁置。但这并不只是一次失败的 Demo。它把多模态 RAG、GPU 推理服务、增量索引、后台任务、数据版本和检索评测放进了同一个真实系统，使我更清楚地看到：
-
-> 个人知识库首先是一个数据与证据系统，其次才是模型应用。模型决定能力上限，数据建模、索引版本和评测闭环决定它是否真的可用。
+项目没有达到我对搜索质量的预期，因此暂时搁置。下面从索引与检索路径说明实现，再结合模型身份漂移和索引快照分析失败原因；重点是分清模型能力、数据覆盖和评测缺口。
 
 本文基于 `personal-knowledge-lab`、独立的 `pkl-vllm-service`、本地 SQLite 索引快照和运行日志完成。文中会明确区分已经落地的实现与仍处于设计阶段的能力，不把 roadmap 写成结果。
 
@@ -55,7 +53,9 @@ math: true
 
 这个类比也带来一个重要结论：caption 和 embedding 不是“内容本身”，只是可以被丢弃、重算和迁移的索引。更换模型、prompt、pooling 或向量维度，本质上都相当于一次索引格式升级。
 
-## 当前架构：让 Qwen 负责采集，而不是在线搜索
+## 索引路径：从只读文件到可追溯的模型观察
+
+### 当前架构：让 Qwen 负责采集，而不是在线搜索
 
 早期最自然的想法，是每次查询都让视觉大模型逐张看图并回答“是否相关”。它的问题也很直接：延迟随照片数量线性增长，GPU 成本高，结果不可重复，并且难以说明究竟是哪条证据命中。
 
@@ -85,9 +85,9 @@ math: true
 
 [Qwen2.5-VL](https://arxiv.org/abs/2502.13923) 负责把像素转成可检索的结构化描述；[CLIP](https://arxiv.org/abs/2103.00020) 保留原始画面的跨模态召回能力；[InsightFace](https://github.com/deepinsight/insightface) 提供人脸检测和 embedding。在线查询只访问已经生成的索引，不再把整套相册交给 VLM 重看一遍。
 
-这与经典 RAG 的 ingestion、indexing、retrieval、synthesis 分层类似，可以参考 [LlamaIndex 对 RAG 阶段的划分](https://github.com/run-llama/llama_index/blob/main/docs/src/content/docs/framework/understanding/rag/index.mdx)。但框架只能帮助编排组件，并不会自动解决数据归属、模型版本、幂等任务和评测问题，这些仍然是应用自己的系统责任。
+这与经典 RAG 的 ingestion、indexing、retrieval、synthesis 分层类似，可以参考 [LlamaIndex 对 RAG 阶段的划分](https://github.com/run-llama/llama_index/blob/main/docs/src/content/docs/framework/understanding/rag/index.mdx)。但框架只能帮助编排组件，并不会自动解决数据归属、模型版本、幂等（Idempotency）任务和评测问题，这些仍然是应用自己的系统责任。
 
-## Context 不是一段更长的 caption
+### Context 不是一段更长的 caption
 
 照片索引最危险的问题，不是模型漏掉一个物体，而是把“看起来合理的推断”写成事实。例如室内装饰可能像杭州某家餐厅，但画面本身不能证明地点；两个人站在一起也不能证明关系。
 
@@ -124,7 +124,26 @@ math: true
 
 这里还保留了一个渐进迁移设计：索引失效版本仍叫 `photo_context`，payload schema 已升级为 `photo_context_v2`。前者控制重建批次，后者控制字段语义。这样不必在改 schema 的一刻让所有照片同时失效，但旧记录是否已经重建必须变得可观测。
 
-## 多路检索：不要直接相加两个不同空间的分数
+### 人脸能力：聚类不是身份事实
+
+人脸聚类只能给出相似性分组，不能自动成为身份事实；需要用户确认、保留修改来源，并支持错误合并后的拆分。人物链路如下：
+
+```text
+照片
+  -> InsightFace 检测与 face embedding
+  -> 与 cluster centroid 比较
+  -> person cluster
+  -> 用户命名 / alias / ignore
+  -> 重建受影响照片的 people context
+```
+
+cluster centroid 使用增量均值更新。用户把一个 cluster 命名为“乔乔”后，`refresh_person_vectors` 任务才会把名字和别名写入相关照片的检索 context。因此“找乔乔在地铁里的照片”由用户确认的 cluster、视觉场景和其他证据联合完成，不依赖模型凭脸猜人。
+
+本地快照有 1,227 次人脸检测和 464 个 cluster，其中仍有 96 张图片等待人脸处理。这个数字首先暴露的是评测问题：阈值可能把同一个人拆得过细，也可能错误合并相似面孔。成熟的开源照片系统 [Immich 的人脸识别](https://immich.app/docs/features/facial-recognition) 同样把检测、embedding、聚类和用户命名分开，并提供合并、隐藏等人工修正路径。这里真正值得借鉴的不是“也有一个 People 页面”，而是允许用户持续纠正聚类结果。
+
+## 检索与后台维护：排序、队列及模型服务
+
+### 多路检索：不要直接相加两个不同空间的分数
 
 每张图片目前有一条 `clip:image` 向量，也有 caption、dense caption、object、activity、OCR、location、time、event、metadata 等文本向量。不同向量空间的 cosine score 不具备天然可比性：CLIP 的 0.31 与文本模型的 0.78，不能因为都是小数就直接相加。
 
@@ -148,24 +167,7 @@ $$
 
 当前的 `confidence` 只是融合特征推导出的启发式值，并不是经过校准的概率。把它显示成“83% 正确”会制造并不存在的精确感。
 
-## 人脸能力：聚类不是身份事实
-
-人物链路目前是：
-
-```text
-照片
-  -> InsightFace 检测与 face embedding
-  -> 与 cluster centroid 比较
-  -> person cluster
-  -> 用户命名 / alias / ignore
-  -> 重建受影响照片的 people context
-```
-
-cluster centroid 使用增量均值更新。用户把一个 cluster 命名为“乔乔”后，`refresh_person_vectors` 任务才会把名字和别名写入相关照片的检索 context。因此“找乔乔在地铁里的照片”由用户确认的 cluster、视觉场景和其他证据联合完成，不依赖模型凭脸猜人。
-
-本地快照有 1,227 次人脸检测和 464 个 cluster，其中仍有 96 张图片等待人脸处理。这个数字首先暴露的是评测问题：阈值可能把同一个人拆得过细，也可能错误合并相似面孔。成熟的开源照片系统 [Immich 的人脸识别](https://immich.app/docs/features/facial-recognition) 同样把检测、embedding、聚类和用户命名分开，并提供合并、隐藏等人工修正路径。这里真正值得借鉴的不是“也有一个 People 页面”，而是允许用户持续纠正聚类结果。
-
-## 后台队列：索引是一项长期的数据维护工作
+### 后台队列：索引是一项长期的数据维护工作
 
 FastAPI 启动后，`QueueController` 周期性扫描 SQLite 任务表，补入未索引照片、待处理人脸和到期的文档扫描任务。worker 通过条件更新 claim 任务，`ProcessingRun` 记录开始/结束时间、worker、模型 profile、输出统计和错误。
 
@@ -179,7 +181,7 @@ FastAPI 启动后，`QueueController` 周期性扫描 SQLite 任务表，补入�
 
 SQLite 适合承担当前规模下的 catalog 和任务状态，但必须正视它的并发边界：[SQLite WAL](https://www.sqlite.org/wal.html) 可以让 reader 与 writer 并行，仍然同时只有一个 writer。当前连接配置没有显式启用 WAL，任务增加后应该将 journal mode、busy timeout、短事务和写入批次一起纳入压测，而不是只调 worker 数量。
 
-## 为什么把 vLLM 从应用仓库拆出去
+### 为什么把 vLLM 从应用仓库拆出去
 
 `personal-knowledge-lab` 负责业务状态，`pkl-vllm-service` 只负责模型运行时：
 
@@ -211,7 +213,9 @@ pkl-vllm-service
 
 WSL 里还有一个很具体的工程教训：这台机器的 `127.0.0.1` TCP policy route 会导向异常 loopback 设备，进程虽然显示监听，客户端却收到连接拒绝。使用普通 HTTP server 复现后，服务改为绑定 `127.0.0.2:8100`，仍只暴露在本机 loopback。很多“模型服务故障”最终是网络、环境或进程边界问题，不能仅靠重装模型解决。
 
-## 视觉 token、像素预算和基准数字
+## 失败复盘：资源预算、模型身份与样本覆盖
+
+### 视觉 token、像素预算和基准数字
 
 Qwen2.5-VL 不会直接把 JPEG 字节送入语言模型。图片先被处理成视觉 token，与 prompt 一起完成 prefill，随后才生成 JSON。像素越多，视觉 token 越多，prefill 计算与 KV cache 压力也随之增加。
 
@@ -232,7 +236,7 @@ limit_mm_per_prompt.image=1
 
 这个数字证明 continuous batching 有效，但不能翻译成“真实相册每张只需 0.38 秒”。真实 worker 日志中，每张照片通常需要 4.7～7.2 秒，少数超过 10 秒；其中还包括图片读取与缩放、请求传输、JSON 解析、CLIP/文本向量、人脸处理和数据库写入。微基准回答运行时容量，端到端日志回答用户实际等待时间，两者不能混用。
 
-## 一次很关键的模型身份漂移
+### 一次很关键的模型身份漂移
 
 项目配置中请求的文本模型是 `BAAI/bge-m3`。[BGE-M3](https://arxiv.org/abs/2402.03216) 的价值在于多语言，以及 dense、lexical、multi-vector 等多种检索表示。但检查运行代码、模型缓存和数据库后，实际情况是：
 
@@ -256,9 +260,9 @@ index_version   = ...
 
 worker 启动时应验证数据库中向量的模型指纹；不一致就拒绝混写并触发显式 reindex。这本质上不是 ML 细节，而是 schema compatibility。
 
-## 为什么图片搜索没有达到预期
+### 为什么图片搜索没有达到预期
 
-当前数据库快照包含：
+检索质量的判断需要带上样本覆盖范围：当前快照规模较小，OCR 与文档通道也不完整，不能把少量成功案例外推到完整个人知识库。快照包含：
 
 | 项目 | 数量 |
 | --- | ---: |
@@ -279,37 +283,39 @@ python3 -m pytest -p no:cacheprovider backend/tests -q
 
 但“pipeline 全部成功”并不代表“搜索足够好”。结合代码与数据，我认为主要瓶颈来自以下几个层面。
 
-### 1. 中文查询与英文 CLIP 的能力错位
+#### 中文查询与英文 CLIP 的能力错位
 
 当前视觉模型是 `openai/clip-vit-base-patch32`。它适合验证 text-to-image 的基本链路，但原始训练数据与中文查询并不匹配，ViT-B/32 对细粒度物体和小文字也有限。Immich 的 [搜索文档](https://docs.immich.app/features/searching/) 同样明确提醒：非英语查询应选择合适的多语言模型。
 
 下一步不是随意换一个“更大 CLIP”，而是用真实中文 query 对比 multilingual CLIP/SigLIP 类模型，观察 Recall@10、显存、索引时间和向量维度的整体变化。
 
-### 2. VLM context 是有损表示
+#### VLM context 是有损表示
 
 caption 将高维画面压缩成有限文本。没被模型写出来的细节，后续文本 embedding 无法恢复；被模型猜错的内容则会变成新的噪声。observation/inference 分层可以降低污染，但不能消除信息损失。
 
 因此原始视觉向量、OCR、结构化元数据和 VLM context 应当互补，不能让一段 dense caption 成为照片的唯一真相。
 
-### 3. OCR 还不是独立的一等检索器
+#### OCR 还不是独立的一等检索器
 
 当前 visible text 主要来自 VLM 输出，数据库中只有 63 张照片拥有 OCR namespace。截图、白板、票据和报错信息需要专门 OCR、文本规范化和 lexical/BM25 检索。精确错误码或函数名交给 dense embedding，往往不如倒排索引可靠。
 
-### 4. 检索仍是 Python 中的线性扫描
+#### 检索仍是 Python 中的线性扫描
 
 `photo_vectors` 以 JSON 存在 SQLite，查询时读入 Python 计算 cosine。在 529 张图上可以工作，也便于观察每条向量；继续扩展到几万张图后，内存、延迟和过滤顺序都会成为问题。
 
 [Qdrant](https://qdrant.tech/documentation/manage-data/) 可以提供 ANN、payload filter 和更成熟的索引维护；其 [collection、named vectors 与 alias](https://qdrant.tech/documentation/manage-data/collections/) 也适合当前的多 namespace 与无停机迁移。但迁移向量数据库只解决规模和工程效率，不会自动修好中文 CLIP、坏 caption 或错误权重。
 
-### 5. 权重和置信度还没有数据依据
+#### 权重和置信度还没有数据依据
 
 当前意图规则、RRF 权重和 confidence 都来自工程经验。没有标注 query 集时，很容易对几条印象深刻的失败样例反复调参，最后得到只对这些样例有效的系统。
 
-### 6. 文档检索仍是 baseline
+#### 文档检索仍是 baseline
 
 照片已经有实验性的多路语义检索，但文档目前主要是本地 parser、chunk 与 TF-IDF，不是完整的 BGE-M3、sparse+dense、rerank pipeline。照片和文档也不是同一种资产：PDF 需要页码、版面、表格、代码和公式，照片需要人物、时空、OCR 与视觉场景。所谓统一检索，不应等同于把所有内容塞进一个 embedding。
 
-## 与已有开源项目的关系
+## 下一轮实验：先建立评测，再决定扩展
+
+### 与已有开源项目的关系
 
 如果目标只是获得成熟的本地照片管理产品，[Immich](https://docs.immich.app/developer/architecture/) 已经提供移动端备份、PostgreSQL、机器学习服务、人物、OCR、地点和语义搜索。重新实现一套相册产品并没有明显价值。
 
@@ -323,9 +329,9 @@ Personal Knowledge Lab 的价值在另一个方向：
 
 LlamaIndex、Haystack 等框架适合快速搭建 RAG orchestration；Immich 适合直接使用；Qdrant 适合向量规模增长之后的基础设施。这个项目更像一个个人 AI/数据库实验台。它不应该以“代码都是自己写的”为目标，而应该借鉴成熟项目的边界，再把精力放到可解释性、评测与跨资产检索上。
 
-## 下一步：让评测成为 Vibe Coding 的规格
+### 下一步：让评测成为 Vibe Coding 的规格
 
-这次最深的反思，是 Vibe Coding 极大降低了生成 pipeline 和页面的成本，却没有自动生成产品判断。任务成功数、页面能打开、单元测试通过，只能证明系统在运行，不能证明用户找到了想要的内容。
+流水线成功率不能替代检索质量，因为索引任务完成时并不知道用户期待哪些结果。下一轮应先建立带相关性标注的查询集，再比较模型与检索策略。
 
 下一阶段如果继续，我会先暂停堆组件，建立一个小而真实的离线评测集：
 
@@ -348,22 +354,8 @@ LlamaIndex、Haystack 等框架适合快速搭建 RAG orchestration；Immich 适
   -> 用户反馈进入持续评测
 ```
 
-这也可以借鉴数据库优化器的思路：先有 workload 和 profile，再调整索引、执行计划与代价模型。没有 workload 的“性能优化”容易沦为跑分，没有标注集的“RAG 优化”也容易沦为 Demo 调参。
+这也可以借鉴数据库优化器的思路：先有 workload 和 profile，再调整索引、执行计划与代价模型（Cost Model）。没有 workload 的“性能优化”容易沦为跑分，没有标注集的“RAG 优化”也容易沦为 Demo 调参。
 
-## 阶段结论
+### 阶段结论
 
-这轮实践让我形成了几个更确定的判断。
-
-第一，VLM 更适合离线提取候选事实，而不是成为每次查询的在线循环。这样才能控制延迟、显存和不可重复性。
-
-第二，原始文件、确定性元数据、模型观察、模型推断和用户确认必须拥有不同的可信度边界。把它们全部揉成一段 caption，后面换任何 embedding 都无法恢复证据。
-
-第三，模型、prompt 和 embedding 都是索引 schema 的一部分。`requested model` 不等于 `resolved model`，静默 fallback 是比一次 bad case 更严重的系统错误。
-
-第四，队列、版本、日志和 `match_reason` 不是外围设施。它们决定系统能否从失败中恢复，能否解释结果，也决定一次升级能否安全重建。
-
-最后，个人知识库真正困难的部分，不是“把 Qwen、CLIP、BGE、Qdrant 接起来”，而是持续回答这些问题：
-
-> 它找到了什么？为什么找到？漏掉了什么？哪一条是事实，哪一条只是推断？模型变化后旧索引还可信吗？数据是否始终留在自己手中？
-
-因此这个项目虽然暂时停下，但它已经完成了更重要的一步：从一个“本地多模态搜索 Demo”，转向一套可以被验证、被解释、被迁移的数据系统。下一次继续时，我不会先再接一个模型，而会先让评测成为系统的规格。
+再次继续前，先冻结模型与索引指纹，标注文中建议的查询集，逐通道比较 Recall、排序与延迟，再决定是否更换模型。当前实现不适合无人审核的身份判断或地点归因，小规模快照也不能证明扩大图库后仍满足延迟预算。

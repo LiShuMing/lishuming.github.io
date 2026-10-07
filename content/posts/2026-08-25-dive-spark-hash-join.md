@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Spark Hash Join：从 JoinSelection、HashedRelation 到 AQE 与 Spill 边界"
 date: 2026-08-25T00:00:00+08:00
-lastmod: 2026-08-30T00:00:00+08:00
+lastmod: 2026-10-07T00:00:00+08:00
 slug: "dive-spark-hash-join"
 categories:
   - 大数据
@@ -17,21 +17,15 @@ description: "结合 Apache Spark 源码，分析 BroadcastHashJoin、ShuffledHa
 draft: false
 ---
 
-## 1. 背景：为什么 Spark 没有默认选择 Hash Join
+## 选择前提：语义、分发与资源估计
 
-在 StarRocks、ClickHouse 等分析型数据库中，Hash Join 通常是等值连接的核心实现：选择较小一侧构建哈希表，另一侧流式 Probe，在内存充足时可以获得接近 `O(N + M)` 的执行复杂度。
+### 背景：为什么 Spark 没有默认选择 Hash Join
+
+在 StarRocks、ClickHouse 等分析型数据库中，Hash Join 通常是等值连接的核心实现：选择较小一侧构建哈希表（Hash Table），另一侧流式 Probe，在哈希分布近似均匀且内存充足时，Build/Probe 主路径接近 `O(N + M)`；若显式输出 `Z` 条匹配结果，总工作量还要计入 `O(Z)`。
 
 Spark SQL 的默认选择却不同。小表满足广播条件时，Spark 会优先使用 `BroadcastHashJoin`；一旦两侧都不能广播，常见执行计划往往变成 `SortMergeJoin`，而不是 `ShuffledHashJoin`。
 
-这很容易被简化成“Spark 的 Hash Join 性能不好”，但源码展示的是一个更完整的取舍：
-
-1. Spark 面向共享集群上的通用 ETL，数据规模和统计信息经常不可靠；
-2. `ShuffledHashJoin` 要求每个 Task 的 Build 分区完整驻留内存；
-3. Spark 的 `HashedRelation` 没有真正可用的 Join Spill 路径；
-4. `SortMergeJoin` 的排序和同 Key 缓冲都可以落盘，失败边界更可控；
-5. AQE 可以用真实分区大小重新选择 Join，但不会改变 Hash Table 本身不可 Spill 的事实。
-
-因此，Spark 的策略并不是简单比较 Hash 与 Sort 的 CPU 复杂度，而是在性能、内存上界、数据倾斜和失败恢复之间做系统级决策。
+差异需要从内存与恢复路径解释：本文快照中的 `HashedRelation` 缺少可恢复的 Join Spill，而 SMJ 的排序和同 Key 缓冲有落盘路径。AQE 可以修正统计与策略，不能改变算子的内存模型，因此比较还需计入数据倾斜（Data Skew）和失败边界。
 
 本文基于 Apache Spark 提交 [`786bb3d`](https://github.com/apache/spark/tree/786bb3d9751fc6c4993997c088345ceba1b7a8d5) 分析以下问题：
 
@@ -44,35 +38,11 @@ Spark SQL 的默认选择却不同。小表满足广播条件时，Spark 会优�
 
 这里的配置默认值和 Rule 顺序只对应这一源码快照。Spark 官方当前的[配置文档](https://spark.apache.org/docs/latest/configuration)仍列出 `spark.sql.shuffledHashJoinFactor=3`，但具体发行版、Vendor Runtime 和 Native Plugin 可能改写 JoinSelection 或替换物理算子。排查生产计划时，应同时记录 Spark Build Version、Session Conf、Initial/Final Plan 和插件版本，不能仅凭文章中的默认值判断。
 
-## 2. 先说结论
+### 选择顺序与估计边界
 
-Spark Join 的核心判断可以浓缩成三层：
+BHJ、SHJ 与 SMJ 的选择依赖语义、分发和内存条件。广播要求全局 Build 较小，SHJ 则要求每个 Task 的局部 Build 能驻留；不能广播且无法可靠估计内存时，可外排的 SMJ 提供另一条路径。这里的大小判断通常来自统计估计，并不是对实际峰值内存的证明。下面依次核对准入条件、执行结构与 AQE 的调整范围。
 
-```text
-第一层：能否 Broadcast？
-  └─ 能：BroadcastHashJoin，避免两侧 Shuffle
-
-第二层：每个 Shuffle 分区的 Build 侧是否足够小？
-  └─ 能证明足够小：ShuffledHashJoin
-
-第三层：无法证明 Hash Table 一定装得下
-  └─ Join Key 可排序：SortMergeJoin
-```
-
-源码进一步给出六个关键结论：
-
-1. **BHJ 是 Spark 等值 Join 的第一选择。** 默认自动广播阈值为 10 MiB，也可以由 Hint 或 AQE 的运行时统计触发。
-2. **SHJ 默认很难被静态选中。** `spark.sql.join.preferSortMergeJoin=true`，即使关闭它，小表仍需同时满足“单分区可建 Hash Table”和“明显小于另一侧”。
-3. **SHJ 与 BHJ 共用 `HashedRelation`。** 区别主要在 Build 输入的分发方式：前者两侧按 Key Shuffle，后者由 Driver 收集并广播 Build 侧。
-4. **Spark Hash Join 的 Build 侧不支持稳定 Spill。** `UnsafeHashedRelation` 的 `BytesToBytesMap` 和 `LongHashedRelation` 在 Join 路径都无法释放有效内存，申请失败后 Task 直接失败。
-5. **SMJ 的默认地位首先来自可预测性。** Shuffle Sort、External Sort Run 和重复 Key 缓冲都具备落盘路径，更适合大表 Join 和统计误差较大的 ETL。
-6. **AQE 是重新规划，不是算子原地变形。** Stage 物化后，Spark 更新逻辑计划的运行时统计或注入 Hint，再重新执行 `JoinSelection`。
-
-最重要的判断是：
-
-> Spark 不是放弃 Hash Join，而是只在能够证明 Build 侧足够小时主动使用 Hash Join；当这个证明不足时，选择可 Spill 的 SortMergeJoin 作为安全基线。
-
-## 3. Spark Join 的算子坐标
+### Spark Join 的算子坐标
 
 Spark SQL 的常见物理 Join 可以分为以下几类：
 
@@ -92,11 +62,11 @@ Spark SQL 的常见物理 Join 可以分为以下几类：
 
 这种分层很重要：选择 BHJ 还是 SHJ，首先改变的是数据如何到达 Build/Probe 算子；选择 Hash 还是 Merge，才真正改变分区内部的 Join 算法。
 
-## 4. 静态规划：JoinSelection 的决策树
+### 静态规划：JoinSelection 的决策树
 
 物理选择入口位于 [`SparkStrategies.JoinSelection`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala#L181)。公共判断逻辑位于 [`JoinSelectionHelper`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/joins.scala#L290)。
 
-### 4.1 先区分等值与非等值 Join
+#### 先区分等值与非等值 Join
 
 `ExtractEquiJoinKeys` 把 Join 条件拆成：
 
@@ -115,7 +85,7 @@ Join condition
    └─ 无 equi keys ──► Cartesian / Broadcast Nested Loop
 ```
 
-### 4.2 Hint 的优先级
+#### Hint 的优先级
 
 当用户提供 Hint 时，`JoinSelection` 按以下顺序尝试：
 
@@ -126,7 +96,7 @@ Join condition
 
 Hint 不是无条件命令。比如 Full Outer Join 不能规划为 BHJ，Hash Key 不满足二进制相等语义时也不能强制使用 Hash Join。无法应用的 Hint 会报告告警，并继续尝试其他策略或无 Hint 路径。
 
-### 4.3 无 Hint 的默认顺序
+#### 无 Hint 的默认顺序
 
 `createJoinWithoutHint()` 的源码顺序非常直接：
 
@@ -152,9 +122,11 @@ createBroadcastHashJoin(false)
 
 > Spark 首先尝试 BHJ；对不能广播的大表等值 Join，SHJ 的准入条件默认关闭，于是 SMJ 成为最常见落点。
 
-## 5. Hash Join 的三个准入条件
+### Hash Join 的三个准入条件
 
-### 5.1 Key 必须支持二进制稳定相等
+哈希连接（Hash Join）必须同时满足键相等语义、合法 Build 方向和资源判断；Hint 不能让语义不支持的 Join 变得合法。
+
+#### Key 必须支持二进制稳定相等
 
 当前源码的 `hashJoinSupported()` 要求所有 Join Key 都满足：
 
@@ -166,9 +138,9 @@ UnsafeRowUtils.isBinaryStable(e.dataType)
 
 这里不能简单理解为“所有可 Hash 的 JVM 类型都能 Join”。Spark 要求 Hash、Equality 和 SQL Collation 语义闭合；不满足时会记录 Warning，并放弃 BHJ/SHJ。
 
-### 5.2 Join Type 决定哪一侧可以 Build
+#### Join Type 决定哪一侧可以 Build
 
-Build 侧不是永远选右表。外连接必须保留特定一侧的未匹配行，因此不同 Join Type 的合法 Build 方向不同。
+Build 侧不是永远选右表。外连接（Outer Join）必须保留特定一侧的未匹配行，因此不同 Join Type 的合法 Build 方向不同。
 
 | Join Type | BHJ 常见合法 Build 侧 | SHJ 合法性特点 |
 | --- | --- | --- |
@@ -180,7 +152,7 @@ Build 侧不是永远选右表。外连接必须保留特定一侧的未匹配�
 
 当两侧都合法时，`getBuildSide()` 根据 `stats.sizeInBytes` 选择更小的一侧。统计不准确不仅影响是否广播，也会影响哪一侧承担 Hash Table 内存。
 
-### 5.3 大小判断不是一个阈值
+#### 大小判断不是一个阈值
 
 BHJ 只需要满足 `canBroadcastBySize()`：
 
@@ -204,7 +176,9 @@ BuildSize × shuffledHashJoinFactor <= StreamSize
 
 这个估算有明显局限：平均值无法发现倾斜。总数据量满足条件，不代表最大的 Build 分区一定能放进单个 Task 的内存。
 
-## 6. BroadcastHashJoin：用全局小表换掉 Shuffle
+## Hash 执行：两种分发方式与同一个内存核心
+
+### BroadcastHashJoin：用全局小表换掉 Shuffle
 
 [`BroadcastHashJoinExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala) 的核心价值不是 Hash Probe 本身，而是避免 Stream 侧 Shuffle。
 
@@ -223,7 +197,7 @@ BuildSize × shuffledHashJoinFactor <= StreamSize
        probe local stream partitions
 ```
 
-### 6.1 Build 侧在哪里构建
+#### Build 侧在哪里构建
 
 `BroadcastExchangeExec.relationFuture` 执行以下步骤：
 
@@ -250,7 +224,7 @@ BHJ 的内存风险因此横跨多个层次：
 
 自动广播阈值与执行期上限不是一回事。Hint 可以绕过 10 MiB 的自动选择门槛，但不能让 Driver 内存和 Hash Table 容量变成无限。
 
-### 6.2 Probe 与 WholeStage Codegen
+#### Probe 与 WholeStage Codegen
 
 非 Null-Aware Anti Join 路径的核心非常短：
 
@@ -273,7 +247,7 @@ streamedPlan.execute().mapPartitions { streamedIter =>
 
 若 `keyIsUnique=true`，代码生成可以调用 `getValue()`，避免为重复 Key 创建 Iterator；非唯一 Key 则调用 `get()` 遍历同 Key Value 链。唯一性因此不仅影响语义，还会改变生成代码的控制流和对象分配。
 
-## 7. ShuffledHashJoin：每个分区独立 Build
+### ShuffledHashJoin：每个分区独立 Build
 
 [`ShuffledHashJoinExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/ShuffledHashJoinExec.scala) 要求两侧按 Join Key 形成相同的 `ClusteredDistribution`。`EnsureRequirements` 会在需要时插入 Shuffle Exchange。
 
@@ -286,7 +260,7 @@ Right ──Hash Shuffle──┘
                      └─ Partition N: build local hash + stream probe
 ```
 
-### 7.1 一次 Task 的执行模型
+#### 一次 Task 的执行模型
 
 `doExecute()` 使用 `zipPartitions` 配对两侧相同分区：
 
@@ -309,7 +283,7 @@ streamedPlan.execute().zipPartitions(buildPlan.execute()) {
 
 > 对每一个 Shuffle 分区，Build Rows、Hash Index、重复 Key 链和外连接匹配标记能否同时装入该 Task 可获得的 Execution Memory？
 
-### 7.2 Outer Join 为什么更复杂
+#### Outer Join 为什么更复杂
 
 当 Full Outer Join，或者外侧恰好被选为 Build 侧时，只流式 Probe 无法输出未匹配的 Build Row。`buildSideOrFullOuterJoin()` 使用两阶段算法：
 
@@ -318,7 +292,7 @@ streamedPlan.execute().zipPartitions(buildPlan.execute()) {
 
 Key 唯一时用 `BitSet` 记录 `keyIndex`；Key 不唯一时用 `OpenHashSet[Long]` 编码 `(keyIndex, valueIndex)`。这会增加额外内存，也会使这类 Join 无法保持普通 Stream 侧输出顺序。
 
-### 7.3 Semi/Anti Join 的重复 Key 优化
+#### Semi/Anti Join 的重复 Key 优化
 
 对 Left Semi、Left Anti 等存在性语义，如果剩余条件不依赖 Build 侧非 Key 列，Build Hash Table 每个 Key 只需保留一行。
 
@@ -331,7 +305,7 @@ Key 唯一时用 `BitSet` 记录 `keyIndex`；Key 不唯一时用 `OpenHashSet[L
 
 这一优化可以显著减少高重复维表的内存，但不能解决高基数 Build 分区无法装入内存的问题。
 
-## 8. HashedRelation：Hash Join 的内存核心
+### HashedRelation：Hash Join 的内存核心
 
 `HashedRelation.apply()` 根据 Key 形态选择两种实现：
 
@@ -340,7 +314,7 @@ Key 唯一时用 `BitSet` 记录 `keyIndex`；Key 不唯一时用 `OpenHashSet[L
 | 单个 `LongType` 且不允许 Null Key | `LongHashedRelation` | `LongToUnsafeRowMap` |
 | 通用 UnsafeRow Key | `UnsafeHashedRelation` | `BytesToBytesMap` |
 
-### 8.1 UnsafeHashedRelation
+#### UnsafeHashedRelation
 
 `UnsafeHashedRelation` 使用 [`BytesToBytesMap`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/core/src/main/java/org/apache/spark/unsafe/map/BytesToBytesMap.java)：
 
@@ -366,7 +340,7 @@ Memory Pages
 
 `UnsafeHashedRelation.apply()` 持续读取 Build Iterator，生成 Join Key 并调用 `loc.append()`。一旦 append 返回 false，代码释放 Map 并抛出 `cannotAcquireMemoryToBuildUnsafeHashedRelationError`。
 
-### 8.2 LongHashedRelation
+#### LongHashedRelation
 
 单 Long Key 可以走更专门的 `LongToUnsafeRowMap`：
 
@@ -377,9 +351,13 @@ Memory Pages
 
 当 Key 范围紧凑时，Dense Mode 能减少 Hash 计算与冲突探测；当 Key 分布稀疏时则保留 Sparse Mode，避免按巨大数值范围分配数组。
 
-## 9. Spill 真相：Spark Hash Join 为什么会直接失败
+## 超出内存以后：Hash 与 Sort 的恢复边界
 
-### 9.1 BytesToBytesMap 的 spill() 为什么帮不到 Join
+### Spill 真相：Spark Hash Join 为什么会直接失败
+
+底层容器具有 `spill()` 接口不等于 Join 能落盘恢复；本文版本的 BytesToBytesMap 只有进入特定破坏性迭代路径才执行相应 spill，常规 HashedRelation 查找不具备这套协议。
+
+#### BytesToBytesMap 的 spill() 为什么帮不到 Join
 
 `BytesToBytesMap` 是 `MemoryConsumer`，看上去实现了 `spill()`：
 
@@ -412,7 +390,7 @@ def spill(size: Long, trigger: MemoryConsumer): Long = 0L
                      └─ append=false -> 释放 Relation -> Task 失败
 ```
 
-### 9.2 统一内存管理不等于所有算子都可 Spill
+#### 统一内存管理不等于所有算子都可 Spill
 
 `TaskMemoryManager` 可以在 Execution Memory 紧张时要求其他 `MemoryConsumer` 释放内存。Sort、Aggregation 或 Shuffle Buffer 可能把数据写盘，为 Hash Table 腾出空间；但 Hash Table 自己没有 Partitioned Spill 状态机。
 
@@ -424,7 +402,7 @@ def spill(size: Long, trigger: MemoryConsumer): Long = 0L
 
 所以把 `spark.memory.fraction` 调大只能扩大失败边界，不能把 SHJ 变成 Grace Hash Join。
 
-### 9.3 倾斜是 SHJ 最危险的输入
+#### 倾斜是 SHJ 最危险的输入
 
 假设 Build 侧总大小 20 GiB、200 个分区，平均每个分区约 100 MiB，看起来可以接受；但如果一个热点 Key 形成 5 GiB 分区，该 Task 仍需一次性构建 5 GiB 以上的 Relation。
 
@@ -442,7 +420,7 @@ Build 原始 UnsafeRow
 
 因此不能用 Shuffle 文件压缩后的字节数直接等价 Hash Table 峰值。
 
-## 10. SortMergeJoin：为什么它是大表 Join 的安全基线
+### SortMergeJoin：大表 Join 的外排能力与限制
 
 [`SortMergeJoinExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala) 要求：
 
@@ -455,7 +433,7 @@ Left  -> Hash Shuffle -> External Sort ──┐
 Right -> Hash Shuffle -> External Sort ──┘
 ```
 
-### 10.1 Merge 扫描并非完全 O(1) 内存
+#### Merge 扫描并非完全 O(1) 内存
 
 SMJ 同时向前扫描两个有序输入：
 
@@ -472,7 +450,7 @@ SMJ 同时向前扫描两个有序输入：
 - 内存需求不必等于整个 Build 分区；
 - 最坏情况更多表现为磁盘 I/O 和长尾，而不是立即 OOM。
 
-### 10.2 SMJ 仍然可能很慢
+#### SMJ 仍然可能很慢
 
 可 Spill 不等于无代价：
 
@@ -483,7 +461,9 @@ SMJ 同时向前扫描两个有序输入：
 
 但对通用 ETL，磁盘退化通常比不可恢复的 Hash Build OOM 更容易治理。这正是源码配置 `preferSortMergeJoin=true` 的工程含义。
 
-## 11. AQE：运行时重新选择 Join
+## 运行时调整：AQE、倾斜与 Native Engine
+
+### AQE：运行时重新选择 Join
 
 AQE 不是在执行到一半时把 `SortMergeJoinExec` 对象直接改成 `BroadcastHashJoinExec`。其核心流程是：
 
@@ -511,7 +491,7 @@ invalidateStatsCache + AQEOptimizer
 
 入口位于 [`AdaptiveSparkPlanExec.reOptimize()`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala#L793)。
 
-### 11.1 Runtime Stats：SMJ/SHJ 升级为 BHJ
+#### Runtime Stats：SMJ/SHJ 升级为 BHJ
 
 物化后的 `QueryStageExec` 产生 `isRuntime=true` 的统计。`canBroadcastBySize()` 检测到运行时统计后，会使用：
 
@@ -523,17 +503,17 @@ spark.sql.adaptive.autoBroadcastJoinThreshold
 
 需要注意：如果 Shuffle Stage 已经物化，之前的 Shuffle 成本不会神奇消失。AQE 能避免后续 Sort/Merge，并可能用 Local Shuffle Read 读取已有 Block，但无法回收已经发生的网络和写盘成本。
 
-### 11.2 DynamicJoinSelection：基于分区统计注入 Hint
+#### DynamicJoinSelection：基于分区统计注入 Hint
 
 [`DynamicJoinSelection`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/DynamicJoinSelection.scala) 读取 `ShuffleQueryStageExec.mapStats.bytesByPartitionId`，有两类核心判断。
 
-#### 避免不划算的 Broadcast
+##### 避免不划算的 Broadcast
 
 如果某侧包含大量空分区，Shuffle Join 的许多 Task 可以快速短路；把另一侧广播后，反而可能失去这个优势。规则会根据 Join Type 和哪一侧为空，注入 `NO_BROADCAST_HASH`。
 
 Outer/Anti Join 需要保留未匹配行，不能简单在任意空侧短路，因此源码对 `LeftOuter`、`RightOuter`、`LeftAnti` 做了额外区分。
 
-#### SMJ 升级为 SHJ
+##### SMJ 升级为 SHJ
 
 如果所有分区都满足：
 
@@ -553,7 +533,7 @@ spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold = 0
 
 因此，除非用户显式配置，AQE 通常不会主动把 SMJ 升级为 SHJ。这再次说明 Spark 对无 Spill Hash Join 的默认态度非常保守。
 
-### 11.3 用户 Hint 优先于 AQE Hint
+#### 用户 Hint 优先于 AQE Hint
 
 `DynamicJoinSelection` 只在对应一侧没有用户 Join Strategy Hint 时写入 AQE Hint。优先级由此保持一致：
 
@@ -563,7 +543,7 @@ spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold = 0
     > 静态自动选择
 ```
 
-### 11.4 已经广播的 Stage 不允许回退
+#### 已经广播的 Stage 不允许回退
 
 [`LogicalQueryStageStrategy`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala) 排在普通策略之前。
 
@@ -571,7 +551,7 @@ spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold = 0
 
 这是一种 Sunk Cost 保护：物理 Stage 一旦完成，重新规划必须尊重已经付出的执行成本。
 
-### 11.5 Local Shuffle Read 的准确位置
+#### Local Shuffle Read 的准确位置
 
 [`OptimizeShuffleWithLocalRead`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/OptimizeShuffleWithLocalRead.scala) 常被误解为“BHJ 降级为 Shuffle Join 后使用 Local Read”。源码实际处理的是：
 
@@ -581,7 +561,7 @@ spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold = 0
 
 它服务于 **Shuffle Join → BHJ** 的升级复用，而不是给 **BHJ → Shuffle Join** 的降级提供本地读。
 
-## 12. 倾斜优化能否解决 SHJ OOM
+### 倾斜优化能否解决 SHJ OOM
 
 [`OptimizeSkewedJoin`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/OptimizeSkewedJoin.scala) 可以识别显著大于中位数和绝对阈值的分区，将一侧切成多个 Mapper Range，并复制另一侧对应分区。
 
@@ -593,7 +573,7 @@ spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold = 0
               (L-3, R-copy-3)
 ```
 
-它能降低单 Task 输入并增加并行度，但不能从根本上赋予 `HashedRelation` Spill 能力：
+它能降低单 Task 输入并增加并行度（Degree of Parallelism），但不能从根本上赋予 `HashedRelation` Spill 能力：
 
 - Build 分区拆分后仍需完整驻留；
 - 若倾斜来自单个超高频 Key，另一侧复制可能增加总 I/O；
@@ -602,9 +582,9 @@ spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold = 0
 
 因此，Skew Join Optimization 是风险缓解，不是 SHJ 内存安全证明。
 
-## 13. Native Engine：为什么 Hash Join 更容易成为默认方案
+### Native Engine：为什么 Hash Join 更容易成为默认方案
 
-现代 Native Engine 往往采用向量化 Hash Probe、显式内存池和 Partitioned Spill。以 Velox 为例，Hash Join 被拆成 `HashBuild`、`HashProbe` 与 `HashJoinBridge`：
+Velox 等执行引擎把向量化 Probe、显式内存管理与 Partitioned Spill 结合，改变了 Hash Join 的可用内存边界；“Native”这一实现语言标签本身不保证收益。Velox 的职责拆分为 `HashBuild`、`HashProbe` 与 `HashJoinBridge`：
 
 ```text
 Build vectors -> HashBuild -> in-memory HashTable
@@ -631,9 +611,13 @@ Native Engine 还可以利用批量 Probe、SIMD、Dictionary Vector 和更精�
 
 对于 Databricks Photon、Snowflake 等闭源引擎，公开资料可以说明它们采用 Native/Vectorized Execution，但无法像本文分析 Spark 和 Velox 一样验证具体 Hash Table、Partition 数、Spill 触发和恢复协议。因此不应把产品层性能描述当成可复现的源码结论。
 
-## 14. 如何选择与调优
+## 把计划与 Task 指标连起来验证
 
-### 14.1 优先修复统计，而不是先写 Hint
+### 如何选择与调优
+
+策略选择应以过滤后的实际 Build 大小和分区峰值为依据，平均分区或文件压缩大小都不能保证哈希表装入内存。
+
+#### 优先修复统计，而不是先写 Hint
 
 BHJ 是否被选择、Build Side 是哪一侧，都依赖 `sizeInBytes`。如果统计长期失真：
 
@@ -659,7 +643,9 @@ estimated build bytes
 
 平均分区很小但单个热点分区很大时，增加 Executor 总内存可能只会推迟失败。更有效的动作通常是提高有效分区数、治理热点 Key、交换 Build Side，或者保留可 Spill 的 SMJ。
 
-### 14.2 何时适合 BHJ
+#### 何时适合 BHJ
+
+广播适合经过过滤后足够小的 Build 集合，但每个接收端都需承担状态内存，Driver 构建与传输也需要预算。
 
 - Build 侧经过过滤后确定很小；
 - Driver 有足够内存完成 Collect 与 Build；
@@ -667,7 +653,9 @@ estimated build bytes
 - Stream 侧很大，避免 Shuffle 的收益明显；
 - Join Type 允许相应 Build Side。
 
-### 14.3 何时可以考虑 SHJ
+#### 何时可以考虑 SHJ
+
+SHJ 可以避免分区内排序，但必须检查最大 Build 分区及并发 Task 的内存，而不只是总量平均值。
 
 - 两侧已经按 Join Key 分区，或者 Shuffle 无法避免；
 - Build 侧显著小于 Stream 侧；
@@ -684,7 +672,9 @@ spark.sql.join.preferSortMergeJoin=false
 
 这会扩大 SHJ 候选范围，却不会增加 Spill 能力。
 
-### 14.4 何时保留 SMJ
+#### 何时保留 SMJ
+
+外排能把部分内存压力转成 I/O，但热点重复键、磁盘容量和输出规模仍可能成为瓶颈。
 
 - 大表对大表；
 - 数据规模与选择率难以准确估计；
@@ -693,9 +683,11 @@ spark.sql.join.preferSortMergeJoin=false
 - 下游可以复用 Join Key Ordering；
 - 本地磁盘 Spill 能力充足。
 
-## 15. 排障时应该看什么
+### 排障时应该看什么
 
-### 15.1 先看 Initial Plan 与 Final Plan
+AQE 可能改变 Join 策略，因此需要关联初始计划、最终计划与 Task 指标，才能确定内存压力发生在哪条路径。
+
+#### 先看 Initial Plan 与 Final Plan
 
 启用 AQE 后，单看初始 `EXPLAIN` 不足以判断实际 Join。需要对比：
 
@@ -717,7 +709,9 @@ Final Plan
 6. Adaptive Threshold 是否配置；
 7. Broadcast Stage 是否已经物化并被锁定。
 
-### 15.2 关键指标
+#### 关键指标
+
+指标需要按分发、构建、探测与落盘阶段归因；单一总耗时无法区分策略问题和输入倾斜。
 
 | 算子 | 建议关注指标 |
 | --- | --- |
@@ -729,7 +723,9 @@ Final Plan
 
 对 SHJ，平均 `buildDataSize` 价值有限。真正应该观察的是最大分区、P95/P99 分区和失败 Task 对应的 Shuffle Partition。
 
-### 15.3 常见误区
+#### 常见误区
+
+统计阈值、统一内存管理与 AQE 各自控制不同阶段，不能将其中一个能力外推为整个 Join 的资源保障。
 
 | 误区 | 更准确的理解 |
 | --- | --- |
@@ -740,7 +736,9 @@ Final Plan
 | Skew Join 能彻底解决 Hash OOM | 它降低单分区大小，但 Build 仍必须驻留 |
 | Broadcast Hint 可以忽略大小 | Hint 绕过自动阈值，不绕过 Driver/Executor 物理内存 |
 
-## 16. 一张图串起完整决策
+### 一张图串起完整决策
+
+选择顺序只是入口，能否执行还取决于类型、分布与内存；下面的图需要结合前述准入条件阅读。
 
 ```text
 Logical Join
@@ -778,7 +776,11 @@ Logical Join
       可复用 Local Read                      可能改为 SHJ           保留 Shuffle Join
 ```
 
-## 17. 源码阅读路线
+### 调优的适用边界
+
+优化器通常只有统计估计，不能证明真实 Build 的内存上界。采用 BHJ/SHJ 前应检查最大分区、行宽与并发 Task 的预算；估计不可靠且缺少 Join Spill 时，可以保留可外排的 SMJ，但仍要验证磁盘、热点键与输出规模。以上边界限定在本文 Spark 源码快照，不适用于所有插件执行器。
+
+## 源码阅读路线
 
 建议按“选择 → 分发 → 数据结构 → AQE”的顺序阅读：
 
@@ -792,21 +794,6 @@ Logical Join
 8. [`SortMergeJoinExec.scala`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/SortMergeJoinExec.scala)：对比 Merge Buffer 与 Spill；
 9. [`DynamicJoinSelection.scala`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/DynamicJoinSelection.scala)：理解运行时 Hint；
 10. [`AdaptiveSparkPlanExec.scala`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala)：理解 Stage 物化与重新规划。
-
-## 18. 总结
-
-Spark Hash Join 的设计可以归纳为四层约束：
-
-1. **语义约束**：必须有等值 Key，二进制 Hash/Equality 必须与 SQL 语义一致；
-2. **分发约束**：BHJ 需要全局小表，SHJ 需要每个局部 Build 分区足够小；
-3. **内存约束**：`HashedRelation` 必须完整驻留，Join 路径没有可靠 Spill；
-4. **运行时约束**：AQE 可以修正统计和策略，但不能改变算子的基本内存模型。
-
-这也解释了 Spark 与 OLAP/Native Engine 的差异：长期驻留的数据库引擎可以围绕 Hash Join 构建精细的内存仲裁、分区 Spill、Runtime Filter 和 Pipeline 调度；Spark JVM 执行器则选择将稳定性更强的 SMJ 作为大表 Join 基线，再用 Broadcast、Hint 和 AQE 有条件地切换到 Hash Join。
-
-最终，Join 选择不是一道“Hash 还是 Sort”的静态算法题，而是一个端到端系统问题：
-
-> 优化器必须证明数据分发与内存上界，Runtime 必须兑现这个证明；如果 Hash Table 没有退化路径，那么保守的计划往往不是性能不足，而是对失败成本的诚实定价。
 
 ## 参考资料
 
