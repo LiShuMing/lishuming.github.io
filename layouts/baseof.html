@@ -17,14 +17,16 @@
   <body>
     <div id="container">
       <div id="main" role="main">
-        <header>
-          <nav>
+        <header class="site-header">
+          <div class="brand">
+            <h1><a href="/" class="sitename" rel="home" title="返回首页">{{ .Site.Title }}</a></h1>
+            <p id="description">{{ .Site.Params.description }}</p>
+          </div>
+          <nav aria-label="主导航">
             {{ range .Site.Menus.main }}
-            <span><a href="{{ .URL }}" class="navigator" title="{{ .Name }}">{{ .Name }}</a></span>
+            <a href="{{ .URL }}" class="navigator" title="{{ .Name }}">{{ .Name }}</a>
             {{ end }}
           </nav>
-          <h1><a href="/" class="sitename" rel="home" title="返回首页">{{ .Site.Title }}</a></h1>
-          <div id="description">{{ .Site.Params.description }}</div>
         </header>
 
         <article class="content">
@@ -33,7 +35,7 @@
       </div>
 
       <footer>
-        <p><small>Powered by <a href="https://gohugo.io/">Hugo</a> | Copyright 2013.11.11 - {{ now.Format "2006.01.02" }} by <a href="/about/">{{ .Site.Params.author }}</a> | <span class="label label-info">{{ now.Format "2006-01-02 15:04:05 MST" }}</span></small></p>
+        <p><small>Powered by <a href="https://gohugo.io/">Hugo</a> · Copyright 2013.11.11 – {{ now.Format "2006.01.02" }} by <a href="/about/">{{ .Site.Params.author }}</a></small></p>
       </footer>
     </div>
   </body>

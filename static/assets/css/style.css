@@ -19,10 +19,10 @@ nav a{
     color:#000000;
     }
 nav a:hover{
-    background-color:#ff0000;
+    background-color:#f6ebe8;
     text-decoration:none;
-    color:#f9f9f9;
-    -webkit-transition:color .2s linear;
+    color:#b42318;
+    -webkit-transition:color .15s ease, background-color .15s ease;
 }
 
 footer small {
