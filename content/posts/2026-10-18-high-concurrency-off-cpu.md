@@ -12,7 +12,6 @@ tags:
   - StarRocks
   - eBPF
 description: "历史案例：高并发小查询 CPU 打不满时，如何用 Profile、Off-CPU 堆栈与系统计数器连成证据链；标明版本与复现缺口，不做新实验。"
-draft: true
 ---
 
 > **读完带走**
