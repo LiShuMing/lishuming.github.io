@@ -434,7 +434,7 @@ html {
   --accent: #b42318;
   --accent-soft: #f6ebe8;
   --measure: 42rem;
-  --shell: 1080px;
+  --shell: 1320px;
 }
 
 body {
@@ -445,9 +445,9 @@ body {
 }
 
 #container {
-  width: min(100% - 48px, var(--shell));
+  width: calc(100% - 48px);
   max-width: var(--shell);
-  margin: 40px auto;
+  margin: clamp(16px, 2vw, 40px) auto;
   padding: 0;
   border-top: 3px solid var(--accent);
   box-shadow: 0 12px 40px rgba(40, 30, 20, 0.06);
@@ -613,12 +613,12 @@ body {
 }
 
 .post-layout {
-  grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
-  gap: 2rem 2.25rem;
+  grid-template-columns: minmax(11rem, 18%) minmax(0, 1fr);
+  gap: clamp(1.5rem, 3vw, 3rem);
 }
 
 .post-layout--without-toc .post-main {
-  max-width: 46rem;
+  max-width: 960px;
 }
 
 .post-header {
