@@ -2,12 +2,12 @@ baseURL = 'https://lishuming.github.io/'
 languageCode = 'zh-CN'
 title = 'Aphasia'
 author = 'LiShuMing'
-description = '杭州 · 数据库与 AI Infra 学习笔记'
+description = '源码、实验与随笔'
 theme = 'aphasia'
 
 [params]
   author = 'LiShuMing'
-  description = '杭州 · 数据库与 AI Infra 学习笔记'
+  description = '源码、实验与随笔'
 
 [menu]
   [[menu.main]]
