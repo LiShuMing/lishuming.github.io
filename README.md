@@ -1,8 +1,8 @@
-# Aphasia
+# Vipassana
 
 [lishuming.github.io](https://lishuming.github.io/) — Hugo 个人站。作者署名 **LiShuMing**（杭州 · 数据库与 AI Infra）。
 
-原站点基于 Jekyll，现已迁移至 Hugo。站名 Aphasia 沿用；页脚与 About 不再使用 Mr.Think / 柠檬树 / alemontree 作为对外署名。
+原站点基于 Jekyll，现已迁移至 Hugo。站名 Vipassana；页脚与 About 不再使用 Mr.Think / 柠檬树 / alemontree 作为对外署名。
 
 ## 目录结构
 

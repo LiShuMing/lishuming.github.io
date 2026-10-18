@@ -22,7 +22,9 @@ description: "这个博客记录阅读、源码实验和行旅。"
 
 ## 关于本站
 
-站名 Aphasia 是这个站点沿用的名字；作者署名统一为 LiShuMing。本站用 Hugo 生成，托管在 GitHub Pages。
+站名 Vipassana 取自巴利语「清晰地看见」；作者署名统一为 LiShuMing。本站用 Hugo 生成，托管在 GitHub Pages。
+
+（占位删除）；作者署名统一为 LiShuMing。本站用 Hugo 生成，托管在 GitHub Pages。
 
 如果文章对你有帮助，或者你有不同看法，欢迎交流。
 

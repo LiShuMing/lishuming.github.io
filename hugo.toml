@@ -1,6 +1,6 @@
 baseURL = 'https://lishuming.github.io/'
 languageCode = 'zh-CN'
-title = 'Aphasia'
+title = 'Vipassana'
 author = 'LiShuMing'
 description = '源码、实验与随笔'
 theme = 'aphasia'
