@@ -379,3 +379,46 @@ html {
         white-space:nowrap;
     }
 }
+
+
+/* Post header: title + meta before body */
+.post-header {
+  margin: 0 0 1.25em;
+  padding-bottom: 0.75em;
+  border-bottom: 1px solid #e6e6e6;
+}
+.post-title {
+  margin: 0 0 0.35em;
+  font-size: 1.75em;
+  line-height: 1.25;
+}
+.post-meta {
+  margin: 0;
+  color: #999999;
+  font-size: 0.9em;
+}
+.post-meta time + .post-categories::before {
+  content: " · ";
+}
+.post-categories a {
+  color: #666666;
+}
+.post-dek {
+  margin: 0.6em 0 0;
+  color: #555555;
+  font-size: 0.95em;
+  line-height: 1.5;
+}
+
+/* Home listing summaries from front matter description */
+.listing-item {
+  margin-bottom: 0.85em;
+}
+.listing-summary {
+  margin: 0.25em 0 0 0;
+  padding: 0 0 0 1em;
+  color: #666666;
+  font-size: 0.9em;
+  line-height: 1.45;
+  max-width: 46em;
+}
