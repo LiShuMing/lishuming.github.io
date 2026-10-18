@@ -1,7 +1,7 @@
 ---
 title: "【源码】从零实现一个 Cascades Optimizer：optd 全链路源码剖析"
 date: 2026-09-01T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 slug: "dive-optd-cascades-optimizer"
 categories:
   - 数据库
@@ -15,6 +15,11 @@ tags:
 description: "从亲手实现一个现代 Cascades Optimizer 的视角，结合 optd 当前源码，完整分析计划表示、Memo、规则匹配、任务搜索、代价与统计、Winner、两阶段优化、自适应反馈及 DataFusion 执行计划落地。"
 draft: false
 ---
+
+> 本系列第 3/4 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}}) · [下一篇]({{< relref "2026-09-01-dive-starrocks-optimizer.md" >}})
+
+> **与 StarRocks Optimizer 对照（3–6 行）**  
+> optd 是教学向 Cascades：**Memo / 任务调度 / Winner 表**写得完整，便于看清搜索骨架。StarRocks 则是生产 Enforcer：Required Property 级联、Exchange/Sort 插入与 Cost 一并计入。读本篇抓「候选如何进 Memo、如何剪枝」；读 [StarRocks Optimizer]({{< relref "2026-09-01-dive-starrocks-optimizer.md" >}}) 抓「属性不满足时如何付账」。重复的 Memo 术语见系列第 1–2 篇，本文只保留与 DataFusion 落地相关的差异。
 
 查询优化器（Query Optimizer）的计划质量受三个条件共同限制：规则能生成哪些合法候选，代价模型（Cost Model）如何比较候选，以及搜索预算允许探索多大空间。只跟踪 Filter 下推或 Join 交换，无法解释一条计划为何没有被选中；它可能代价更高，也可能从未进入搜索空间。
 

@@ -1,7 +1,7 @@
 ---
 title: "SIGMOD 2026 Industry Papers"
 date: 2026-08-09T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 categories:
   - 数据库
 tags:
@@ -11,6 +11,8 @@ tags:
 description: "SIGMOD 2026 工业界论文阅读笔记，29 篇论文按 7 大主题整理，涵盖云原生数据库、分布式 OLTP、查询优化、向量检索与 AI 数据基础设施等方向。"
 draft: false
 ---
+
+> 本系列第 2/3 篇 · 论文雷达 · [上一篇]({{< relref "2026-09-19-database-research-frontiers.md" >}}) · [下一篇]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})
 
 [SIGMOD 2026](https://2026.sigmod.org/) 今年 May 31 - June 05, 2026 在 Bengaluru, India 举行。每年我都会抽时间读工业界论文，关注系统在生产约束下怎样取舍。今年 Industry Track 共 29 篇论文，参与方包括 AWS、Microsoft、Google、Snowflake、Databricks、Oracle、IBM、Adobe、Dynatrace、Neo4j，以及阿里巴巴、字节跳动、腾讯、美团等国内公司。下面按方向整理为 7 个主题，每篇附上下载链接和个人的快速分析。
 

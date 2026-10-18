@@ -1,7 +1,7 @@
 ---
 title: "【源码】Dynamic Filter 穿越 Outer Join：StarRocks、Doris 与 Trino 的正确性边界"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 slug: "dynamic-filter-through-outer-join"
 categories:
   - 数据库
@@ -12,25 +12,56 @@ tags:
   - StarRocks
   - Apache Doris
   - Trino
-description: "结合 StarRocks、Apache Doris 与 Trino 源码，分析 Runtime Filter/Dynamic Filter 的生成、传播、Outer Join NULL 语义、Null-Safe Equality 及 Producer-Consumer 正确性。"
+description: "Outer Join 下 RF/DF 穿越的正确性边界：统一判据 + StarRocks/Doris/Trino 对照；工程判断前置，压缩路径复述。"
 draft: false
 ---
 
-Runtime Filter（RF）或 Dynamic Filter（DF）通过 Build 侧摘要减少 Probe 输入，但收益依赖选择率、到达时间与 Join 语义：Hash Join 的 Build 侧先收集连接键，再把键值摘要发送给 Probe 侧 Scan，从而提前跳过不可能匹配的数据。
+> 本系列第 3/3 篇 · Join 执行 · [上一篇]({{< relref "2026-09-10-dive-hash-sort-strategy.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
 
-对 Inner Join 而言，这个过程相对直观；一旦计划中出现 Left、Right 或 Full Outer Join，问题就会发生根本变化：
+> **读完带走**
+>
+> - RF/DF 只能**无假阴性**地缩小 Probe；Outer Join 下真正的风险是**改变匹配状态后新产生的补 NULL 行**仍能通过上层谓词（典型反例：`coalesce`）。
+> - **生成**与**穿越**必须分开判定：Left/Full 通常不当自己的保留侧 Producer，不代表父层 RF 不能穿过它。
+> - 三系统对照：StarRocks 偏双边等值复制；Doris 分血缘直穿与 Inner/Semi 等值扩展，并显式拦 Null-Safe；Trino 要求先落到保留侧再有向派生。
+> - 工程上优先用文末统一判据表做回归，而不是比“谁下推得更深”。
 
-> 父 Join 生成的 RF/DF 能否穿过下层 Outer Join？可以下推到保留侧、NULL 生成侧，还是两侧？需要满足哪些条件？
+Runtime Filter（RF）/ Dynamic Filter（DF）用 Build 侧键摘要提前过滤 Probe。Inner Join 较直观；一旦计划含 Outer Join，关键问题变为：
 
-直觉上的“连接键相等，所以过滤器可以沿等值关系传播”并不充分。Outer Join 不只决定哪些行能够匹配，还会在未匹配时合成 NULL。下推过滤器可能改变一行的匹配状态，使原本的匹配行变成 NULL 补齐行；这个新结果又可能通过上层表达式，最终改变查询语义。
+> 父 Join 的 RF/DF 能否穿过下层 Outer Join？落在保留侧、NULL 生成侧，还是两侧？在什么条件下不会改语义？
 
-本文结合 StarRocks、Apache Doris 和 Trino 的源码，建立一套统一的正确性模型，并回答以下问题：
+“键相等即可沿等值类传播”不充分：提前删掉本可匹配的 NULL 生成侧行，会合成补 NULL 行；若上层表达式把 NULL 映射成可匹配值，结果就会变。
 
-1. “当前 Join 自己生成过滤器”与“父层过滤器穿过当前 Join”为什么必须分开讨论？
-2. Outer Join 的保留侧和 NULL 生成侧分别允许怎样的下推？
-3. 普通等值 `=`、Null-Safe Equality `<=>` 与 `IS NOT DISTINCT FROM` 有什么差异？
-4. 为什么 `slot`、`cast(slot)` 通常安全，而 `coalesce(slot, 0)` 可能改变结果？
-5. StarRocks、Doris 和 Trino 分别如何实现传播与正确性保护？
+## 我的工程判断（先读）
+
+**主张：** 下推安全 ⟺ 对被丢弃的每一行，未下推计划中它可能产生的全部输出，在原过滤位置仍会被拒绝；且因匹配状态变化新产生的补 NULL 行也不能通过原条件。  
+**机制：** 分层检查 Producer 完整性、目标侧保留语义、父谓词是否拒 NULL、Probe 表达式是否 Propagate NULL、等值传播方向、Producer–Consumer 闭环。  
+**适用：** 内核正确性审计、跨引擎对照、结果级回归设计。  
+**不适用：** 不能用 Explain 里出现 RF、或下推层数，代替结果正确性。
+
+一眼可用的边界：
+
+| 场景 | 通常结论 |
+|------|----------|
+| Left/Full 对自己的保留侧当 Producer | 否（会删必须输出的未匹配行） |
+| Right Join 用 Build Domain 滤非保留侧 | 可以（仍要完整 Build + Fail-Open） |
+| 父 RF 经 Child Outer：先落保留侧 | 通常可提前删除最终也会被拒的行 |
+| 父 RF 进入 NULL 生成侧 | 仅当 Probe 表达式 Null-Propagating，且父比较拒 NULL（或显式保留 nullAllowed 语义） |
+| `coalesce` / `ifnull` 作 Probe | 不得进 NULL 生成侧 |
+| 父条件为 `<=>` / `IS NOT DISTINCT FROM` | 不得按普通 `=` 做无向双边复制 |
+
+`coalesce` 最小反例：
+
+```sql
+SELECT *
+FROM A
+LEFT JOIN B ON A.k = B.k
+INNER JOIN C ON coalesce(B.k, 0) = C.k;
+-- A.k=1, B.k=1, C.k=0 → 正确结果为空；
+-- 若错误地把上层 DF 推到 B 并删掉 B.k=1，会合成 B=NULL，
+-- coalesce(NULL,0)=0 通过上层，结果多一行。
+```
+
+下文钉问题边界与源码版本，再按 StarRocks / Doris / Trino 对照实现；**统一判据表与三系统对比表**仍是本文核心资产。
 
 ## 问题边界：生成过滤器与穿越 Outer Join
 
@@ -142,40 +173,7 @@ A columns + B columns = NULL
 
 #### 为什么 `coalesce` 是关键反例
 
-`coalesce` 能把补 NULL 转成普通值，使错误下推产生的新行通过父条件，因而可以区分只看键等价的实现。
-
-```sql
-SELECT *
-FROM A
-LEFT JOIN B ON A.k = B.k
-INNER JOIN C ON coalesce(B.k, 0) = C.k;
-```
-
-假设：
-
-```text
-A.k = 1
-B.k = 1
-C.k = 0
-```
-
-原计划中：
-
-```text
-A LEFT JOIN B 产生 B.k = 1
-coalesce(1, 0) = 0 为 FALSE
-最终无结果
-```
-
-如果上层过滤器被错误地下推到 B 并提前删除 `B.k = 1`：
-
-```text
-A LEFT JOIN B 失去匹配，重新产生 B.k = NULL
-coalesce(NULL, 0) = 0 为 TRUE
-最终错误地产生一行
-```
-
-这说明问题不只是“NULL 会不会被过滤”，而是**下推是否改变 Outer Join 的匹配状态，以及由此生成的新 NULL 行能否通过原谓词**。
+文首工程判断已给出最小反例。要点：问题不是“NULL 会不会被滤掉”，而是**下推是否改变匹配状态，以及新补 NULL 行能否通过原谓词**。`slot` / 保 NULL 的 `cast` 通常可证；`coalesce` / `ifnull` / 未知 UDF 默认不可进 NULL 生成侧。
 
 #### Null-Rejecting 与 Null-Propagating
 
@@ -264,29 +262,8 @@ if (result.isPresent() && result.get()) {
 - `probeExpr` 必须是直接 `SlotRef`；
 - Probe Slot 必须参与当前 Join 的普通 `BinaryType.EQ`。
 
-满足条件后，两侧都会尝试，而不是短路：
+满足条件后两侧都会尝试（非短路）：同一 Filter ID 可落到 `Scan(A).k` 与 `Scan(B).k`。普通 `=` 拒 NULL 且无假阴性时能扩大过滤面；若父 RF 带 `equalForNull`，不能仅凭下层普通 EQ 无条件反向复制（见下节边界）。
 
-```java
-boolean pushed =
-        pushDownRuntimeFiltersForChild(context, probeExpr, partitionByExprs, 0);
-pushed |=
-        pushDownRuntimeFiltersForChild(context, probeExpr, partitionByExprs, 1);
-```
-
-假设父层 RF 的 Probe 是 `B.k`，子树为：
-
-```text
-A LEFT JOIN B ON A.k = B.k
-```
-
-候选表达式推导可以把同一个 Filter ID 分别落到：
-
-```text
-Scan(A)：A.k
-Scan(B)：B.k
-```
-
-普通 `=` 拒绝 NULL，且 RF 对 Build Domain 无假阴性时，所有能参与父层匹配的非 NULL 等值键都必须通过过滤器，因此双边传播能够显著扩大过滤范围。
 
 #### Unilateral：按 Join 类型限制方向
 
@@ -462,41 +439,15 @@ if ((node.getType() != INNER && node.getType() != RIGHT)
 
 父 Join 产生的 DF 进入子 Left Join 时，被当作 `inheritedPredicate` 交给 [`processLimitedOuterJoin()`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/optimizations/PredicatePushDown.java)。
 
-关键过程是：
-
-```java
-Expression outerRewritten =
-        outerInference.rewrite(conjunct, outerScope);
-if (outerRewritten != null) {
-    outerPushdownConjuncts.add(outerRewritten);
-
-    Expression innerRewritten =
-            potentialNullSymbolInference.rewrite(
-                    outerRewritten, innerScope);
-    if (innerRewritten != null) {
-        innerPushdownConjuncts.add(innerRewritten);
-    }
-}
-else {
-    postJoinConjuncts.add(conjunct);
-}
-```
-
-这形成一条有方向的传播：
+过程要点：先把 inheritedPredicate 改写到保留侧 scope；成功后再沿 Join Equality 派生 NULL 生成侧副本，否则留在 Join 上方（`postJoinConjuncts`）。
 
 ```text
-父层 DF
-  → 必须先能改写为 Left Join 保留侧表达式
-  → 保留侧保留一份 Predicate
-  → 再借助 Join Equality 派生 NULL 生成侧副本
+父层 DF → 必须先能写成保留侧谓词 → 保留侧留一份
+        → 再派生 NULL 生成侧副本（只减匹配候选）
 ```
 
-安全性来自两个条件：
+安全性依赖：保留侧仍持有原谓词；即便 Inner 侧匹配状态变化，不满足 DF 的保留行仍会被拒，不会凭空增多结果。
 
-1. 原谓词已经下推并保留在 Outer/Preserved Side；
-2. Inner/NULL-Generating Side 的副本只是进一步减少匹配候选。
-
-即使 Inner 侧提前过滤导致匹配状态变化，Outer 侧原谓词仍会拒绝不满足 DF 的保留行，不会凭空增加最终结果。
 
 #### 引用 NULL 生成侧时停留在 Join 上方
 

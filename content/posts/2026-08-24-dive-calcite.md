@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Calcite 优化器：Hep、Volcano、谓词推导与 Join Reorder"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 slug: "dive-calcite-optimizer"
 categories:
   - 数据库
@@ -15,6 +15,8 @@ tags:
 description: "结合 Apache Calcite、StarRocks 与 Apache Doris 源码，分析 Hep、Volcano、Memo、Null-Rejecting 谓词推导、Outer Join Reorder、物理计划后处理、运行时统计与 Dynamic Filter 的实现边界。"
 draft: false
 ---
+
+> 本系列第 1/4 篇 · 优化器 / Cascades · [下一篇]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}})
 
 Apache Calcite 经常被称为“通用 SQL 优化器”，但这个称呼容易造成两个误解：第一，Calcite 不是把 SQL 输入后直接输出分布式执行计划的完整数据库内核；第二，接入 Calcite 也不意味着自动获得成熟的 Join Reorder、Runtime Filter 和自适应执行能力。
 

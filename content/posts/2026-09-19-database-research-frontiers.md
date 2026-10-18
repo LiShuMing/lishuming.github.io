@@ -1,7 +1,7 @@
 ---
 title: "【论文】2026 数据库内核研究进展：从因子化执行到自适应优化与增量维护"
 date: 2026-09-19T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 slug: "database-research-frontiers-2026"
 categories:
   - 数据库
@@ -13,33 +13,44 @@ tags:
   - 增量计算
   - VLDB
   - SIGMOD
-description: "围绕 SIGMOD、VLDB、OSDI、FAST 与 CIDR 的近期论文，分析数据库优化对象如何从单个算子扩展到中间表示、数据子集、后台维护和状态演化，并连接已有的 Umbra、学习优化器与云存储阅读路线。"
+description: "调研风整理：以成本模型为脊柱，对照 FFX、SplitJoin、学习优化器、存储卸载与 IVM/布局维护；含 2026-10-18 检索窗口更新。"
 draft: false
 ---
 
-这组近期论文将优化对象从单个算子扩展到中间表示（Intermediate Representation）、数据子集和后续维护工作。FFX 讨论重复组合是否需要展开，SplitJoin 为不同数据部分选择计划，HATS 和 Enzyme 则把后台积压或下游变化纳入成本。它们解决的约束不同，不能用“GPU”“LLM”或“增量计算”这样的标签概括机制。
+> 本系列第 1/3 篇 · 论文雷达 · [下一篇]({{< relref "2026-08-09-sigmod-2026-industry-papers.md" >}}) · 对照：[Umbra]({{< relref "2026-09-04-dive-umbra.md" >}}) · [现代硬件]({{< relref "2026-08-09-modern-database-hardware.md" >}})
 
-本文按执行、优化、存储和增量维护展开，最后比较这些工作新增的成本项。讨论限定于所选论文，不据此判断整个领域的研究占比。
+> **读完带走**
+>
+> - 优化对象已从“单个算子更快”扩展到**中间表示、数据子集、候选反馈与后续维护**；FFX / SplitJoin / Enzyme / HATS 解决的约束不同，不能用 GPU / LLM / 增量计算一类标签互相替代。
+> - 工程上应优先问：**少生成了什么、为谁付了账、何时失效**。第六节的成本对照表是本文的阅读脊柱。
+> - “最新”只覆盖本稿检索窗口；**2026-10-18 补检**未发现足以改写主线的、截止日后新增硬证据（详见第一节检索窗口更新）。
+> - 延续 [Umbra 研究路线]({{< relref "2026-09-04-dive-umbra.md" >}}) 与 [数据库系统论文精读]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})：本文补机制边界与可组合实验，不据此判断领域占比。
 
-这也延续了此前的 [Umbra 研究路线]({{< relref "2026-09-04-dive-umbra.md" >}}) 和 [数据库系统论文精读]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})：前者讨论执行器怎样逐步放松理想化假设，后者讨论现代硬件、工业系统和自治机制。本文进一步关注这些机制之间的边界，以及下一步值得验证的组合。
+## 一、检索口径与阅读深度
 
-## 一、先明确“最新”与“读过”的含义
-
-“近期进展”只覆盖本文实际检索和核对的材料，不代表会议论文全集。原稿检索截止于 **2026 年 9 月 19 日**，从 [VLDB 2026](https://vldb.org/2026/program.html)、[SIGMOD 2026](https://2026.sigmod.org/sigmod_papers.shtml)、[OSDI 2026](https://www.usenix.org/conference/osdi26/technical-sessions)、[FAST 2026](https://www.usenix.org/conference/fast26/technical-sessions)、[CIDR 2026](https://www.cidrdb.org/cidr2026/program.html) 和 [SOSP 2025](https://sigops.org/s/conferences/sosp/2025/accepted.html) 的官方目录筛选，再回到原文、作者页面或出版方摘要。
-
-这里包含不同出版体系：VLDB 对应 PVLDB，SIGMOD Research 对应 PACMMOD，OSDI、FAST、SOSP 是会议。APQO 的期刊出版时间是 2025 年 12 月，但属于 SIGMOD 2026；FFX 在 2026 年 9 月上传 arXiv，不代表它到 9 月才正式发表。本文没有穷尽 PVLDB v20、全部 online-first 和 2027 已接收稿，因此“最新”指本轮核实的近期研究窗口。
-
-阅读深度也需要分开：
+原稿检索截止 **2026-09-19**，来源为 [VLDB 2026](https://vldb.org/2026/program.html)、[SIGMOD 2026](https://2026.sigmod.org/sigmod_papers.shtml)、[OSDI 2026](https://www.usenix.org/conference/osdi26/technical-sessions)、[FAST 2026](https://www.usenix.org/conference/fast26/technical-sessions)、[CIDR 2026](https://www.cidrdb.org/cidr2026/program.html)、[SOSP 2025](https://sigops.org/s/conferences/sosp/2025/accepted.html) 的官方目录，再回原文 / 作者页 / 出版方摘要。VLDB↔PVLDB、SIGMOD Research↔PACMMOD；会议与期刊时间戳不可混读（如 APQO 期刊日期 2025-12、归属 SIGMOD 2026；FFX 的 arXiv 上传日不等于首次发表日）。未穷尽 PVLDB v20 与 2027 已接收稿。
 
 | 材料 | 本文依据 | 如何使用 |
 |---|---|---|
 | FFX、SplitJoin、Sirius、OBELISK、O3-LSM、HATS、LogDrive、Enzyme、WAIR | 原文重点章节与实验说明 | 分析机制及适用边界 |
-| APQO | 出版方摘要 | 判断问题定位，保留实验核对事项 |
-| Mantle | 作者正文架构片段 | 讨论职责划分，不推断完整恢复协议 |
-| AutoLiquid | 已有公开设计材料、此次发现的正式论文入口 | 延续预读状态，不冒充全文精读 |
-| Semirings | 预印本摘要与定理陈述 | 讨论语义边界，不推广复杂度结论 |
+| APQO | 出版方摘要 | 问题定位；实验待全文核对 |
+| Mantle | 作者正文架构片段 | 职责划分；不推断完整恢复协议 |
+| AutoLiquid | 公开设计材料 + VLDB Industry 正式入口 | 设计预读，非全文精读 |
+| Semirings | 预印本摘要与定理陈述 | 语义边界；不推广复杂度 |
 
-本文未运行这些论文的 artifact。涉及实验的数字均来自作者报告；文中的简化例子和工程实验建议，则是为了说明问题而构造的分析。
+未运行 artifact；文中数字来自作者报告，简化例子为说明用构造。
+
+### 检索窗口更新（2026-10-18）
+
+对因子化执行、自适应 / 分片 Join order、学习优化器生产部署、IVM / 布局维护等同主题，在 **2026-09-20 至 2026-10-18** 补检 SIGMOD / VLDB 官方目录与可访问 PDF / arXiv。**未发现足以改写本文主线主张的、明确落在该窗口内的新增硬证据。** 以下条目仅作同主题对照，不升格为“截止日后最新进展”：
+
+| 条目 | 状态 | 用途 |
+|---|---|---|
+| [The Data World Is Not Flat](https://www.vldb.org/pvldb/vol19/p3006-lehner.pdf)（Lehner & Neumann，PVLDB 19(11)，VLDB 2026） | 会议目录早于 09-19；**待核对**全文与 FFX 的分工 | 代码生成路径上的因子化执行；与 FFX 向量化路径对照，勿混为同一系统 |
+| [GenJoin](https://arxiv.org/abs/2411.04525)（PACMMOD / SIGMOD 2026 Round 1） | 正式发表早于本窗口 | 学习优化器“以子计划 hint 收缩搜索空间”的对照点，接在 OBELISK / APQO 后读 |
+| AIDB 2026 workshop：[Balsa → DuckDB 移植](https://vldb.org/2026/Workshops/VLDB-Workshops-2026/AIDB/aidb26_9.pdf) | workshop，非 Research Track | 跨架构可移植性案例；不据此外推生产数仓 |
+
+若后续 PVLDB / PACMMOD online-first 出现同主题全文，应先核对发表时间戳，再决定是否并入第六节成本表。
 
 ## 二、查询执行：优化生成了什么，而不只是处理得多快
 
@@ -290,9 +301,12 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
 
 本轮只核对摘要与定理陈述，因此不将受查询结构、半环性质等条件限制的结果推广到删除、任意 SQL 或外连接（Outer Join）。它适合作为 DBSP 阅读后的理论补充，帮助列清楚语义前提。
 
-## 六、这些论文共同推动了怎样的成本模型
+## 六、成本模型对照（阅读脊柱）
 
-中间表示与状态维护会改变后续工作量，因此成本分析不能止于当前算子。下面分别列出单次执行与长期运行的账目，不是可直接相加的耗时公式，也不是某篇论文的统一模型：
+**主张：** 中间表示与状态维护会改写后续工作量，成本不能止于当前算子的加速比。  
+**机制：** 把账目拆成“一次执行”与“一段运行”，再按论文方向对齐新增决策对象。  
+**适用：** 比较不同研究路线时做速览；选型评审时作为检查清单。  
+**不适用：** 不可当作可直接相加的统一耗时公式，也不是某篇论文的官方模型。
 
 ```text
 一次执行的代价
@@ -309,18 +323,18 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
   + 失败恢复与重新验证
 ```
 
-这些项不能简单独立相加后就认为问题解决了：因子化会改变中间规模，布局会改变未来扫描，后台维护会改变前台竞争，上游刷新会改变下游输入。研究价值恰恰在于识别并控制这些相互作用。
+项与项会耦合：因子化改变中间规模，布局改变未来扫描，后台维护改变前台竞争，上游刷新改变下游输入。研究价值在于识别并控制这些相互作用，而不是把加速比并列相加。
 
-| 论文方向 | 新纳入决策的对象 | 应重点观察的代价 |
-|---|---|---|
-| FFX / SplitJoin | 中间表示、数据子集 | 展开、划分、峰值内存 |
-| Sirius | 执行硬件与数据位置 | 搬运、回退、显存竞争 |
-| OBELISK / APQO | 候选空间、历史状态 | 探索、校准、失效 |
-| O3-LSM / HATS | 卸载位置、后台任务 | 网络、干扰、维护积压 |
-| LogDrive / Mantle | 持久性、排序、目录快速路径 | 请求费用、协调、恢复 |
-| Enzyme / WAIR | 刷新策略、布局重写 | 下游变化、重写与未来收益 |
+| 论文方向 | 主张（一句话） | 新纳入决策的对象 | 重点观察的代价 | 典型不适用 / 边界 |
+|---|---|---|---|---|
+| FFX / SplitJoin | 少展开、按子集换计划 | 中间表示、数据子集 | 展开、划分、峰值内存 | 低重复 / 均匀数据可能回收不了结构或划分开销 |
+| Sirius | 复用前端，量端到端路径 | 硬件与数据位置 | 搬运、回退、显存竞争 | 算子覆盖不全或租金口径变化时不可外推 |
+| OBELISK / APQO | 管候选与反馈生命周期 | 候选空间、历史状态 | 探索、校准、失效 | 一次性查询、schema/统计漂移后旧赢家失效 |
+| O3-LSM / HATS | 卸载与后台是同一张账单 | 卸载位置、后台任务 | 网络、干扰、维护积压 | 局部环境吞吐 ≠ 普通部署；只看前台 P99 会漏积压 |
+| LogDrive / Mantle | 持久 / 排序 / 快速路径可分层 | 持久性、排序、目录路径 | 请求费用、协调、恢复 | 低单价存储 ≠ 低系统成本；恢复协议待全文 |
+| Enzyme / WAIR | 维护什么、何时维护、维护到哪 | 刷新策略、布局重写 | 下游变化、重写与未来扫描收益 | 单视图最便宜 ≠ 依赖图最优；历史 workload 未必代表未来 |
 
-因此，评价这些系统时，平均加速比只是一个切面。还应问：在哪些负载上退化？回退有什么固定成本？反馈过期多久？如果把观察窗口拉长，后台工作是否保持稳定？
+速览时优先问四句：**在哪些负载上退化？回退固定成本多少？反馈多久过期？把窗口拉长后后台是否仍稳定？** 平均加速比只是其中一个切面。
 
 ## 七、下一步阅读与实验路线
 
@@ -333,6 +347,26 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
 **第三阶段：补齐云端状态与语义边界。** 阅读 LogDrive → Mantle，并将 Sirius 与 Semirings 分别作为硬件路径和理论条件的专题。AutoLiquid 的正式全文核对也在此阶段补齐，再与 WAIR 比较完整决策流程。
 
 跨论文组合仍需单独验证：FFX 与 SplitJoin 的收益不能直接相乘，Enzyme 与 WAIR 的目标函数也不能默认兼容。APQO、Mantle、AutoLiquid 和 Semirings 保持前文声明的有限阅读等级；补齐全文与实验条件后，才能据此提出实现细节或性能比较。
+
+## 附录：湖仓与执行正确性（工程对照，非会议同级）
+
+检索补充窗口至 **2026-10-18**。下列条目来自近期引擎 / Iceberg 材料核对，**不抬升为与 SIGMOD/VLDB 主文同级主张**；用于标出生产路径上的正确性边界，并链到 Join / Dynamic Filter 系列。
+
+### A.1 单调快照时间戳（Iceberg，已合）
+
+同分支 snapshot 的 `timestamp-ms` 须严格大于父快照：spec 与实现已合入。价值在于让时间旅行与增量消费有可比较的全序，而不是依赖墙钟巧合。笔记层仍标 needs-review，本文只记录「约束已进主干」这一事实。
+
+### A.2 AMT 基线合仓（非 format adoption）
+
+AMT 相关基线 PR 已合入（公开讨论口径 18+1）。这是实现与测试基线推进，**不是** format v4 的 adoption 宣告；阅读时勿与「格式已默认启用」混淆。
+
+### A.3 DuckDB：spill 后 Join filter 静默丢行（已修）
+
+外部 hash join 在 spill 后若 Bloom 只含第一轮 build 域，可能静默丢行（#25702）；后续 #25718 / #26959 已修。机制提醒与 Dynamic Filter / Runtime Filter 相同：**filter 域必须覆盖全部 build 分区，否则假阴性会改写结果**。详细路径见 Join 系列与 Dynamic Filter 正确性篇；本附录不展开源码。
+
+### 跟踪清单（待审，正文不展开）
+
+Spark External Lookup Join（SPIP/DISCUSS）；Spark EXPLAIN COST on VIEW、恒 false FULL JOIN 改写；Doris SQL plan management；TiDB CBO late materialization；Trino Iceberg MERGE 隔离；ClickHouse Iceberg 读路径漏新 commit；Iceberg FILE 类型投票 / DV 行级并发 / promotable types / KMS vending。
 
 ## 参考文献
 
@@ -351,3 +385,5 @@ WAIR 将 clustering key 的选择与 reclustering policy 区分开，关注查�
 11. [Workload-Aware Incremental Reclustering in Cloud Data Warehouses](https://doi.org/10.1145/3802127). SIGMOD 2026.
 12. [AutoLiquid: Autonomic Data Layout Optimization for the Databricks Lakehouse](https://www.vldb.org/pvldb/vol19/p4023-liang.pdf). VLDB 2026 Industry；本文保持设计预读状态。
 13. [The Role of Semirings in Incremental View Maintenance](https://arxiv.org/abs/2606.07795v2). arXiv 预印本，v2 更新于 2026-09-12。
+14. （同主题对照，非 09-20 后新增）[The Data World Is Not Flat: Efficient Factorized Execution for Relational Systems](https://www.vldb.org/pvldb/vol19/p3006-lehner.pdf). PVLDB 19(11), 2026. **待核对**与 FFX 的路径分工。
+15. （同主题对照，正式发表早于本窗口）[GenJoin: Conditional Generative Plan-to-Plan Query Optimizer that Learns from Subplan Hints](https://arxiv.org/abs/2411.04525). PACMMOD / SIGMOD 2026。

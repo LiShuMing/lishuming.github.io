@@ -2,7 +2,7 @@
 title: "【Paper】数据库系统论文精读：从现代硬件到工业自治"
 slug: "database-paper-reading-notes"
 date: 2026-08-23T20:21:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 categories:
   - 数据库
 tags:
@@ -22,6 +22,8 @@ description: "持续更新的数据库系统论文精读笔记：从 Bf-Tree、H
 draft: false
 toc: true
 ---
+
+> 本系列第 3/3 篇 · 论文雷达 · [上一篇]({{< relref "2026-08-09-sigmod-2026-industry-papers.md" >}}) · 对照：[Umbra]({{< relref "2026-09-04-dive-umbra.md" >}})
 
 这是一篇持续更新的数据库论文精读笔记。
 

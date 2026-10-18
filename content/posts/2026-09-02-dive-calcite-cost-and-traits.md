@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Calcite VolcanoPlanner：Cost 账本、两种 RuleDriver 与 Trait Enforcement"
 date: 2026-09-02T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 slug: "dive-calcite-cost-and-traits"
 categories:
   - 数据库
@@ -15,6 +15,10 @@ tags:
 description: "结合 Apache Calcite 源码，分析 VolcanoPlanner 如何记账、比较与传播代价，IterativeRuleDriver 与 TopDownRuleDriver 在剪枝上的本质差异，Trait 如何通过 AbstractConverter 或 Convention.enforce 被强制满足，并用一个真实运行的 Join + ORDER BY 例子走读完整任务时序。"
 draft: false
 ---
+
+> 本系列第 2/4 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-08-24-dive-calcite.md" >}}) · [下一篇]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}})
+
+> Memo / RelSet / RelSubset 的基本结构见 [系列第 1 篇 Calcite 总览]({{< relref "2026-08-24-dive-calcite.md" >}})；本文只讲 Cost 账本、两种 RuleDriver 与 Trait Enforcement 的差异。
 
 VolcanoPlanner 的代价比较、候选枚举与物理属性（Physical Property）补偿是三个独立机制。默认 driver 不用成本上界截断规则枚举，但搜索期间仍持续更新最优候选；最终提取计划时只是读取这些结果。混淆两者，会误判 CBO 的工作时机。
 

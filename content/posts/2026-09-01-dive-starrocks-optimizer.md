@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 StarRocks Optimizer：Enforcer、Property 级联与 Cost 选型"
 date: 2026-09-01T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-18T00:00:00+08:00
 slug: "dive-starrocks-optimizer"
 categories:
   - 数据库
@@ -15,6 +15,11 @@ tags:
 description: "结合 StarRocks 源码，分析 QueryOptimizer 全生命周期、Cascades 任务调度、Property 级联、Enforcer 插入、Join 分发和聚合阶段选型，并澄清 Merge Join 与 Sort Aggregate 的实际决策边界。"
 draft: false
 ---
+
+> 本系列第 4/4 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
+
+> **与 optd 对照（3–6 行）**  
+> 本篇重点是生产路径上的 **Enforcer / Property 级联 / 分发与聚合选型**。教学骨架（Memo、OptimizeGroup、Winner）见 [optd Cascades]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) 与系列第 1–2 篇；下文默认读者已熟悉这些名词，只展开 StarRocks 在 Required Property 不满足时如何插入 Exchange/Sort 并计入 Cost。
 
 在 Cascades 查询优化器（Query Optimizer）中，物理算子的成本必须连同满足输入要求的成本一起比较。父节点还会要求孩子提供特定的数据分布、排序或 CTE 属性；孩子已有的输出属性如果不能满足要求，优化器必须插入 Exchange 或 Sort，并把这些额外成本计入完整计划。只有把 **Operator、Required Property、Enforcer 与 Cost** 放在一起，所谓“最优物理计划”才有完整含义。
 
