@@ -46,7 +46,7 @@ Hash Join 用 Build 侧索引减少等值匹配的查找工作，但其资源边
 | ClickHouse | [`c631f591`](https://github.com/ClickHouse/ClickHouse/tree/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23) | Hash/Parallel Hash/Grace Hash Join、多形态 Key |
 | DuckDB | [`1c4ecd81`](https://github.com/duckdb/duckdb/tree/1c4ecd8138ae0c63c73957a411e65484301bb300) | 行式 Tuple 布局、Radix 分区、External Hash Join、Perfect Hash Join |
 
-本文关注执行引擎的共性与差异。Spark 的 JoinSelection、`HashedRelation`、AQE 与「Hash Join 默认不可 Spill」边界见文末 [附录：Spark Hash Join 特有路径](#spark-hash-join)；原独立篇现为跳转页。
+本文关注执行引擎的共性与差异。Spark 的 JoinSelection、`HashedRelation`、AQE 与「Hash Join 默认不可 Spill」边界见文末 [附录：Spark Hash Join 特有路径](#spark-hash-join)。
 
 ### 比较方法
 
@@ -1520,7 +1520,7 @@ Hash Join 慢或 OOM 时，不应只看总 Spill Bytes。建议按以下顺序�
 
 ## 附录：Spark Hash Join 特有路径 {#spark-hash-join}
 
-本附录只保留 Spark 相对主文四引擎的差异：**JoinSelection 决策树、HashedRelation、AQE 动态切换，以及内置 Hash Join 不可 Spill 的失败边界**。通用哈希表/分区恢复协议见正文；原独立文 [深入 Spark Hash Join]({{< relref "2026-08-25-dive-spark-hash-join.md" >}}) 现为跳转页（先不 301）。
+本附录只保留 Spark 相对主文四引擎的差异：**JoinSelection 决策树、HashedRelation、AQE 动态切换，以及内置 Hash Join 不可 Spill 的失败边界**。通用哈希表/分区恢复协议见正文。
 
 ### 选择前提：语义、分发与资源估计
 

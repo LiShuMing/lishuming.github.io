@@ -1011,7 +1011,7 @@ spill 增加了内存不足时继续执行的路径，但不保证一定完成�
 本文讨论“选 Hash 还是选 Sort”，以下几篇分别从算子内部实现、优化器机制与资源维度补齐上下文：
 
 - [深入 Hash Join：从内存哈希表（Hash Table）到分区 Spill]({{< relref "2026-08-26-dive-hash-join.md" >}})：本文 §4.3 把 spill 当成一个相变点讨论，那篇把相变前后的哈希表结构与分区恢复拆开细看。
-- [深入 Spark Hash Join（现为跳转页）]({{< relref "2026-08-25-dive-spark-hash-join.md" >}}) → [Hash Join 主文 Spark 附录]({{< relref "2026-08-26-dive-hash-join.md" >}}#spark-hash-join)：JoinSelection / HashedRelation / AQE / Spill 边界，可与本文 §3.6 对照。
+- [Hash Join 主文 Spark 附录]({{< relref "2026-08-26-dive-hash-join.md" >}}#spark-hash-join)：JoinSelection / HashedRelation / AQE / Spill 边界，可与本文 §3.6 对照。
 - [深入 Calcite VolcanoPlanner：Cost 账本、两种 RuleDriver 与 Trait Enforcement]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}})：本文 §2.3 说“Ordering 是可消费的物理属性”，那篇回答这个属性在 Cascades 搜索里到底如何被强制与传播。
 - [查询并行度的三次决策：从初始分区到 AQE 与历史反馈（History-Based Feedback）]({{< relref "2026-09-12-dive-dop.md" >}})：本文 §6.1 把 stage 边界列为一种 adaptive barrier，那篇讨论在这些边界上还能调什么。
 - [从芯片到数据中心：2026 AI Infra 与现代系统技术雷达]({{< relref "2026-09-10-system-ai-infra-hardware-distributed-systems.md" >}})：本文 §4.6 提到硬件会移动 crossover 边界，那篇把 CXL、带宽层级这些变量放到更大的图里。
