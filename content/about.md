@@ -1,11 +1,10 @@
 ---
 title: 关于我
+toc: false
 tags:
   - 关于我
 description: "杭州，关注数据库与 AI Infra；这个博客记录源码、实验和行旅。"
 ---
-
-## 关于我
 
 你好，我是 [LiShuMing](https://github.com/LiShuMing)，住在杭州。
 
@@ -17,9 +16,9 @@ description: "杭州，关注数据库与 AI Infra；这个博客记录源码、
 
 ## 建议阅读路径
 
-- **查询优化与执行（约半天）**：[Dive into StarRocks Optimizer](/2026/09/01/dive-starrocks-optimizer/)、[Dive into Calcite Cost and Traits](/2026/09/02/dive-calcite-cost-and-traits/)、[Dive into Hash Join](/2026/08/26/dive-hash-join/)、[Dynamic Filter Outer Join](/2026/08/24/dynamic-filter-outer-join/)
-- **一次行旅**：[伊比利亚的街道、石头与画](/2026/10/01/iberian-streets-stones-and-paintings/)、[银川纪行](/2026/09/01/journey-through-yinchuan/)（现场照片还在补）
-- **更短的入口**：[现代数据库与硬件](/2026/08/09/modern-database-hardware/)、[数据库阅读书目](/2025/08/09/database-reading-list/)
+- **查询优化与执行（约半天）**：[Dive into StarRocks Optimizer]({{< ref "posts/2026-09-01-dive-starrocks-optimizer.md" >}})、[Dive into Calcite Cost and Traits]({{< ref "posts/2026-09-02-dive-calcite-cost-and-traits.md" >}})、[Dive into Hash Join]({{< ref "posts/2026-08-26-dive-hash-join.md" >}})、[Dynamic Filter 穿越 Outer Join]({{< ref "posts/2026-08-24-dynamic-filter-outer-join.md" >}})
+- **一次行旅**：[伊比利亚游记]({{< ref "posts/2026-10-01-iberian-streets-stones-and-paintings.md" >}})、[银川纪行]({{< ref "posts/2026-09-01-journey-through-yinchuan.md" >}})（现场照片还在补）
+- **更短的入口**：[现代硬件与数据库]({{< ref "posts/2026-08-09-modern-database-hardware.md" >}})、[Database 阅读清单]({{< ref "posts/2025-08-09-database-reading-list.md" >}})
 
 ## 关于本站
 

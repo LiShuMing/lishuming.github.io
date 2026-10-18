@@ -288,7 +288,9 @@ html {
     color:#666;
     font-weight:400;
     font-size:inherit;
-    overflow-wrap:anywhere;
+    overflow-wrap:break-word;
+    word-break:keep-all;
+    line-break:strict;
 }
 
 #TableOfContents code,
@@ -539,8 +541,8 @@ body {
 }
 
 .listing-seperator {
-  margin: 1.75rem 0 0.85rem;
-  padding-bottom: 0.35rem;
+  margin: 1.35rem 0 0.25rem;
+  padding-bottom: 0.3rem;
   border-bottom: 1px solid var(--line);
   color: var(--muted);
   font-size: 0.8rem;
@@ -556,10 +558,10 @@ body {
 .listing-item {
   display: grid;
   grid-template-columns: 6.5rem minmax(0, 1fr);
-  gap: 0.85rem 1.25rem;
+  gap: 0.55rem 1.25rem;
   align-items: start;
   margin: 0;
-  padding: 1rem 0;
+  padding: 0.85rem 0;
   border-bottom: 1px solid var(--line);
   list-style: none;
 }
@@ -611,8 +613,8 @@ body {
 }
 
 .post-layout {
-  grid-template-columns: minmax(11rem, 15rem) minmax(0, 1fr);
-  gap: 2rem 2.5rem;
+  grid-template-columns: minmax(14rem, 18rem) minmax(0, 1fr);
+  gap: 2rem 2.25rem;
 }
 
 .post-layout--without-toc .post-main {
@@ -737,3 +739,21 @@ footer a:hover {
     padding: 1.25rem 1rem 1.75rem;
   }
 }
+
+.post-header .post-title,
+.post-header .post-meta,
+.post-header .post-dek {
+  display: block;
+  width: 100%;
+}
+
+.post {
+  text-align: left;
+  text-justify: none;
+}
+
+.post p {
+  text-align: left;
+  letter-spacing: normal;
+}
+
