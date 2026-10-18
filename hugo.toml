@@ -1,13 +1,13 @@
 baseURL = 'https://lishuming.github.io/'
 languageCode = 'zh-CN'
 title = 'Aphasia'
-author = 'Mr.Think'
-description = 'Cogito ergo sum.'
+author = 'LiShuMing'
+description = '杭州 · 数据库与 AI Infra 学习笔记'
 theme = 'aphasia'
 
 [params]
-  author = 'Mr.Think'
-  description = 'Cogito ergo sum.'
+  author = 'LiShuMing'
+  description = '杭州 · 数据库与 AI Infra 学习笔记'
 
 [menu]
   [[menu.main]]
