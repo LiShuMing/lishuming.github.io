@@ -1,7 +1,7 @@
 ---
 title: "【草稿】Iceberg 规格笔记：V3 Deletion Vector 边界与 V4 进行中变更"
 date: 2026-10-18T00:00:00+08:00
-lastmod: 2026-10-18T00:00:00+08:00
+lastmod: 2026-10-20T00:00:00+08:00
 slug: "iceberg-v3-dv-and-v4-wip"
 categories:
   - 数据库
@@ -10,7 +10,7 @@ tags:
   - 湖仓
   - Spec
   - Deletion Vector
-description: "草稿：V3 equality/position→DV 全景与并发边界，以及 V4 已合入/投票中/仅讨论三栏；合仓≠adoption；反例标 spec-only。未正式发表。"
+description: "草稿：V3 equality/position→DV 全景与并发边界，以及 V4 已合入/投票中/仅讨论三栏；FILE 规格投票已通过且 #17918 已合（仍非 adoption）；反例标 spec-only。未正式发表。"
 draft: true
 ---
 
@@ -24,7 +24,7 @@ draft: true
 1. **V2 用两类 delete file 做行级删**（position / equality）；**V3 把按位置删换成 DV**（每数据文件每快照至多一个），禁止新写 position delete，equality **仍可写**。V4 规格文字方向是禁止**新写** equality（≠ formal adopt）。
 2. **V3 DV 让删除变便宜，也把冲突粒度钉在「单文件一个 DV」上**——不相交行的并发行级写，今天仍可能在文件/分区级失败；社区提案要把校验细化到行重叠（#18020 / #17754，**仍 open**）。
 3. **V4 有两条已经「进主干」但含义不同的线**：（a）同分支快照时间戳必须严格大于父——**语义约束，已合 spec+实现**；（b）AMT 基线规格 PR 合进 main——**方便并行改规格，不是 format adoption**。
-4. **FILE 类型、DV 行级并发、REST/KMS、promotable types** 多数仍在投票或 open PR——适合进跟踪清单，不适合写成「湖仓已默认如此」。
+4. **FILE 类型**规格投票已通过且 #17918 已合（仍非 format adoption）；**DV 行级并发、REST/KMS、promotable types** 多数仍 open——适合进跟踪清单，不适合写成「湖仓已默认如此」。
 5. **仍缺两块**：完整 V1→V2 读图、引擎实现对照。V3 equality/position→DV 全景 **已齐**（§1.0）。
 
 ## 案例 / 证据边界
@@ -162,7 +162,7 @@ V3 表上，每个数据文件通常对应 **一个** deletion vector。两个�
 | **`_last_updated_timestamp_ms`** | — | — | Spec #17636 **draft**；依赖元数据路径大致打通后 plumbing |
 | **AMT 基线规格** | PR #16025 **MERGED**（2026-10-14；entry structures 等） | 合仓 VOTE：**18+1**（9 binding），**明确不是 format adoption** | 加密、列文件更新、去掉 partition tuple 等可后续迭代 |
 | **AMT 机制本身（inline/flush）** | （基线文字进仓，≠ 全量实现门控） | — | 教学向推导见 Merced 文；内联剪枝、迁移、并发合并仍开放 |
-| **FILE 类型** | — | VOTE 截 10-14：**进行中**（笔记：17+1，3 binding；窗约至 10-16 上海）；Spec #17918 **open** | Issue #17919 挂 API / 引擎后续 |
+| **FILE 类型** | Spec #17918 **MERGED**（2026-10-20 07:07 Asia/Shanghai；基线规格文字） | RESULT：**通过**（8 binding +1 / 19 non-binding +1 / 1 non-binding +0 / 0 −1）；**仍非 format adoption** | Issue #17919 挂 API / 引擎后续 |
 
 ### 2.1 单调快照时间戳（已合 · 与 frontiers A.1 对齐）
 
@@ -208,15 +208,18 @@ V3 表上，每个数据文件通常对应 **一个** deletion vector。两个�
 
 **证据等级：合仓投票通过 + PR 已合入 · needs-review（未做实现级技术核验）；概念段为教学摘要**
 
-### 2.3 FILE 类型（投票中）
+### 2.3 FILE 类型（投票通过 + 规格 PR 已合 · 仍非 adoption）
 
 **问题**：多模态对象用路径字符串或缺校验的巨大 binary，语义与扫描成本都不理想。提案在 v4 引入一等 `file` 类型（内联字节或外部对象/字节区间引用；值语义跟 Parquet FILE）。
 
-**规格要点（整理自投票帖 / #17918，PR 仍 open）**：隐式子字段 `uri/offset/size/content_type/checksum/inline`；相对 URI 相对表 location；整值相等/排序/哈希未定义；不能当 identifier、分区或排序源；不能类型提升进出。
+**规格要点（整理自投票帖 / #17918）**：隐式子字段 `uri/offset/size/content_type/checksum/inline`；相对 URI 相对表 location；整值相等/排序/哈希未定义；不能当 identifier、分区或排序源；不能类型提升进出。
 
-**状态（截 2026-10-14）**：投票窗口进行中；笔记计票 17+1（3 binding）、未见 -1；**正式结果以邮件宣布为准，本稿不预判通过**。
+**状态（2026-10-20 核对，Asia/Shanghai）**：
+- RESULT 邮件（Talat Uyarer，UTC 2026-10-19 21:44）：**通过** — 8 binding +1、19 non-binding +1、1 non-binding +0、0 −1。
+- Spec PR [#17918](https://github.com/apache/iceberg/pull/17918)：**MERGED**（2026-10-19 23:07 UTC ≈ 次日 07:07 上海；merged_by danielcweeks）。
+- 边界与 AMT 合仓同：**规格文字进仓 ≠ v4 format adoption**；引擎/API 仍看 [#17919](https://github.com/apache/iceberg/issues/17919)。
 
-**证据等级：投票中 · needs-review**
+**证据等级：投票通过 + 规格 PR 已合入 · needs-review（未核最终 diff 措辞相对投票稿是否有改；未做引擎实现对照）**
 
 ---
 
