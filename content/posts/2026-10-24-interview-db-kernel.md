@@ -18,9 +18,9 @@ draft: false
 
 **资深内核工程师的强答必须交代四件事：语义在什么条件下仍成立、代价在哪一层被估算、状态谁拥有、失败后如何恢复。** 背出 Cascades、SIMD、Iceberg 名词只能提供追问入口。本文沿“解析 → 逻辑等价 → 物理代价 → 执行批处理 → 增量维护 → 存算与湖仓契约 → 分布式失败”展开，每个主题都给出可被反例挑战的回答。
 
-读者是在线分析处理（Online Analytical Processing，OLAP）数据库内核，以及可能转向人工智能基础设施（AI Infrastructure）的高级工程师、资深工程师（Staff Engineer）、技术负责人（Tech Lead）候选人。Kevin Li 的 StarRocks 与大型分布式 SQL 引擎背景决定选材优先级，但本文没有把他的任何未公开实现写成事实；需要个人证据的位置统一使用【模板】。
+读者是在线分析处理（Online Analytical Processing，OLAP）数据库内核，以及可能转向人工智能基础设施（AI Infrastructure）的高级工程师、资深工程师（Staff Engineer）、技术负责人（Tech Lead）候选人。StarRocks 与大型分布式 SQL 引擎相关经验决定选材优先级，但本文没有把任何未公开实现写成事实；需要个人证据的位置统一使用【模板】。
 
-原料来自 xlab 面试目录中的数据库分册、C++/OLAP 详解第 6 章，以及物化视图（Materialized View，MV）与增量视图维护（Incremental View Maintenance，IVM）调研笔记；机制细节对照已发表的优化器、Dynamic Filter 与 Iceberg 笔记。公开来源核验截至 2026-10-24。【事实】用于文档或论文明确支持的陈述，【推断】用于备考建议与逻辑推演，【模板】等待作者用真实材料补齐。
+备考材料覆盖数据库专题、C++/OLAP 机制笔记，以及物化视图（Materialized View，MV）与增量视图维护（Incremental View Maintenance，IVM）调研；机制细节对照已发表的优化器、Dynamic Filter 与 Iceberg 笔记。公开来源核验截至 2026-10-24。【事实】用于文档或论文明确支持的陈述，【推断】用于备考建议与逻辑推演，【模板】等待用真实材料补齐。
 
 ## 一、优化器：先证明等价，再比较代价
 
@@ -186,7 +186,7 @@ draft: false
 
 【事实】工业界常见产品化形态是：声明新鲜度目标 + 自动调度刷新 + 有限算子覆盖。Snowflake 文档描述 Dynamic Table 以目标延迟等参数管理刷新，见 [About dynamic tables](https://docs.snowflake.com/en/user-guide/dynamic-tables-about)。Databricks 文档将物化视图与 Delta Live Tables / 声明式流水线关联，见 [Delta Live Tables](https://docs.databricks.com/aws/en/dlt/)。具体算子矩阵以各云当前文档为准，面试时应声明阅读日期。
 
-【推断】xlab IVM 调研中的竞品对照可作阅读线索，但其中未核对的版本号与 Issue 进展不得直接写成【事实】。对 StarRocks，可公开讨论的产品概念是异步 MV、分区变更追踪（Partition Change Tracking，PCT）等文档化能力；行级 IVM 是否落地要以当时版本发行说明为准。
+【推断】各类 IVM 调研中的竞品对照可作阅读线索，但未核对的版本号与 Issue 进展不得直接写成【事实】。对 StarRocks，可公开讨论的产品概念是异步 MV、分区变更追踪（Partition Change Tracking，PCT）等文档化能力；行级 IVM 是否落地要以当时版本发行说明为准。
 
 **追问链**：
 
@@ -376,7 +376,7 @@ draft: false
 
 **强答要点**：多数分析读需要的是点内一致快照：同一查询看到的基表/文件集合不中途换成另一提交。写偏斜、幻读等 OLTP 考题要会，但不是每天主导 OLAP 故障。真正高频的是：长查询与并发导入之间的快照选择、MV 与基表混读的新鲜度、以及湖表提交后多久对引擎可见。
 
-【事实】MySQL InnoDB 的 MVCC / 隔离级别材料见 xlab `database-interview-questions.md`；它们证明你理解读写并发，但回答 OLAP 岗位时应主动切换到快照、分区与刷新 SLA。
+【事实】MySQL InnoDB 的 MVCC / 隔离级别材料足以证明你理解读写并发，但回答 OLAP 岗位时应主动切换到快照、分区与刷新 SLA。
 
 **追问链**：
 
@@ -415,10 +415,10 @@ draft: false
 
 **常见差答／陷阱**：用团队总加速替代个人贡献；只有设计 PPT 没有回放数据。
 
-## 勘误：相对 xlab 原料改了什么
+## 勘误：相对常见备考表述改了什么
 
-- `database-interview-questions.md` 以 MySQL/Redis 为主；本篇把 OLTP 索引/MVCC 降为衔接，主线改为 OLAP 优化、执行、IVM 与湖仓。
-- `interview-questions-results.md` Part 6 的 OLAP 设计提纲补充了外连接判据、MV 改写拒绝条件、存算分离缓存语义与 Iceberg 规格边界。
+- 某数据库题库 以 MySQL/Redis 为主；本篇把 OLTP 索引/MVCC 降为衔接，主线改为 OLAP 优化、执行、IVM 与湖仓。
+- 某题目详解 Part 6 的 OLAP 设计提纲补充了外连接判据、MV 改写拒绝条件、存算分离缓存语义与 Iceberg 规格边界。
 - IVM 调研稿中的竞品版本与 Issue 进度，默认降为【推断】线索；【事实】优先链到官方文档与规格。
 - 不沿用原料或口头传统中的无条件加速比；涉及 SIMD / 向量化只谈机制与测量方法。
 - 个人项目成绩全部保留为【模板】，避免把社区身份直接写成机制证据。
