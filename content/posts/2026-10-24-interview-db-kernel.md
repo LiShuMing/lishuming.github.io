@@ -18,7 +18,7 @@ draft: false
 
 **资深内核工程师的强答必须交代四件事：语义在什么条件下仍成立、代价在哪一层被估算、状态谁拥有、失败后如何恢复。** 背出 Cascades、SIMD、Iceberg 名词只能提供追问入口。本文沿“解析 → 逻辑等价 → 物理代价 → 执行批处理 → 增量维护 → 存算与湖仓契约 → 分布式失败”展开，每个主题都给出可被反例挑战的回答。
 
-读者是在线分析处理（Online Analytical Processing，OLAP）数据库内核，以及可能转向人工智能基础设施（AI Infrastructure）的高级工程师、资深工程师（Staff Engineer）、技术负责人（Tech Lead）候选人。Kevin Li 的 StarRocks / MaxCompute 背景决定选材优先级，但本文没有把他的任何未公开实现写成事实；需要个人证据的位置统一使用【模板】。
+读者是在线分析处理（Online Analytical Processing，OLAP）数据库内核，以及可能转向人工智能基础设施（AI Infrastructure）的高级工程师、资深工程师（Staff Engineer）、技术负责人（Tech Lead）候选人。Kevin Li 的 StarRocks 与大型分布式 SQL 引擎背景决定选材优先级，但本文没有把他的任何未公开实现写成事实；需要个人证据的位置统一使用【模板】。
 
 原料来自 xlab 面试目录中的数据库分册、C++/OLAP 详解第 6 章，以及物化视图（Materialized View，MV）与增量视图维护（Incremental View Maintenance，IVM）调研笔记；机制细节对照已发表的优化器、Dynamic Filter 与 Iceberg 笔记。公开来源核验截至 2026-10-24。【事实】用于文档或论文明确支持的陈述，【推断】用于备考建议与逻辑推演，【模板】等待作者用真实材料补齐。
 

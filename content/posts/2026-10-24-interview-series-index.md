@@ -19,7 +19,7 @@ draft: false
 
 【推断】对 Kevin Li 而言，准备主线应从在线分析处理（Online Analytical Processing，OLAP）、优化器（Optimizer）、物化视图（Materialized View，MV）与增量视图维护（Incremental View Maintenance，IVM）展开，再连接向量化执行（Vectorized Execution）、资源管理和失败恢复。理由是：沿一个熟悉的请求或状态变化解释正确性，比同时复习多个陌生系统更容易形成可核查的深度证据。
 
-StarRocks 核心开发者与代码提交者（Committer）、阿里巴巴（Alibaba）MaxCompute SQL 引擎相关工作和历史 P8 背景，是选材起点。它们不能直接换算成另一家公司的职级，也不能替代本人职责、代码位置和结果条件。涉及项目成绩、事故处理和组织影响的叙述，都应由 Kevin 补充允许披露的真实材料。
+StarRocks 核心开发者与代码提交者（Committer）、以及大型分布式 SQL 引擎与增量视图维护相关工作，是选材起点。开源身份与过往职级都不能直接换算成另一家公司的职级，也不能替代本人职责、代码位置和结果条件。涉及项目成绩、事故处理和组织影响的叙述，都应由 Kevin 补充允许披露的真实材料。
 
 ## 先选岗位路径，再决定在哪一篇停下来深挖
 
