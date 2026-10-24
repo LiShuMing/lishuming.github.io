@@ -19,7 +19,7 @@ draft: false
 
 这篇文章记录一次基于 [Raft 源码](https://github.com/botiverse/raft-source)的独立部署模式（Standalone Mode）适配与迭代。这里的 Raft 是人和 Agent 共用的协作平台，与同名的一致性算法不是同一个项目。目标是复用已有网页和运行时，在本地保留协作数据，再逐步补上桌面接入与发行能力。
 
-阅读源码时使用的基线是 `849d036f0e26e06dd518c72f988119450b0a87b0`。下文的四批修复是该工作区中的本地改动，尚未发布；构建与测试结果截至 2026-10-24。完整 HTTP 服务的编译产物启动仍受原生依赖兼容性阻塞，Mac 安装包也没有实机验证。本文讨论已走通的链路、失败的尝试和下一步的工程条件。
+阅读源码时使用的基线是 `849d036f0e26e06dd518c72f988119450b0a87b0`。下文的四批修复是该工作区中的本地改动，尚未发布；构建与测试结果截至 2026-10-24。完整 HTTP 服务的编译产物启动仍受原生依赖兼容性阻塞，Mac 安装包也没有实机验证。本文讨论已走通的链路、失败的尝试和下一步的工程条件；后半部分（§7–§11）回到源码结构，谈我为什么喜欢这套 agentic 架构、它与同类开源项目的对比，以及面向个人的 standalone 改造思路。
 
 ## 1. 先确认平台管理的状态，再决定如何本地化
 
@@ -157,6 +157,86 @@ const identity = JSON.stringify([
 
 后续工作的顺序也因此明确：先用符合项目要求的运行环境打通完整 HTTP 启动，再收齐可搬运的依赖与资产，验证移动目录和数据恢复；桌面接入同步完成自建中心协议适配，最后在 macOS 上验证安装、退出、重启与升级。每一步都应保留自己的证据，不能由前一步的成功代签。
 
+## 7. 回到源码：Raft 怎样把 Agent 组织成一个团队
+
+前面几节讲的是部署和修复，这一节回到我最初被吸引的地方：Raft 的数据模型。以下内容基于公开镜像 [botiverse/raft-source](https://github.com/botiverse/raft-source) 的 `db5e399`（Release v1.21.23-source.1，2026-10-20 07:55 北京时间）。我先用 Codex 只读扫了一遍仓库，整理出结构报告，再逐条用 `rg` 核对路径和符号。下文提到的路径和符号都在该快照中确认存在。这个仓库是 release mirror，按版本整包导出，不接受 PR，许可证是 FSL-1.1-ALv2，属于 source-available（源码可见），不是 OSI 意义上的开源。
+
+**【事实】Agent 是一等成员，不是函数调用。** `packages/server/src/db/schema.ts` 的 `agents` 表保存 Agent 的名称、描述、runtime/model/runtimeConfig、sessionId、所在 machineId 和执行模式。`channelAgents` 与 `channelHumans` 分别记录 Agent 和人的频道成员关系，权限角色分 member/admin。`agents.description` 由 `packages/daemon/src/drivers/systemPrompt.ts` 写进初始提示词，相当于这名成员的岗位说明。频道类型覆盖 channel/private/joint/dm/thread，线程通过 `parentMessageId` 挂在父消息下。人和 Agent 用的是同一套组织结构。
+
+**【事实】协作原语和人的工作流一一对应。**
+- 认领与改派：`packages/server/src/services/taskService.ts` 提供 `claimTaskDetailed()`、`claimTask()`、`unclaimTask()`、`assignTask()`，认领时有冲突检查，修改带 revision 并发控制。
+- 状态机：同一文件里的状态迁移表包含 `in_progress → in_review → done`，`in_review` 可以退回 `in_progress`。
+- 提及投递：`mentionDeliveryOccurrences` 把每次 @ 的投递状态（server 决策、daemon 接收、ack 或终止错误）记成可追踪的记录。
+- 线程关注：`threadFollows` 记录谁因为发起、回复、被提及或手动操作而关注了某个线程，也记录完成和取消关注。
+
+我没有找到独立的 handoff API，交接是通过改派和线程回复完成的。
+
+**【事实】异构运行时被收敛到一个接口。** `packages/daemon/src/drivers/types.ts` 定义 `RuntimeDriver`，核心成员包括：
+- `spawn()`、`parseLine()`、`encodeStdinMessage()`、`buildSystemPrompt()`，负责拉起进程、解析输出、投递输入和构造提示词；
+- `busyDeliveryMode`（`direct`/`notification`/`none`），表示 Agent 正在忙时新消息怎么送达；
+- 一组会话恢复和 compaction（上下文压缩）期间的投递能力声明。
+
+`packages/daemon/src/drivers/index.ts` 的 `driverFactories` 注册了 builtin、claude、codex、grok、cursor、gemini、kimi、kimi-sdk、opencode、pi，以及已弃用、仅为老 Agent 保留的 copilot 和 antigravity。每个运行时配有自己的 EventNormalizer，例如 `claudeEventNormalizer.ts`、`codexEventNormalizer.ts`、`piEventNormalizer.ts`，把各家不同的流式输出统一成平台事件。daemon 侧由 `packages/daemon/src/core.ts` 的 `DaemonCore` 和 `agentProcessManager.ts` 的 `AgentProcessManager` 管理进程生命周期。
+
+**【事实】人工把关是局部的，不是全局闸门。** 明确的审批流程在 `packages/server/src/routes/internalAgentApi.ts`：集成登录这类操作会返回 `approval_required` 并生成 action card，由 `actionCardsService.ts` 的 `prepareActionCard()`、`executeActionCard()` 执行。在运行时内部，`codex.ts` 设置了 `approvalPolicy: "never"`，`claudeLaunch.ts` 使用 `--permission-mode bypassPermissions`。也就是说，平台把单个运行时的工具审批关掉，把约束上移到身份、频道权限、凭据代理（README 说明 daemon 通过本地 origin-bound proxy 代发凭据，Agent 不直接持有 server 凭据）和任务的 review 状态上。
+
+【推断】`in_review` 状态并不强制必须由人审核。任何有频道写权限的成员都能推动状态迁移，所以 review 是一种组织约定，而不是系统强制。我认为这个取舍符合它“把 Agent 当同事”的定位，但团队需要自己约定谁有权把任务推到 done。
+
+## 8. 为什么我喜欢这套 agentic 架构
+
+我真正欣赏的是 Raft 选择抽象的层次。它没有再造一个 coding agent，而是把 Claude Code、Codex、Cursor、Gemini、Kimi、OpenCode 这些已经各自成熟、又互不兼容的 vibe coding 工具当成可替换的“劳动力”，在它们上面加一层组织抽象：身份、频道、任务、提及、关注、记忆。
+
+今天的工具生态是割裂的。每家都有自己的会话格式、上下文管理、权限模型和 subagent 机制，换一个工具就意味着重新搬一遍上下文和习惯。Raft 的 `RuntimeDriver` 把这种割裂压缩到 daemon 里的一个驱动文件。上层只关心这名成员是谁、在哪个频道、认领了什么、交付了什么。【推断】这和数据库领域的做法很像：存储引擎可以插拔，优化器和事务语义保持稳定。运行时会快速迭代甚至被淘汰（注册表里已经有两个 deprecated 驱动），组织层的事实却需要长期保存。
+
+另一个打动我的点是它把 Agent 编织进人的组织方式，而不是让人去适应 Agent。人习惯的分工、认领、在线程里讨论、@ 负责人、提交 review、交接时留记录，在 Raft 里都是数据库里的一等实体，人和 Agent 走同一条路径。我在本地实践中感受最深的是第 5 节提到的写入范围冲突：这类问题在人的团队里早有成熟解法（认领、分支、评审），Raft 让我可以直接复用这些经验，而不必为 Agent 发明一套新的管理学。
+
+## 9. 与同形态开源项目的对比
+
+先界定可比对象。多 Agent 领域大致有三类项目：一是 Agent 开发框架（用代码编排 LLM 调用），二是单体 coding agent（一个 Agent 写代码），三是“虚拟团队”模拟。Raft 不完全属于其中任何一类，它更接近“人和异构 Agent 共用的协作工作区”。下表列出各项目截至 2026-10-24 的状态，数据来自 GitHub API 和官方 README/文档。
+
+| 项目 | 形态 | 优势 | 相对 Raft 的短板 / 差异 |
+|---|---|---|---|
+| [Raft](https://github.com/botiverse/raft-source) | 人与 Agent 共用工作区，编排现成 CLI 运行时 | 复用 Claude Code/Codex 等成熟运行时；持久身份、频道、任务、投递状态都落库；可自建执行机器 | FSL source-available，不收 PR；部署链重（Node 24、Postgres/Redis/对象存储，见 README）；审批多靠约定 |
+| [OpenHands](https://github.com/OpenHands/OpenHands) | 开源 coding agent 平台与 SDK（MIT） | 社区最大（约 9.2 万 star）、沙箱执行完善、可自托管 | 核心是自家 agent loop，不以编排第三方 CLI 为中心；组织层（频道、认领）弱 |
+| [MetaGPT](https://github.com/FoundationAgents/MetaGPT) | 按 SOP 分角色的“软件公司” | 角色分工和产物模板化，论文影响大 | 偏一次性生成流水线；仓库最近推送在 2026-01，活跃度下降；人很难作为平等成员持续参与 |
+| [ChatDev](https://github.com/OpenBMB/ChatDev) | 角色对话链组成的虚拟软件公司（Apache-2.0） | 角色化协作可视化，适合研究 | 研究导向，不面向长期运行的团队工作区 |
+| [CrewAI](https://github.com/crewAIInc/crewAI) | Python 多 Agent 框架：roles/tasks/crews/flows（MIT） | 上手快，角色与任务抽象直观 | 需要自己写编排代码；Agent 是进程内对象，不是持久成员；不直接驱动 Claude Code/Codex 这类 CLI |
+| [LangGraph](https://github.com/langchain-ai/langgraph) | 有状态图编排（MIT） | 状态机、checkpoint、人类中断点表达力强，适合生产工作流 | 底层原语，组织语义要自己搭；同样以 LLM API 为中心 |
+| [AutoGen](https://github.com/microsoft/autogen) → [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) | 对话式多 Agent 框架 | MAF 1.0 主打 A2A、MCP 与多 provider | AutoGen README 已声明正在转入归档，新用户转 MAF；社区分支 [AG2](https://github.com/ag2ai/ag2) 另行维护 |
+| [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) | 轻量 SDK：handoffs、guardrails、tracing（MIT） | handoff 语义清晰、简单 | 开发库而非工作区；没有持久组织状态 |
+| Claude Code [subagents](https://code.claude.com/docs/en/sub-agents) / [agent teams](https://code.claude.com/docs/en/agent-teams) | 单一运行时内的子 Agent 与团队 | 零部署、与 Claude Code 深度集成 | 绑定单一厂商运行时；团队状态随会话存在，不是跨工具的长期组织 |
+| [Goose](https://github.com/aaif-goose/goose) | 本地通用 Agent，MCP 扩展（Apache-2.0） | 本地优先，扩展生态好 | 单 Agent 为主，多 Agent 组织不是核心 |
+
+我的判断【推断】：
+1. 编排层的竞争正在从“谁的 agent loop 更聪明”转向“谁能管住多个 agent loop”。CrewAI、LangGraph、MAF 解决的是开发者如何用代码编排 LLM；Raft 解决的是一个团队如何长期和一群异构 Agent 共事。后者的护城河在组织数据和投递语义，不在模型调用。
+2. Raft 最大的风险不在技术，在于许可和部署门槛。FSL 加上不收 PR，意味着个人只能 fork 自用，改进很难回流；依赖栈重，个人试用成本高。这正是我做 standalone 的动机。
+3. 厂商自带的 subagent/team 会把轻量场景吃掉。Raft 的价值要体现在跨运行时、跨机器、需要长期留痕的协作上。
+4. 如果只需要一条确定的工作流，LangGraph 更合适；如果要研究角色化生成，MetaGPT/ChatDev 足够；如果想让 Claude Code 和 Codex 像两名同事一样在同一个频道里认领任务、互相 review，目前我只在 Raft 里看到了比较完整的建模。
+
+## 10. 我的改造：面向个人的 standalone 模式
+
+改造思路很简单：个人场景不需要多租户云服务，但需要保留 Raft 的组织抽象。公开镜像的 `./raftdev start` 要拉起 Postgres、Redis、对象存储、server、web、daemon（见 README），对一个人、一台机器来说太重。需要说明的是，公开镜像 `db5e399` 中没有 `packages/server/src/standalone*` 目录，前文引用的 standalone 相关文件都在我的本地工作区，本文不给出它们的永久链接。
+
+改造内容仅限前文已经记录的部分，这里按“个人使用需要什么”重新归纳：
+
+- **一个进程、一个状态目录**：`standalone/config.ts` 把数据库指向 `pglite://`，上传目录和签名密钥放入独立状态目录，清掉继承自云端的配置（§1）。上游 `db/index.ts` 本身就支持 PGlite 分支，改造是在复用这条路径，而不是另起炉灶。
+- **单进程协调状态不落库**：`localReplicaStateStore.ts` 把租约、唤醒锁、运行活动放在内存 `Map` 中，重启即重建（§1）。这是“单实例”前提下的简化，不适用于多副本部署。
+- **中心与执行机器可分离**：`remoteComputerRoutes.ts` 和 `standaloneRemote.ts` 支持在另一台机器上通过设备批准接入 runner，并校验包的大小与 SHA-256（§1）。个人场景下，可以在家里服务器上放中心，在工作机或 GPU 机上跑 Agent。
+- **可交付的构建链与失败边界**：启动预检先于状态创建、桌面环境身份键、worker 按入口类型决定是否加载源码 loader、实验性 JS 构建脚本（§2–§4）。
+
+【推断】个人场景真正需要的是三件事：低启动成本、数据在自己手里、能同时调度手头已经付费的多个 coding 工具。上面的改造分别对应这三点。目前离“开箱即用”还差完整 HTTP 启动（受 sharp/glibc 和 Node 版本阻塞）、备份恢复验证和 Mac 桌面接入（§2、§6），这些仍在待办里，不能算已经交付。
+
+## 11. 后续：多接触这类 agentic 工具
+
+这次折腾让我确认了一件事：未来几年，工程师的一部分工作会从“写代码”变成“组织一群会写代码的 Agent”，而组织能力本身也需要工程化，包括状态归属、投递语义、证据链和可恢复性。这些恰好是我做数据库内核多年反复处理的问题：事务边界、并发控制、日志和恢复。
+
+接下来我想做几件事：
+- 在合规的运行环境里把 standalone 的 HTTP 链路彻底跑通，并做一次完整的备份恢复演练；
+- 让 Claude Code 和 Codex 在同一个频道里分工，一个实现、一个 review，用真实的数据库项目（例如我自己的引擎实验仓库）观察交接和返工成本；
+- 继续跟踪 OpenHands、LangGraph、Microsoft Agent Framework 和厂商 agent teams 的演进，看组织层的抽象最后会收敛到平台、协议（MCP/A2A）还是运行时本身。
+
+我很期待这种形态继续成熟。工具会换代，人和 Agent 一起工作的组织方式，值得认真设计。
+
 ## 源码与验证入口
 
 公开项目入口：[Raft](https://github.com/botiverse/raft-source)。本次阅读快照为 `849d036f0e26e06dd518c72f988119450b0a87b0`；新增修复仍是本地工作区内容，因此下表给出定位路径，不伪造尚未发布改动的永久链接。
@@ -172,6 +252,8 @@ const identity = JSON.stringify([
 | 本轮启动预检 | `packages/server/src/standalone.ts`、`standalone/startup.ts` |
 | 桌面环境与缓存身份 | `packages/web/src/desktopRuntimeEnvironment.ts` |
 | 实验构建 | `scripts/build-standalone-server.mjs` |
+| 任务认领与状态机 | `packages/server/src/services/taskService.ts` |
+| 协作数据模型 | `packages/server/src/db/schema.ts`（`agents`、`channelAgents`、`threadFollows`、`mentionDeliveryOccurrences`） |
 | Worker 执行 | `packages/server/src/services/workerPool/workerExecutor.ts`、`workerEntry.ts` |
 
 复查时应固定同一源码快照、输入和运行环境。文章中的模块数与测试数对应本次实验，不能作为未来版本的默认保证。
