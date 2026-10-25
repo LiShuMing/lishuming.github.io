@@ -1,5 +1,5 @@
 ---
-title: "从源码构建 Raft standalone：部署适配、故障修复与多 Agent 协作设计"
+title: "从 raft-source 到单机部署：把多个 coding agent 组织成团队"
 date: 2026-10-24T19:30:00+08:00
 slug: "raft-standalone-multi-agent-engineering"
 categories:
@@ -11,210 +11,62 @@ tags:
   - 源码分析
   - 多智能体
   - TypeScript
-description: "记录 Raft standalone 从源码运行到实验 JavaScript 构建的适配过程，解释状态、运行时、上下文和记忆的边界，以及多 Agent 任务认领、协作投递和证据管理的优化方向。"
+description: "从人类组织式协作理解 Raft，比较 coding agent 产品与开发框架，记录 standalone 改造、构建验证及尚未打通的部署边界。"
 draft: false
 ---
 
-把一个 AI 协作平台放到自己的机器上，遇到的问题很快就会超出“能不能启动”。网页关闭以后任务能否继续执行？模型对话损坏以后还能不能接着工作？换一台执行机器，需要搬的是数据库、工作目录，还是模型运行时的会话文件？这些问题决定了部署边界，也决定了多智能体（Multi-Agent）协作是否可维护。
+## 1. 缘起：为何对 raft-source 感兴趣
 
-这篇文章记录一次基于 [Raft 源码](https://github.com/botiverse/raft-source)的独立部署模式（Standalone Mode）适配与迭代。这里的 Raft 是人和 Agent 共用的协作平台，与同名的一致性算法不是同一个项目。目标是复用已有网页和运行时，在本地保留协作数据，再逐步补上桌面接入与发行能力。
+我对 [raft-source](https://github.com/botiverse/raft-source) 感兴趣，首先是因为它把 Claude Code、Codex 等 vibe-coding 工具放进了一套接近人类组织的协作关系：人在频道里提出问题，Agent 认领任务，在相关线程中讨论，再交付评审。多智能体（Multi-Agent）的吸引力在这里变得具体：换一个执行工具以后，任务归属、讨论记录和交接依据是否还能留下来？这比单独增加几个模型进程，更接近我想持续使用的工作方式。本文的 Raft 是人与 Agent 共用的协作平台，与同名的共识算法（Consensus Algorithm）无关；公开镜像采用 FSL-1.1-ALv2，属于源码可见（Source-available），不是 OSI 意义上的开源，并且按 release 导出、不收 PR。
 
-阅读源码时使用的基线是 `849d036f0e26e06dd518c72f988119450b0a87b0`。下文的四批修复是该工作区中的本地改动，尚未发布；构建与测试结果截至 2026-10-24。完整 HTTP 服务的编译产物启动仍受原生依赖兼容性阻塞，Mac 安装包也没有实机验证。下文区分已验证链路、启动阻塞与待做改造，再比较其组织抽象。
+这种组织方式有源码上的对应关系。公开镜像 `db5e399`（Release v1.21.23-source.1）中的 `packages/server/src/db/schema.ts` 保存 Agent 身份、运行时（Runtime）配置、会话和执行机器信息，`channelAgents` 与 `channelHumans` 保存频道成员关系；线程用 `parentMessageId` 连接父消息。岗位说明由 `agents.description` 经 `drivers/systemPrompt.ts` 注入。人和 Agent 共用频道组织，平台还把身份、成员关系和讨论结构从一次模型对话中分离出来。这里的版本定位沿用原有源码阅读记录，公开材料可从[固定快照](https://github.com/botiverse/raft-source/tree/db5e399)追溯。
 
-## 1. 先确认平台管理的状态，再决定如何本地化
+执行侧则保留工具之间的差异。`packages/daemon/src/drivers/types.ts` 的 `RuntimeDriver` 通过 `spawn()`、`parseLine()`、`encodeStdinMessage()` 和 `buildSystemPrompt()` 对接进程、输出、输入和提示；驱动注册位于同目录的 `index.ts`，事件规范化与 `DaemonCore`、`AgentProcessManager` 一起管理运行过程。我的判断：这层抽象的价值是让组织记录独立于执行工具，而不是承诺 Claude Code 与 Codex 的原生会话可以互换。还要限定其覆盖范围：Agent 主对话经运行时接入，不代表整个仓库没有直接请求模型服务的代码，server 的翻译 provider 就有 OpenAI-compatible 实现，部分驱动也使用进程内 SDK。
 
-Raft 的主要职责是保存协作事实，并管理执行这些工作的运行时（Runtime）。把它当成一个聊天网页，会漏掉后台进程、任务归属和数据恢复；把它当成一个统一模型 SDK，又会把外部运行时的上下文（Context）管理错误地算到平台头上。
+接下来的问题是，这样的工作区能否以个人可以维护的成本运行。本文面向已经使用 coding agent、希望理解协作和部署边界的工程师：先比较产品与框架承担哪些责任，再分析单个 Agent 和团队各自的难点，最后记录独立部署模式（Standalone Mode）的本地改造。部署实践沿用 `849d036f0e26e06dd518c72f988119450b0a87b0` 工作区基线，本地修复尚未发布；它与前述公开镜像分析分开。实验结果截至 2026-10-24，完整 HTTP 启动和 Mac 安装包均未验收，不能从源码中的接口推导出已经可用的发行能力。
 
-```text
-人 / Agent
-    │ 网页或 CLI：消息、任务、提及、附件
-    ▼
-server ─────── 持久协作数据与访问权限
-    │ 执行机器连接、输入投递、状态回传
-    ▼
-daemon / computer
-    │ RuntimeDriver 与事件规范化
-    ▼
-Claude Code / Codex / Pi / 其他运行时
-    │ 模型请求、工具调用、原生会话
-    ▼
-模型服务与本机工具
-```
+## 2. 竞品与公司调研：执行、编排与个人助手各自承担什么
 
-`packages/server` 保存身份、消息、任务等平台状态；`packages/web` 提供界面，`packages/cli` 提供供人和 Agent 调用的命令。执行侧的 `packages/daemon/src/drivers/index.ts` 注册不同运行时驱动，统一导出 `RuntimeDriver`、`RuntimeSession`、`SpawnContext` 等接口。驱动与事件规范化代码把不同运行时的输出转换成平台能处理的事件。
+比较这些工具，需要先问任务在哪里执行、谁保存状态、谁决定交接。OpenAI 的 [Codex CLI](https://developers.openai.com/codex/cli/) 在本地仓库读取、修改文件并运行命令，[Codex cloud](https://developers.openai.com/codex/cloud/) 提供云端执行入口；[Agents SDK](https://developers.openai.com/tracks/building-agents) 则面向用代码构造应用，提供控制权交接（Handoffs）、护栏（Guardrails）和执行追踪（Tracing）。这些抽象分别处理执行与编排，SDK 能保存会话也不等于应用自动拥有频道、岗位和任务认领。我的判断：选现成 coding 产品，是把更多执行管理交给产品；选 SDK，则仍要自己定义业务状态、工具和审批责任。
 
-这里应限定“平台不直接管理模型调用”这句话的范围：**Agent 主对话通过运行时驱动接入**，不意味着整个仓库没有直接调用模型服务的代码。例如 server 的翻译 provider 中就有 OpenAI-compatible 实现，部分运行时驱动还采用进程内 SDK。把所有模型请求都画成一个外部 CLI，会掩盖这些差异。
+Anthropic 同时提供 Claude Code 和可嵌入应用的 [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview)，后者复用 Claude Code 的 Agent 循环、工具和上下文管理能力。[子 Agent（Subagents）](https://code.claude.com/docs/en/sub-agents)可以有独立上下文与工具配置；[agent teams](https://code.claude.com/docs/en/agent-teams)允许多个 Claude Code 实例共享任务、直接通信，由团队负责人协调。官方文档仍将 agent teams 标为实验功能，默认关闭，并列出会话恢复、任务协调与关闭行为方面的限制。我的判断：如果工作已经集中在 Claude Code，先验证它自带的分工能力更省部署成本；只有确实需要跨工具保留组织关系时，才值得再引入一个协作平台。
 
-本地化首先要处理的是 server 的依赖。`standalone/config.ts` 将数据库地址指向 `pglite://...`，把上传目录和签名密钥（Signing Key）放入独立状态目录，并清除一批可能继承自云端的数据库、存储及通知配置。数据库入口 `db/index.ts` 选择 PGlite，迁移由 `db/pgliteMigrations.ts` 执行。PGlite 是嵌入式 PostgreSQL 实现，减少了本地启动所需的独立服务。
+Cursor 的 [Cloud Agents](https://cursor.com/docs/cloud-agent) 原称 Background Agents，在隔离的云端虚拟机中运行开发环境，并支持并行执行，不要求本地机器持续在线；并行能力本身不能证明任务之间已经形成协作闭环。Cognition 围绕 Devin 提供软件工程 Agent 产品，并在 [2025 年 7 月 14 日的公告](https://cognition.com/blog/windsurf)中宣布签署收购 Windsurf 的最终协议，范围包含产品、知识产权和品牌。公告中“未来数月整合能力”属于当时的计划，不能作为功能已经交付的证据。我的判断：考察这类产品时，应沿着任务输入、执行环境、结果审阅这条路径验证，不能从收购或并行执行直接推出跨运行时组织能力。
 
-但不能把所有分布式组件一律换成嵌入式数据库。`standalone/localReplicaStateStore.ts` 将单 server 进程内的连接租约（Lease）、唤醒锁和运行活动状态放进 `Map`，注释明确说明这些状态在退出时重置。持久协作数据由 PGlite 保存，连接状态由进程重建。这个边界适用于单 server 实例，不能据此推导出多副本部署已经不需要共享协调存储。
+个人助手又提出另一组需求。[OpenClaw 的项目介绍](https://openclaw.ai/blog/introducing-openclaw)记录了 Clawdbot、Moltbot 到 OpenClaw 的更名过程，将其定位为运行在自有机器、通过既有聊天应用使用的助手；[源码仓库](https://github.com/openclaw/openclaw)提供开源实现。它关注个人跨入口使用助手的连续性。开发框架则让开发者自己组织执行：[OpenHands](https://github.com/OpenHands/OpenHands)提供软件开发 Agent 平台与 SDK；[CrewAI](https://github.com/crewAIInc/crewAI)以角色、任务和 Crews 表达协作，以 Flows 控制事件驱动流程；[LangGraph](https://docs.langchain.com/oss/python/langgraph/overview)提供有状态图、持久执行及人工介入能力。我的判断：这些方案把交互入口和状态设计交给了不同的责任方，不能只按 Agent 数量比较。
 
-本地中心和执行机器也需要分别部署。`standalone/remoteComputerRoutes.ts` 检查登记机器的权限，在下载 runner 前校验包名、大小与 SHA-256；`daemon/src/standaloneRemote.ts` 通过 `setup` 进行浏览器设备批准，再由 `start` 复用已保存的机器接入状态。源码要求独立的私有状态目录，拒绝把同一个目录绑定到另一中心；运行时配置留在执行机器上。这个设计让中心与执行端可以分离，但每个 runner 仍需满足 Node 版本和平台架构要求。
+角色化的软件组织也已有不同实现：[MetaGPT](https://github.com/FoundationAgents/MetaGPT)用产品经理、架构师、工程师等角色与标准作业程序（Standard Operating Procedure）组织产物；[ChatDev](https://github.com/OpenBMB/ChatDev)将虚拟软件公司的 1.0 保留为旧版，2.0 已转向可配置的多 Agent 编排平台。[Microsoft Agent Framework](https://learn.microsoft.com/en-us/agent-framework/overview/)也提供 Agent 与多 Agent 工作流的构建能力，这里不把任何版本路线或预告当成正式可用能力。我的判断：Raft 所处的位置，是把现成的异构 coding 运行时放进人与 Agent 共用的长期工作区，用频道、认领、线程和投递记录维持协作。这个定位来自前述 Raft 源码事实，不表示其他产品无法扩展出类似能力，也不意味着 Raft 已解决部署和审阅成本。
 
-这段是源码确认的流程，本轮没有重新做远程登记实验。它也解释了备份为何不能只复制一个数据库目录：平台数据、上传文件、签名密钥、机器接入状态和运行时原生会话承担不同职责。本文尚未完成整套备份恢复验证，不能把这些路径的存在当成恢复能力已经验收。
+## 3. 难点：先管好单个 Agent，再承担团队的协调成本
 
-## 2. 从源码能运行，到能发行，中间还有一条构建链
+单个 Agent 的管理首先涉及工具执行与状态归属：它能调用什么工具、进程是否仍在运行、重启后延续哪次会话，都需要明确答案。Raft 将身份与运行时会话（Session）分开保存，重启尝试延续会话，重置则换新会话；工作目录和频道关系不必随一次对话结束而消失。驱动还声明会话恢复、上下文压缩（Compaction）以及忙时投递能力，`busyDeliveryMode` 区分 direct、notification 和 none。我的判断：统一接口能让平台知道应如何投递与恢复，但执行工具的行为仍须逐一验证；进程存在、消息被接受、任务正确完成，是不同的验收条件。
 
-根目录的 `standalone:build` 构建 daemon、远程 runner 包和 web，没有生成独立 server。server 自己的 `build` 是 `tsc`，而 `tsconfig.json` 设置了 `noEmit: true`。因此即使这一命令成功，也不能证明存在可执行的 `dist/server.js`。源码入口 `src/standalone.ts` 通过 `@oxc-node/core/register` 启动，依赖 TypeScript 加载器处理导入。
+上下文（Context）与跨会话记忆（Memory）也需要各自的预算。`packages/daemon/src/drivers/claudeInputBudget.ts` 对 daemon 构造的启动文本预检：默认上限为 200,000 tokens，特定模型名匹配路径为 1,000,000，预留 32,000；估算方法是可见文本 UTF-8 字节数除以 3 后向上取整，超限在启动命令前报告 `INPUT_TOO_LARGE`。这不是模型服务的权威 tokenizer，也不覆盖 Claude 恢复会话时自行载入的历史。`startupMemoryBlock.ts` 在服务端 `constructedWakeContext` 显式启用且未被本地关闭时，为新会话注入 `MEMORY.md` 头部，恢复会话跳过注入；预算限制的是注入视图，不截断源文件。由此得到的使用建议是让记忆保存任务索引、决定、证据位置与下一步，并在重新操作前核对仍会变化的进程、分支和服务状态。
 
-如果直接把入口文件转成 JavaScript，仍会留下几类问题：省略扩展名的相对导入、指向工作区 TypeScript 文件的包导入、以 `new URL(..., import.meta.url)` 定位的 worker，以及相对路径上的数据库迁移和版本信息。转译语法只解决了其中一部分。
+权限与评估不能由“有评审状态”代替。公开镜像中，`routes/internalAgentApi.ts` 对集成登录等特定操作返回 `approval_required`，再由 `actionCardsService.ts` 的 `prepareActionCard()`、`executeActionCard()`处理；与此同时，`codex.ts` 设置 `approvalPolicy: "never"`，`claudeLaunch.ts` 使用 `--permission-mode bypassPermissions`。README 描述 daemon 通过绑定本地来源的代理代发凭据，Agent 不直接持有 server 凭据；这些机制的边界不同，不能概括为每次工具执行都有人审批。任务服务中的 `in_review` 也不强制人工审核，有频道写权限的成员可以推动状态迁移。我的判断：实际使用前必须约定谁审阅、审什么、谁能置为 done，并用代码差异、测试条件和失败记录评价产物；本文没有完成模型质量或团队效率评估。
 
-为验证这条链路，本轮新增了实验脚本 `scripts/build-standalone-server.mjs`。它从 standalone 入口遍历转译后仍被引用的工作区模块，解析本地依赖，把导入改写为产物之间的相对 JavaScript 路径；静态 TypeScript worker URL 也加入构建图。同时复制数据库迁移和相关包的版本文件。输出目录必须是新目录，避免覆盖正在使用的产物。
+增加多个 Agent 后，任务编排（Orchestration）还要约束写入和交接。`packages/server/src/services/taskService.ts` 的 `claimTaskDetailed()`、`claimTask()`、`unclaimTask()`、`assignTask()`处理认领与改派，认领检查冲突、修改使用 revision，状态为 `in_progress → in_review → done`，评审可以退回。原有阅读没有找到独立 handoff API，交接通过改派和线程回复完成。任务冲突检查却不会自动隔离共享文件：这次本地实践开始时，工作区已有 19 个运行时表单相关文件被修改，修复保留了这些改动，并限定在桌面环境、standalone、构建脚本和 worker 范围。我的判断：认领应同时说明产物与写入范围，依赖步骤应明确交接；并发读取与并发修改共享 Git 状态，需要不同的约束。
 
-实际构建生成了 **709 个模块**。从主入口递归检查的 **706 个 JavaScript 模块**均能解析，相对导入目标均存在；两者数量不同，是因为构建还包含静态 worker URL 引入的模块。使用纯 Node 加载已输出的启动预检和配置模块，也执行通过。
+通信成本来自投递和消费，而不只是消息数量。`mentionDeliveryOccurrences` 记录 server 决策、daemon 接收及 ack 或终止错误，`threadFollows` 保存关注来源、完成和取消关注；线程可见性与关注者投递分开，因此看到频道不等于每个 Agent 都要消费全部讨论。我的判断：让负责人在对应线程接收证据、完成后减少无关关注，有助于控制唤醒范围，但这里没有 token 节省或吞吐提升的测量。更多执行者还会增加重复读取、接口核对、合并与人类审阅工作；只有任务能够独立推进、交付证据足够清楚时，并发节省的等待才可能覆盖这些成本。
 
-这些结果只能证明转译和部分加载链路成立。脚本使用 `transpileModule`，没有完成全仓库类型检查（Type Checking）；外部 npm 依赖仍用符号链接（Symbolic Link）复用现有安装，网页和 daemon 需另供。产物有明确的 `compiled-workspace` 阶段标记，尚不能搬到另一台机器当作安装包使用。
+## 4. 单机改造与部署：保留持久数据，逐层验证启动链
 
-接着进行真正的启动尝试：在全新状态目录、随机本地端口上，用 `node .../standalone.js` 启动，不传源码加载器。进程在监听前退出，原因是已安装的 `sharp` 原生依赖要求 `GLIBC_2.27`，宿主机只有 glibc 2.17。当前 Node 为 22.18.0，也低于仓库声明的 24。
+单机改造的目标是降低个人部署的依赖数量，同时说清哪些状态能恢复。公开镜像 `db5e399` 的 `./raftdev start` 涉及 Postgres、Redis、对象存储、server、web 和 daemon，其中没有 `packages/server/src/standalone*`；下述 standalone 路径属于本地工作区，不能附上伪造的上游改动链接。本轮复用 PGlite 分支，`standalone/config.ts` 将数据库指向 `pglite://...`，把上传文件和签名密钥（Signing Key）放进独立状态目录，并清除可能继承的云端数据库、存储和通知配置；`db/index.ts` 选择嵌入式 PostgreSQL 实现 PGlite，`db/pgliteMigrations.ts` 负责迁移。`standalone/localReplicaStateStore.ts` 将连接租约（Lease）、唤醒锁和活动状态保存在内存 `Map` 中，退出后重建。这个取舍依赖单 server 实例，不能推广到需要共享协调状态的多副本环境。
 
-这次失败把问题从“有没有产物”推进到了“产物依赖什么运行环境”。本轮没有替换系统库、修改共享依赖或重启现有服务。后续必须在符合要求的 Node 和原生依赖环境下重新验证；静态导入检查无法替代这一步。
+中心与执行端仍可分开。`standalone/remoteComputerRoutes.ts` 检查登记权限，并在下载 runner 前校验包名、大小与 SHA-256；`daemon/src/standaloneRemote.ts` 通过 `setup` 进行浏览器设备批准，再以 `start` 复用机器接入状态。独立的私有状态目录不能绑定到另一中心，运行时配置留在执行机器上，runner 仍受 Node 版本和平台架构约束。这些是原有源码阅读确认的流程，本轮没有重新执行远程登记实验。它同时说明备份不能只看数据库：平台数据、上传文件、签名密钥、机器接入状态和原生会话各有职责，整套备份恢复还没有验收。
 
-## 3. 修复启动失败路径，让失败留下可解释的状态
+启动失败路径的修复先处理副作用顺序。原入口在检查网页 `index.html` 前执行 `configureStandalone()`，会先创建目录与密钥；修改后的 `standalone/startup.ts` 先检查网页入口是否可读，失败提示构建网页或设置 `RAFT_STANDALONE_WEB_DIST`。原有 6 项配置、预检和网页路由测试通过，其中子进程验证了缺少网页时非零退出且不创建状态目录。另一处是 `packages/web/src/desktopRuntimeEnvironment.ts` 的环境身份键：原先只比较数字 `generation`，现在同时比较环境 ID、前端地址、API 地址、socket 地址和 generation，避免共用存储时目标变了却沿用旧状态；原有 34 项相关测试通过。旧数字缓存升级后会清理一次、需要重新登录；这些测试没有证明曾发生凭据泄漏，也没有放宽官方环境校验，自建中心握手与桌面壳仍待适配。
 
-第一项发生在启动入口。原代码先执行 `configureStandalone()`，创建状态目录和签名密钥，再检查网页 `index.html`。如果用户只拿到了服务源码、没有网页产物，启动虽然失败，却已经留下了一部分持久状态，而且错误主要表现为文件不存在。
+构建链的缺口来自“命令成功”与“存在可运行产物”的差别。原有 `standalone:build` 构建 daemon、runner 包和 web，没有输出独立 server；server 的 `build` 调用 `tsc`，而配置为 `noEmit: true`。本地实验脚本 `scripts/build-standalone-server.mjs` 遍历依赖、重写相对 JavaScript 导入，将静态 worker URL 纳入构建图，并复制迁移和版本文件，要求输出到新目录。本次生成 709 个模块，从主入口递归检查的 706 个 JavaScript 模块均可解析且相对导入存在，差额来自静态 worker URL 引入的模块。后台线程还需独立修复：`services/workerPool/workerExecutor.ts` 对 `.js`、`.mjs`、`.cjs` 入口继承父进程参数，不再补 `--import @oxc-node/core/register`，`.ts` 保留加载器逻辑。原有集成验证覆盖真实 JavaScript 与 TypeScript worker；重建后的编译产物用纯 Node 完成注册、消息往返、处理器抛错、线程崩溃及恢复执行，回传 `process.execArgv` 为 `[]`。这证明了被测试的线程链路，不覆盖所有后台任务。
 
-修复后由 `standalone/startup.ts` 先检查网页入口是否为可读文件，再进入状态配置。失败提示同时给出构建网页和设置 `RAFT_STANDALONE_WEB_DIST` 两条路径。测试不仅调用预检函数，还实际启动子进程，指定不存在的网页目录与全新状态路径，确认进程非零退出、提示正确，而且状态目录没有创建。相关配置、预检和网页路由共 **6 项测试通过**。
+完整服务启动仍然失败。在全新状态目录、随机本地端口上直接运行编译后的 `standalone.js`，进程在监听前因 `sharp` 原生依赖退出：它要求 `GLIBC_2.27`，宿主机为 glibc 2.17；当时 Node 为 22.18.0，也低于仓库要求的 24。实验脚本使用 `transpileModule`，没有完成全仓库类型检查（Type Checking），外部 npm 依赖通过符号链接（Symbolic Link）复用现有安装，网页与 daemon 还需另供，产物标为 `compiled-workspace`。因此 709/706 的检查结果不能算可搬运发行包验收，也不能算 HTTP 运行通过。上述数字均是原实践记录，本次文章重写没有重跑 Raft 实验；符合要求的运行环境、完整启动、备份恢复和 Mac 实机验证仍是后续工作。
 
-第二项涉及桌面切换环境时的登录状态清理。原逻辑仅保存数字 `generation`，用它判断缓存是否过期。同一存储空间如果切换了目标环境，却碰巧拿到相同数字，就不会触发清理。
+## 5. 使用思路：让协作留下可继续执行的依据
 
-新的比较键包含环境 ID、前端地址、API 地址、socket 地址及 generation：
+我希望把日常使用组织成围绕具体任务的协作：人在频道说明目标、约束和验收依据，由负责的 Agent 认领，在任务线程里积累决定和证据；实现与评审可以分给 Claude Code 和 Codex，但各自的写入范围需要先说清。这是下一步准备验证的用法，不是已经运行成熟的团队流程。对于有依赖的工作，我会要求交接包含代码位置、当前状态、执行过的检查及未解决问题，避免新会话只收到一句“继续之前的工作”。记忆入口只保留便于扫描的索引，细节按主题保存，恢复时重新核对易变事实。
 
-```ts
-const identity = JSON.stringify([
-  environment.environmentId,
-  environment.frontendOrigin,
-  environment.apiOrigin,
-  environment.socketOrigin,
-  environment.generation,
-]);
-```
+我的判断：Raft 更值得用于跨运行时、跨机器、需要持续认领与留痕的任务，因为其持久身份、频道和投递状态正好承接这些需求。若一次工作在单个运行时中就能完成，额外部署中心、维护驱动与恢复数据的成本可能超过收益；若任务不断争用相同文件或人类审阅时间，增加 Agent 也不会自然缩短交付。审批要求严格时，还必须先核对运行时权限与平台动作卡片的实际覆盖范围，不能把 `in_review` 当成强制人工关卡。是否适合长期使用，需要用交接、冲突、返工和恢复成本检验，而本文尚无这些收益测量。
 
-地址改变时旧状态失效，同一目标重复加载则不重复清理。桌面运行环境、握手及相关消费者的 **34 项测试通过**。旧版本只保存数字，因此升级后第一次读取会清理一次，需要重新登录。
+这次实践给我的具体心得是，组织抽象与运行交付需要分别拿出证据。频道、认领和线程让我能描述谁负责什么，worker 验证让我确认某条执行链不再依赖源码加载器，`sharp` 的失败则说明部署环境尚未满足要求。每份证据都有用，但不能互相代替。对 Mac 接入，我仍倾向先让桌面控制台连接现有中心、把任务留在执行机器，再讨论完全本地运行；前者主要验证连接、认证和握手，后者还涉及本机依赖、数据目录、后台进程、升级与恢复。是否选 Electron 或 Tauri，应等这些接口和打包链核对后决定。
 
-这个修复也有适用条件。现有 production 和 staging 通常由不同页面源隔离，测试不能证明它们已经发生过跨环境凭据泄漏。它验证的是共用存储时的切换防护，也没有放宽原先只允许官方环境的校验。自建中心接入仍须同时处理运行时配置、握手契约和原生桌面壳。
-
-## 4. Worker 的运行方式也必须跟随构建产物变化
-
-主入口去掉 TypeScript 加载器以后，后台线程仍可能偷偷依赖它。这个问题出现在 `services/workerPool/workerExecutor.ts`：执行器发现父进程没有 loader，就补上 `--import @oxc-node/core/register`，即使 worker 已经编译成 JavaScript。
-
-对于源码执行，这个行为合理：worker 需要解析 TypeScript 和省略扩展名的导入。对于编译产物，它却引入了不必要的运行依赖。如果只测试主线程入口，这一问题可能一直藏到附件处理等异步任务开始时才出现。
-
-修复将判断绑定到 worker 入口。`.js`、`.mjs` 和 `.cjs` 入口继承父进程参数，不再补源码加载器；`.ts` 入口保留现有逻辑。测试分两层完成：先跑真实 JavaScript worker 和原有 TypeScript worker 的集成测试，再重新构建，在产物目录里用纯 Node 加载编译后的执行器与默认 `workerEntry.js`。
-
-产物中的真实线程完成了 bootstrap 注册、消息往返、处理器抛错、线程崩溃和恢复后再次执行。线程回传的 `process.execArgv` 为 `[]`，说明这次执行没有携带源码加载器。这比只检查输出文件里存在 `.js` 更强，但仍只覆盖 worker 链路，不代表完整 HTTP 服务已经启动成功。
-
-| 验证对象 | 实际结果 | 尚不能推出什么 |
-|---|---|---|
-| 桌面环境状态清理 | 34 项相关测试通过 | 自建中心和 Mac 桌面已适配 |
-| 启动预检、配置、网页路由 | 6 项测试通过 | 整个服务已完成运行验证 |
-| 实验 JS 构建 | 输出 709 模块，主入口 706 模块静态检查通过 | 类型检查和可搬运发行包完成 |
-| 编译产物 worker | 真实线程执行及崩溃恢复通过 | 全部后台任务都已覆盖 |
-| 编译产物 HTTP 启动 | sharp 原生依赖加载失败 | 不能记为运行通过 |
-
-## 5. 多 Agent 优化先从状态归属和协作投递开始
-
-源码和手册首先区分 Agent 身份与运行时会话（Session）。Agent 的身份、工作目录、频道成员关系等由平台保存，底下通常维持一个活动运行时会话。重启尝试延续会话，重置则换一个新会话。频道、私信和线程保存的是协作历史，它们不是多个模型会话的简单拼接。
-
-这个区分允许一种恢复策略：模型上下文失效时重建会话，从工作区记忆和平台消息找回任务，而不删除协作事实。但恢复质量取决于工作记录。如果只写“继续之前的工作”，新会话仍需重新猜测代码位置、测试状态和待办事项。
-
-### 用任务认领控制写入，用线程控制讨论范围
-
-本轮实践中，执行者开始时发现工作区已有 **19 个运行时表单相关文件**被修改。这些是其他工作的改动，本轮保留，不能因为由当前执行者看到就变成其所有。后续修复限定在桌面环境、standalone 启动、构建脚本和 worker 相关文件中。
-
-由此得到的协作建议是：任务认领应同时记录产物与写入范围，协作者可以并发读取，但不要让多个 Agent 同时修改同一个共享 Git 状态。拆分工作时，优先按互不重叠的接口或成果拆分；有前后依赖的步骤保留明确交接。并行度的收益来自减少等待，代价是更多接口、版本和结果核对。
-
-线程投递也有类似边界。Raft 将线程可见性与关注者投递分开：能看到一个频道，并不意味着每个 Agent 都需要消费其全部讨论。实际使用时，明确负责者、在相关线程回复、完成后减少不必要的关注，可以降低无关唤醒。这里没有测量 token 节省或吞吐提升，属于基于投递机制的使用建议。
-
-### 上下文需要预算，但预算不等于完整模型历史
-
-`drivers/claudeInputBudget.ts` 对 daemon 负责的启动文本做预算：代码中默认上限为 200,000 tokens，特定模型名匹配路径使用 1,000,000，预留 32,000。估计方法是可见文本的 UTF-8 字节数除以 3 后向上取整。超过预算会在拉起命令前报告 `INPUT_TOO_LARGE`。
-
-这是一项运行时专用的预检，不是模型服务的权威 tokenizer，也不覆盖恢复会话时 Claude 自己载入的历史。不能拿这组参数评价所有运行时的上下文窗口。
-
-记忆注入同样有条件。`startupMemoryBlock.ts` 为新会话注入 `MEMORY.md` 头部，但配置要求服务端 `constructedWakeContext` 显式启用，并允许本地开关关闭；恢复会话跳过注入，以免重复污染已有上下文。注入视图有预算，源文件不会因此被截断。
-
-因此跨会话记忆（Memory）适合保存任务索引、重要决定、证据位置和下一步，不适合不断堆积全部日志。更长的记忆会消耗输入预算，旧的状态还可能诱导下一次会话作出错误判断。可行的优化是让入口文件保持可扫描，把细节放到按主题组织的文件；重新操作前，再验证进程、分支和服务等会变化的事实。平台能提供读取入口，记忆内容是否准确仍需要维护。
-
-## 6. 把优化成果组织成可以复核的交付
-
-对 Mac App，我仍建议先实现桌面控制台连接现有中心，让任务继续在执行机器上运行，再讨论 Mac 完全本地运行。前者优先解决连接、认证和握手，后者还要承担本机依赖、数据目录、后台进程、升级和恢复。是否选择 Electron 或 Tauri，应在这些接口与打包链核对后决定；当前源码中的桌面接口存在，不等于已经有可用的自建中心 Mac 发行版。
-
-后续工作的顺序也因此明确：先用符合项目要求的运行环境打通完整 HTTP 启动，再收齐可搬运的依赖与资产，验证移动目录和数据恢复；桌面接入同步完成自建中心协议适配，最后在 macOS 上验证安装、退出、重启与升级。每一步都应保留自己的证据，不能由前一步的成功代签。
-
-## 7. 回到源码：Raft 怎样把 Agent 组织成一个团队
-
-这一部分基于公开镜像 [botiverse/raft-source](https://github.com/botiverse/raft-source) 的 `db5e399`（Release v1.21.23-source.1，2026-10-20 07:55 北京时间），与前文本地修复基线分开。用 Codex 整理结构后，我逐条用 `rg` 核对路径和符号。镜像按 release 导出、不收 PR，许可证 FSL-1.1-ALv2，属于源码可见（Source-available），不是 OSI 意义上的开源。
-
-**Agent 身份与协作事实持久保存。** `packages/server/src/db/schema.ts` 的 `agents` 表记录身份、runtime/model/runtimeConfig、sessionId、machineId 与执行模式；`channelAgents`、`channelHumans` 记录 member/admin 关系。`agents.description` 经 `drivers/systemPrompt.ts` 注入为岗位说明，线程通过 `parentMessageId` 连接父消息。人和 Agent 共享频道组织。
-
-**任务与投递各有状态。** `services/taskService.ts` 提供 `claimTaskDetailed()`、`claimTask()`、`unclaimTask()`、`assignTask()`，认领检查冲突，修改使用 revision；状态为 `in_progress → in_review → done`，review 可退回。`mentionDeliveryOccurrences` 追踪 server 决策、daemon 接收及 ack／终止错误；`threadFollows` 记录关注来源与完成、取消关注。没有找到独立 handoff API，交接通过改派和线程回复完成。
-
-**运行时差异收敛到驱动接口。** `drivers/types.ts` 的 `RuntimeDriver` 用 `spawn()`、`parseLine()`、`encodeStdinMessage()`、`buildSystemPrompt()`处理进程、输出、输入和提示；`busyDeliveryMode` 声明忙时 direct／notification／none 投递，会话恢复与上下文压缩（Compaction）另有能力声明。`drivers/index.ts` 的 `driverFactories` 注册 builtin、claude、codex、grok、cursor、gemini、kimi、kimi-sdk、opencode、pi，以及为老 Agent 保留的 deprecated copilot、antigravity。各运行时的 EventNormalizer 统一流式事件，`DaemonCore` 与 `AgentProcessManager` 管理生命周期。
-
-**人工审批仅覆盖特定操作。** `routes/internalAgentApi.ts` 对集成登录等操作返回 `approval_required`，由 `actionCardsService.ts` 的 `prepareActionCard()`、`executeActionCard()`处理。运行时内部，`codex.ts` 设置 `approvalPolicy: "never"`，`claudeLaunch.ts` 使用 `--permission-mode bypassPermissions`；约束依赖身份、频道权限与凭据代理。README 说明 daemon 通过本地 origin-bound proxy 代发凭据，Agent 不直接持有 server 凭据。
-
-`in_review` 不强制人工审核，有频道写权限的成员即可推动迁移。团队仍须约定谁能置为 done；任务状态不能替代工具执行审批。
-
-## 8. 为什么我喜欢这套 agentic 架构
-
-我欣赏 Raft 把抽象放在组织层：现有 coding 工具负责执行，平台保存身份、任务、频道、提及、关注和记忆。`RuntimeDriver` 隔离会话与投递差异，运行时被替换时，协作事实仍可保留；这不意味着原生会话格式可以互换。
-
-人和 Agent 共用认领、线程讨论、评审和交接，比另造一套 Agent 管理方式更贴近我的工作习惯。第 5 节的写入范围冲突就是例子：需要明确产物、写入权和合并责任，增加模型进程不会自动解决这些问题。
-
-## 9. 与同形态开源项目的对比
-
-先界定可比对象。多 Agent 领域大致有三类项目：一是 Agent 开发框架（用代码编排 LLM 调用），二是单体 coding agent（一个 Agent 写代码），三是“虚拟团队”模拟。Raft 不完全属于其中任何一类，它更接近“人和异构 Agent 共用的协作工作区”。下表列出各项目截至 2026-10-24 的状态，数据来自 GitHub API 和官方 README/文档。
-
-| 项目 | 形态 | 优势 | 相对 Raft 的短板 / 差异 |
-|---|---|---|---|
-| [Raft](https://github.com/botiverse/raft-source) | 人与 Agent 共用工作区，编排现成 CLI 运行时 | 复用 Claude Code/Codex 等成熟运行时；持久身份、频道、任务、投递状态都落库；可自建执行机器 | FSL source-available，不收 PR；部署链重（Node 24、Postgres/Redis/对象存储，见 README）；审批多靠约定 |
-| [OpenHands](https://github.com/OpenHands/OpenHands) | 开源 coding agent 平台与 SDK（MIT） | 社区最大（约 9.2 万 star）、沙箱执行完善、可自托管 | 核心是自家 agent loop，不以编排第三方 CLI 为中心；组织层（频道、认领）弱 |
-| [MetaGPT](https://github.com/FoundationAgents/MetaGPT) | 按 SOP 分角色的“软件公司” | 角色分工和产物模板化，论文影响大 | 偏一次性生成流水线；仓库最近推送在 2026-01，活跃度下降；人很难作为平等成员持续参与 |
-| [ChatDev](https://github.com/OpenBMB/ChatDev) | 角色对话链组成的虚拟软件公司（Apache-2.0） | 角色化协作可视化，适合研究 | 研究导向，不面向长期运行的团队工作区 |
-| [CrewAI](https://github.com/crewAIInc/crewAI) | Python 多 Agent 框架：roles/tasks/crews/flows（MIT） | 上手快，角色与任务抽象直观 | 需要自己写编排代码；Agent 是进程内对象，不是持久成员；不直接驱动 Claude Code/Codex 这类 CLI |
-| [LangGraph](https://github.com/langchain-ai/langgraph) | 有状态图编排（MIT） | 状态机、checkpoint、人类中断点表达力强，适合生产工作流 | 底层原语，组织语义要自己搭；同样以 LLM API 为中心 |
-| [AutoGen](https://github.com/microsoft/autogen) → [Microsoft Agent Framework](https://github.com/microsoft/agent-framework) | 对话式多 Agent 框架 | MAF 1.0 主打 A2A、MCP 与多 provider | AutoGen README 已声明正在转入归档，新用户转 MAF；社区分支 [AG2](https://github.com/ag2ai/ag2) 另行维护 |
-| [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) | 轻量 SDK：handoffs、guardrails、tracing（MIT） | handoff 语义清晰、简单 | 开发库而非工作区；没有持久组织状态 |
-| Claude Code [subagents](https://code.claude.com/docs/en/sub-agents) / [agent teams](https://code.claude.com/docs/en/agent-teams) | 单一运行时内的子 Agent 与团队 | 零部署、与 Claude Code 深度集成 | 绑定单一厂商运行时；团队状态随会话存在，不是跨工具的长期组织 |
-| [Goose](https://github.com/aaif-goose/goose) | 本地通用 Agent，MCP 扩展（Apache-2.0） | 本地优先，扩展生态好 | 单 Agent 为主，多 Agent 组织不是核心 |
-
-选择取决于需要长期保存什么：确定工作流可用 LangGraph，角色生成研究可看 MetaGPT／ChatDev；跨运行时、跨机器且需要持续认领和留痕，才更接近 Raft 的组织模型。许可、上游不收 PR 与部署依赖增加个人维护成本，是 standalone 的动机；轻量协作则先比较运行时自带的团队能力。
-
-## 10. 我的改造：面向个人的 standalone 模式
-
-个人部署需要保留组织数据，并降低启动成本。公开镜像 `db5e399` 的 `./raftdev start` 需要 Postgres、Redis、对象存储、server、web、daemon；其中没有 `packages/server/src/standalone*`，这些文件来自前文本地工作区，不能给出上游永久链接。
-
-本轮复用 PGlite 分支，将上传与签名密钥放入独立状态目录；单 server 的租约、唤醒锁和活动状态使用内存 `Map`，重启重建。中心与 runner 可分离，通过设备批准及包大小、SHA-256 校验接入。启动预检、环境身份键、worker loader 与实验 JS 构建分别见 §2–§4。
-
-这些简化依赖单实例前提。HTTP 启动仍被 sharp/glibc 和 Node 版本阻塞，备份恢复与 Mac 桌面接入未验收，当前产物不能视为开箱即用发行包。
-
-## 11. 后续：先跑通恢复，再测协作收益
-
-这次实践让我更想继续接触组织多个 coding Agent 的工具，重点观察状态归属、投递与证据，而不是只比较生成速度。接下来的验证有三项：
-
-- 在符合项目要求的运行环境跑通 HTTP，并完成备份恢复演练。
-- 让 Claude Code 与 Codex 在同一频道分工实现、评审，在自己的数据库实验仓库记录交接、合并与返工成本。
-- 跟踪 OpenHands、LangGraph、Microsoft Agent Framework 和厂商团队能力，比较哪些组织状态由平台保存、哪些仍依赖运行时会话。
-
-只有扣除协调、验证与恢复成本，才有依据判断这套组织层是否适合个人长期使用。
-
-## 源码与验证入口
-
-公开项目入口：[Raft](https://github.com/botiverse/raft-source)。本次阅读快照为 `849d036f0e26e06dd518c72f988119450b0a87b0`；新增修复仍是本地工作区内容，因此下表给出定位路径，不伪造尚未发布改动的永久链接。
-
-| 关注点 | 主要源码路径 |
-|---|---|
-| 运行时驱动 | `packages/daemon/src/drivers/index.ts`、`types.ts` |
-| 启动输入预算 | `packages/daemon/src/drivers/claudeInputBudget.ts` |
-| 新会话记忆注入与开关 | `packages/daemon/src/startupMemoryBlock.ts` |
-| 本地状态与环境隔离 | `packages/server/src/standalone/config.ts` |
-| PGlite 与迁移 | `packages/server/src/db/index.ts`、`pgliteMigrations.ts` |
-| 单进程连接协调 | `packages/server/src/standalone/localReplicaStateStore.ts` |
-| 本轮启动预检 | `packages/server/src/standalone.ts`、`standalone/startup.ts` |
-| 桌面环境与缓存身份 | `packages/web/src/desktopRuntimeEnvironment.ts` |
-| 实验构建 | `scripts/build-standalone-server.mjs` |
-| 任务认领与状态机 | `packages/server/src/services/taskService.ts` |
-| 协作数据模型 | `packages/server/src/db/schema.ts`（`agents`、`channelAgents`、`threadFollows`、`mentionDeliveryOccurrences`） |
-| Worker 执行 | `packages/server/src/services/workerPool/workerExecutor.ts`、`workerEntry.ts` |
-
-复查时应固定同一源码快照、输入和运行环境。文章中的模块数与测试数对应本次实验，不能作为未来版本的默认保证。
+接下来先在符合项目要求的 Node 与原生依赖环境打通 HTTP，收齐可搬运资产，再做移动目录与备份恢复演练；桌面方向继续验证自建中心协议及 macOS 的安装、退出、重启和升级。协作方向则准备在自己的数据库实验仓库，让 Claude Code 与 Codex 分工实现和评审，记录交接、合并与返工，再与运行时自带团队能力及相关框架比较。我的判断：只有把环境维护、协调和人工验证一起算进去，才能决定是否长期保留这层组织；当前最该完成的是可复核的恢复与交付验证。

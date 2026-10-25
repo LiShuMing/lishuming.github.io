@@ -1,5 +1,6 @@
 ---
-title: "算法与系统设计面试：从解题不变量到 OLAP 与 LLM 服务的容量边界"
+title: "面试系列 05｜算法与系统设计面试：从解题不变量到 OLAP 与 LLM 服务的容量边界"
+series: ["面试系列"]
 date: 2026-10-24T10:05:00+08:00
 slug: "interview-algorithms-system-design"
 categories: [面试]

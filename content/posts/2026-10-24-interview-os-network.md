@@ -1,5 +1,6 @@
 ---
-title: "操作系统与网络面试：从调度、内存到 RPC 背压的 Staff 追问链"
+title: "面试系列 04｜操作系统与网络面试：从调度、内存到 RPC 背压的 Staff 追问链"
+series: ["面试系列"]
 date: 2026-10-24T10:04:00+08:00
 slug: "interview-os-network"
 categories: [面试]

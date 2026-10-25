@@ -1,5 +1,6 @@
 ---
-title: "AI 时代基础设施面试：从数据库内核到 LLM 推理与 Agent 运行时"
+title: "面试系列 06｜AI 时代基础设施面试：从数据库内核到 LLM 推理与 Agent 运行时"
+series: ["面试系列"]
 date: 2026-10-24T10:06:00+08:00
 slug: "interview-ai-era-infra-agents"
 categories: [面试]

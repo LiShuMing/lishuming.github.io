@@ -1,5 +1,6 @@
 ---
-title: "面试系列索引：把数据库内核经验变成 Senior、Staff 与 AI 基础设施岗位的证据"
+title: "面试系列 00｜面试系列索引：把数据库内核经验变成 Senior、Staff 与 AI 基础设施岗位的证据"
+series: ["面试系列"]
 date: 2026-10-24T10:00:00+08:00
 slug: "interview-series-index"
 categories: [面试]

@@ -1,5 +1,6 @@
 ---
-title: "资深工程师面试方法与策略：从项目证据到岗位与 Offer 决策"
+title: "面试系列 01｜资深工程师面试方法与策略：从项目证据到岗位与 Offer 决策"
+series: ["面试系列"]
 date: 2026-10-24T10:01:00+08:00
 slug: "interview-method-and-strategy"
 categories: [面试]

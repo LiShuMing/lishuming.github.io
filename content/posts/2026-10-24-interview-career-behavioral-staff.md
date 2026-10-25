@@ -1,5 +1,6 @@
 ---
-title: "Staff/TL 职业与行为面试：把技术判断变成组织成果"
+title: "面试系列 07｜Staff/TL 职业与行为面试：把技术判断变成组织成果"
+series: ["面试系列"]
 date: 2026-10-24T10:07:00+08:00
 slug: "interview-career-behavioral-staff"
 categories: [面试]

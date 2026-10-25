@@ -63,5 +63,6 @@ theme = 'aphasia'
     tabWidth = 4
 
 [taxonomies]
-  tag = 'tags'
   category = 'categories'
+  tag = 'tags'
+  series = 'series'

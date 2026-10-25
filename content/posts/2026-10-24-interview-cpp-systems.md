@@ -1,5 +1,6 @@
 ---
-title: "C++ 与系统编程面试：从生命周期证明到并发与性能决策"
+title: "面试系列 03｜C++ 与系统编程面试：从生命周期证明到并发与性能决策"
+series: ["面试系列"]
 date: 2026-10-24T10:03:00+08:00
 slug: "interview-cpp-systems"
 categories: [面试]
