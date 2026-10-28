@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="440" viewBox="0 0 1000 440" role="img" aria-labelledby="title desc">
+  <title id="title">从114到136：固定片段替换的长度证据</title>
+  <desc id="desc">原串由34、40、40字符三段组成。中间40字符被62字符地址替换，前后段一致，长度增加22。图中不包含真实Key。</desc>
+  <rect width="1000" height="440" rx="20" fill="#f4f7fb"/>
+  <g font-family="Microsoft YaHei, Noto Sans CJK SC, sans-serif" fill="#172b45">
+    <text x="38" y="55" font-size="28" font-weight="700">114 → 136：变化集中在中间一段</text>
+    <text x="38" y="88" font-size="18" fill="#50657c">结构示意 · 所有数字均为 ASCII 字符数 · 不含真实凭据</text>
+    <text x="38" y="148" font-size="21" font-weight="700">原文</text>
+    <rect x="140" y="114" width="220" height="65" rx="10" fill="#dce9f9"/>
+    <rect x="372" y="114" width="260" height="65" rx="10" fill="#d6eee7"/>
+    <rect x="644" y="114" width="260" height="65" rx="10" fill="#dce9f9"/>
+    <text x="250" y="155" text-anchor="middle" font-size="23">前段 34</text>
+    <text x="502" y="155" text-anchor="middle" font-size="23">中段 40</text>
+    <text x="774" y="155" text-anchor="middle" font-size="23">后段 40</text>
+    <text x="38" y="270" font-size="21" font-weight="700">错误串</text>
+    <rect x="140" y="231" width="190" height="76" rx="10" fill="#dce9f9"/>
+    <rect x="342" y="231" width="326" height="76" rx="10" fill="#ffe4d9" stroke="#ce6745" stroke-width="2"/>
+    <rect x="680" y="231" width="224" height="76" rx="10" fill="#dce9f9"/>
+    <text x="235" y="278" text-anchor="middle" font-size="23">前段 34</text>
+    <text x="505" y="263" text-anchor="middle" font-size="22" font-weight="700">固定地址 62</text>
+    <text x="505" y="291" text-anchor="middle" font-size="17" fill="#9a442d">bc1p…（不展示完整值）</text>
+    <text x="792" y="278" text-anchor="middle" font-size="23">后段 40</text>
+    <path d="M502 186 L502 219 M495 210 L502 219 L509 210" fill="none" stroke="#ce6745" stroke-width="3"/>
+    <text x="38" y="365" font-size="25" font-weight="700">长度增量 = 62 − 40 = 22</text>
+    <text x="38" y="402" font-size="19" fill="#50657c">局部固定替换已观察到；具体匹配规则尚未完成逆向验证。</text>
+  </g>
+</svg>
