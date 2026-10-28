@@ -7,9 +7,11 @@
     <title>{{ if .IsHome }}{{ .Site.Title }}{{ else }}{{ .Title }} | {{ .Site.Params.author }}{{ end }}</title>
     <link rel="shortcut icon" href="/lsm.ico">
 
-    <link rel="stylesheet" type="text/css" href="/assets/css/layout.css">
-    <link rel="stylesheet" type="text/css" href="/assets/css/style.css">
-    <link rel="stylesheet" type="text/css" href="/assets/css/highlight.css">
+    {{- range slice "layout" "style" "highlight" }}
+    {{- $path := printf "assets/css/%s.css" . }}
+    {{- $stylesheet := resources.FromString $path (readFile (printf "static/%s" $path)) | fingerprint "sha256" }}
+    <link rel="stylesheet" type="text/css" href="{{ $stylesheet.RelPermalink }}" integrity="{{ $stylesheet.Data.Integrity }}" crossorigin="anonymous">
+    {{- end }}
 
     <script type="text/javascript" src="/media/js/jquery-1.7.1.min.js"></script>
     {{ block "extra_head" . }}{{ end }}
