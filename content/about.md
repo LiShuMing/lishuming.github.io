@@ -17,7 +17,7 @@ description: "这个博客记录阅读、源码实验和行旅。"
 ## 建议阅读路径
 
 - **查询优化与执行（约半天）**：[Dive into StarRocks Optimizer]({{< ref "posts/2026-09-01-dive-starrocks-optimizer.md" >}})、[Dive into Calcite Cost and Traits]({{< ref "posts/2026-09-02-dive-calcite-cost-and-traits.md" >}})、[Dive into Hash Join]({{< ref "posts/2026-08-26-dive-hash-join.md" >}})、[Dynamic Filter 穿越 Outer Join]({{< ref "posts/2026-08-24-dynamic-filter-outer-join.md" >}})
-- **一次行旅**：[伊比利亚游记]({{< ref "posts/2026-10-01-iberian-streets-stones-and-paintings.md" >}})、[银川纪行]({{< ref "posts/2026-09-01-journey-through-yinchuan.md" >}}）（现场照片还在补）
+- **一次行旅**：[伊比利亚游记]({{< ref "posts/2026-10-01-iberian-streets-stones-and-paintings.md" >}})、[银川纪行]({{< ref "posts/2026-09-01-journey-through-yinchuan.md" >}})（现场照片还在补）
 - **更短的入口**：[现代硬件与数据库]({{< ref "posts/2026-08-09-modern-database-hardware.md" >}})、[Database 阅读清单]({{< ref "posts/2025-08-09-database-reading-list.md" >}})
 
 ## 关于本站
@@ -29,4 +29,10 @@ description: "这个博客记录阅读、源码实验和行旅。"
 ## 联系方式
 
 - [GitHub：LiShuMing](https://github.com/LiShuMing)
+- [X：@Ming_Paradise](https://x.com/Ming_Paradise)
 - [邮箱：lism2013@hotmail.com](mailto:lism2013@hotmail.com)
+- [简书（Jianshu）](https://www.jianshu.com/u/689be58a4c70)
+- [博客园（Cnblogs）](https://www.cnblogs.com/sansan)
+- [知乎（Zhihu）](https://www.zhihu.com/people/11-89-66-30-50-71)
+- [微博（Weibo）](https://weibo.com/u/2695101071)
+- [豆瓣（Douban）](https://www.douban.com/people/iDonCorleone/)

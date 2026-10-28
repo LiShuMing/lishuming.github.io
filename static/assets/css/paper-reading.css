@@ -1,0 +1,19 @@
+.post .paper-source-quote pre,
+.post .paper-source-quote code {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  box-shadow: none;
+  font: inherit;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: normal;
+  letter-spacing: 0;
+}
+
+.post .paper-source-quote {
+  max-width: 100%;
+}

@@ -1,0 +1,6 @@
+# Direct dependency versions observed in the 2026-10-28 experiment; not a transitive lockfile.
+numpy==2.5.0
+pandas==3.0.3
+jupyterlab==4.6.1
+ipykernel>=6.29
+cupy-cuda13x==14.2.0

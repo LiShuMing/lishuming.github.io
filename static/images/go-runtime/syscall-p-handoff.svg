@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="680" viewBox="0 0 1080 680" role="img" aria-labelledby="title desc">
+  <title id="title">A blocking syscall with one P</title>
+  <desc id="desc">M A holds P0 and runs a reader G. While the reader blocks in read, sysmon can detach P0 and hand it to M B. M B runs a writer G, waking the reader. The reader must have a P before resuming Go execution.</desc>
+  <defs><marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#52616b" stroke-width="1.5"/></marker></defs>
+  <rect width="1080" height="680" fill="#fff"/>
+  <g font-family="Arial, sans-serif" fill="#17252b">
+    <text x="36" y="46" font-size="26" font-weight="700">A blocked M does not have to keep the only P</text>
+    <text x="36" y="79" font-size="17" fill="#52616b">Go 1.26.2 / GOMAXPROCS=1 / ordinary entersyscall path / schematic timing</text>
+    <text x="36" y="146" font-size="19" font-weight="700">M A / reader G</text>
+    <text x="36" y="280" font-size="19" font-weight="700">P0 owner</text>
+    <text x="36" y="418" font-size="19" font-weight="700">M B / writer G</text>
+    <g fill="none" stroke="#d6dfe3" stroke-width="2"><path d="M215 153 H1035"/><path d="M215 290 H1035"/><path d="M215 427 H1035"/></g>
+    <rect x="220" y="116" width="178" height="64" rx="5" fill="#e6f5f6" stroke="#087f8c"/>
+    <text x="234" y="143" font-size="18">running Go</text><text x="234" y="167" font-size="16">M A holds P0</text>
+    <rect x="398" y="116" width="385" height="64" rx="5" fill="#fff4dc" stroke="#b18420"/>
+    <text x="416" y="143" font-size="18">blocking read syscall</text><text x="416" y="167" font-size="16">reader G is _Gsyscall</text>
+    <rect x="835" y="116" width="200" height="64" rx="5" fill="#e6f5f6" stroke="#087f8c"/>
+    <text x="850" y="143" font-size="18">resume with a P</text><text x="850" y="167" font-size="16">or become runnable</text>
+    <rect x="220" y="257" width="290" height="64" rx="5" fill="#eaf4ed" stroke="#33805a"/>
+    <text x="235" y="294" font-size="19">M A holds P0</text>
+    <rect x="564" y="257" width="219" height="64" rx="5" fill="#eaf4ed" stroke="#33805a"/>
+    <text x="580" y="294" font-size="19">M B holds P0</text>
+    <rect x="564" y="394" width="219" height="64" rx="5" fill="#e6f5f6" stroke="#087f8c"/>
+    <text x="580" y="422" font-size="18">writer G runs</text><text x="580" y="447" font-size="16">write wakes read</text>
+    <g fill="none" stroke="#52616b" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M510 289 H559"/><path d="M675 322 V389"/><path d="M783 425 H810 V185"/><path d="M220 505 H1035"/>
+    </g>
+    <text x="444" y="225" font-size="18" fill="#52616b">sysmon: retake + handoffp</text>
+    <text x="220" y="536" font-size="17" fill="#52616b">time →</text>
+    <text x="36" y="589" font-size="19">Ordinary entersyscall may retain P briefly for a fast return.</text>
+    <text x="36" y="621" font-size="19">entersyscallblock hands P off immediately; netpoll waits park G through another path.</text>
+    <text x="36" y="653" font-size="17" fill="#52616b">A released P may be idle between tasks. This diagram omits those intervals and runtime helper Gs.</text>
+  </g>
+</svg>

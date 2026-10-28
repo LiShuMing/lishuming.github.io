@@ -1,7 +1,7 @@
 ---
 title: "【LLM】 LLM学习：一条面向 RTX 5070 Ti 的实践学习路线"
 date: 2026-08-15T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 categories:
   - AI Infra
 tags:
@@ -117,6 +117,8 @@ source ./scripts/cuda_env.sh
 ### 阶段三：建立 GPU 性能意识
 
 这一阶段回答三个问题：GPU 为什么快，GPU 为什么有时不快，以及显存为什么会耗尽。
+
+补充实践：[《从 NumPy 到 CUDA：用 CuPy 验证设备边界、线程索引与异步计时》]({{< relref "2026-10-28-cupy-cuda-device-boundaries-and-timing.md" >}}) 已完成本机最小验证，并提供中文注释 Notebook。它用 CPU 参照、显式传输、`RawKernel` 长度边界和 CUDA Event 计时衔接 NumPy 基础；这部分不依赖 PyTorch，也不替代本阶段后续的训练显存与 profiler 实验。
 
 首先比较 NumPy CPU、PyTorch CPU 和 PyTorch CUDA 的矩阵乘法。测试必须包含 warmup，并在计时边界调用 `torch.cuda.synchronize()`，否则测到的可能只是异步 kernel launch 时间。还要比较大量小矩阵计算和一次大矩阵计算，理解 launch overhead 与并行度（Degree of Parallelism）。
 

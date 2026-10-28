@@ -1,0 +1,2646 @@
+{
+  "version": 1,
+  "date": "2026-10-22",
+  "draft": true,
+  "papers": [
+    {
+      "number": 1,
+      "title": "The Cascades Framework for Query Optimization",
+      "slug": "paper-the-cascades-framework-for-query-optimization",
+      "bundle": "2026-10-22-paper-the-cascades-framework-for-query-optimization",
+      "source": "optimizer-framework/the-cascades-framework-for-query-optimization.pdf",
+      "topic": "优化器框架",
+      "topic_en": "Query Optimizer",
+      "pdf_sha256": "43c3a97a615da30b530cda5003cdc94419400d92ebe58984cbd163c9b416379d",
+      "report_sha256": "d32e2a755d9cf35300ddb0dbcd1f1cb9aa1a99d235dd2e52a1461dac2c3be79d",
+      "pdf_pages": 10,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/optimizer-framework/the-cascades-framework-for-query-optimization.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 14,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1.  Optimization Tasks"
+          ],
+          "graphics": 28,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 2,
+          "captions": [
+            "Figure 1 shows the tasks that make up the optimizer’s search algorithm. Arrows indicate which type of task"
+          ],
+          "graphics": 0,
+          "role": "evaluation",
+          "file": "source-page-002.png"
+        }
+      ]
+    },
+    {
+      "number": 2,
+      "title": "Shared-Nothing 架构上查询优化的并行化",
+      "slug": "paper-parallelizing-query-optimization-on-shared-nothing-architectures",
+      "bundle": "2026-10-22-paper-parallelizing-query-optimization-on-shared-nothing-architectures",
+      "source": "optimizer-framework/parallelizing-query-optimization-on-shared-nothing-architectures.pdf",
+      "topic": "优化器框架",
+      "topic_en": "Query Optimizer",
+      "pdf_sha256": "9be2ca92b81fd480d0126bbb3433093a990f5f4d5719ec5af2142f9862cab07b",
+      "report_sha256": "fd6984756deeb7081f31ed79ad724bcaa172fbbd1d8b0ac00674a08bef31d1a7",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/optimizer-framework/parallelizing-query-optimization-on-shared-nothing-architectures.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 45,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [
+            "table is admissible. Otherwise, we must remove subsets vio-"
+          ],
+          "graphics": 0,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 11,
+          "captions": [
+            "Figure 1:",
+            "Figure 2 shows results for larger search spaces and only for",
+            "Figure 2: MPQ scales steadily for suﬃciently large"
+          ],
+          "graphics": 384,
+          "role": "evaluation",
+          "file": "source-page-011.png"
+        }
+      ]
+    },
+    {
+      "number": 3,
+      "title": "Volcano Optimizer Generator ：可扩展性与高效搜索的架构权衡",
+      "slug": "paper-the-volcano-optimizer-generator-extensibility-and-efficient-search",
+      "bundle": "2026-10-22-paper-the-volcano-optimizer-generator-extensibility-and-efficient-search",
+      "source": "optimizer-framework/the-volcano-optimizer-generator--extensibility-and-efficient-search.pdf",
+      "topic": "优化器框架",
+      "topic_en": "Query Optimizer",
+      "pdf_sha256": "77a4930474ee3caf2e774c72d1b842190e299fd4f492ea3577f8307972cc3f5f",
+      "report_sha256": "fff7ed66da2d9e4515fc21639cfa4d3cf445e1ddcaf9a8aaf623621a7b5ad33a",
+      "pdf_pages": 10,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/optimizer-framework/the-volcano-optimizer-generator--extensibility-and-efficient-search.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 18,
+      "evidence_count": 33,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Figure 2 shows an outline of the search algorithm use"
+          ],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 2. Outline of the Search Algorithm.",
+            "Figure 3. Associativity Rule."
+          ],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 4,
+      "title": "扩展关系代数查询处理框架以支持外连接：Rosenthal与Reiner (1984) 论文",
+      "slug": "paper-extending-the-algebraic-framework-of-query-processing-to-handle-outerjoins",
+      "bundle": "2026-10-22-paper-extending-the-algebraic-framework-of-query-processing-to-handle-outerjoins",
+      "source": "join-order/extending-the-algebraic-framework-of-query-processing-to-handle-outerjoins.pdf",
+      "topic": "连接重排",
+      "topic_en": "Join Reordering",
+      "pdf_sha256": "a6642ffbff284d3cfc343c234f464a3607ac2409f432d1d0d66665fb11832b20",
+      "report_sha256": "d87883cb3cb94575c48fbba03c84a9d07a306dfaabf90d3bf138a2279b1022b8",
+      "pdf_pages": 10,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/join-order/extending-the-algebraic-framework-of-query-processing-to-handle-outerjoins.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 31,
+      "screenshots": [
+        {
+          "page": 8,
+          "captions": [],
+          "graphics": 36,
+          "role": "mechanism",
+          "file": "source-page-008.png"
+        },
+        {
+          "page": 5,
+          "captions": [],
+          "graphics": 35,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 5,
+      "title": "USING EELs, A PRACTICAL APPROACH TO OUTERJOIN AND ANTIJOIN REORDERING",
+      "slug": "paper-using-eels-a-practical-approach-to-outerjoin-and-antijoin-reordering",
+      "bundle": "2026-10-22-paper-using-eels-a-practical-approach-to-outerjoin-and-antijoin-reordering",
+      "source": "join-order/using-eels,-a-practical-approach-to-outerjoin-and-antijoin-reordering.pdf",
+      "topic": "连接重排",
+      "topic_en": "Join Reordering",
+      "pdf_sha256": "cdfe4452ea506064a53bd691be9ed74f66c13c91acc345a117d12e190e8157a7",
+      "report_sha256": "b1cf78e7f31dde04941de7dacaa5091ced9f4c9670ba9ef7444a0f3650591cf8",
+      "pdf_pages": 18,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/join-order/using-eels%2C-a-practical-approach-to-outerjoin-and-antijoin-reordering.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 38,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 6,
+          "captions": [],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-006.png"
+        }
+      ]
+    },
+    {
+      "number": 6,
+      "title": "Seeking the Truth About Ad Hoc Join Costs",
+      "slug": "paper-seeking-the-truth-about-ad-hoc-join-costs",
+      "bundle": "2026-10-22-paper-seeking-the-truth-about-ad-hoc-join-costs",
+      "source": "cost-model/seeking-the-truth-about-ad-hoc-join-costs.pdf",
+      "topic": "代价模型",
+      "topic_en": "Cost Model",
+      "pdf_sha256": "4cd11473ebe0254006482924510ae3392938dbb28866f32a1dd3ee0b7e0790e6",
+      "report_sha256": "bf3d637fdefd193f57e9f01c1516e619df9dd4fd47fe7ccff2ae935a6e3c5e0f",
+      "pdf_pages": 27,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/cost-model/seeking-the-truth-about-ad-hoc-join-costs.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 47,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 6,
+          "captions": [],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-006.png"
+        }
+      ]
+    },
+    {
+      "number": 7,
+      "title": "Adaptive Query Processing in the Looking Glass",
+      "slug": "paper-adaptive-query-processing-in-the-looking-glass",
+      "bundle": "2026-10-22-paper-adaptive-query-processing-in-the-looking-glass",
+      "source": "statistics/adaptive-query-processing-in-the-looking-glass.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "e09083b3b6818ab4ad3c7d123e924e654ca2bee556ba73a9f838b0f4ddba669c",
+      "report_sha256": "1d34f3773dc432848142b4ac9b1828a74f0476e0b86cf2e7ea9cb2e50e21908c",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/statistics/adaptive-query-processing-in-the-looking-glass.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 39,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Figure 2: The traditional approach to query processing",
+            "Figure 3: AQP in plan-based systems"
+          ],
+          "graphics": 48,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1: Publication timeline"
+          ],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-003.png"
+        }
+      ]
+    },
+    {
+      "number": 8,
+      "title": "DB2 UDB 中自动化统计信息收集（ASC）机制",
+      "slug": "paper-automated-statistics-collection-in-db2-udb",
+      "bundle": "2026-10-22-paper-automated-statistics-collection-in-db2-udb",
+      "source": "statistics/automated-statistics-collection-in-db2-udb.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "7b227392867b0ff3f41348ce8420025c9cdfd7211642b7ac6b1fa6fe20159986",
+      "report_sha256": "e84e773ea892ed3c5171657a0d093a8ce23cf7cc514d87e8c9debf3c2300dbac",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/statistics/automated-statistics-collection-in-db2-udb.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 47,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1 depicts the overall architecture of the ASC",
+            "Figure 1: ASC Architecture"
+          ],
+          "graphics": 161,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 4,
+          "captions": [
+            "Figure 2 illustrates the overall detection process. As",
+            "table is referenced in the query workload, however, then it",
+            "Figure 2: UDI-Driven Autonomic Process",
+            "Figure 3: Computing the Change Value"
+          ],
+          "graphics": 104,
+          "role": "evaluation",
+          "file": "source-page-004.png"
+        }
+      ]
+    },
+    {
+      "number": 9,
+      "title": "海量数据摘要的机制、误差契约与工程边界：Samples、Histograms、Wavelets、Sketches 深入研究",
+      "slug": "paper-synopses-for-massive-data-samples-histograms-wavelets-sketches",
+      "bundle": "2026-10-22-paper-synopses-for-massive-data-samples-histograms-wavelets-sketches",
+      "source": "statistics/synopses-for-massive-data_-samples,-histograms,-wavelets,-sketches.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "8134aa70c707116ed479c7c844fc30cf5daf0eaa7c1192dfa1e691d3be570ac6",
+      "report_sha256": "2d045ad47235509ecc3879b1647b2f7ac31b52c737b16f70b6a9b1f49708ef2e",
+      "pdf_pages": 296,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/statistics/synopses-for-massive-data%3A-samples%2C-histograms%2C-wavelets%2C-sketches.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 16,
+      "evidence_count": 49,
+      "screenshots": [
+        {
+          "page": 251,
+          "captions": [
+            "Fig. 5.11 Illustration of the k minimum values procedure."
+          ],
+          "graphics": 36,
+          "role": "mechanism",
+          "file": "source-page-251.png"
+        },
+        {
+          "page": 76,
+          "captions": [
+            "Fig. 3.2 Equi-depth histogram on continuous data."
+          ],
+          "graphics": 22,
+          "role": "evaluation",
+          "file": "source-page-076.png"
+        }
+      ]
+    },
+    {
+      "number": 10,
+      "title": "直方图在数据库查询优化中的历史演进与内核机制",
+      "slug": "paper-the-history-of-histograms",
+      "bundle": "2026-10-22-paper-the-history-of-histograms",
+      "source": "statistics/the-history-of-histograms.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "15358f3fefdbef8d05970f949c17bc068d8fc4b220edb96abd0575353feb7888",
+      "report_sha256": "9ef515ce3dd36e81faf7cf87a71923fddd8015078922bcfc3642c9217e688c3b",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/statistics/the-history-of-histograms.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 41,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [],
+          "graphics": 0,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        }
+      ]
+    },
+    {
+      "number": 11,
+      "title": "Universality of Serial Histograms",
+      "slug": "paper-universality-of-serial-histograms",
+      "bundle": "2026-10-22-paper-universality-of-serial-histograms",
+      "source": "statistics/universality-of-serial-histograms.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "e6cf1f82f35feb94109d1cc9e806a5b8b68579ac5b0ea43d44caa7f70b698996",
+      "report_sha256": "b757d7508ff9385b5fb493df637ff2dd72ee283bd21724ee123a1697902b6d06",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/statistics/universality-of-serial-histograms.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 35,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Figure 1: Zipf frequency distribution."
+          ],
+          "graphics": 33,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 9,
+          "captions": [
+            "Figure 3 shows the absolute"
+          ],
+          "graphics": 33,
+          "role": "evaluation",
+          "file": "source-page-009.png"
+        }
+      ]
+    },
+    {
+      "number": 12,
+      "title": "Exploiting Functional Dependence in Query Optimization",
+      "slug": "paper-thesis-exploiting-functional-dependence-in-query-optimization",
+      "bundle": "2026-10-22-paper-thesis-exploiting-functional-dependence-in-query-optimization",
+      "source": "functional-dependencies/[thesis]-exploiting-functional-dependence-in-query-optimization.pdf",
+      "topic": "属性与函数依赖",
+      "topic_en": "Physical Properties",
+      "pdf_sha256": "25b531958f39817c1839ef422dc07d75222233cc6e2ea7baf3c21b596366d8af",
+      "report_sha256": "cf4a1eb958a71865683264af08795c349b437e7bb7a2bac8b33a5415a288325f",
+      "pdf_pages": 334,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/functional-dependencies/%5Bthesis%5D-exploiting-functional-dependence-in-query-optimization.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 33,
+      "screenshots": [
+        {
+          "page": 170,
+          "captions": [
+            "Table 3.3: Notation for procedure analysis."
+          ],
+          "graphics": 43,
+          "role": "mechanism",
+          "file": "source-page-170.png"
+        },
+        {
+          "page": 254,
+          "captions": [
+            "Figure 5.2: Erroneous nested-loop strategy for Example 34."
+          ],
+          "graphics": 31,
+          "role": "evaluation",
+          "file": "source-page-254.png"
+        }
+      ]
+    },
+    {
+      "number": 13,
+      "title": "An Efficient Framework for Order Optimization",
+      "slug": "paper-an-efficient-framework-for-order-optimization",
+      "bundle": "2026-10-22-paper-an-efficient-framework-for-order-optimization",
+      "source": "functional-dependencies/an-efficient-framework-for-order-optimization.pdf",
+      "topic": "属性与函数依赖",
+      "topic_en": "Physical Properties",
+      "pdf_sha256": "559da591c0ba95c08f9b5e7784829e5ea66c07481849c3cf4be23a654a5cdd6e",
+      "report_sha256": "16cd21ae79229029a9936e633c1dbeaa090759308a690766ce729eef0e048905",
+      "pdf_pages": 24,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/functional-dependencies/an-efficient-framework-for-order-optimization.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 54,
+      "screenshots": [
+        {
+          "page": 9,
+          "captions": [
+            "Figure 1: Possible FSM for orderings",
+            "Figure 2: Possible DFSM for the NFSM in Figure 1",
+            "Figure 1 an FSM for the interesting order (a, b, c) and its preﬁxes (remember that we"
+          ],
+          "graphics": 85,
+          "role": "mechanism",
+          "file": "source-page-009.png"
+        },
+        {
+          "page": 10,
+          "captions": [
+            "Figure 3: Preparation steps of the algorithm",
+            "Figure 3 gives an overview of the preparation phase. It is divided into four major"
+          ],
+          "graphics": 0,
+          "role": "evaluation",
+          "file": "source-page-010.png"
+        }
+      ]
+    },
+    {
+      "number": 14,
+      "title": "Incorporating Partitioning and Parallel Plans into the SCOPE Optimizer",
+      "slug": "paper-incorporating-partitioning-and-parallel-plans-into-the-scope-optimizer",
+      "bundle": "2026-10-22-paper-incorporating-partitioning-and-parallel-plans-into-the-scope-optimizer",
+      "source": "functional-dependencies/incorporating-partitioning-and-parallel-plans-into-the-scope-optimizer.pdf",
+      "topic": "属性与函数依赖",
+      "topic_en": "Physical Properties",
+      "pdf_sha256": "459a7fdad9783118fe96b57fe582cef328180035d09ec5e67d6b5c18806ec699",
+      "report_sha256": "7822f0b96727beb2b2d0685eeb4add4f174c83fbb3471d63ac4a4a7e1e19add2",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/functional-dependencies/incorporating-partitioning-and-parallel-plans-into-the-scope-optimizer.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 63,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Fig. 2."
+          ],
+          "graphics": 91,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 11,
+          "captions": [
+            "Fig. 3.",
+            "Figure 3(b) shows the optimized plan generated by the"
+          ],
+          "graphics": 235,
+          "role": "evaluation",
+          "file": "source-page-011.png"
+        }
+      ]
+    },
+    {
+      "number": 15,
+      "title": "Of Nests and Trees: 嵌套子查询、聚合与量词的统一处理框架",
+      "slug": "paper-a-unitied-approach-to-processing-queries-that-contain-nested-subqueries-aggregates-and",
+      "bundle": "2026-10-22-paper-a-unitied-approach-to-processing-queries-that-contain-nested-subqueries-aggregates-and",
+      "source": "nested-query/a-unitied-approach-to-processing-queries-that-contain-nested-subqueries,-aggregates,-and-quantifiers.pdf",
+      "topic": "嵌套查询与去相关",
+      "topic_en": "Query Unnesting",
+      "pdf_sha256": "2c775abdbb5ecd914b6f5561188b8364bf3849319f52984fa57aaa3a77c4c6a9",
+      "report_sha256": "3e4a9695aa45e7b0c1e128b77315a5b4eb0b93beee0131efa3caeaf621c8a815",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/nested-query/a-unitied-approach-to-processing-queries-that-contain-nested-subqueries%2C-aggregates%2C-and-quantifiers.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 32,
+      "screenshots": [
+        {
+          "page": 8,
+          "captions": [
+            "Figure 4.3 Legal Join Permutations"
+          ],
+          "graphics": 35,
+          "role": "mechanism",
+          "file": "source-page-008.png"
+        },
+        {
+          "page": 3,
+          "captions": [
+            "Figure 2.1 shows the query graph for Query 2.",
+            "Figure 2.1 Query Graph for Query 2",
+            "Figure 3.1"
+          ],
+          "graphics": 33,
+          "role": "evaluation",
+          "file": "source-page-003.png"
+        }
+      ]
+    },
+    {
+      "number": 16,
+      "title": "分布式关系数据库R*中嵌套查询的优化机制",
+      "slug": "paper-optimization-of-nested-queries-in-a-distributed-relational-database",
+      "bundle": "2026-10-22-paper-optimization-of-nested-queries-in-a-distributed-relational-database",
+      "source": "nested-query/optimization-of-nested-queries-in-a-distributed-relational-database.pdf",
+      "topic": "嵌套查询与去相关",
+      "topic_en": "Query Unnesting",
+      "pdf_sha256": "9f051092a11b18d90b3057a571ba45864c95ce595c23a88ffa4ea6fe6830c92d",
+      "report_sha256": "160df75ae08cf1a322b3320453416682144efeec83132e1ede5f6015811c9a29",
+      "pdf_pages": 13,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/nested-query/optimization-of-nested-queries-in-a-distributed-relational-database.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 29,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [
+            "Figure 1: Algorithm for Optimizhg",
+            "Figure 2 and Figure 3). So both the initiator and applier processes",
+            "Figure 3: Procedure for Evaluate-at-Application"
+          ],
+          "graphics": 33,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 8,
+          "captions": [
+            "Figure 4: Evaluate-at-OPEN",
+            "Figure 5: Procehre"
+          ],
+          "graphics": 33,
+          "role": "evaluation",
+          "file": "source-page-008.png"
+        }
+      ]
+    },
+    {
+      "number": 17,
+      "title": "SQL-like与QUEL-like关联聚合嵌套查询的去相关化正确性研究",
+      "slug": "paper-sql-like-and-quel-like-correlation-queries-with-aggregates-revisited",
+      "bundle": "2026-10-22-paper-sql-like-and-quel-like-correlation-queries-with-aggregates-revisited",
+      "source": "nested-query/sql-like-and-quel-like-correlation-queries-with-aggregates-revisited.pdf",
+      "topic": "嵌套查询与去相关",
+      "topic_en": "Query Unnesting",
+      "pdf_sha256": "f1273132ffcd28bb2c700fa70e2428c998b2e4ff130fa97572b24b997340ff22",
+      "report_sha256": "a165ff03b6df8e40a64ad12190e76893b674f1a0cfbb663e219c44cfaf6d5626",
+      "pdf_pages": 17,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/nested-query/sql-like-and-quel-like-correlation-queries-with-aggregates-revisited.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 23,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 6,
+          "captions": [],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-006.png"
+        }
+      ]
+    },
+    {
+      "number": 18,
+      "title": "The Complete Story of Joins (in HyPer)",
+      "slug": "paper-the-complete-story-of-joins",
+      "bundle": "2026-10-22-paper-the-complete-story-of-joins",
+      "source": "nested-query/the-complete-story-of-joins.pdf",
+      "topic": "嵌套查询与去相关",
+      "topic_en": "Query Unnesting",
+      "pdf_sha256": "e859d93a431c75d59da7f9283744845f06cf87b23e05a43e7dbd2927dfe750c4",
+      "report_sha256": "b374cdef57feee07d486abcc95058c5efdb34f67f66243bfd1232eb05e091e33",
+      "pdf_pages": 20,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/nested-query/the-complete-story-of-joins.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 29,
+      "screenshots": [
+        {
+          "page": 11,
+          "captions": [
+            "Fig. 2: Outer Join Example"
+          ],
+          "graphics": 83,
+          "role": "mechanism",
+          "file": "source-page-011.png"
+        },
+        {
+          "page": 12,
+          "captions": [
+            "Figure 2, each hash table entry has one additional byte, initially 0, that is set to 1 when a"
+          ],
+          "graphics": 51,
+          "role": "evaluation",
+          "file": "source-page-012.png"
+        }
+      ]
+    },
+    {
+      "number": 19,
+      "title": "Unnesting Arbitrary Queries",
+      "slug": "paper-unnesting-arbitrary-queries",
+      "bundle": "2026-10-22-paper-unnesting-arbitrary-queries",
+      "source": "nested-query/unnesting-arbitrary-queries.pdf",
+      "topic": "嵌套查询与去相关",
+      "topic_en": "Query Unnesting",
+      "pdf_sha256": "f73b4d6716c16eaf4731774597323537f2ef4b6e9362355bc6c826b5df891fd8",
+      "report_sha256": "b125b8bdbaebf51a1dcd140536c26b720b325b569941e811bb2e849928955945",
+      "pdf_pages": 20,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/nested-query/unnesting-arbitrary-queries.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 36,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [
+            "Figure 1: Example Application of Dependent Join “Push-Down”"
+          ],
+          "graphics": 19,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 9,
+          "captions": [
+            "Figure 2: Original Query Q1"
+          ],
+          "graphics": 7,
+          "role": "evaluation",
+          "file": "source-page-009.png"
+        }
+      ]
+    },
+    {
+      "number": 20,
+      "title": "编译型查询的自适应执行：从字节码解释到机器码的动态切换",
+      "slug": "paper-adaptive-execution-of-compiled-queries",
+      "bundle": "2026-10-22-paper-adaptive-execution-of-compiled-queries",
+      "source": "execution-engine/adaptive-execution-of-compiled-queries.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "22c52605219990006a75f88477ccf41103a078776bbfe385e2635d81212dd658",
+      "report_sha256": "70ef0d033c6428886aa58ec0eb39d37fb6ee520d29c8f57e043ab6acc9a79449",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/adaptive-execution-of-compiled-queries.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 57,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [
+            "Fig. 1.",
+            "Fig. 1. The SQL text is ﬁrst parsed into an abstract syntax",
+            "Fig. 2.",
+            "Fig. 2 clearly shows that there is a tradeoff between latency"
+          ],
+          "graphics": 64,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        },
+        {
+          "page": 4,
+          "captions": [
+            "Fig. 4.",
+            "Fig. 5.",
+            "Fig. 5 illustrates the integration of this concept into the"
+          ],
+          "graphics": 95,
+          "role": "evaluation",
+          "file": "source-page-004.png"
+        }
+      ]
+    },
+    {
+      "number": 21,
+      "title": "编译与向量化查询执行范式的深度对比",
+      "slug": "paper-everything-you-always-wanted-to-know-about-compiled-and-cectorized-queries-but-were-af",
+      "bundle": "2026-10-22-paper-everything-you-always-wanted-to-know-about-compiled-and-cectorized-queries-but-were-af",
+      "source": "execution-engine/everything-you-always-wanted-to-know-about-compiled-and-cectorized-queries-but-were-afraid-to-ask.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "8653fde533a0120eb564a467879ed69a60e9d87a71173f79fa8d10568c310101",
+      "report_sha256": "0d72a068abe97603a0e4bb8f8ad64e1c6aca69b39ddcacf31b16afbd0480b71b",
+      "pdf_pages": 14,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/everything-you-always-wanted-to-know-about-compiled-and-cectorized-queries-but-were-afraid-to-ask.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 43,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Figure 3: Performance – TPC-H SF=1, 1 thread",
+            "Table 1: CPU Counters – TPC-H SF=1, 1 thread, normalized by",
+            "Figure 3 compares the single-threaded performance of the two",
+            "Table 1 shows some important CPU statistics, from which a num-"
+          ],
+          "graphics": 119,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 4: Memory Stalls – TPC-H, 1 thread",
+            "Figure 5: Tectorwise Vector Sizes – Times are normalized by 1K"
+          ],
+          "graphics": 481,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 22,
+      "title": "Looking Ahead Makes Query Plans Robust",
+      "slug": "paper-looking-ahead-makes-query-plans-robust",
+      "bundle": "2026-10-22-paper-looking-ahead-makes-query-plans-robust",
+      "source": "execution-engine/looking-ahead -makes-query-plans-robust.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "b432a9a4500d78eb29d9cad547009a02321d33b43f9855eb0f68deda970a60c1",
+      "report_sha256": "f1d2af1bc7a9d71c5837ec7f09d98c3f28d64fe9af148701245d786dc2e3c68c",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/looking-ahead%20-makes-query-plans-robust.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 45,
+      "screenshots": [
+        {
+          "page": 1,
+          "captions": [
+            "Figure 1:"
+          ],
+          "graphics": 73,
+          "role": "mechanism",
+          "file": "source-page-001.png"
+        },
+        {
+          "page": 2,
+          "captions": [
+            "Figure 2: Query 4.3 from Star Schema Benchmark and two left-deep query plans for it.",
+            "Figure 1 illustrates how the use of LIP increases robust-"
+          ],
+          "graphics": 42,
+          "role": "evaluation",
+          "file": "source-page-002.png"
+        }
+      ]
+    },
+    {
+      "number": 23,
+      "title": "主存哈希连接在现代处理器架构上的硬件感知与硬件无关之争",
+      "slug": "paper-main-memory-hash-joins-on-modern-processor-architectures",
+      "bundle": "2026-10-22-paper-main-memory-hash-joins-on-modern-processor-architectures",
+      "source": "execution-engine/main-memory-hash-joins-on-modern-processor-architectures.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "efb7bd21ca19b10a81fbc532390476e14f705752097394515db27a556d1e0290",
+      "report_sha256": "7cf556f79a0b4659c2cd9c9f0c10b8f1c89bfd0ce95a188478feafdb424b782b",
+      "pdf_pages": 14,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/main-memory-hash-joins-on-modern-processor-architectures.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 49,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [
+            "Fig. 1. Canonical hash join.",
+            "Fig. 2. No partitioning join."
+          ],
+          "graphics": 83,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Fig. 5. Original hash table implementation in [3].",
+            "Fig. 6. Our hash table implementation.",
+            "Fig. 7.",
+            "table is an array of head pointers, each of which points"
+          ],
+          "graphics": 81,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 24,
+      "title": "MonetDB/X100: Hyper-Pipelining Query Execution",
+      "slug": "paper-monetdn-x100-hyper-pipelining-query-execution",
+      "bundle": "2026-10-22-paper-monetdn-x100-hyper-pipelining-query-execution",
+      "source": "execution-engine/monetdn-x100-hyper-pipelining-query-execution.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "a7f90e86394d25f92e0b8a89e4d9ae1c4f78651f0b5a1dce75f0a0a6d6234554",
+      "report_sha256": "0c6987da9ffeaedb2768b765104a427ac789cb685838951069237cf516991587",
+      "pdf_pages": 14,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/monetdn-x100-hyper-pipelining-query-execution.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 15,
+      "evidence_count": 46,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Figure 2: Itanium Hardware Predication Eliminates",
+            "Figure 2 shows a micro-benchmark of the selection"
+          ],
+          "graphics": 131,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 9,
+          "captions": [
+            "Figure 7 lists the currently supported X100 algebra op-",
+            "Figure 6: Execution scheme of a simpliﬁed TPC-H"
+          ],
+          "graphics": 74,
+          "role": "evaluation",
+          "file": "source-page-009.png"
+        }
+      ]
+    },
+    {
+      "number": 25,
+      "title": "Morsel-Driven Parallelism: A NUMA-Aware Query Evaluation Framework for the Many-Core Age",
+      "slug": "paper-morsel-driven-parallelism-a-numa-aware-query-evaluation-framework-for-the-many-core-ag",
+      "bundle": "2026-10-22-paper-morsel-driven-parallelism-a-numa-aware-query-evaluation-framework-for-the-many-core-ag",
+      "source": "execution-engine/morsel-driven-parallelism-a-numa-aware-query-evaluation-framework-for-the-many-core-age.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "e3867df0883833b8fd5f1a02f9c95e7ada22fb33a2f053c4754d4c909f820a59",
+      "report_sha256": "77453861aa7c32b3e2f8daa553555fd8cca3b3b7192ffb756f7b11bcf5fc75cd",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/morsel-driven-parallelism-a-numa-aware-query-evaluation-framework-for-the-many-core-age.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 73,
+      "screenshots": [
+        {
+          "page": 1,
+          "captions": [
+            "Figure 1: Idea of morsel-driven parallelism: R 1A S 1B T"
+          ],
+          "graphics": 59,
+          "role": "mechanism",
+          "file": "source-page-001.png"
+        },
+        {
+          "page": 4,
+          "captions": [
+            "Figure 4: Morsel-wise processing of the probe phase",
+            "Figure 5:"
+          ],
+          "graphics": 193,
+          "role": "evaluation",
+          "file": "source-page-004.png"
+        }
+      ]
+    },
+    {
+      "number": 26,
+      "title": "Query Evaluation Techniques for Large Databases：物理代数、外存匹配与并行执行的原文精读",
+      "slug": "paper-query-evaluation-techniquesfor-large-databases",
+      "bundle": "2026-10-22-paper-query-evaluation-techniquesfor-large-databases",
+      "source": "execution-engine/query-evaluation-techniquesfor-large-databases.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "288d7523776017fdf5e7b9bf0bfafd1d9a0ea600c3ed6daf6c1a265ccde59069",
+      "report_sha256": "0dca1195b8f9a6f0a2bb4a1b567f606a180341a63ef04067016afba9c7e9c744",
+      "pdf_pages": 98,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/query-evaluation-techniquesfor-large-databases.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 20,
+      "evidence_count": 50,
+      "screenshots": [
+        {
+          "page": 13,
+          "captions": [
+            "Table 2."
+          ],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-013.png"
+        },
+        {
+          "page": 18,
+          "captions": [
+            "Figure 7."
+          ],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-018.png"
+        }
+      ]
+    },
+    {
+      "number": 27,
+      "title": "Relaxed Operator Fusion for In-Memory Databases: Making Compilation, Vectorization, and Prefetching Work Together At Last",
+      "slug": "paper-relaxed-operator-fusion-for-in-memory-databases-making-compilation-vectorization-and-p",
+      "bundle": "2026-10-22-paper-relaxed-operator-fusion-for-in-memory-databases-making-compilation-vectorization-and-p",
+      "source": "execution-engine/relaxed-operator-fusion-for-in-memory-databases-making-compilation-vectorization-and-prefetching-work-together-at-last.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "4ded6b8ac68654fa5e2048ae8b10c040080f75ba6de557972ddcccc20573f261",
+      "report_sha256": "4650b2ef5390541bd38a968dd2e64d662ac85523fd77aa9efea6b35ae5fc03e5",
+      "pdf_pages": 13,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/relaxed-operator-fusion-for-in-memory-databases-making-compilation-vectorization-and-prefetching-work-together-at-last.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 71,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [
+            "Figure 1: TPC-H Q19 – An abbreviated version of TPC-H’s Q19. The three",
+            "Figure 2: Query Compilation Example – The plan for TPC-H Q19 (Fig. 2a)"
+          ],
+          "graphics": 185,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        },
+        {
+          "page": 3,
+          "captions": [
+            "Figure 3: Vectorization Example – An execution plan for TPC-H Q19 from",
+            "Fig. 1 that uses the vectorized processing model.",
+            "Fig. 3 shows pseudo-code for TPC-H Q19 using the vectorized"
+          ],
+          "graphics": 183,
+          "role": "evaluation",
+          "file": "source-page-003.png"
+        }
+      ]
+    },
+    {
+      "number": 28,
+      "title": "Volcano: 一个可扩展且并行的查询执行系统",
+      "slug": "paper-volcano-an-extensible-and-parallel-query-evaluation-system",
+      "bundle": "2026-10-22-paper-volcano-an-extensible-and-parallel-query-evaluation-system",
+      "source": "execution-engine/volcano---an-extensible-and-parallel-query-evaluation-system.pdf",
+      "topic": "查询执行引擎",
+      "topic_en": "Query Execution",
+      "pdf_sha256": "46dd869fc795434f7f85e329faa3d3dc9b6736d088d090b3a0d33e86e89cc180",
+      "report_sha256": "2fc149d31d1faa96492ac2c5cf2aa4a1450b63d5cdf6ef9b2bf3483cf384a6ab",
+      "pdf_pages": 16,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/execution-engine/volcano---an-extensible-and-parallel-query-evaluation-system.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 18,
+      "evidence_count": 55,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [
+            "Fig. 3 shows the basic principle"
+          ],
+          "graphics": 124,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 11,
+          "captions": [
+            "Fig. 6 shows the processes created for vertical"
+          ],
+          "graphics": 123,
+          "role": "evaluation",
+          "file": "source-page-011.png"
+        }
+      ]
+    },
+    {
+      "number": 29,
+      "title": "《Architecture of a Database System》：面向内核工程师的架构剖析",
+      "slug": "paper-architecture-of-a-database-system-foundations-and-trends-in-databases",
+      "bundle": "2026-10-22-paper-architecture-of-a-database-system-foundations-and-trends-in-databases",
+      "source": "architecture/architecture-of-a-database-system.-foundations-and-trends-in-databases.pdf",
+      "topic": "数据库架构",
+      "topic_en": "Database Architecture",
+      "pdf_sha256": "f922de7ac782e8c5e075b03adf8f4bffc29bd5edb52bd19ac407c5110a7c1fc2",
+      "report_sha256": "2e80726ab19959fa0c5c188d3a5af66ac060a37f8b0771dfb8c67b2ae1094de4",
+      "pdf_pages": 119,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/architecture/architecture-of-a-database-system.-foundations-and-trends-in-databases.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 26,
+      "evidence_count": 109,
+      "screenshots": [
+        {
+          "page": 52,
+          "captions": [
+            "Fig. 4.3 Two query plans for updating a table via an IndexScan. The plan on the left is"
+          ],
+          "graphics": 18,
+          "role": "mechanism",
+          "file": "source-page-052.png"
+        },
+        {
+          "page": 13,
+          "captions": [
+            "Fig. 2.1 Process per DBMS worker model: each DBMS worker is implemented as an OS"
+          ],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-013.png"
+        }
+      ]
+    },
+    {
+      "number": 30,
+      "title": "A Generalised Solution to Distributed Consensus ：面向数据库内核工程师的共识协议抽象与Quorum弱化分析",
+      "slug": "paper-a-generalised-solution-to-distributed-consensus",
+      "bundle": "2026-10-22-paper-a-generalised-solution-to-distributed-consensus",
+      "source": "consensus/a-generalised-solution-to-distributed-consensus.pdf",
+      "topic": "共识协议",
+      "topic_en": "Consensus",
+      "pdf_sha256": "39fdf18efd1d7d0ed019ca6409865c3ed5f14e064294a65d181874cbe598b774",
+      "report_sha256": "7bf0d976d4deb9e963c2c15433cc0ba44a7caa6f36b819d2085eef09384d4046",
+      "pdf_pages": 20,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consensus/a-generalised-solution-to-distributed-consensus.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 47,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [
+            "Figure 8: The Paxos algorithm using write-once registers.",
+            "Figure 9: Sample message exchange for Paxos",
+            "Figure 10: Sample client state tables (left) and decision tables (right) for client C0 during the"
+          ],
+          "graphics": 40,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1: Sample conﬁgurations for systems of three or four servers.",
+            "Figure 2: Sample state tables for a system using the conﬁguration in Figure 1a.",
+            "Figure 3 describes a generalised solution to consensus by giving four rules governing how clients in-",
+            "Figure 3: The four rules for correctness."
+          ],
+          "graphics": 2,
+          "role": "evaluation",
+          "file": "source-page-003.png"
+        }
+      ]
+    },
+    {
+      "number": 31,
+      "title": "Consensus: Bridging Theory and Practice：Raft机制、证明边界与工程复核",
+      "slug": "paper-consensus-bridging-theory-and-practice",
+      "bundle": "2026-10-22-paper-consensus-bridging-theory-and-practice",
+      "source": "consensus/consensus_-bridging-theory-and-practice.pdf",
+      "topic": "共识协议",
+      "topic_en": "Consensus",
+      "pdf_sha256": "c9b8a8141b3f3adb1e7299c3edb0f6c344b8519d25c440ae7187b3e0f6d9d0b6",
+      "report_sha256": "f3725aea2d8ddec51828dab3c8ae6f523e9d76f4db3c78fafab460b189b100f4",
+      "pdf_pages": 258,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consensus/consensus%3A-bridging-theory-and-practice.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 96,
+      "screenshots": [
+        {
+          "page": 70,
+          "captions": [
+            "Figure 5.2: A server replaces the committed entries in its log (indexes 1 through 5) with a"
+          ],
+          "graphics": 52,
+          "role": "mechanism",
+          "file": "source-page-070.png"
+        },
+        {
+          "page": 59,
+          "captions": [
+            "Figure 4.7: An example of how a server can be disruptive even before the Cnew log entry has"
+          ],
+          "graphics": 43,
+          "role": "evaluation",
+          "file": "source-page-059.png"
+        }
+      ]
+    },
+    {
+      "number": 32,
+      "title": "Distributed Consensus Revised ：Paxos 算法族的泛化与弱化",
+      "slug": "paper-distributed-consensus-revised",
+      "bundle": "2026-10-22-paper-distributed-consensus-revised",
+      "source": "consensus/distributed-consensus-revised.pdf",
+      "topic": "共识协议",
+      "topic_en": "Consensus",
+      "pdf_sha256": "151696064201aabd120f72e9805c4e553846fc8f6963a6fd2486b3d004c88471",
+      "report_sha256": "3d15e15ab60c5bea0d9c5f3569db51e3e467b289b0ebe96cd98d57201ff553c8",
+      "pdf_pages": 151,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consensus/distributed-consensus-revised.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 34,
+      "evidence_count": 182,
+      "screenshots": [
+        {
+          "page": 47,
+          "captions": [
+            "Table 2.4: Comparison between SAA & Classic Paxos"
+          ],
+          "graphics": 43,
+          "role": "mechanism",
+          "file": "source-page-047.png"
+        },
+        {
+          "page": 33,
+          "captions": [
+            "Figure 2.2: Example run of Classic Paxos with two serial proposers. Proposer p1 executes"
+          ],
+          "graphics": 104,
+          "role": "evaluation",
+          "file": "source-page-033.png"
+        }
+      ]
+    },
+    {
+      "number": 33,
+      "title": "Raft 扩展版精读：复制日志、安全边界与实际评估",
+      "slug": "paper-in-search-of-an-understandable-consensus-algorithm-extended-version",
+      "bundle": "2026-10-22-paper-in-search-of-an-understandable-consensus-algorithm-extended-version",
+      "source": "consensus/in-search-of-an-understandable-consensus-algorithm-(extended-version).pdf",
+      "topic": "共识协议",
+      "topic_en": "Consensus",
+      "pdf_sha256": "5a5c679b6a7c88007faeff8c3eef19a77e9e5caa8bd7390922584fe8ecf0ce1f",
+      "report_sha256": "f3af277e6b832ed86a8977242c832989e1894555dca4c8c86f95b73c2c70cae6",
+      "pdf_pages": 18,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consensus/in-search-of-an-understandable-consensus-algorithm-%28extended-version%29.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 58,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [
+            "Figure 3: Raft guarantees that each of these properties is true",
+            "Figure 4: Server states. Followers only respond to requests",
+            "Figure 5: Time is divided into terms, and each term begins"
+          ],
+          "graphics": 63,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 6,
+          "captions": [
+            "Figure 6: Logs are composed of entries, which are numbered"
+          ],
+          "graphics": 108,
+          "role": "evaluation",
+          "file": "source-page-006.png"
+        }
+      ]
+    },
+    {
+      "number": 34,
+      "title": "Anna: A KVS For Any Scale：格合并、无协调 Actor 与一致性边界的原文精读",
+      "slug": "paper-anna-a-kvs-for-any-scale",
+      "bundle": "2026-10-22-paper-anna-a-kvs-for-any-scale",
+      "source": "consistency/anna_-a-kvs-for-any-scale.pdf",
+      "topic": "分布式一致性",
+      "topic_en": "Consistency",
+      "pdf_sha256": "1e58855bcf74aa845028390e1ab0b3e19d413a3c0100f47bb7d16be0228926ba",
+      "report_sha256": "d3ec7545dbf9d340c20b4a87c0554c5ec7b813ac1f7ffdb4f6a83a55587f3ae4",
+      "pdf_pages": 18,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consistency/anna%3A-a-kvs-for-any-scale.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 20,
+      "evidence_count": 60,
+      "screenshots": [
+        {
+          "page": 6,
+          "captions": [
+            "TABLE I: Taxonomy of existing KVS systems. The scale column indicates whether a system is designed to run on a Single",
+            "Figure I, Azure DocumentDB [29] supports multiple single-"
+          ],
+          "graphics": 148,
+          "role": "mechanism",
+          "file": "source-page-006.png"
+        },
+        {
+          "page": 13,
+          "captions": [
+            "Fig. 6: Anna’s single-node throughput across thread counts.",
+            "Fig. 7: Performance breakdown for different KVSs under",
+            "Figure 6a and 7a show the result of the high-contention"
+          ],
+          "graphics": 661,
+          "role": "evaluation",
+          "file": "source-page-013.png"
+        }
+      ]
+    },
+    {
+      "number": 35,
+      "title": "Ark：把选举、日志与写确认连接起来的共识协议精读",
+      "slug": "paper-ark-a-real-world-consensus-implementation",
+      "bundle": "2026-10-22-paper-ark-a-real-world-consensus-implementation",
+      "source": "consistency/ark_-a-real-world-consensus-implementation.pdf",
+      "topic": "分布式一致性",
+      "topic_en": "Consistency",
+      "pdf_sha256": "1e5a88d44d4b936d3c8d8bf50d549f1e7f08d59ebc3eb4d7ece4fd54abb35b06",
+      "report_sha256": "09463bd6f9421f637761681d2ebe2a69764d4381a9adb50a594db6d3452f79b3",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consistency/ark%3A-a-real-world-consensus-implementation.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 16,
+      "evidence_count": 34,
+      "screenshots": [
+        {
+          "page": 1,
+          "captions": [],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-001.png"
+        }
+      ]
+    },
+    {
+      "number": 36,
+      "title": "PACELC原文精读：分区时的A/C与正常复制路径上的L/C",
+      "slug": "paper-consistency-tradeoffs-in-modern-distributed-database-system-design",
+      "bundle": "2026-10-22-paper-consistency-tradeoffs-in-modern-distributed-database-system-design",
+      "source": "consistency/consistency-tradeoffs-in-modern-distributed-database-system-design.pdf",
+      "topic": "分布式一致性",
+      "topic_en": "Consistency",
+      "pdf_sha256": "ecc847f31d99f2bc63297b6b4f7f7f97dedd75f048242e831acebc4e2d2b017c",
+      "report_sha256": "9f1f4cafc10a86affc7c531bd0d61678b6fc4c10a669c1a47c835db41df49b40",
+      "pdf_pages": 6,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consistency/consistency-tradeoffs-in-modern-distributed-database-system-design.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 23,
+      "evidence_count": 27,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [],
+          "graphics": 43,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 6,
+          "captions": [],
+          "graphics": 41,
+          "role": "evaluation",
+          "file": "source-page-006.png"
+        }
+      ]
+    },
+    {
+      "number": 37,
+      "title": "HLC精读：因果时间戳、一致切面与数据库保证的边界",
+      "slug": "paper-logical-physical-clocks-and-consistent-snapshots-in-globally-distributed-databases",
+      "bundle": "2026-10-22-paper-logical-physical-clocks-and-consistent-snapshots-in-globally-distributed-databases",
+      "source": "consistency/logical-physical-clocks-and-consistent-snapshots-in-globally-distributed-databases.pdf",
+      "topic": "分布式一致性",
+      "topic_en": "Consistency",
+      "pdf_sha256": "d64d003ab28f8ccd12861d385587a1002ce6d48fe9294e90b8e32e67dc222ee8",
+      "report_sha256": "c4f657c363f067a91ac83e8f054c0857745df9568db4848fed2c87d90269562b",
+      "pdf_pages": 13,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/consistency/logical-physical-clocks-and-consistent-snapshots-in-globally-distributed-databases.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 18,
+      "evidence_count": 33,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [
+            "Figure 5: HLC algorithm for node j",
+            "Figure 6: The trace in Figure 4 re-timestamped with HLC"
+          ],
+          "graphics": 10,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 9,
+          "captions": [
+            "Figure 7. As shown in these ﬁgures, the distribution of c",
+            "Figure 7: Distribution of c values for varying ϵ",
+            "Figure 8: Distribution of c values with a straggler",
+            "Figure 9: Distribution of c values with a straggler out of"
+          ],
+          "graphics": 3,
+          "role": "evaluation",
+          "file": "source-page-009.png"
+        }
+      ]
+    },
+    {
+      "number": 38,
+      "title": "Oracle 10g ADDM：统一时间记账、分层诊断与建议的证据边界",
+      "slug": "paper-automatic-performance-diagnosis-and-tuning-in-oracle",
+      "bundle": "2026-10-22-paper-automatic-performance-diagnosis-and-tuning-in-oracle",
+      "source": "diagnosis-and-tuning/automatic-performance-diagnosis-and-tuning-in-oracle.pdf",
+      "topic": "诊断与自动调优",
+      "topic_en": "Database Tuning",
+      "pdf_sha256": "b81ff9425deabf6de50c89058d9e07595e1b79e661066279ddb353c3410a206a",
+      "report_sha256": "3239be68b03d85a20791ec5f935e0aafa04957f4fc01e2ba1795cc3be82b9609",
+      "pdf_pages": 11,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/diagnosis-and-tuning/automatic-performance-diagnosis-and-tuning-in-oracle.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 45,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Figure 2 illustrates database time as it is summed over",
+            "Figure 2: Database time defined as the sum of the time spent in processing all user requests",
+            "Figure 1: Database time from a single user’s perspective."
+          ],
+          "graphics": 154,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 6,
+          "captions": [
+            "Figure 4: Active Session History Samples"
+          ],
+          "graphics": 182,
+          "role": "evaluation",
+          "file": "source-page-006.png"
+        }
+      ]
+    },
+    {
+      "number": 39,
+      "title": "Oracle 10g 自动 SQL 调优精读：SQL Profile、条件性建议与实测边界",
+      "slug": "paper-automatic-sql-tuning-in-oracle-10g",
+      "bundle": "2026-10-22-paper-automatic-sql-tuning-in-oracle-10g",
+      "source": "diagnosis-and-tuning/automatic-sql-tuning-in-oracle-10g.pdf",
+      "topic": "诊断与自动调优",
+      "topic_en": "Database Tuning",
+      "pdf_sha256": "39874e02cbe85302b8d728e3567bf91c788f29456322a2bf70904ed0c8bc0d1a",
+      "report_sha256": "22b32b862ba24d2307cc93767eff72e78c3eee038b877ef40e35832b8a8cfee1",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/diagnosis-and-tuning/automatic-sql-tuning-in-oracle-10g.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 22,
+      "evidence_count": 35,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [],
+          "graphics": 150,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 8,
+          "captions": [],
+          "graphics": 234,
+          "role": "evaluation",
+          "file": "source-page-008.png"
+        }
+      ]
+    },
+    {
+      "number": 40,
+      "title": "C. J. Date的SQL批评原文精读：1983方言、正交性与NULL改写边界",
+      "slug": "paper-a-critique-of-the-sql-database-language",
+      "bundle": "2026-10-22-paper-a-critique-of-the-sql-database-language",
+      "source": "essentials/a-critique-of-the-sql-database-language.pdf",
+      "topic": "关系模型与查询语言",
+      "topic_en": "Relational Model",
+      "pdf_sha256": "b58801afbd47356caac70e3e3a983ab5cd74e3cb17be6ca654d71a9a760b38e5",
+      "report_sha256": "c3e92d2135680e4ef4b7e8a0dd37380a58fcd0bc3937463e27ebc8d4de291c9c",
+      "pdf_pages": 47,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/essentials/a-critique-of-the-sql-database-language.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 27,
+      "evidence_count": 37,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 9,
+          "captions": [],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-009.png"
+        }
+      ]
+    },
+    {
+      "number": 41,
+      "title": "Codd 1970关系模型原文精读：数据独立性、集合操作与一致性定义的边界",
+      "slug": "paper-a-relational-model-of-data-for-large-shared-data-banks",
+      "bundle": "2026-10-22-paper-a-relational-model-of-data-for-large-shared-data-banks",
+      "source": "essentials/a-relational-model-of-data-for-large-shared-data-banks.pdf",
+      "topic": "关系模型与查询语言",
+      "topic_en": "Relational Model",
+      "pdf_sha256": "89021870ffacd8cf251ed88abdbd5351ff9d15fe90c9bd51d0820eb4c5232311",
+      "report_sha256": "ed2504c30dcea1a32e71fb0a9edc73d83dc9f5fa893121a33acc92c4da1deafe",
+      "pdf_pages": 11,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/essentials/a-relational-model-of-data-for-large-shared-data-banks.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 21,
+      "evidence_count": 21,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "FIG. 1. A relation of degree 4",
+            "FiG. 2. A relation with two identical domains"
+          ],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 7,
+          "captions": [
+            "FIG. 4.",
+            "FIG. 5. Two joinable relations",
+            "FIG. 6.",
+            "FIG. 7. Another join of R with S (from Figure 5)"
+          ],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-007.png"
+        }
+      ]
+    },
+    {
+      "number": 42,
+      "title": "RM/T原文精读：实体身份、语义约束与关系集合代数",
+      "slug": "paper-extending-the-database-relational-model-to-capture-more-meaning",
+      "bundle": "2026-10-22-paper-extending-the-database-relational-model-to-capture-more-meaning",
+      "source": "essentials/extending-the-database-relational-model-to-capture-more-meaning.pdf",
+      "topic": "关系模型与查询语言",
+      "topic_en": "Relational Model",
+      "pdf_sha256": "a430773909f5162e575e92a486b1cb8eab23f807c9d6ae5f7cf41c4f382f7579",
+      "report_sha256": "ee2ddc5c1942f4b93c22739d2c846151e389f746ac91de68dc9a1649240ed086",
+      "pdf_pages": 38,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/essentials/extending-the-database-relational-model-to-capture-more-meaning.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 35,
+      "evidence_count": 70,
+      "screenshots": [
+        {
+          "page": 19,
+          "captions": [
+            "Fig. 3. Characteristic relations"
+          ],
+          "graphics": 23,
+          "role": "mechanism",
+          "file": "source-page-019.png"
+        },
+        {
+          "page": 3,
+          "captions": [],
+          "graphics": 23,
+          "role": "evaluation",
+          "file": "source-page-003.png"
+        }
+      ]
+    },
+    {
+      "number": 43,
+      "title": "INGRES 1975原文精读：QUEL层次、查询分解与改写语义",
+      "slug": "paper-ingres-a-relational-data-base-system",
+      "bundle": "2026-10-22-paper-ingres-a-relational-data-base-system",
+      "source": "essentials/ingres_-a-relational-data-base-system.pdf",
+      "topic": "关系模型与查询语言",
+      "topic_en": "Relational Model",
+      "pdf_sha256": "ce3f853e902ffb1c7bce5ba6e083a5d60313127b7c8852e13dcfb0c650a45a77",
+      "report_sha256": "28018cd5622716790b339296beb63f089f0972a80df97f88c338c2b3b5d8670c",
+      "pdf_pages": 8,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/essentials/ingres%3A-a-relational-data-base-system.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 22,
+      "evidence_count": 22,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [],
+          "graphics": 1,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        },
+        {
+          "page": 1,
+          "captions": [],
+          "graphics": 3,
+          "role": "evaluation",
+          "file": "source-page-001.png"
+        }
+      ]
+    },
+    {
+      "number": 44,
+      "title": "SEQUEL原文精读：块结构映射、重复语义与量化边界",
+      "slug": "paper-sequel-a-structured-english-query-language",
+      "bundle": "2026-10-22-paper-sequel-a-structured-english-query-language",
+      "source": "essentials/sequel_-a-structured-english-query-language.pdf",
+      "topic": "关系模型与查询语言",
+      "topic_en": "Relational Model",
+      "pdf_sha256": "46fc2ddc000d2bb924293adec04a53f6df0d2f8df584ac7957b85ba1387d90ce",
+      "report_sha256": "7d24e3384fcb84ab2d037f21622dcaeef0a6789878bf2b4314cc1e1d17adef39",
+      "pdf_pages": 16,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/essentials/sequel%3A-a-structured-english-query-language.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 20,
+      "evidence_count": 20,
+      "screenshots": [
+        {
+          "page": 1,
+          "captions": [],
+          "graphics": 3,
+          "role": "mechanism",
+          "file": "source-page-001.png"
+        },
+        {
+          "page": 2,
+          "captions": [
+            "Figure i. Relation describing enployees."
+          ],
+          "graphics": 1,
+          "role": "evaluation",
+          "file": "source-page-002.png"
+        }
+      ]
+    },
+    {
+      "number": 45,
+      "title": "开放列式格式精读：压缩、转码与执行路径的可比性",
+      "slug": "paper-a-deep-dive-into-common-open-formats-for-analytical-dbmss",
+      "bundle": "2026-10-22-paper-a-deep-dive-into-common-open-formats-for-analytical-dbmss",
+      "source": "formats/a-deep-dive-into-common-open-formats-for-analytical-dbmss.pdf",
+      "topic": "分析型数据格式",
+      "topic_en": "Columnar Formats",
+      "pdf_sha256": "b3e3c63b4d3883665dd17aefd6802c199bb66621816f90bf0bf802a4d25f39e9",
+      "report_sha256": "4184be5fff955351254aa9ef737a647d16f0ddab09122de138123dd8d739458c",
+      "pdf_pages": 13,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/formats/a-deep-dive-into-common-open-formats-for-analytical-dbmss.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 18,
+      "evidence_count": 49,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Table 1: A comparison of the features found in common open columnar data formats.",
+            "Figure 2: A Parquet row batch.",
+            "Figure 3: An ORC row batch.",
+            "Table 2: Column format name convention mapping.",
+            "Table 2 has the mapping between our naming and each format."
+          ],
+          "graphics": 66,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Table 4: Evaluation overview and key results.",
+            "Figure 4: Column compression ratio CDFs over the CodecDB, BI and JOB datasets.",
+            "Figure 5: Distinct value CDFs.",
+            "Table 5: Total size (in GB) by format for columns in the",
+            "Table 6: Average and stddev compression ratios by data type."
+          ],
+          "graphics": 564,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 46,
+      "title": "The End of Slow Networks: It's Time for a Redesign",
+      "slug": "paper-the-end-of-slow-networks-it-s-time-for-a-redesign",
+      "bundle": "2026-10-22-paper-the-end-of-slow-networks-it-s-time-for-a-redesign",
+      "source": "network/the-end-of-slow-networks_-it's-time-for-a-redesign.pdf",
+      "topic": "网络与系统协同",
+      "topic_en": "RDMA",
+      "pdf_sha256": "465c4f64ada3c88cbc280a98633732ebb98609c2a7988df8e7611f39ae330be1",
+      "report_sha256": "f8978d28deacad314fc029813e931d352938239a76800fe4a536f4e4b4311ce8",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/network/the-end-of-slow-networks%3A-it%27s-time-for-a-redesign.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 20,
+      "evidence_count": 58,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Figure 2: Network Throughput and Latency",
+            "Figure 3: CPU Overhead for Network Operations",
+            "Figure 3 shows that RDMA has a constant overhead on",
+            "Figure 4(a) shows the classical shared-nothing (SN) ar-"
+          ],
+          "graphics": 749,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 1,
+          "captions": [
+            "Figure 1(b) shows the theoretical (left)",
+            "Figure 1: Memory vs Network Bandwidth: (a) spec-"
+          ],
+          "graphics": 134,
+          "role": "evaluation",
+          "file": "source-page-001.png"
+        }
+      ]
+    },
+    {
+      "number": 47,
+      "title": "Count-Min Sketch原文精读：非负碰撞噪声、加性界与分层应用",
+      "slug": "paper-an-improved-data-stream-summary-the-count-min-sketch-and-its-applications-journal-of-a",
+      "bundle": "2026-10-22-paper-an-improved-data-stream-summary-the-count-min-sketch-and-its-applications-journal-of-a",
+      "source": "probabilistic-counting/an-improved-data-stream-summary_-the-count-min-sketch-and-its-applications,-journal-of-algorithms.pdf",
+      "topic": "概率计数与抽样",
+      "topic_en": "Sketches",
+      "pdf_sha256": "abc881cc07ecb2e5d5babc88b4e8f77bfc8cb29e3a245b9a4ed363bf5058d808",
+      "report_sha256": "a9262e043a6147b9272c3949b0fe309cbf94b712178c01b89824b98424220a90",
+      "pdf_pages": 18,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/probabilistic-counting/an-improved-data-stream-summary%3A-the-count-min-sketch-and-its-applications%2C-journal-of-algorithms.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 30,
+      "evidence_count": 54,
+      "screenshots": [
+        {
+          "page": 15,
+          "captions": [
+            "Table 1"
+          ],
+          "graphics": 4,
+          "role": "mechanism",
+          "file": "source-page-015.png"
+        },
+        {
+          "page": 7,
+          "captions": [],
+          "graphics": 3,
+          "role": "evaluation",
+          "file": "source-page-007.png"
+        }
+      ]
+    },
+    {
+      "number": 48,
+      "title": "Naru：联合分布学习与逐步重要性采样的基数估计精读",
+      "slug": "paper-deep-unsupervised-cardinality-estimation",
+      "bundle": "2026-10-22-paper-deep-unsupervised-cardinality-estimation",
+      "source": "probabilistic-counting/deep-unsupervised-cardinality-estimation.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "3cd3cfbe66f79daf36037faf2ca66ef5b6088fc4b75d5ffcc5f574a1b0c62f7d",
+      "report_sha256": "91298c5631cf95fd0aecd299d58a19650f8c49de43072faf73972f8b4483185a",
+      "pdf_pages": 14,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/probabilistic-counting/deep-unsupervised-cardinality-estimation.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 30,
+      "evidence_count": 47,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [
+            "Figure 3: The intuition of progressive sampling. Uniform sam-"
+          ],
+          "graphics": 43,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 8,
+          "captions": [
+            "Figure 4: Distribution of query selectivity (§6.1.3)."
+          ],
+          "graphics": 65,
+          "role": "evaluation",
+          "file": "source-page-008.png"
+        }
+      ]
+    },
+    {
+      "number": 49,
+      "title": "Distinct Sampling：值级一致抽样、值内蓄水池与条件NDV报告精读",
+      "slug": "paper-distinct-sampling-for-highly-accurate-answers-to-distinct-values-queries-and-event-rep",
+      "bundle": "2026-10-22-paper-distinct-sampling-for-highly-accurate-answers-to-distinct-values-queries-and-event-rep",
+      "source": "probabilistic-counting/distinct-sampling-for-highly-accurate-answers-to-distinct-values-queries-and-event-reports.pdf",
+      "topic": "概率计数与抽样",
+      "topic_en": "Sketches",
+      "pdf_sha256": "cdc50c91ce80651d8e673571bf749012e5db6cd7af0b9142cc55f0ba3812d5e9",
+      "report_sha256": "8b91e955cabf1b04e7959af7d5127dc83374cb453ebf6d1f93abd311d79ea1d6",
+      "pdf_pages": 10,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/probabilistic-counting/distinct-sampling-for-highly-accurate-answers-to-distinct-values-queries-and-event-reports.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 24,
+      "evidence_count": 24,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [
+            "Figure 5: Accuracy vs. data skew",
+            "Table 1: Data set characteristics",
+            "Figure 6: Accuracy vs. predicate selectivity"
+          ],
+          "graphics": 175,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 8,
+          "captions": [
+            "Figure 7: Accuracy vs. sample size for the text of Wuther-",
+            "Figure 8: Cover Type query",
+            "Figure 9: Accuracy vs. sample size for the Cover Type",
+            "Figure 10: Census query",
+            "Figure 9 presents the results of this experiment. At the"
+          ],
+          "graphics": 202,
+          "role": "evaluation",
+          "file": "source-page-008.png"
+        }
+      ]
+    },
+    {
+      "number": 50,
+      "title": "LEO：DB2 2001 原型的执行反馈、统计关联与计划改进边界",
+      "slug": "paper-leo-db2s-learning-optimizer",
+      "bundle": "2026-10-22-paper-leo-db2s-learning-optimizer",
+      "source": "probabilistic-counting/leo-–-db2’s-learning-optimizer.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "45c7c8f3ba3325285475226dfea6cfd30f8655baf558d9c18189d7c59e3363ac",
+      "report_sha256": "18dcf3e707978d4bbe5e1ecea6899f93c97c018550dfd8977ccf6a82d026112b",
+      "pdf_pages": 10,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/probabilistic-counting/leo-%E2%80%93-db2%E2%80%99s-learning-optimizer.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 52,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1 shows how LEO is integrated into the",
+            "Figure 1: LEO Architecture",
+            "Figure 2 shows the skeleton of a QEP for this statement,"
+          ],
+          "graphics": 89,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 7,
+          "captions": [
+            "Figure 4: Actual Data Distribution",
+            "Figure 5 shows the column statistics collected for X.Price",
+            "Figure 5: Column Statistics",
+            "Figure 6: Adjustments"
+          ],
+          "graphics": 58,
+          "role": "evaluation",
+          "file": "source-page-007.png"
+        }
+      ]
+    },
+    {
+      "number": 51,
+      "title": "NeuroCard：全外联接采样、列分解与表子集扇出校正精读",
+      "slug": "paper-neurocard-one-cardinality-estimator-for-all-tables",
+      "bundle": "2026-10-22-paper-neurocard-one-cardinality-estimator-for-all-tables",
+      "source": "probabilistic-counting/neurocard_-one-cardinality-estimator-for-all-tables.pdf",
+      "topic": "统计与基数估计",
+      "topic_en": "Cardinality Estimation",
+      "pdf_sha256": "9411e03b3e4bbb1ec5da82d994e2ad1e432c681bfea1792da3d452b2064a697c",
+      "report_sha256": "7075f662ce43407c967de6382963879b9c805a5a6bc2827a58f1ee2e070851db",
+      "pdf_pages": 13,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/probabilistic-counting/neurocard%3A-one-cardinality-estimator-for-all-tables.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 32,
+      "evidence_count": 52,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [
+            "Figure 2: Overview of NeuroCard. The Join Sampler (§4) provides"
+          ],
+          "graphics": 124,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        },
+        {
+          "page": 10,
+          "captions": [
+            "Table 3: JOB-light-ranges, estimation errors. Lowest errors bolded.",
+            "Table 4: JOB-M, estimation errors. Lowest errors are bolded.",
+            "Figure 7: Statistical and physical efficiency of NeuroCard."
+          ],
+          "graphics": 77,
+          "role": "evaluation",
+          "file": "source-page-010.png"
+        }
+      ]
+    },
+    {
+      "number": 52,
+      "title": "FM/PCSA原文精读：首零位图、随机平均与distinct估计边界",
+      "slug": "paper-probabilistic-counting-algorithms-for-data-base-applications",
+      "bundle": "2026-10-22-paper-probabilistic-counting-algorithms-for-data-base-applications",
+      "source": "probabilistic-counting/probabilistic-counting-algorithms-for-data-base-applications.pdf",
+      "topic": "概率计数与抽样",
+      "topic_en": "Sketches",
+      "pdf_sha256": "51480946da12ac941552dffaadc3bb8d55f2a99f290d25541f8debb52be6fd5e",
+      "report_sha256": "13cf5806d55cd902a29cdd3b0625f151a83f868bd0c41c18c82703316fbef3d9",
+      "pdf_pages": 28,
+      "source_url": "https://algo.inria.fr/flajolet/Publications/FlMa85.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 34,
+      "evidence_count": 37,
+      "screenshots": [
+        {
+          "page": 16,
+          "captions": [
+            "FIG. 1.",
+            "TABLE I1"
+          ],
+          "graphics": 2,
+          "role": "mechanism",
+          "file": "source-page-016.png"
+        },
+        {
+          "page": 23,
+          "captions": [
+            "TABLE I11",
+            "TABLE IV"
+          ],
+          "graphics": 2,
+          "role": "evaluation",
+          "file": "source-page-023.png"
+        }
+      ]
+    },
+    {
+      "number": 53,
+      "title": "Looking Back at Postgres：可扩展内核、失败路线与开源演化的历史精读",
+      "slug": "paper-looking-back-at-postgres",
+      "bundle": "2026-10-22-paper-looking-back-at-postgres",
+      "source": "rdbms/looking-back-at-postgres.pdf",
+      "topic": "数据库系统实践",
+      "topic_en": "Database Systems",
+      "pdf_sha256": "b0f27dae130d2f2c405e4f6977193046fcf1df633cd896a7de08d7a5addf9186",
+      "report_sha256": "f50b8bca6a25667bed52ca7e2c2bd88a84de76af37499eae43f49d771f213b6d",
+      "pdf_pages": 9,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/rdbms/looking-back-at-postgres.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 30,
+      "evidence_count": 38,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [
+            "Figure 1: Postgres features ﬁrst mentioned in the 1986 pa-"
+          ],
+          "graphics": 0,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        }
+      ]
+    },
+    {
+      "number": 54,
+      "title": "Megastore：实体组事务、Paxos快速路径与Coordinator可见性屏障精读",
+      "slug": "paper-megastore-providing-scalable-highly-available-storage-for-interactive-services",
+      "bundle": "2026-10-22-paper-megastore-providing-scalable-highly-available-storage-for-interactive-services",
+      "source": "rdbms/megastore_-providing-scalable,-highly-available-storage-for-interactive-services.pdf",
+      "topic": "数据库系统实践",
+      "topic_en": "Database Systems",
+      "pdf_sha256": "d0c8cb663e5ff5fe83a2d67d28f84163e586477ebd9dd39e549cc7f4e5bd6d98",
+      "report_sha256": "d3e3566f6cd3c66b2b49be101a8add23d9514835d4e90632472df593e628e193",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/rdbms/megastore%3A-providing-scalable%2C-highly-available-storage-for-interactive-services.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 36,
+      "evidence_count": 48,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1: Scalable Replication",
+            "Figure 2: Operations Across Entity Groups"
+          ],
+          "graphics": 189,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 7,
+          "captions": [
+            "Figure 5 shows the key components of Megastore for an",
+            "Figure 5: Megastore Architecture Example"
+          ],
+          "graphics": 67,
+          "role": "evaluation",
+          "file": "source-page-007.png"
+        }
+      ]
+    },
+    {
+      "number": 55,
+      "title": "五分钟法则三十年后：缓存经济阈值与存储层级的演示稿精读",
+      "slug": "paper-the-five-minute-rule-thirty-years-later-and-its-impact-on-the-storage-hierarchy",
+      "bundle": "2026-10-22-paper-the-five-minute-rule-thirty-years-later-and-its-impact-on-the-storage-hierarchy",
+      "source": "storage-media/the-five-minute-rule-thirty-years-later-and-its-impact-on-the-storage-hierarchy.pdf",
+      "topic": "存储介质与缓存",
+      "topic_en": "Storage Hierarchy",
+      "pdf_sha256": "4e9628377032704e5d52221d0125eb806337d847cc73170c6671eaf5515850a6",
+      "report_sha256": "dde8d612cb9a715a8d3b795dead4a922084fd20ed579ede07b2c9056c05f20b6",
+      "pdf_pages": 29,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-media/the-five-minute-rule-thirty-years-later-and-its-impact-on-the-storage-hierarchy.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 27,
+      "evidence_count": 28,
+      "screenshots": [
+        {
+          "page": 12,
+          "captions": [],
+          "graphics": 35,
+          "role": "mechanism",
+          "file": "source-page-012.png"
+        },
+        {
+          "page": 11,
+          "captions": [],
+          "graphics": 34,
+          "role": "evaluation",
+          "file": "source-page-011.png"
+        }
+      ]
+    },
+    {
+      "number": 56,
+      "title": "Fractal Trees与LSM：缓冲写、合并策略及放大口径的白皮书精读",
+      "slug": "paper-a-comparison-of-fractal-trees-to-log-structured-merge-lsm-trees",
+      "bundle": "2026-10-22-paper-a-comparison-of-fractal-trees-to-log-structured-merge-lsm-trees",
+      "source": "storage-structure/a-comparison-of-fractal-trees-to-log-structured-merge-(lsm)-trees.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "669c6a10184fbd01b2f6b392fddb0a386c282b7f74736d62f179a2534ff30d88",
+      "report_sha256": "1078cffb571c79d24a48d3697eaea0d4d93130e9ff4e165d77ce7dd20cebfee0",
+      "pdf_pages": 15,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/a-comparison-of-fractal-trees-to-log-structured-merge-%28lsm%29-trees.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 32,
+      "evidence_count": 40,
+      "screenshots": [
+        {
+          "page": 7,
+          "captions": [
+            "Figure 3: The FT index of Figure 2 after we have inserted 23, 41, and 43. Those newly"
+          ],
+          "graphics": 37,
+          "role": "mechanism",
+          "file": "source-page-007.png"
+        },
+        {
+          "page": 6,
+          "captions": [
+            "Figure 2: An FT index containing the ﬁrst twenty numbers (except that 23, 31, 41, and 43",
+            "Figure 1, except it has extra buffers, which happen to be empty.",
+            "Figure 3 shows how an FT index uses the buffers. When a data record is inserted into"
+          ],
+          "graphics": 36,
+          "role": "evaluation",
+          "file": "source-page-006.png"
+        }
+      ]
+    },
+    {
+      "number": 57,
+      "title": "CaaS-LSM：压实服务化、混合调度与故障回退的源文研究",
+      "slug": "paper-caas-lsm-compaction-as-a-service-for-lsm-based-key-value-stores-in-storage-disaggregat",
+      "bundle": "2026-10-22-paper-caas-lsm-compaction-as-a-service-for-lsm-based-key-value-stores-in-storage-disaggregat",
+      "source": "storage-structure/caas-lsm_-compaction-as-a-service-for-lsm-based-key-value-stores-in-storage-disaggregated-infrastructure.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "e414e21026b80399f1a8818a6d3e5e0adb2066f13e1478d5e0e0fa79deca0d34",
+      "report_sha256": "8a7554aa23e76c50f225d3ecb185f68dbc0030e188009c3fb4b432bffc64654d",
+      "pdf_pages": 28,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/caas-lsm%3A-compaction-as-a-service-for-lsm-based-key-value-stores-in-storage-disaggregated-infrastructure.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 74,
+      "screenshots": [
+        {
+          "page": 10,
+          "captions": [
+            "Fig. 6. The overall architecture of CaaS-LSM."
+          ],
+          "graphics": 92,
+          "role": "mechanism",
+          "file": "source-page-010.png"
+        },
+        {
+          "page": 11,
+          "captions": [
+            "Fig. 7. Architecture of execution plane, and its relationship with the LSM-KVS instances and control plane"
+          ],
+          "graphics": 65,
+          "role": "evaluation",
+          "file": "source-page-011.png"
+        }
+      ]
+    },
+    {
+      "number": 58,
+      "title": "RUM猜想：读、更新与空间放大的模型、边界及设计路线精读",
+      "slug": "paper-designing-access-methods-the-rum-conjecture",
+      "bundle": "2026-10-22-paper-designing-access-methods-the-rum-conjecture",
+      "source": "storage-structure/designing-access-methods_-the-rum-conjecture.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "29315acebbcbb511f2f094e97752ef0426c39be6abcbe5688748b29bcbc95e13",
+      "report_sha256": "84a68a72678a8c6608f9cb673408c6808387cf17809be427f74f77419b51fa6f",
+      "pdf_pages": 6,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/designing-access-methods%3A-the-rum-conjecture.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 25,
+      "evidence_count": 26,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Table 1: The base data typically exist either as a sorted column or as an unsorted column. When using an additional index we (i)",
+            "Figure 2: RUM overheads in memory hierarchies."
+          ],
+          "graphics": 100,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 3: Tunable behavior in the RUM space."
+          ],
+          "graphics": 15,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 59,
+      "title": "Bourbon：不可变 SST 的学习索引、训练摊销与实测边界",
+      "slug": "paper-from-wisckey-to-bourbon-a-learned-index-for-log-structured-merge-trees",
+      "bundle": "2026-10-22-paper-from-wisckey-to-bourbon-a-learned-index-for-log-structured-merge-trees",
+      "source": "storage-structure/from-wisckey-to-bourbon_-a-learned-index-for-log-structured-merge-trees.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "7da94695e5ee55f0103c52c1b02c31dab4ecf12ca00452e2fc36356d0f4b1064",
+      "report_sha256": "090e251dcd4cef5a74223cf98650490c04f6df0377ec567dc57570f6e9c57616",
+      "pdf_pages": 18,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/from-wisckey-to-bourbon%3A-a-learned-index-for-log-structured-merge-trees.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 10,
+      "evidence_count": 51,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1: LevelDB and WiscKey."
+          ],
+          "graphics": 101,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 2: Lookup Latency Breakdown. The ﬁgure shows",
+            "Figure 2 shows the breakdown of lookup la-"
+          ],
+          "graphics": 121,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 60,
+      "title": "LeanStore: In-Memory Data Management Beyond Main Memory",
+      "slug": "paper-leanstore-in-memory-data-management-beyond-main-memory",
+      "bundle": "2026-10-22-paper-leanstore-in-memory-data-management-beyond-main-memory",
+      "source": "storage-structure/leanstore_-in-memory-data-management-beyond-main-memory.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "c070f7f12514d6e8da54b10639f0fe70829f7a19d97b93c064eb66fea9cb2f33",
+      "report_sha256": "4af4507b3858dbe919c49f588491be7b4044581123e6f39c9df6c16fbb4585be",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/leanstore%3A-in-memory-data-management-beyond-main-memory.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 20,
+      "evidence_count": 68,
+      "screenshots": [
+        {
+          "page": 3,
+          "captions": [
+            "Fig. 2."
+          ],
+          "graphics": 65,
+          "role": "mechanism",
+          "file": "source-page-003.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Fig. 4."
+          ],
+          "graphics": 71,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 61,
+      "title": "LSM存储综述精读：归并策略、调优基线与多索引正确性",
+      "slug": "paper-lsm-based-storage-techniques-a-survey",
+      "bundle": "2026-10-22-paper-lsm-based-storage-techniques-a-survey",
+      "source": "storage-structure/lsm-based-storage-techniques_-a-survey.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "4698c9c3eedde896379f53576733cbce9ad9a88f9af21972f608f957af90c574",
+      "report_sha256": "0418c7a098569010e093cc3dae4f014495a23a3aa1c812087be16affb083181d",
+      "pdf_pages": 25,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/lsm-based-storage-techniques%3A-a-survey.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 35,
+      "evidence_count": 63,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [
+            "Fig. 5: Partitioned tiering with vertical grouping",
+            "Fig. 6: Partitioned tiering with horizontal grouping",
+            "Figure 6 shows an example of the horizontal grouping"
+          ],
+          "graphics": 101,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 13,
+          "captions": [
+            "Fig. 12: Example FD-tree structure"
+          ],
+          "graphics": 50,
+          "role": "evaluation",
+          "file": "source-page-013.png"
+        }
+      ]
+    },
+    {
+      "number": 62,
+      "title": "SuRF论文精读：有序近似过滤、FST布局与边界核验",
+      "slug": "paper-surf-practical-range-query-filtering-with-fast-succinct-tries",
+      "bundle": "2026-10-22-paper-surf-practical-range-query-filtering-with-fast-succinct-tries",
+      "source": "storage-structure/surf-practical-range-query-filtering-with-fast-succinct-tries.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "4f8dab3065b89ffc7ac3dbb72e78e820dc58626f420dcfedd3060af33104e550",
+      "report_sha256": "7994e7fa030417d81ad121107d5bca5ddc858cde65405c91a4b9a3c8e9ceec37",
+      "pdf_pages": 14,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/surf-practical-range-query-filtering-with-fast-succinct-tries.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 34,
+      "evidence_count": 66,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [
+            "Figure 1: An example ordinal tree encoded using LOUDS",
+            "Figure 2: LOUDS-DS Encoded Trie – The $ symbol represents the char-"
+          ],
+          "graphics": 110,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 4: An example of deriving SuRF variations from a full trie."
+          ],
+          "graphics": 75,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 63,
+      "title": "原始LSM-tree论文精读：Rolling Merge、两重摊销与成本最优的边界",
+      "slug": "paper-the-log-structured-merge-tree-lsm-tree",
+      "bundle": "2026-10-22-paper-the-log-structured-merge-tree-lsm-tree",
+      "source": "storage-structure/the-log-structured-merge-tree-(lsm-tree).pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "2fba8f74a15cee6b7965daa8e11d39f9a77d03b36e9dd4814120e771be81a173",
+      "report_sha256": "4ec2446f0ff0efe9ae42b0ed803b96b585454b895bc59a64b146452a6fd0d2b0",
+      "pdf_pages": 32,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/the-log-structured-merge-tree-%28lsm-tree%29.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 40,
+      "evidence_count": 84,
+      "screenshots": [
+        {
+          "page": 5,
+          "captions": [
+            "Figure 2.2. Conceptual picture of rolling merge steps, with result written back to disk"
+          ],
+          "graphics": 152,
+          "role": "mechanism",
+          "file": "source-page-005.png"
+        },
+        {
+          "page": 11,
+          "captions": [
+            "Figure 3.1.  Graph of cost of access per MByte vs. Temperature"
+          ],
+          "graphics": 13,
+          "role": "evaluation",
+          "file": "source-page-011.png"
+        }
+      ]
+    },
+    {
+      "number": 64,
+      "title": "Umbra: A Disk-Based System with In-Memory Performance",
+      "slug": "paper-umbra-a-disk-based-system-with-in-memory-performance",
+      "bundle": "2026-10-22-paper-umbra-a-disk-based-system-with-in-memory-performance",
+      "source": "storage-structure/umbra_-a-disk-based-system-with-in-memory-performance.pdf",
+      "topic": "存储结构与索引",
+      "topic_en": "Storage Engine",
+      "pdf_sha256": "de89479593e78f484930b40ab6287e07509e0977355c9e549c0e1f1067904e31",
+      "report_sha256": "2f1be577de91f3eeb9a288b3dda0db5770d6762fd04e7ff0b5a2ab4f362e2d67",
+      "pdf_pages": 7,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/storage-structure/umbra%3A-a-disk-based-system-with-in-memory-performance.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 20,
+      "evidence_count": 58,
+      "screenshots": [
+        {
+          "page": 2,
+          "captions": [
+            "Figure 1: Illustration of the buffer manager, assuming a buffer pool size of 512 KiB and a minimum page size of 64 KiB. The buffer"
+          ],
+          "graphics": 133,
+          "role": "mechanism",
+          "file": "source-page-002.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 4: Structure of the 16-byte string headers in Umbra.",
+            "Figure 5: Pipelines and the corresponding steps for a simple"
+          ],
+          "graphics": 130,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 65,
+      "title": "Generalized Isolation Level Definitions：版本历史、谓词依赖与PL隔离级别精读",
+      "slug": "paper-generalized-isolation-level-definitions",
+      "bundle": "2026-10-22-paper-generalized-isolation-level-definitions",
+      "source": "transaction/generalized-isolation-level-definitions.pdf",
+      "topic": "事务与并发控制",
+      "topic_en": "Concurrency Control",
+      "pdf_sha256": "5ac2c466bea65e87d41be38d18c3b49ea52f18e410badf2bc12c9bfce5a926fd",
+      "report_sha256": "9915c0034639f0e15ddba35bc99b728f1d0d76e9df8e7b2b78f93e9baf1edcc5",
+      "pdf_pages": 12,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/transaction/generalized-isolation-level-definitions.pdf",
+      "engine": "codex-current-session",
+      "reading_count": 24,
+      "evidence_count": 24,
+      "screenshots": [
+        {
+          "page": 8,
+          "captions": [
+            "Figure 2. Deﬁnitions of direct conﬂicts between transactions.",
+            "Figure 3 shows the DSG for this history. As we can see,",
+            "Figure 3. DSG for history H"
+          ],
+          "graphics": 44,
+          "role": "mechanism",
+          "file": "source-page-008.png"
+        },
+        {
+          "page": 3,
+          "captions": [
+            "Figure 1. Consistency Levels and Locking ANSI-92 Isolation Levels",
+            "Figure 1 summarizes the isolation levels as deﬁned in [8]"
+          ],
+          "graphics": 38,
+          "role": "evaluation",
+          "file": "source-page-003.png"
+        }
+      ]
+    },
+    {
+      "number": 66,
+      "title": "Percolator：主锁提交、快照读取与可折叠通知的原文精读",
+      "slug": "paper-large-scale-incremental-processing-using-distributed-transactions-and-notifications",
+      "bundle": "2026-10-22-paper-large-scale-incremental-processing-using-distributed-transactions-and-notifications",
+      "source": "transaction/large-scale-incremental-processing-using-distributed-transactions-and-notifications.pdf",
+      "topic": "事务与并发控制",
+      "topic_en": "Concurrency Control",
+      "pdf_sha256": "7a9e42fc3e58da94339eec8cba0468871815808fca5eef9158d46313331cea06",
+      "report_sha256": "f0c1d74c6ac493389637b99f15c66d11d2ea6ce159ffe678ed7aaf0a5e589b87",
+      "pdf_pages": 14,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/transaction/large-scale-incremental-processing-using-distributed-transactions-and-notifications.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 36,
+      "evidence_count": 42,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Figure 4: This ﬁgure shows the Bigtable writes performed by",
+            "Figure 5: The columns in the Bigtable representation of a Per-"
+          ],
+          "graphics": 101,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 6: Pseudocode for Percolator transaction protocol."
+          ],
+          "graphics": 45,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    },
+    {
+      "number": 67,
+      "title": "Staring into the Abyss：千核模拟中的并发控制瓶颈与证据边界",
+      "slug": "paper-staring-into-the-abyss-an-evaluation-of-concurrency-control-with-one-thousand-cores",
+      "bundle": "2026-10-22-paper-staring-into-the-abyss-an-evaluation-of-concurrency-control-with-one-thousand-cores",
+      "source": "transaction/staring-into-the-abyss_-an-evaluation-of-concurrency-control-with-one-thousand-cores.pdf",
+      "topic": "事务与并发控制",
+      "topic_en": "Concurrency Control",
+      "pdf_sha256": "e12a79de069e73aaac0260a401fb1539e43ef9c8efe2545aea58221039e928fe",
+      "report_sha256": "f5349a26a433e5a33f40364a8607f981bd2c8119d6ef5a5ac71968edf0cff4d8",
+      "pdf_pages": 13,
+      "source_url": "https://github.com/lonng/db-papers/blob/4ff1331069c7cf52ac97dd769e5f484c1c35c200/papers/transaction/staring-into-the-abyss%3A-an-evaluation-of-concurrency-control-with-one-thousand-cores.pdf",
+      "engine": "qwen3.8-max",
+      "reading_count": 34,
+      "evidence_count": 58,
+      "screenshots": [
+        {
+          "page": 4,
+          "captions": [
+            "Figure 1: Graphite Simulator Infrastructure – Application threads are",
+            "Figure 2: Target Architecture – Tiled chip multi-processor with 64 tiles"
+          ],
+          "graphics": 106,
+          "role": "mechanism",
+          "file": "source-page-004.png"
+        },
+        {
+          "page": 5,
+          "captions": [
+            "Figure 3: Simulator vs. Real Hardware – Comparison of the concurrency"
+          ],
+          "graphics": 204,
+          "role": "evaluation",
+          "file": "source-page-005.png"
+        }
+      ]
+    }
+  ],
+  "generated_files": {
+    "content/posts/2026-10-22-paper-the-cascades-framework-for-query-optimization/source-page-003.png": "0941fb0464f6c100a5dd172c54286e41ce481be63d60b68fa126906fff67d9ed",
+    "content/posts/2026-10-22-paper-the-cascades-framework-for-query-optimization/source-page-002.png": "4a2a1340f3612722050da2636ac65175197dc9a609e84e0016560c634e78151a",
+    "content/posts/2026-10-22-paper-parallelizing-query-optimization-on-shared-nothing-architectures/source-page-007.png": "03b1a829fee0a5387523fa0f1e1ff4f6c5821da90103ec817423b40c33b1e43a",
+    "content/posts/2026-10-22-paper-parallelizing-query-optimization-on-shared-nothing-architectures/source-page-011.png": "8ae841a18ced83c7453090bce867de40e66f3eccc40dd7c4eb75cafb6465bdcb",
+    "content/posts/2026-10-22-paper-the-volcano-optimizer-generator-extensibility-and-efficient-search/source-page-004.png": "9cdba0167cb539138266b8a527f0ffd958705dc4a011a2c23d143484e8bddffe",
+    "content/posts/2026-10-22-paper-the-volcano-optimizer-generator-extensibility-and-efficient-search/source-page-005.png": "c807639b480a1fa406cfe8cc0de2d0b54f87ad9210dd7f39f043fa2bb72964d4",
+    "content/posts/2026-10-22-paper-extending-the-algebraic-framework-of-query-processing-to-handle-outerjoins/source-page-008.png": "e1a48dbf5f5e322ffa236e40fb8ce8037c3ca27640ef6527d0d287a3f3abe27f",
+    "content/posts/2026-10-22-paper-extending-the-algebraic-framework-of-query-processing-to-handle-outerjoins/source-page-005.png": "defd2d135d7f686f3d2a54024a2bb6c7352b228fbf3e17f78fc7bf82340b2a72",
+    "content/posts/2026-10-22-paper-using-eels-a-practical-approach-to-outerjoin-and-antijoin-reordering/source-page-004.png": "91f97afbaa95fccfc147c63d1366e5a26079efed7e3426e3742ed977289cee17",
+    "content/posts/2026-10-22-paper-using-eels-a-practical-approach-to-outerjoin-and-antijoin-reordering/source-page-006.png": "6216261f0ca7b61986845951bceabcf172f8beb10ea3fc93ebb54b958f0446cc",
+    "content/posts/2026-10-22-paper-seeking-the-truth-about-ad-hoc-join-costs/source-page-005.png": "0322e85bca1e95ecdf14c89230e8fc529933290f0486e612d54102e0995308c7",
+    "content/posts/2026-10-22-paper-seeking-the-truth-about-ad-hoc-join-costs/source-page-006.png": "c790ffe0e909606899ffdbd7143a62f32903342c3fadff2935db5e3a2e743c63",
+    "content/posts/2026-10-22-paper-adaptive-query-processing-in-the-looking-glass/source-page-004.png": "6e7fb9ce0b59a23b67ee12db1bb56614aab299b3cbf806299387eda3b61cd9bf",
+    "content/posts/2026-10-22-paper-adaptive-query-processing-in-the-looking-glass/source-page-003.png": "074e6ea886e6dfd8d354aee6feecd36485a3c1d1dc52f5667bea755d867990f6",
+    "content/posts/2026-10-22-paper-automated-statistics-collection-in-db2-udb/source-page-003.png": "5953d3a0b708756bb28d54712491b6c12e7f5d55d65dccb2b95c683c2a5c1a80",
+    "content/posts/2026-10-22-paper-automated-statistics-collection-in-db2-udb/source-page-004.png": "91e91a39bfb404ca76b2b83317fc9f8e0dce2d99f172ed2d9e75c7613b54c071",
+    "content/posts/2026-10-22-paper-synopses-for-massive-data-samples-histograms-wavelets-sketches/source-page-251.png": "a431377a7c8d8e4e4393a15e8317d7f9793d196aa53845367314fb3b1f5c3ae5",
+    "content/posts/2026-10-22-paper-synopses-for-massive-data-samples-histograms-wavelets-sketches/source-page-076.png": "0a92793a1675e9b27222dffe73c29a934643d32a7a90ca037658a1652ba4b34d",
+    "content/posts/2026-10-22-paper-the-history-of-histograms/source-page-002.png": "18586d98fe7a54d73129042ef38c7c11061b95c6bd5f8936f1b43e9bd27d7e66",
+    "content/posts/2026-10-22-paper-universality-of-serial-histograms/source-page-004.png": "c7f0db6a88ff258f3db681551d20c24b0a8e10ba63839f959a2861fc2ce40cec",
+    "content/posts/2026-10-22-paper-universality-of-serial-histograms/source-page-009.png": "e2c2a11483f2616b50c87f0fb99a2f862e3bdffa86b013f8554aa44f82167bb7",
+    "content/posts/2026-10-22-paper-thesis-exploiting-functional-dependence-in-query-optimization/source-page-170.png": "be695d972b0ea356797defebd666baa2336b8631e065f5eb668117c1894b6a68",
+    "content/posts/2026-10-22-paper-thesis-exploiting-functional-dependence-in-query-optimization/source-page-254.png": "d6086243eb7069cba3eccc596c050eb09705000df5968980ffd93c0c7fd494c5",
+    "content/posts/2026-10-22-paper-an-efficient-framework-for-order-optimization/source-page-009.png": "cf71ddd20707d487115815d6b633e689fe766bf7077a8ea26488467cefa34a6f",
+    "content/posts/2026-10-22-paper-an-efficient-framework-for-order-optimization/source-page-010.png": "c4555521b30c1bbd835f2a49a278f812b612ee641173cc4c61555fe4f03839f5",
+    "content/posts/2026-10-22-paper-incorporating-partitioning-and-parallel-plans-into-the-scope-optimizer/source-page-003.png": "287cb97fcb7fea71c192bb7ef5dc9857f9b94a5d9e143c22e9fe60abe472d4cd",
+    "content/posts/2026-10-22-paper-incorporating-partitioning-and-parallel-plans-into-the-scope-optimizer/source-page-011.png": "1374aa52f7ec4fed07ecbdcc3f349194664ae3ac87184d3dbad92cbd516df0fd",
+    "content/posts/2026-10-22-paper-a-unitied-approach-to-processing-queries-that-contain-nested-subqueries-aggregates-and/source-page-008.png": "f88c8f0132de566030df17c6de4a1f26fdd7d7d55775db3b542230a9527edb50",
+    "content/posts/2026-10-22-paper-a-unitied-approach-to-processing-queries-that-contain-nested-subqueries-aggregates-and/source-page-003.png": "8fcf8a29933a0eae91e7fabb1a9e2b4e1594bc05cd3b4a264d63517268c29cca",
+    "content/posts/2026-10-22-paper-optimization-of-nested-queries-in-a-distributed-relational-database/source-page-007.png": "9d6006556176b4f8be976a32e0b759040f0928b7c94f24bdf03635464474fa05",
+    "content/posts/2026-10-22-paper-optimization-of-nested-queries-in-a-distributed-relational-database/source-page-008.png": "ec6aa6ef812208841be8d9f3c52b2228b75d517f83798b32f567e6a10ddbce01",
+    "content/posts/2026-10-22-paper-sql-like-and-quel-like-correlation-queries-with-aggregates-revisited/source-page-005.png": "6fd26e22e6d22ba714540bc868198027e46b8db68ee254647a6e8b32ffb33048",
+    "content/posts/2026-10-22-paper-sql-like-and-quel-like-correlation-queries-with-aggregates-revisited/source-page-006.png": "ed15c539633b65a43ea77b7a0c13da26b0a5994af9812c5dc411c11285330843",
+    "content/posts/2026-10-22-paper-the-complete-story-of-joins/source-page-011.png": "16a8508d611508957aca77df42b2e38c64510ebefa037f0fe3eff0f247feb50c",
+    "content/posts/2026-10-22-paper-the-complete-story-of-joins/source-page-012.png": "8b4d3446b12cdeb0e327dd9508ae176944ace1f3cde96c14fdb8a066fcd10282",
+    "content/posts/2026-10-22-paper-unnesting-arbitrary-queries/source-page-007.png": "0259868591027d648d398e4619601fa045aba2311f8cc0ad31510d6d61b73589",
+    "content/posts/2026-10-22-paper-unnesting-arbitrary-queries/source-page-009.png": "a85c2f3413c96716932575cc98ee31314c6047383eba2ce15e9aee77f6f715e2",
+    "content/posts/2026-10-22-paper-adaptive-execution-of-compiled-queries/source-page-002.png": "4eaa16a3e00477bf6a59eb4ea6121f4bf82c85d792a0ac2201f6c6a6823f0ae7",
+    "content/posts/2026-10-22-paper-adaptive-execution-of-compiled-queries/source-page-004.png": "01d5efc25ffb2b6f47f77de280807ff86c987b82064b2c1d6fa13f919cd9a332",
+    "content/posts/2026-10-22-paper-everything-you-always-wanted-to-know-about-compiled-and-cectorized-queries-but-were-af/source-page-004.png": "204c4f92b5df3d945456c8f486be550e72a3c735c4995a98d21f7488fd62933a",
+    "content/posts/2026-10-22-paper-everything-you-always-wanted-to-know-about-compiled-and-cectorized-queries-but-were-af/source-page-005.png": "7203fbd35f20a270d4e5141af1e66dbdd57f947f6a284a926c04690a3935bd03",
+    "content/posts/2026-10-22-paper-looking-ahead-makes-query-plans-robust/source-page-001.png": "3be8436e89b1fe4d8003be7f1eeef754e5a10dc070ba56797900978d3273bfd9",
+    "content/posts/2026-10-22-paper-looking-ahead-makes-query-plans-robust/source-page-002.png": "f8cfbfc2bf370549d8ccae0a1c186283a4bfdc78a6c5bfd4705bcc69ffbb801c",
+    "content/posts/2026-10-22-paper-main-memory-hash-joins-on-modern-processor-architectures/source-page-002.png": "163cf7d689a4fb47548da933ab2d66b36777f81fb49be84a1dbc656d39d52207",
+    "content/posts/2026-10-22-paper-main-memory-hash-joins-on-modern-processor-architectures/source-page-005.png": "977b7756a5efecdcefcc3b881799fff742fb054e1c3e7cd0fa241f001dac20b4",
+    "content/posts/2026-10-22-paper-monetdn-x100-hyper-pipelining-query-execution/source-page-004.png": "b9377f98a7a0605fb51e9d130d80c20b125f87f11b3f0516909a485728010fca",
+    "content/posts/2026-10-22-paper-monetdn-x100-hyper-pipelining-query-execution/source-page-009.png": "b0ae094dc79214dd46936b062522359b01cfb924683d7ac44d032cfde6dea7a9",
+    "content/posts/2026-10-22-paper-morsel-driven-parallelism-a-numa-aware-query-evaluation-framework-for-the-many-core-ag/source-page-001.png": "c2dc904b326ff14ca10001d47a87bbdaa1eb4fa7099b8d79315f918e9600c5d0",
+    "content/posts/2026-10-22-paper-morsel-driven-parallelism-a-numa-aware-query-evaluation-framework-for-the-many-core-ag/source-page-004.png": "a0c4f5876dcd320a01fed1e326f71625e89880ad544609c82d8aaf27a4761d6f",
+    "content/posts/2026-10-22-paper-query-evaluation-techniquesfor-large-databases/source-page-013.png": "4466f123c137417dd8d9065b3f92521a4fd5b2cb5caf183f9f1e0b11abc7a86c",
+    "content/posts/2026-10-22-paper-query-evaluation-techniquesfor-large-databases/source-page-018.png": "89ed1e4a7f69476d251053611cb4e7ecae7f186524372db53b7ef31669537527",
+    "content/posts/2026-10-22-paper-relaxed-operator-fusion-for-in-memory-databases-making-compilation-vectorization-and-p/source-page-002.png": "5f5cfd1c045cc11252a646befd4544b9cf8828be19c5cddbe64569652b18e770",
+    "content/posts/2026-10-22-paper-relaxed-operator-fusion-for-in-memory-databases-making-compilation-vectorization-and-p/source-page-003.png": "1ee4c722fa53e43b21854d367e751b7466c83ca176f963a8932db3839ba493bb",
+    "content/posts/2026-10-22-paper-volcano-an-extensible-and-parallel-query-evaluation-system/source-page-007.png": "eec11299b4de9131b3b7d4e49ae4c118d8f94a590a67422b6607b9e9f3795ea0",
+    "content/posts/2026-10-22-paper-volcano-an-extensible-and-parallel-query-evaluation-system/source-page-011.png": "deab3487ad0d71eda905c21be501ec46b7a3b3da665d26323622f8af71c10581",
+    "content/posts/2026-10-22-paper-architecture-of-a-database-system-foundations-and-trends-in-databases/source-page-052.png": "6bb85ce6c09e421f250dd475fae3b0eaa29f8eadf0a565dd31bd43a573e66093",
+    "content/posts/2026-10-22-paper-architecture-of-a-database-system-foundations-and-trends-in-databases/source-page-013.png": "17b4794f26677a2393cad8d59ab554c4a9764a24063e58fa234a5c74f419e6ff",
+    "content/posts/2026-10-22-paper-a-generalised-solution-to-distributed-consensus/source-page-007.png": "2eda017342b83b23ad3f3a5fc4273366ff87fe6c3233f425f5cca70806a27fb5",
+    "content/posts/2026-10-22-paper-a-generalised-solution-to-distributed-consensus/source-page-003.png": "38f86849e6336ca7e27863c20c43b05a72592236bcc233479de650fd838be2e2",
+    "content/posts/2026-10-22-paper-consensus-bridging-theory-and-practice/source-page-070.png": "16d2fe2b2707e8099e178d60ce9eac8868a8b1eab7b3248e428c643c107d5680",
+    "content/posts/2026-10-22-paper-consensus-bridging-theory-and-practice/source-page-059.png": "ddc77a9dd7a6c62f2ac4be87c389f0a77178171040226bdecea71bda756dcd3e",
+    "content/posts/2026-10-22-paper-distributed-consensus-revised/source-page-047.png": "c1722f2090dd55503def6212200510c4a8e5719e52c1234fd3deda9654ee47ca",
+    "content/posts/2026-10-22-paper-distributed-consensus-revised/source-page-033.png": "b9a82675b0a898b62009c48cfb3fbb8b659d5fca03c312b09a9b209c5dc8590c",
+    "content/posts/2026-10-22-paper-in-search-of-an-understandable-consensus-algorithm-extended-version/source-page-005.png": "c9d75fa1109e393bd980798d74f1fac59c52dc62456c4f4e52f6d0aa6f443ed0",
+    "content/posts/2026-10-22-paper-in-search-of-an-understandable-consensus-algorithm-extended-version/source-page-006.png": "d4ff996cf7340ccec0d2909c35c9f48e42cbf8a75240bc39dc23d946c72a8dd7",
+    "content/posts/2026-10-22-paper-anna-a-kvs-for-any-scale/source-page-006.png": "04c607076a9fa30b4f66f0cc2fe5051db9da5b1fb28ce32bf16f4fb552e8e41a",
+    "content/posts/2026-10-22-paper-anna-a-kvs-for-any-scale/source-page-013.png": "9748be3ff14cd218f398f61438f05c8bae5e94f34d337c653a8261b766f8e42a",
+    "content/posts/2026-10-22-paper-ark-a-real-world-consensus-implementation/source-page-001.png": "87cf96e04e16fc0e47e383402dd08ea5307826f7bdee763c8879160d42833ed9",
+    "content/posts/2026-10-22-paper-consistency-tradeoffs-in-modern-distributed-database-system-design/source-page-004.png": "cf38b2c469c7a364ba0aa76ae255be4076f8c83fd26f000ce9a8667cf993bc02",
+    "content/posts/2026-10-22-paper-consistency-tradeoffs-in-modern-distributed-database-system-design/source-page-006.png": "00c751587e5c53478ed00d7b84ce56962cc72616d44ecf8794433d7e04427425",
+    "content/posts/2026-10-22-paper-logical-physical-clocks-and-consistent-snapshots-in-globally-distributed-databases/source-page-005.png": "b627ab896d24bcc186f14029fe66551619f06bac4ef44d0f9f6ae88776fe58e1",
+    "content/posts/2026-10-22-paper-logical-physical-clocks-and-consistent-snapshots-in-globally-distributed-databases/source-page-009.png": "7af5d218a1cdcea258a9d136fc783cfbe9eec54bdcf299d90f779ba02d4d540a",
+    "content/posts/2026-10-22-paper-automatic-performance-diagnosis-and-tuning-in-oracle/source-page-003.png": "9596722155e98ffd54f0979bfa7b6d9dcaa7782965233e8f5ba4bca85424b0f4",
+    "content/posts/2026-10-22-paper-automatic-performance-diagnosis-and-tuning-in-oracle/source-page-006.png": "ca44d06f082f4eaf23f5fe87a1b5a79d735cbc56441caa9cb3f34e372fec7962",
+    "content/posts/2026-10-22-paper-automatic-sql-tuning-in-oracle-10g/source-page-007.png": "8f5315a812382a776847a6f286ee47f2f6de4220a21c0337f168900fe34df98f",
+    "content/posts/2026-10-22-paper-automatic-sql-tuning-in-oracle-10g/source-page-008.png": "dc373b92f068b3d2c62a0536c1b2efcf3bc298fc9ff0a368d4fc7b44fc8b93d0",
+    "content/posts/2026-10-22-paper-a-critique-of-the-sql-database-language/source-page-005.png": "76dea7cfcf6f5cfd9e5c537f827dbd0bdf90a6a5d98fb833a83c285427f9cb40",
+    "content/posts/2026-10-22-paper-a-critique-of-the-sql-database-language/source-page-009.png": "04554d228f84153e6110836673146a44a22434d4444bd3bc9a0867b2855e1a51",
+    "content/posts/2026-10-22-paper-a-relational-model-of-data-for-large-shared-data-banks/source-page-003.png": "696247aa0fb4a2aa18af622d62ed0cb8da6d7b51f7e30ea1b7692e9ca350e330",
+    "content/posts/2026-10-22-paper-a-relational-model-of-data-for-large-shared-data-banks/source-page-007.png": "39755819ffcf7319995553ced8530be9c4aeb3d28a749bc47e42316089a07725",
+    "content/posts/2026-10-22-paper-extending-the-database-relational-model-to-capture-more-meaning/source-page-019.png": "5cbe6175b199126898742b973c8ab66cc663beb4209a954e5c711ff70dcc0585",
+    "content/posts/2026-10-22-paper-extending-the-database-relational-model-to-capture-more-meaning/source-page-003.png": "e5a0427a16ae1261c6e5f8fc22328cccdc96bd12593e73aa57637059458a8f55",
+    "content/posts/2026-10-22-paper-ingres-a-relational-data-base-system/source-page-002.png": "0988ef2541a3a1be95a880e9739debc2f45c32b04e6eaad2761cec4e0427fd9f",
+    "content/posts/2026-10-22-paper-ingres-a-relational-data-base-system/source-page-001.png": "ccf97f7e8cad19be6560ea19ea7ae4f319c35e7b22eff1da1c0598e8cb3baa33",
+    "content/posts/2026-10-22-paper-sequel-a-structured-english-query-language/source-page-001.png": "1d05e464c5789662bc6a33e9e4ca70fe047810cda409cd6305b4cc79f3bd6b21",
+    "content/posts/2026-10-22-paper-sequel-a-structured-english-query-language/source-page-002.png": "f610f063db7954dc5a632ba8676bb0762d1d1c26b68ca8dfa8787f0e3de8c894",
+    "content/posts/2026-10-22-paper-a-deep-dive-into-common-open-formats-for-analytical-dbmss/source-page-003.png": "0023ec2c36fd6e0dbc5cc0de0d1ae790fb94c04c92193395051e98c01da2a976",
+    "content/posts/2026-10-22-paper-a-deep-dive-into-common-open-formats-for-analytical-dbmss/source-page-005.png": "7ab7db30d56562d2818c51f68779a81f8fe5d437ed9f41f16161cea1c9119c61",
+    "content/posts/2026-10-22-paper-the-end-of-slow-networks-it-s-time-for-a-redesign/source-page-003.png": "534c1fa10535416d92559eec9df51677ebad68f9f3e0637d7e7fd9fb0bd3caff",
+    "content/posts/2026-10-22-paper-the-end-of-slow-networks-it-s-time-for-a-redesign/source-page-001.png": "221b95c06035155ed39f10555ead70ce3435b647580cb030be6a29b1ed5b5941",
+    "content/posts/2026-10-22-paper-an-improved-data-stream-summary-the-count-min-sketch-and-its-applications-journal-of-a/source-page-015.png": "3aa55c5ae0ac4f7f2cfb0e7b469883c3b184c2d51c94479e392ee4f6e0764c8a",
+    "content/posts/2026-10-22-paper-an-improved-data-stream-summary-the-count-min-sketch-and-its-applications-journal-of-a/source-page-007.png": "1ce23333d6a12f2ffb477c88e5de4c70827daab3fb03d4845bf6d18458e2fcdf",
+    "content/posts/2026-10-22-paper-deep-unsupervised-cardinality-estimation/source-page-005.png": "bed2f15f9c5a07894240bfb9088f1caa96b0d05615ea01597db636acd48b07c9",
+    "content/posts/2026-10-22-paper-deep-unsupervised-cardinality-estimation/source-page-008.png": "d1bb24fa340cb13c952ddc47d45a77c351b75b088844e3887c30b3bad6ed779e",
+    "content/posts/2026-10-22-paper-distinct-sampling-for-highly-accurate-answers-to-distinct-values-queries-and-event-rep/source-page-007.png": "2ad22fd239c7a74a144a79d2893cb9fed54173b1c08345cf12ccd4d8caa502af",
+    "content/posts/2026-10-22-paper-distinct-sampling-for-highly-accurate-answers-to-distinct-values-queries-and-event-rep/source-page-008.png": "198aa19ff4490e69305873ae376e0591ff4aac5bc1de9d32435a4754f4828e9d",
+    "content/posts/2026-10-22-paper-leo-db2s-learning-optimizer/source-page-003.png": "3493a6ce74b17e4d5ee40850609f93c6053097a561d5598f6e96892a7ec23641",
+    "content/posts/2026-10-22-paper-leo-db2s-learning-optimizer/source-page-007.png": "7625f5d1922860197d2cb7aa722c48258e8315713ddf7fa7ca6c83481f565f20",
+    "content/posts/2026-10-22-paper-neurocard-one-cardinality-estimator-for-all-tables/source-page-002.png": "493ae65dd215023bf9a8b5f23d019afba1a72a3003394afc25b44ff5c8c28c05",
+    "content/posts/2026-10-22-paper-neurocard-one-cardinality-estimator-for-all-tables/source-page-010.png": "d3c291943fb03bf7056376e2ec8c8282e175e79e0f6727873807f8e2078d0aaf",
+    "content/posts/2026-10-22-paper-probabilistic-counting-algorithms-for-data-base-applications/source-page-016.png": "4f6cf1428440b74e8e81764ae5b3854254fa64d7ae163b47f2404e97c89503ee",
+    "content/posts/2026-10-22-paper-probabilistic-counting-algorithms-for-data-base-applications/source-page-023.png": "f37813c349f3935beccae72ab3ed648f4b859b65306d839618e0f1d8d41c5574",
+    "content/posts/2026-10-22-paper-looking-back-at-postgres/source-page-002.png": "849928657c159344235e4a5efe36d221d6adcd56d9d555bec9531c82196eaefe",
+    "content/posts/2026-10-22-paper-megastore-providing-scalable-highly-available-storage-for-interactive-services/source-page-003.png": "3912fd07ff3534ef8b53e6df43749e64a09acf431bd403364e5ad12a702ba38a",
+    "content/posts/2026-10-22-paper-megastore-providing-scalable-highly-available-storage-for-interactive-services/source-page-007.png": "2232cc46c9428edbd807c1fd760576445453ab6228b0995f786aa902d8ff94a1",
+    "content/posts/2026-10-22-paper-the-five-minute-rule-thirty-years-later-and-its-impact-on-the-storage-hierarchy/source-page-012.png": "c94f16566bf769d75499273f56f088b565262bb0d3017320e355e5b52fe258ec",
+    "content/posts/2026-10-22-paper-the-five-minute-rule-thirty-years-later-and-its-impact-on-the-storage-hierarchy/source-page-011.png": "208074defa5867ce535344d0ad7e7e7491b5c539324636439141d2895d94951e",
+    "content/posts/2026-10-22-paper-a-comparison-of-fractal-trees-to-log-structured-merge-lsm-trees/source-page-007.png": "9bf8f08a04042fdf7e9a8879c77e20d8db87c97227bbc002cbac9d8fb8dd65fc",
+    "content/posts/2026-10-22-paper-a-comparison-of-fractal-trees-to-log-structured-merge-lsm-trees/source-page-006.png": "17139c9be794db049629fecbfb50e94bcf278fbf1b1eeb1aef051bb5ff3c3505",
+    "content/posts/2026-10-22-paper-caas-lsm-compaction-as-a-service-for-lsm-based-key-value-stores-in-storage-disaggregat/source-page-010.png": "9c37963b04f82f3613861ddfdd691cc121c691f6fd8593056a7278ee6c3fa444",
+    "content/posts/2026-10-22-paper-caas-lsm-compaction-as-a-service-for-lsm-based-key-value-stores-in-storage-disaggregat/source-page-011.png": "e35a5e4979867acd7f80b9498bd1f3c61f6cb86cb1301800507ee5ec901651be",
+    "content/posts/2026-10-22-paper-designing-access-methods-the-rum-conjecture/source-page-004.png": "78e8899478398c5c74671bdff1c0e6f2b2e41aab792ba8200c3cf5855cc0866b",
+    "content/posts/2026-10-22-paper-designing-access-methods-the-rum-conjecture/source-page-005.png": "b7f796edfe6bd7fdead35b8b70e4e28fce75d8c5675159a11271c3cfc7b27ef2",
+    "content/posts/2026-10-22-paper-from-wisckey-to-bourbon-a-learned-index-for-log-structured-merge-trees/source-page-003.png": "f0077499e42bfcee8dd7dedb93e99eea382e2273694c2f70abdd3499501fe4c8",
+    "content/posts/2026-10-22-paper-from-wisckey-to-bourbon-a-learned-index-for-log-structured-merge-trees/source-page-005.png": "c3bd12edffe4272f5ffe1591d8c7b476f5af4b99715af72d2196493b30b1fb1f",
+    "content/posts/2026-10-22-paper-leanstore-in-memory-data-management-beyond-main-memory/source-page-003.png": "c1548fe0d133963455bfc9b6b8433bd638891d008ad27b4991622e7904e0cb73",
+    "content/posts/2026-10-22-paper-leanstore-in-memory-data-management-beyond-main-memory/source-page-005.png": "bbf6b71c8c7a0a9efa6b6e014191df46eb7d880299d2a34c05483275829bf23c",
+    "content/posts/2026-10-22-paper-lsm-based-storage-techniques-a-survey/source-page-005.png": "0ff620a580a2d87ea1ecb2f7865c16d358210cbe5edbb64b7c2a9c9810833187",
+    "content/posts/2026-10-22-paper-lsm-based-storage-techniques-a-survey/source-page-013.png": "4f42939975276347b499a23ce5cfef4b884afdab1d9446ff8a2e2f73ce053299",
+    "content/posts/2026-10-22-paper-surf-practical-range-query-filtering-with-fast-succinct-tries/source-page-002.png": "2980ba0f42e628fb98f6dd6741d580f6f6f5aad19502445a113fa9bc67187d48",
+    "content/posts/2026-10-22-paper-surf-practical-range-query-filtering-with-fast-succinct-tries/source-page-005.png": "d2be8ed71c78ef9692fecdd2c2d2d517379f29916dc46762938c9b9a6ceb69a8",
+    "content/posts/2026-10-22-paper-the-log-structured-merge-tree-lsm-tree/source-page-005.png": "90f6e7fd6ab35385508252b61e3cfda7247864fbe28c005e16041f9ac2064bbb",
+    "content/posts/2026-10-22-paper-the-log-structured-merge-tree-lsm-tree/source-page-011.png": "ac49e3d2e204130f56c42fbac5243641d16270040e6a31865d04a4107cdc9edd",
+    "content/posts/2026-10-22-paper-umbra-a-disk-based-system-with-in-memory-performance/source-page-002.png": "72030b78c670656a77c8a15ec85dd76c6beafbc125d013f31757c14b256f7aca",
+    "content/posts/2026-10-22-paper-umbra-a-disk-based-system-with-in-memory-performance/source-page-005.png": "c20f3ffb6329e7e54cd8efd1206883528ad287fde07fba539c1cc741723da6e6",
+    "content/posts/2026-10-22-paper-generalized-isolation-level-definitions/source-page-008.png": "2b60955f1e95cb279390859396cd9d51e036a7754dac7b866e77ca87643cd701",
+    "content/posts/2026-10-22-paper-generalized-isolation-level-definitions/source-page-003.png": "a55e8a5c97e5e28167a3636103d8d0b8d49a3d4d3f3a604f6c58b738f45db140",
+    "content/posts/2026-10-22-paper-large-scale-incremental-processing-using-distributed-transactions-and-notifications/source-page-004.png": "9ab7a917ad2e1b05483050ce1eb11c8df112ccc1cb5509f4ec35ff956f7a0261",
+    "content/posts/2026-10-22-paper-large-scale-incremental-processing-using-distributed-transactions-and-notifications/source-page-005.png": "0d4ba85bed93aa13d9f47c5b781180e0837a5fdd7703651abb43f4b5ff98fb07",
+    "content/posts/2026-10-22-paper-staring-into-the-abyss-an-evaluation-of-concurrency-control-with-one-thousand-cores/source-page-004.png": "0f9ec81b83263fcdecb3c9c868d73bd7a5f18907e3227d32944fd432662ff4d4",
+    "content/posts/2026-10-22-paper-staring-into-the-abyss-an-evaluation-of-concurrency-control-with-one-thousand-cores/source-page-005.png": "02cf3f029722861f45511c6439c280199e4e3764cf162415aacab154c7cd28db",
+    "content/posts/2026-10-22-paper-the-cascades-framework-for-query-optimization/index.md": "2bf0b316b37e065d61b60a0b23e870ea2e5200db4c7a83538308a8847f59490e",
+    "content/posts/2026-10-22-paper-parallelizing-query-optimization-on-shared-nothing-architectures/index.md": "a18dc4717af7f69c3f0faf2b63068904924aabcd9994eb2ad06861d48bd7703c",
+    "content/posts/2026-10-22-paper-the-volcano-optimizer-generator-extensibility-and-efficient-search/index.md": "0cb8c3b2af8b3f96af3cd63981ef6b442d510830dc9611a9e1e92bb9dafd69bf",
+    "content/posts/2026-10-22-paper-extending-the-algebraic-framework-of-query-processing-to-handle-outerjoins/index.md": "ae5f6727ab888fcc64353ec8b5e4b9dc6782ec9f936c3ef8491aba3bb8b35dd9",
+    "content/posts/2026-10-22-paper-using-eels-a-practical-approach-to-outerjoin-and-antijoin-reordering/index.md": "2dbd980955b3d88b0f6e2383550ebc73d43867766447efd6377a67ab9d326658",
+    "content/posts/2026-10-22-paper-seeking-the-truth-about-ad-hoc-join-costs/index.md": "bc5e1b9189e7f2cfa2e72a1b354a814206783fb192cc3acb40bf99dfa36a2ab3",
+    "content/posts/2026-10-22-paper-adaptive-query-processing-in-the-looking-glass/index.md": "4c4981548444f9e512762f821fae478f410e401c1c02ca61c0c1d27afe54f418",
+    "content/posts/2026-10-22-paper-automated-statistics-collection-in-db2-udb/index.md": "3d855e2db9e3c3bcc6c6c4d1cfb07a5c2e9aac2d594a5715c657bb5493408797",
+    "content/posts/2026-10-22-paper-synopses-for-massive-data-samples-histograms-wavelets-sketches/index.md": "83490c1a8a440caada122828b2d162b2d5a89a25eb0120534090ab63fc2b8bf9",
+    "content/posts/2026-10-22-paper-the-history-of-histograms/index.md": "10c991c29bec33d64bff1e7b4ecc0d961cced0de5d2b92475853e33e2a00a71f",
+    "content/posts/2026-10-22-paper-universality-of-serial-histograms/index.md": "f0abefde2ff969c8b932f9d7a03e3ec6c01e8dc1b3ec6b851effdb26ff372ae7",
+    "content/posts/2026-10-22-paper-thesis-exploiting-functional-dependence-in-query-optimization/index.md": "ecf66007ae86356ca40fd37534442f50dcbfcbcecb9ff74004c2e4428a1c65aa",
+    "content/posts/2026-10-22-paper-an-efficient-framework-for-order-optimization/index.md": "36d6feff6e2f4749f565cd0bac3af81a6b020ea8e5727008307ca30d4db9825e",
+    "content/posts/2026-10-22-paper-incorporating-partitioning-and-parallel-plans-into-the-scope-optimizer/index.md": "840ca4c0b4b6b94e98fe306826b735b728f964d060c250376ecdc327a23e36b1",
+    "content/posts/2026-10-22-paper-a-unitied-approach-to-processing-queries-that-contain-nested-subqueries-aggregates-and/index.md": "3e11b149bcef1946cc342eb013c28a7a74ccc594f608d4952a4ffc3167515256",
+    "content/posts/2026-10-22-paper-optimization-of-nested-queries-in-a-distributed-relational-database/index.md": "e6beda3773814faf8ec69516e7b6954eb1937e95c363ef33d673c7326997c3b0",
+    "content/posts/2026-10-22-paper-sql-like-and-quel-like-correlation-queries-with-aggregates-revisited/index.md": "5e92672ea0423ab68b5784c79593cdf5bcf932d890a161827292ba9f0433b1c2",
+    "content/posts/2026-10-22-paper-the-complete-story-of-joins/index.md": "03133dda9ecf56f2d8c429ffb362b77d31d1fc420119d3f3595ff5a52b94d2b1",
+    "content/posts/2026-10-22-paper-unnesting-arbitrary-queries/index.md": "1fbbf2e542085ad19105cef56167622e04c8a0b98d14d3ec9909e06e9dd15e56",
+    "content/posts/2026-10-22-paper-adaptive-execution-of-compiled-queries/index.md": "79e39932ed278e8052cbc9df9538b8a24d070e19bcc20df8403a85d852f05371",
+    "content/posts/2026-10-22-paper-everything-you-always-wanted-to-know-about-compiled-and-cectorized-queries-but-were-af/index.md": "c7d1fbac46eb4592eb92fd7e5788ea85b138874bb534606856a55786621bb1a7",
+    "content/posts/2026-10-22-paper-looking-ahead-makes-query-plans-robust/index.md": "6a417d21d40cfa0ad935cead2eafc57d8507b7867eab84ddd3ce129c3929599f",
+    "content/posts/2026-10-22-paper-main-memory-hash-joins-on-modern-processor-architectures/index.md": "7d4e20093a7bddf06c1e872b1b110b8539307874c9b157636f5f72e08533d4d4",
+    "content/posts/2026-10-22-paper-monetdn-x100-hyper-pipelining-query-execution/index.md": "042a1e9d0590886a40bb92b80a98f0efb197a981f05b6c135b112a56051710dc",
+    "content/posts/2026-10-22-paper-morsel-driven-parallelism-a-numa-aware-query-evaluation-framework-for-the-many-core-ag/index.md": "7109910a3d9af9e4e01b3b451829518a8959ffa8f488421cba1649cebb263a76",
+    "content/posts/2026-10-22-paper-query-evaluation-techniquesfor-large-databases/index.md": "52db6e1261052fb4d49354bd4f2c778a7dc4522def2a5051eefa9e7f55c35bd9",
+    "content/posts/2026-10-22-paper-relaxed-operator-fusion-for-in-memory-databases-making-compilation-vectorization-and-p/index.md": "63afd1f8d34643f226f33e2af977526886c854dad9234ffe220d1380ccdaaeee",
+    "content/posts/2026-10-22-paper-volcano-an-extensible-and-parallel-query-evaluation-system/index.md": "f2ce34ae6d410491d595c6ba0e02fa5fc57b90ce76cf3b11d850c1e65abc0355",
+    "content/posts/2026-10-22-paper-architecture-of-a-database-system-foundations-and-trends-in-databases/index.md": "bfd45be32693ac359554787038afe3acd40d081149e024ddc07af699705fdcb4",
+    "content/posts/2026-10-22-paper-a-generalised-solution-to-distributed-consensus/index.md": "e79f905d485136559942df87a1d2deb1cb88523ce7624e370d67e1a50240a618",
+    "content/posts/2026-10-22-paper-consensus-bridging-theory-and-practice/index.md": "74722c1bdad58841c6c812a30757d4e3a1039d738231eaea20fe145de865db6a",
+    "content/posts/2026-10-22-paper-distributed-consensus-revised/index.md": "737aaefff677f71a613423c530b196b3385d7ef80cc1f310b92283d12a67c29c",
+    "content/posts/2026-10-22-paper-in-search-of-an-understandable-consensus-algorithm-extended-version/index.md": "bbf344b4fb9741f485dd382b70cd2d538e1c3ec35b69d311b474f1dccb0fc70f",
+    "content/posts/2026-10-22-paper-anna-a-kvs-for-any-scale/index.md": "0433cc37978b6d392885ee5dc0e6afa84e37d2f3e393bc6a62071e0606306247",
+    "content/posts/2026-10-22-paper-ark-a-real-world-consensus-implementation/index.md": "625f0db9606b683b7a1e0af6e1cc57b806967cd97d58f83ee5d979e880f1c6f3",
+    "content/posts/2026-10-22-paper-consistency-tradeoffs-in-modern-distributed-database-system-design/index.md": "17cbff7b85e8f5b31f825e9de4d09d6e94f706d969d722965446d533276a41fc",
+    "content/posts/2026-10-22-paper-logical-physical-clocks-and-consistent-snapshots-in-globally-distributed-databases/index.md": "40743b52abdce5f90c99fc3854d40f545694fa1fb3680b51e96b35b126874f3e",
+    "content/posts/2026-10-22-paper-automatic-performance-diagnosis-and-tuning-in-oracle/index.md": "e9d769a467f09e54bbd4ce5c2a884c66ccb4bbb8344d0942c3f446cf48ad5fa4",
+    "content/posts/2026-10-22-paper-automatic-sql-tuning-in-oracle-10g/index.md": "534ee63a4e3e29ca1dc86c32cb0e92a0e7f5fa52a77efb076424fd51b1ce16a1",
+    "content/posts/2026-10-22-paper-a-critique-of-the-sql-database-language/index.md": "c65787b9d8a3b8ca8c2137c1c384f6772742c0ec0ec3c106cf8d4193a2241047",
+    "content/posts/2026-10-22-paper-a-relational-model-of-data-for-large-shared-data-banks/index.md": "b8871a6ad90918fbdd93f0fcf2a9528a85cd7ef62ffc9f7d77f155b28fd88698",
+    "content/posts/2026-10-22-paper-extending-the-database-relational-model-to-capture-more-meaning/index.md": "1f9969f899c556f24251654a005139bf4ecd625e90884f9da00f4af885a73ef7",
+    "content/posts/2026-10-22-paper-ingres-a-relational-data-base-system/index.md": "a731c460c88e55f5d952a5401a3a5ece06127db78c8ba704d0f3710d635e1e11",
+    "content/posts/2026-10-22-paper-sequel-a-structured-english-query-language/index.md": "7bc4bca1fb58c8936742f6139d4e675695c74e5313b5e3ab1fb077ce0bc9e3d4",
+    "content/posts/2026-10-22-paper-a-deep-dive-into-common-open-formats-for-analytical-dbmss/index.md": "f697d8325485ba98b1cbddb8bf22f4a24ba6b0fbf189a1a9a030cf863930c6a4",
+    "content/posts/2026-10-22-paper-the-end-of-slow-networks-it-s-time-for-a-redesign/index.md": "7de48d612e89ab44340832fa6f52bd25d00b2866a9373e420169e2a420916c02",
+    "content/posts/2026-10-22-paper-an-improved-data-stream-summary-the-count-min-sketch-and-its-applications-journal-of-a/index.md": "e9a286f67d494f8aa5eea811c167b507cdb0bde6f983beae072918526385b75d",
+    "content/posts/2026-10-22-paper-deep-unsupervised-cardinality-estimation/index.md": "d841ab06647fb6ed65fa224ac637bb63f92a8b78bfd2cfc42725f429ff387b30",
+    "content/posts/2026-10-22-paper-distinct-sampling-for-highly-accurate-answers-to-distinct-values-queries-and-event-rep/index.md": "370c3d84f7a0de56ce73cb6f8d34eeec8da856dff4cbc95db9b2f085cf3af8e0",
+    "content/posts/2026-10-22-paper-leo-db2s-learning-optimizer/index.md": "07e8608328018e22783720abbf795901032083e8709da9097cc10003cca45af1",
+    "content/posts/2026-10-22-paper-neurocard-one-cardinality-estimator-for-all-tables/index.md": "27b2cd13f49a7ec87d7e6ce34f7bc519646bb13ebc73d498f6164b70b5676b75",
+    "content/posts/2026-10-22-paper-probabilistic-counting-algorithms-for-data-base-applications/index.md": "1d3e47dfe7355b2fb9f1c06dd88360c8c8a2f88cb6576e14f83e869bc96ef50a",
+    "content/posts/2026-10-22-paper-looking-back-at-postgres/index.md": "e63a0a42d7b6336fd3fb7393e172cedb36d62f65908bf05e4c0014baea2a97df",
+    "content/posts/2026-10-22-paper-megastore-providing-scalable-highly-available-storage-for-interactive-services/index.md": "4797676125ee3bc3585bf88d672f43c9d4e1486c99712a74ae347d84cf68dec9",
+    "content/posts/2026-10-22-paper-the-five-minute-rule-thirty-years-later-and-its-impact-on-the-storage-hierarchy/index.md": "b94f6dd4c1e8f7caef5ad010a4d8b3582170a5e060308f6a7d3b43c357bfc807",
+    "content/posts/2026-10-22-paper-a-comparison-of-fractal-trees-to-log-structured-merge-lsm-trees/index.md": "42ca8f257aa8db228b11b9d3540d5031a8ff6a7d61aab0e888d17ec219a989bd",
+    "content/posts/2026-10-22-paper-caas-lsm-compaction-as-a-service-for-lsm-based-key-value-stores-in-storage-disaggregat/index.md": "f4d45be52ef8c709b26d80ca4b7b96b6e8e658081067a2fc439ac34d74da5b8e",
+    "content/posts/2026-10-22-paper-designing-access-methods-the-rum-conjecture/index.md": "6a421be6e014961fe847237d21d5e3cd1c319f602843a3221caeeacc21a9535d",
+    "content/posts/2026-10-22-paper-from-wisckey-to-bourbon-a-learned-index-for-log-structured-merge-trees/index.md": "954505a038975d9b0e192361db29f3afdfd955a8d4c7a70189b1d682b19be8bf",
+    "content/posts/2026-10-22-paper-leanstore-in-memory-data-management-beyond-main-memory/index.md": "014183ba8ae30f7300a1f21c05ed2d7750fb8e5041d7c4283359eb4d180b98cb",
+    "content/posts/2026-10-22-paper-lsm-based-storage-techniques-a-survey/index.md": "39de8b9b61eaeadac30ce49dc026b1aafd2932bb0ba6b96528cf05f4f4cc9afc",
+    "content/posts/2026-10-22-paper-surf-practical-range-query-filtering-with-fast-succinct-tries/index.md": "2ee2996a9ef5b96e4c837189001d6f53e580b8e0335b49c27e4112e2985d8e51",
+    "content/posts/2026-10-22-paper-the-log-structured-merge-tree-lsm-tree/index.md": "a75d37515df9aa7a1a6e5217217c6045106f36741793cd1010aefc39440fe4c1",
+    "content/posts/2026-10-22-paper-umbra-a-disk-based-system-with-in-memory-performance/index.md": "6f6fa7f2cbd4c310d98b56126fdd2b04e23ba50e34dbdea0ddb88ad33e44e668",
+    "content/posts/2026-10-22-paper-generalized-isolation-level-definitions/index.md": "1e16b60fb172034ea94967b948024b416a2843d22eee21ce11f358588f6211ca",
+    "content/posts/2026-10-22-paper-large-scale-incremental-processing-using-distributed-transactions-and-notifications/index.md": "db638d0ca3b3d4e2e3e145fb0248f54426d25628473336d8188da6982d7a399a",
+    "content/posts/2026-10-22-paper-staring-into-the-abyss-an-evaluation-of-concurrency-control-with-one-thousand-cores/index.md": "a00f62d62df86a780e8be8e45c30403f9096b7b376d98955d9470b8dca135dfb",
+    "content/posts/2026-10-22-database-papers-source-reading/index.md": "cf6c788aa16b48ed61177538662753aca05c45a6cc3a1e10dd02c0a2f35c0e1b"
+  }
+}
