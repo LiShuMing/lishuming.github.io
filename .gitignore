@@ -23,3 +23,6 @@ _drafts/
 tags
 *.temp
 *.lock
+
+# Local paper-import tooling
+/scripts/__pycache__/

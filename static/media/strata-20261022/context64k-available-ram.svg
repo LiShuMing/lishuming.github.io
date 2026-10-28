@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="550" viewBox="0 0 720 550" role="img" aria-labelledby="title desc">
+<title id="title">64K 配置下长输入测试的可用物理内存</title>
+<desc id="desc">2026 年 10 月 8 日两次串行长输入测试，共 15 个实际采样点。主机可用物理内存从 5.002 GiB 降到最低 0.015 GiB；最低值发生在 39992 token 输入的 prefill。纵轴为 GiB，横轴为首次采样起经过秒数。连线不表示新增采样。数据为整机状态，不表示已发生 OOM。</desc>
+<metadata>[{"seconds":0,"available_ram_gib":5.002},{"seconds":5.274,"available_ram_gib":3.418},{"seconds":10.499,"available_ram_gib":0.557},{"seconds":15.776,"available_ram_gib":0.018},{"seconds":21.254,"available_ram_gib":0.015},{"seconds":26.482,"available_ram_gib":1.569},{"seconds":31.666,"available_ram_gib":1.345},{"seconds":36.858,"available_ram_gib":1.135},{"seconds":42.051,"available_ram_gib":0.994},{"seconds":47.257,"available_ram_gib":0.971},{"seconds":52.46,"available_ram_gib":0.898},{"seconds":57.667,"available_ram_gib":0.788},{"seconds":62.887,"available_ram_gib":0.823},{"seconds":68.098,"available_ram_gib":0.669},{"seconds":73.319,"available_ram_gib":0.656}]</metadata>
+<rect width="720" height="550" fill="#f8fafc"/>
+<g font-family="Microsoft YaHei,Noto Sans CJK SC,sans-serif" fill="#152d43" font-size="22">
+<text x="360" y="39" text-anchor="middle" font-size="27" font-weight="700">长输入测试中的可用物理内存</text>
+<text x="360" y="74" text-anchor="middle" fill="#41576c">64K 配置 · 2026-10-08 · 整机采样</text>
+<text x="86" y="125">可用 RAM（GiB）</text>
+<path d="M86 400H676" stroke="#dce3ea" stroke-width="1"/>
+<path d="M86 300H676" stroke="#dce3ea" stroke-width="1"/>
+<path d="M86 200H676" stroke="#dce3ea" stroke-width="1"/>
+<path d="M86 100H676" stroke="#dce3ea" stroke-width="1"/>
+
+<path d="M86 100V400H676" fill="none" stroke="#64748b" stroke-width="1.5"/>
+<text x="72" y="407" text-anchor="end">0</text>
+<text x="72" y="307" text-anchor="end">2</text>
+<text x="72" y="207" text-anchor="end">4</text>
+<text x="72" y="107" text-anchor="end">6</text>
+<text x="86" y="437" text-anchor="middle">0</text>
+<text x="282.66666666666663" y="437" text-anchor="middle">25</text>
+<text x="479.3333333333333" y="437" text-anchor="middle">50</text>
+<text x="676" y="437" text-anchor="middle">75</text>
+
+<path d="M86.00 149.90 L127.49 229.10 L168.59 372.15 L210.10 399.10 L253.20 399.25 L294.33 321.55 L335.11 332.75 L375.95 343.25 L416.80 350.30 L457.76 351.45 L498.69 355.10 L539.65 360.60 L580.71 358.85 L621.70 366.55 L662.78 367.20" fill="none" stroke="#25658b" stroke-width="3" stroke-linejoin="round"/>
+<circle cx="86.00" cy="149.90" r="4" fill="#25658b"/>
+<circle cx="127.49" cy="229.10" r="4" fill="#25658b"/>
+<circle cx="168.59" cy="372.15" r="4" fill="#25658b"/>
+<circle cx="210.10" cy="399.10" r="4" fill="#25658b"/>
+<circle cx="253.20" cy="399.25" r="4" fill="#25658b"/>
+<circle cx="294.33" cy="321.55" r="4" fill="#25658b"/>
+<circle cx="335.11" cy="332.75" r="4" fill="#25658b"/>
+<circle cx="375.95" cy="343.25" r="4" fill="#25658b"/>
+<circle cx="416.80" cy="350.30" r="4" fill="#25658b"/>
+<circle cx="457.76" cy="351.45" r="4" fill="#25658b"/>
+<circle cx="498.69" cy="355.10" r="4" fill="#25658b"/>
+<circle cx="539.65" cy="360.60" r="4" fill="#25658b"/>
+<circle cx="580.71" cy="358.85" r="4" fill="#25658b"/>
+<circle cx="621.70" cy="366.55" r="4" fill="#25658b"/>
+<circle cx="662.78" cy="367.20" r="4" fill="#25658b"/>
+<circle cx="253.20" cy="399.25" r="6" fill="#b23d36"/>
+<path d="M253.20 391.25V288H314" fill="none" stroke="#b23d36" stroke-width="1.5"/>
+<text x="325" y="250" fill="#9b302d">最低 0.015 GiB ≈ 15 MiB</text>
+<text x="325" y="282" fill="#41576c">约 40K 输入的 prefill 阶段</text>
+<text x="381" y="479" text-anchor="middle">距首次采样的时间（秒）</text>
+<text x="360" y="524" text-anchor="middle" fill="#41576c">15 个实测点；连线仅辅助阅读，不能据此判定 OOM。</text>
+</g>
+</svg>
+

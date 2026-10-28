@@ -1,0 +1,3 @@
+reader tid=13860 gomaxprocs=1
+writer tid=13858 after=103ms
+reader resumed tid=13860 after=103ms byte=42

@@ -20,7 +20,7 @@ body{
     color:#000000;
     background-color:#ffffff;
 }
-header{
+.site-header{
     padding:1em 20px;
     border-bottom: 1px solid #cccccc;
     color: #dd0000;
@@ -172,14 +172,14 @@ embed,object,iframe{
         box-shadow:none;
     }
 
-    header{
+    .site-header{
         padding:.85em 16px;
         display:flex;
         align-items:flex-start;
         gap:.35em .8em;
     }
 
-    header h1{
+    .site-header h1{
         flex-basis:100%;
         margin:0;
         order:1;
@@ -612,23 +612,16 @@ body {
   line-height: 1.6;
 }
 
-.post-layout {
-  grid-template-columns: minmax(11rem, 18%) minmax(0, 1fr);
-  gap: clamp(1.5rem, 3vw, 3rem);
-}
-
-.post-layout--without-toc .post-main {
-  max-width: 960px;
-}
-
 .post-header {
+  display: block;
   margin: 0 0 1.6rem;
-  padding-bottom: 1rem;
+  padding: 0 0 1rem;
   border-bottom: 1px solid var(--line);
 }
 
-.post-title {
+.content .post-title {
   margin: 0 0 0.55rem;
+  padding: 0;
   color: var(--ink);
   font-size: clamp(1.55rem, 2.2vw, 2rem);
   font-weight: 700;

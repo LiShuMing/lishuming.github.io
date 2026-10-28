@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="740" viewBox="0 0 1080 740" role="img" aria-labelledby="title desc">
+  <title id="title">Go runtime: execution, allocation, and reclamation</title>
+  <desc id="desc">A goroutine runs on an M holding a P. The P owns allocation and GC caches. Allocation uses spans; concurrent marking finds live objects, sweeping reuses slots, and scavenging releases physical pages to Linux.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="9" markerHeight="9" refX="8" refY="4" orient="auto"><path d="M0 0 L8 4 L0 8" fill="none" stroke="#52616b" stroke-width="1.5"/></marker>
+  </defs>
+  <rect width="1080" height="740" fill="#fff"/>
+  <g font-family="Arial, sans-serif" fill="#17252b">
+    <text x="40" y="48" font-size="26" font-weight="700">One runtime, shared execution and memory resources</text>
+    <text x="40" y="80" font-size="17" fill="#52616b">Go 1.26.2 / linux-amd64 / conceptual paths, not a scheduling timeline</text>
+    <rect x="40" y="118" width="230" height="112" rx="6" fill="#e6f5f6" stroke="#087f8c"/>
+    <text x="60" y="153" font-size="22" font-weight="700">G: goroutine</text>
+    <text x="60" y="183" font-size="18">stack, state, saved PC/SP</text>
+    <text x="60" y="209" font-size="18">allocation assist debt</text>
+    <rect x="340" y="118" width="250" height="112" rx="6" fill="#eef1f3" stroke="#52616b"/>
+    <text x="360" y="153" font-size="22" font-weight="700">M: OS thread</text>
+    <text x="360" y="183" font-size="18">executes G while holding P</text>
+    <text x="360" y="209" font-size="18">may block in a syscall</text>
+    <rect x="660" y="118" width="380" height="112" rx="6" fill="#eaf4ed" stroke="#33805a"/>
+    <text x="680" y="153" font-size="22" font-weight="700">P: execution resources</text>
+    <text x="680" y="183" font-size="18">run queue / mcache / timers</text>
+    <text x="680" y="209" font-size="18">gcWork / write-barrier buffer</text>
+    <g fill="none" stroke="#52616b" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M270 173 H336"/><path d="M660 173 H594"/>
+      <path d="M850 230 V275"/>
+    </g>
+    <rect x="40" y="280" width="1000" height="90" rx="6" fill="#f4f8f9" stroke="#9aadb5"/>
+    <text x="60" y="313" font-size="22" font-weight="700">Heap allocation</text>
+    <text x="60" y="345" font-size="19">mallocgc  →  per-P mcache  →  mcentral  →  mheap / page allocator  →  Linux mmap</text>
+    <g fill="none" stroke="#52616b" stroke-width="2" marker-end="url(#arrow)">
+      <path d="M220 370 V420"/><path d="M395 484 H442"/><path d="M715 484 H762"/>
+    </g>
+    <rect x="40" y="425" width="355" height="128" rx="6" fill="#e6f5f6" stroke="#087f8c"/>
+    <text x="60" y="459" font-size="22" font-weight="700">Concurrent marking</text>
+    <text x="60" y="491" font-size="18">roots + heap pointer graph</text>
+    <text x="60" y="519" font-size="18">workers + assists + write barrier</text>
+    <rect x="448" y="425" width="267" height="128" rx="6" fill="#eaf4ed" stroke="#33805a"/>
+    <text x="468" y="459" font-size="22" font-weight="700">Concurrent sweep</text>
+    <text x="468" y="491" font-size="18">reusable object slots</text>
+    <text x="468" y="519" font-size="18">empty spans → heap</text>
+    <rect x="768" y="425" width="272" height="128" rx="6" fill="#fff4dc" stroke="#b18420"/>
+    <text x="788" y="459" font-size="22" font-weight="700">Scavenging</text>
+    <text x="788" y="491" font-size="18">free physical pages</text>
+    <text x="788" y="519" font-size="18">madvise → Linux</text>
+    <text x="40" y="606" font-size="20" font-weight="700">Three distinct outcomes</text>
+    <text x="40" y="641" font-size="19">unreachable object  ≠  swept slot  ≠  physical pages released to the OS</text>
+    <text x="40" y="685" font-size="17" fill="#52616b">GC phase transitions include STW coordination. Scavenging has its own pacing.</text>
+    <text x="40" y="714" font-size="17" fill="#52616b">Green Tea batches eligible small-object scans by span; it does not move live heap objects.</text>
+  </g>
+</svg>
