@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="760" viewBox="0 0 1240 760" role="img"
+     aria-label="coalesce 反例：为什么 DF 不能进入 Outer Join 的 NULL 生成侧">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+  <marker id="arrowBad" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#c0392b"/>
+  </marker>
+</defs>
+<rect width="1240" height="760" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328">coalesce 反例：DF 进入 NULL 生成侧会改变结果</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" fill="#5b6570">数据：A{k=1}，B{k=1}，C{k=0}；查询：A LEFT JOIN B ON A.k=B.k INNER JOIN C ON coalesce(B.k,0)=C.k</text>
+<text x="40" y="116" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3f7f52" text-anchor="start">正确执行：不提前删除 B.k=1</text>
+<rect x="40" y="134" width="120" height="40" rx="7" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="52" y="160" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">A: k=1</text>
+<rect x="176" y="134" width="120" height="40" rx="7" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="188" y="160" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">B: k=1</text>
+<rect x="312" y="134" width="120" height="40" rx="7" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="324" y="160" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">C: k=0</text>
+<rect x="40" y="200" width="392" height="54" rx="8" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.3"/>
+<text x="56" y="223" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">LEFT JOIN ON A.k = B.k</text>
+<text x="56" y="242" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">输出 (A.k=1, B.k=1)，B 行参与匹配</text>
+<line x1="256" y1="174" x2="256" y2="198" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="40" y="274" width="392" height="54" rx="8" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.3"/>
+<text x="56" y="297" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">INNER JOIN C ON coalesce(B.k, 0) = C.k</text>
+<text x="56" y="316" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">coalesce(1,0)=1 ≠ 0 → 无匹配</text>
+<line x1="236" y1="254" x2="236" y2="272" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="40" y="348" width="392" height="46" rx="8" fill="#ffffff" stroke="#4d9c62" stroke-width="1.3"/>
+<text x="56" y="376" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#2f6b43" text-anchor="start">结果：0 行</text>
+<line x1="236" y1="328" x2="236" y2="346" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<text x="640" y="116" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#a93226" text-anchor="start">错误下推：把 C 侧 DF（键 {0}）推到 B</text>
+<rect x="640" y="134" width="120" height="40" rx="7" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="652" y="160" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">A: k=1</text>
+<rect x="776" y="134" width="120" height="40" rx="7" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="788" y="160" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">B: k=1</text>
+<rect x="912" y="134" width="120" height="40" rx="7" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="924" y="160" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" font-weight="normal" fill="#1f2328" text-anchor="start">C: k=0</text>
+<rect x="640" y="200" width="392" height="54" rx="8" fill="#fdecea" stroke="#c0392b" stroke-width="1.3"/>
+<text x="656" y="223" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="600" fill="#a93226">DF(C) = {0}  →  B.k ∈ {0}</text>
+<text x="656" y="242" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#a93226" text-anchor="start">B.k=1 被提前删除，但这一行本来会参与匹配</text>
+<line x1="836" y1="174" x2="836" y2="198" stroke="#c0392b" stroke-width="1.6" stroke-dasharray="5 3" marker-end="url(#arrow)"/>
+<rect x="640" y="274" width="392" height="54" rx="8" fill="#fdecea" stroke="#c0392b" stroke-width="1.3"/>
+<text x="656" y="297" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="600" fill="#a93226">LEFT JOIN 重新输出 (A.k=1, B=NULL)</text>
+<text x="656" y="316" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#a93226" text-anchor="start">删除 B 行不是少一行，而是把匹配状态改成未匹配</text>
+<line x1="836" y1="254" x2="836" y2="272" stroke="#c0392b" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="640" y="348" width="392" height="54" rx="8" fill="#fdecea" stroke="#c0392b" stroke-width="1.3"/>
+<text x="656" y="371" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="600" fill="#a93226" text-anchor="start">coalesce(NULL, 0) = 0 → 匹配 C</text>
+<text x="656" y="390" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#a93226" text-anchor="start">补 NULL 行通过了原本拒绝它的上层谓词</text>
+<line x1="836" y1="328" x2="836" y2="346" stroke="#c0392b" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="640" y="420" width="392" height="46" rx="8" fill="#ffffff" stroke="#c0392b" stroke-width="1.3"/>
+<text x="656" y="448" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#a93226" text-anchor="start">结果：1 行（多出 A.k=1, B=NULL, C.k=0）</text>
+<line x1="836" y1="402" x2="836" y2="418" stroke="#c0392b" stroke-width="1.6" marker-end="url(#arrow)"/>
+<line x1="600" y1="110" x2="600" y2="490" stroke="#d7dde3" stroke-width="1" stroke-dasharray="4 4"/>
+<rect x="40" y="508" width="1160" height="118" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.2"/>
+<text x="60" y="534" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">判据：下推安全，要求被删除的行在原计划中一定不会贡献任何输出</text>
+<text x="60" y="558" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">概率性过滤器可以放过不该放的行（假阳性），不能删掉本该保留的行（假阴性）；Outer Join 还要额外检查</text>
+<text x="60" y="578" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">「删除后新合成的补 NULL 行」是否仍被原谓词拒绝。coalesce / ifnull / 未知 UDF 默认不满足 Null-Propagating。</text>
+<text x="60" y="604" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" fill="#1f2328">安全条件：D_build ⊆ D_filter，且删行后输出集合不变</text>
+<line x1="40" y1="654" x2="1200" y2="654" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="678" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start">本图只说明语义风险，不代表任何引擎必然产生这个错误计划；是否真的下推，取决于该版本的生成规则与表达式属性。</text>
+</svg>

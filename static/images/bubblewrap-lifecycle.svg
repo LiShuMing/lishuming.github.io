@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="820" viewBox="0 0 1320 820" role="img"
+     aria-label="Bubblewrap 的启动阶段与不可逆收敛点">
+<title>Bubblewrap 的启动阶段与不可逆收敛点</title>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+</defs>
+<rect width="1320" height="820" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328" text-anchor="start" data-max-w="1240" data-label="title">Bubblewrap 的启动阶段与不可逆收敛点</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1240" data-label="subtitle">四段流水线：解析不产生副作用，权限在 Namespace 内逐步取得，最后单向收敛到目标程序；红字为不可逆步骤</text>
+<rect x="40" y="96" width="1240" height="112" rx="12" fill="#fbfcfe" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="122" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="1200" data-label="band label '① 解析与校验：用户意图变成数据结构，尚未执行挂载'">① 解析与校验：用户意图变成数据结构，尚未执行挂载</text>
+<rect x="60" y="132" width="380" height="64" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="75" y="155" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="350" data-label="card title 'CLI / FD 参数'">CLI / FD 参数</text>
+<text x="75" y="174" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'parse_args_recurse()'">parse_args_recurse()</text>
+<text x="75" y="192" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '空路径参数直接拒绝'">空路径参数直接拒绝</text>
+<rect x="460" y="132" width="380" height="64" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="475" y="155" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="350" data-label="card title 'SetupOp 链'">SetupOp 链</text>
+<text x="475" y="174" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'Bind / Tmpfs / Proc / Dev'">Bind / Tmpfs / Proc / Dev</text>
+<text x="475" y="192" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '修饰符只作用于下一个操作'">修饰符只作用于下一个操作</text>
+<rect x="860" y="132" width="380" height="64" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="875" y="155" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="350" data-label="card title '安全前置校验'">安全前置校验</text>
+<text x="875" y="174" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '互斥选项与权限检查'">互斥选项与权限检查</text>
+<text x="875" y="192" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'SeccompProgram 已从 FD 读入'">SeccompProgram 已从 FD 读入</text>
+<polyline points="660,210 660,234" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="236" width="1240" height="108" rx="12" fill="#fdfaf5" stroke="#e6d3b8" stroke-width="1.2"/>
+<text x="60" y="262" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="1200" data-label="band label '② 取得局部权限：Namespace 与身份映射'">② 取得局部权限：Namespace 与身份映射</text>
+<rect x="60" y="270" width="380" height="64" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="75" y="293" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="350" data-label="card title 'PR_SET_NO_NEW_PRIVS'">PR_SET_NO_NEW_PRIVS</text>
+<text x="75" y="312" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'execve 不再获得新权限'">execve 不再获得新权限</text>
+<text x="75" y="330" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#b03a3a" text-anchor="start" data-max-w="350" data-label="card line '一旦设置不可撤销'">一旦设置不可撤销</text>
+<rect x="460" y="270" width="380" height="64" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="475" y="293" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="350" data-label="card title 'raw_clone(...)'">raw_clone(...)</text>
+<text x="475" y="312" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'NEWUSER / NEWNS / NEWPID / NEWNET'">NEWUSER / NEWNS / NEWPID / NEWNET</text>
+<text x="475" y="330" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'child_wait_fd 控制父子启动顺序'">child_wait_fd 控制父子启动顺序</text>
+<rect x="860" y="270" width="380" height="64" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="875" y="293" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="350" data-label="card title 'UID / GID Map'">UID / GID Map</text>
+<text x="875" y="312" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'setgroups=deny → gid_map'">setgroups=deny → gid_map</text>
+<text x="875" y="330" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '新 NetNS 只拉起 lo'">新 NetNS 只拉起 lo</text>
+<polyline points="660,346 660,370" fill="none" stroke="#b07a35" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="372" width="1240" height="150" rx="12" fill="#fbfdfa" stroke="#cfe0c8" stroke-width="1.2"/>
+<text x="60" y="398" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="1200" data-label="band label '③ 构造文件系统：两次 pivot_root 与两条 Mount 路径'">③ 构造文件系统：两次 pivot_root 与两条 Mount 路径</text>
+<rect x="60" y="408" width="380" height="92" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="75" y="431" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="350" data-label="card title 'pivot_root #1'">pivot_root #1</text>
+<text x="75" y="450" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'tmpfs 上准备 newroot'">tmpfs 上准备 newroot</text>
+<text x="75" y="468" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '绑定 oldroot/proc 供 FD Mount'">绑定 oldroot/proc 供 FD Mount</text>
+<rect x="460" y="408" width="380" height="92" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="475" y="431" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="350" data-label="card title 'setup_newroot()'">setup_newroot()</text>
+<text x="475" y="450" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'safe_openat：openat2 + RESOLVE_IN_ROOT'">safe_openat：openat2 + RESOLVE_IN_ROOT</text>
+<text x="475" y="468" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'mount_setattr，ENOSYS 才回退'">mount_setattr，ENOSYS 才回退</text>
+<rect x="860" y="408" width="380" height="92" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="875" y="431" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="350" data-label="card title 'pivot_root #2 + Detach'">pivot_root #2 + Detach</text>
+<text x="875" y="450" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'oldroot 设为 private 后 MNT_DETACH'">oldroot 设为 private 后 MNT_DETACH</text>
+<text x="875" y="468" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#b03a3a" text-anchor="start" data-max-w="350" data-label="card line '旧根此后不可达'">旧根此后不可达</text>
+<polyline points="660,524 660,544" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="546" width="1240" height="134" rx="12" fill="#f8f5fb" stroke="#d8cbe8" stroke-width="1.2"/>
+<text x="60" y="572" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#6b4b8a" text-anchor="start" data-max-w="1200" data-label="band label '④ 收敛与 exec：把权限降到目标身份'">④ 收敛与 exec：把权限降到目标身份</text>
+<rect x="60" y="580" width="380" height="76" rx="9" fill="#f8f5fb" stroke="#d8cbe8" stroke-width="1.4"/>
+<text x="75" y="603" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#6b4b8a" text-anchor="start" data-max-w="350" data-label="card title '身份与进程角色'">身份与进程角色</text>
+<text x="75" y="622" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '可选 UserNS #2；drop_privs(true)'">可选 UserNS #2；drop_privs(true)</text>
+<text x="75" y="640" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line 'fork → PID 1 Reaper + Target'">fork → PID 1 Reaper + Target</text>
+<rect x="460" y="580" width="380" height="76" rx="9" fill="#f8f5fb" stroke="#d8cbe8" stroke-width="1.4"/>
+<text x="475" y="603" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#6b4b8a" text-anchor="start" data-max-w="350" data-label="card title 'Ambient Capability'">Ambient Capability</text>
+<text x="475" y="622" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '只保留命令行显式请求的能力'">只保留命令行显式请求的能力</text>
+<text x="475" y="640" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#b03a3a" text-anchor="start" data-max-w="350" data-label="card line '丢弃后不可恢复'">丢弃后不可恢复</text>
+<rect x="860" y="580" width="380" height="76" rx="9" fill="#f8f5fb" stroke="#d8cbe8" stroke-width="1.4"/>
+<text x="875" y="603" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#6b4b8a" text-anchor="start" data-max-w="350" data-label="card title 'Seccomp → execvp()'">Seccomp → execvp()</text>
+<text x="875" y="622" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="350" data-label="card line '过滤器是 exec 前最后一步'">过滤器是 exec 前最后一步</text>
+<text x="875" y="640" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.8" font-weight="normal" fill="#b03a3a" text-anchor="start" data-max-w="350" data-label="card line '安装后不可撤销'">安装后不可撤销</text>
+<line x1="40" y1="708" x2="1280" y2="708" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="734" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1240" data-label="footer line 1">Monitor 侧用 signalfd + eventfd 收 Target 退出码；--json-status-fd 用字节数区分 Setup、Exec 失败与正常退出。</text>
+<text x="40" y="758" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1240" data-label="footer line 2">默认 Fail-Closed：Namespace、pivot_root、Capability、Seccomp 失败都终止本次启动；--not-a-security-boundary 只放宽 Bind 的子挂载 Remount。</text>
+</svg>

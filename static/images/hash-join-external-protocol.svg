@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="900" viewBox="0 0 1240 900" role="img"
+     aria-label="外存 Hash Join 的分区、落盘与逐分区恢复协议">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+  <marker id="arrowWarm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#d98a35"/>
+  </marker>
+</defs>
+<rect width="1240" height="900" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328">外存 Hash Join：分区、落盘与逐分区恢复</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" fill="#5b6570">前提：Build 与 Probe 使用同一个 Hash 与同一个分区函数，同一键才会落到同号分区</text>
+<rect x="905" y="32" width="14" height="14" rx="3" fill="#e8f0fb" stroke="#4a7fd4"/>
+<text x="925" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">Build</text>
+<rect x="981" y="32" width="14" height="14" rx="3" fill="#e9f5ec" stroke="#4d9c62"/>
+<text x="1001" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">Probe</text>
+<rect x="1057" y="32" width="14" height="14" rx="3" fill="#fdf0e3" stroke="#d98a35"/>
+<text x="1077" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">落盘/恢复</text>
+<text x="40" y="112" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">① 两侧独立分区，分区号由同一函数决定</text>
+<rect x="40" y="130" width="180" height="56" rx="10" fill="#e8f0fb" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="58" y="154" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">Build 输入行</text>
+<text x="58" y="173" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">列块 / 行</text>
+<line x1="220" y1="158" x2="268" y2="158" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="270" y="130" width="250" height="56" rx="10" fill="#ffffff" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="286" y="154" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">P(hash(key), level)</text>
+<text x="286" y="173" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">分区号 → 0 … N-1</text>
+<line x1="520" y1="158" x2="568" y2="158" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="570" y="118" width="300" height="52" rx="10" fill="#e8f0fb" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="586" y="140" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">Hybrid：部分分区留在内存</text>
+<text x="586" y="159" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">直接完成连接，不写盘</text>
+<rect x="570" y="184" width="300" height="52" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="586" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">其余分区顺序落盘</text>
+<text x="586" y="225" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">列式写出 + 追加分区键</text>
+<rect x="40" y="268" width="180" height="56" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="58" y="292" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">Probe 输入行</text>
+<text x="58" y="311" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">按批读取</text>
+<line x1="220" y1="296" x2="268" y2="296" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="270" y="268" width="250" height="56" rx="10" fill="#ffffff" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="286" y="292" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">同一个 P(hash, level)</text>
+<text x="286" y="311" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">不能换 Hash 或分区层级</text>
+<line x1="520" y1="296" x2="568" y2="296" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="570" y="254" width="300" height="52" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="586" y="276" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">目标分区已在内存</text>
+<text x="586" y="295" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">直接交给对应 Prober</text>
+<rect x="570" y="320" width="300" height="52" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="586" y="342" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">目标分区尚未加载</text>
+<text x="586" y="361" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">写入同号 Probe Spill</text>
+<path d="M 880 170 C 906 170, 906 330, 880 330" fill="none" stroke="#d98a35" stroke-width="1.5" stroke-dasharray="5 4"/>
+<text x="890" y="258" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#b06f22" text-anchor="start">同号配对</text>
+<text x="40" y="428" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">② 逐分区恢复：一次加载多少分区由可用内存决定</text>
+<rect x="40" y="452" width="220" height="64" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="56" y="477" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">读取 Build 分区</text>
+<text x="56" y="498" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">本地缓冲，异步 I/O</text>
+<line x1="260" y1="484" x2="276" y2="484" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="280" y="452" width="220" height="64" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="296" y="477" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">重建局部 Hash Table</text>
+<text x="296" y="498" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">Key/Map 形态重新选择</text>
+<line x1="500" y1="484" x2="516" y2="484" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="520" y="452" width="220" height="64" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="536" y="477" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">读取同号 Probe 分区</text>
+<text x="536" y="498" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">顺序读，不查 Bucket</text>
+<line x1="740" y1="484" x2="756" y2="484" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="760" y="452" width="220" height="64" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="776" y="477" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">向量化 Probe</text>
+<text x="776" y="498" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">Salt → Key → 重复链</text>
+<line x1="980" y1="484" x2="996" y2="484" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="1000" y="452" width="220" height="64" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="1016" y="477" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">释放局部状态</text>
+<text x="1016" y="498" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">进入下一批分区</text>
+<path d="M 1110.0 528 C 1110.0 566, 150.0 566, 150.0 534" fill="none" stroke="#8a949e" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#arrow)"/>
+<text x="510" y="584" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">处理完一批，取下一批分区；全部完成才结束 Probe</text>
+<rect x="40" y="610" width="1160" height="74" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.2"/>
+<text x="60" y="636" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">分区仍然装不下：Recursive Grace Hash Join</text>
+<text x="60" y="660" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">level + 1，Build 与 Probe 两侧同步重分区；只重分这一对分区，其他分区不受影响。</text>
+<text x="60" y="676" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">代价是额外一次读写；分区数不设上限并不能消除热点键——同一键无法被拆到两个分区。</text>
+<rect x="40" y="708" width="1160" height="96" rx="10" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.2"/>
+<text x="60" y="734" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14" font-weight="600" fill="#1f2328" text-anchor="start">不变量与代价</text>
+<text x="60" y="758" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" fill="#1f2328">Hash_build(k) = Hash_probe(k)   ∧   P_build(hash, level) = P_probe(hash, level)</text>
+<text x="60" y="780" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">落盘的是逻辑行/列块，不是 Bucket 指针、Next 链或 Arena 地址；恢复时重建索引，因此地址变化不影响正确性。</text>
+<text x="60" y="798" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">Hybrid 分区的收益：省一次 Build 写盘、一次 Probe 写盘，以及对应的两次读回。</text>
+<line x1="40" y1="836" x2="1200" y2="836" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="858" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" fill="#5b6570">按需 Spill：没有内存压力时只走内存哈希表，不为最坏情况预付分区与落盘成本。</text>
+</svg>

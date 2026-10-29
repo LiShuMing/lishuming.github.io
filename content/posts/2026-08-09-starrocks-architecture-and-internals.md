@@ -1,7 +1,7 @@
 ---
 title: "【源码】StarRocks 实现原理与源码深度分析：从 CBO、Pipeline 到湖仓一体"
 date: 2026-08-09T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 categories:
   - 数据库
 tags:
@@ -17,6 +17,10 @@ draft: false
 StarRocks 将查询规划集中在 FE，把列式批处理和节点内调度放在 BE/CN，并通过不同存储路径承接内表与数据湖查询。性能取决于这些层如何共同减少扫描、数据搬运和等待，而不是由“实时 OLAP”这一产品定位保证。
 
 本文先明确 FE、BE/CN 与存储层的边界，再从表模型进入 SQL 规划和 Pipeline 执行，最后比较数据湖、物化视图（Materialized View）与 Shared-Data 的状态管理。阅读重点是调用路径、数据归属和失败边界；功能存在与目标负载获得收益需要分别验证。
+
+![StarRocks 从 SQL 到存储的四层路径](/images/starrocks-architecture-flow.svg)
+
+图中把一条查询拆成四层：① FE 规划（`StmtExecutor` → RBO → Memo/CBO → 物理改写 → `PlanFragment`），② 调度与部署（`Coordinator` 生成 `ExecutionDAG`，经 Thrift 下发到 BE/CN），③ BE/CN 执行（`FragmentExecutor` → `FragmentContext` → `Pipeline` × DOP → 算子），④ 存储与外部数据（Shared-Nothing、Shared-Data、External Catalog）。箭头表示控制流或数据流，不是一次 RPC 的全部细节；多 Fragment 并行、Exchange 网络协议、失败重试、点查 ShortCircuit 和外部表扫描路径在图中省略，正文各节展开。
 
 ## 一：StarRocks 概览
 
@@ -35,7 +39,7 @@ StarRocks 通过列式存储（Columnar Storage）、批量执行和分布式计
 
 ### 源码分析基线与方法
 
-本文保留原有主题和材料，并使用本地 StarRocks 源码逐项核对。分析基线为 [StarRocks 源码提交 0fd27fd](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1)（2026-03-30）。由于功能迭代很快，文中的类名和调用链以该快照为准；产品版本、商业信息和 Benchmark 结论则可能随时间变化。
+本文保留原有主题和材料，并使用本地 StarRocks 源码逐项核对。初版分析基线为 [StarRocks 源码提交 0fd27fd](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1)（2026-03-30）；2026-10 又在 f977b53（2026-09-22）上复核了一遍，两版之间源码树有过一次模块重排，类名、路径与功能状态的变化见下方的「2026-10 复核记录」。正文的调用链仍以初版基线为准，复核记录单独列出差异；产品版本、商业信息和 Benchmark 结论则可能随时间变化。
 
 阅读源码时采用三条主线：
 
@@ -45,7 +49,33 @@ StarRocks 通过列式存储（Columnar Storage）、批量执行和分布式计
 | 数据 | `OlapTable` → `Partition` → `MaterializedIndex` → `Tablet` | `Tablet` → `Rowset` → `Segment` → Page | 表模型怎样映射为物理文件和版本？ |
 | 湖仓 | `ConnectorMetadata`、`MvRewritePreprocessor`、`WarehouseManager` | Connector DataSource、Lake `TabletManager` | 外部数据、MV 与 Shared-Data 如何复用执行引擎？ |
 
+#### 2026-10 复核记录
 
+复核对象是本地 `~/xwork/starrocks` 的 f977b53（2026-09-22）。从 0fd27fd 到 f977b53，BE 侧 3156 个文件、+211904/−112057 行，FE 主代码 1336 个文件、+109398/−17293 行；这个规模主要来自目录拆分和新功能，不等于下文每条结论都发生了语义变化。以下只列与本文主题相关、且已逐项对照过源码的差异。
+
+**没有变的部分**。`StmtExecutor`、`StatementPlanner`、`QueryOptimizer`、`DefaultCoordinator` 的主调用链仍在；Pipeline 的 `Pipeline`/`PipelineDriver`/`GlobalDriverExecutor` 状态机、`CollectStatsStateEnum` 的 `BLOCK`/`PASSTHROUGH`/`ROUND_ROBIN` 三态、`JoinHashMapMethodType` 的枚举、`RuntimeFilterLayout` 的布局选择逻辑都没有改动。
+
+**源码路径与命名空间迁移**。这一版把 BE 的 `exec/pipeline` 拆成了几个模块，链接到旧路径的读者会 404：
+
+| 旧位置（0fd27fd） | 新位置（f977b53） |
+|---|---|
+| `be/src/exec/pipeline/fragment_executor.{h,cpp}`，`starrocks::pipeline::FragmentExecutor` | `be/src/orchestration/fragment_executor.{h,cpp}`，`starrocks::orchestration::FragmentExecutor` |
+| `be/src/exec/pipeline/fragment_context.*`、`pipeline.h`、`pipeline_driver.*` | `be/src/exec/runtime/`；旧 `exec/pipeline/fragment_context.h` 只保留 `#include` 兼容壳 |
+| `be/src/storage/runtime_range_pruner.hpp` | `be/src/compute_env/runtime_range_pruner.hpp` |
+| `be/src/exec/sort/merge_path.*` | `be/src/compute_env/sorting/merge_path.*` |
+| `fe/.../warehouse/WarehouseManager.java` | `fe/.../server/WarehouseManager.java` |
+| `be/src/storage/lake/lake_primary_index.*` | `be/src/storage/lake/lake_persistent_index.*` |
+
+**功能状态变化**。
+
+- Range Distribution 不再是“进行中”：Shared-Data 模式下 `Config.enable_range_distribution` 默认 `true`，未显式写 `DISTRIBUTED BY` 的表会选 Range Distribution；自动分裂/合并由 `TabletReshardJobMgr` 调度 `SplitTabletJob`/`MergeTabletJob`，目标 Tablet 大小 `tablet_reshard_target_size` 默认 10 GiB，单次最大分裂数 `tablet_reshard_max_split_count` 默认 1024。MV 侧的 Range Distribution 另有 `enable_mv_range_distribution`，默认 `false`。
+- SQL 内 AI 函数有了一条独立的优化与执行链路：`AIFunctionLoweringRule` 在谓词下推前把 AI 调用下沉为 `LogicalAIProjectOperator`，`AIFunctionPlacementValidator` 只允许 AI 调用作为 AI Project 的直接输出；`PushDownTopNBelowAIProjectRule`（受 `enable_ai_topn_pushdown` 控制）在排序键只依赖透传列时减少进入 AI 调用的行数，`ForceCTEReuseRule.forCallsMatching(AiFunctionExtractor::isAICall)` 避免同一调用在多个 CTE 引用间重复执行。BE 侧对应 `AISinkOperator`/`AISourceOperator` 与 `AIProjectProcessor`。
+- 增量物化视图的刷新与改写进一步分开：`IvmRewriter` 取代了 `RuleSet.TVR_REWRITE_RULES`；刷新处理器从 `BaseMVRefreshProcessor` 拆成 `MVRefreshProcessor` 及 `MVPCTRefreshProcessor`/`MVIVMRefreshProcessor`/`MVHybridRefreshProcessor`，由 `MVRefreshProcessorFactory` 按 `RefreshMode` 选择。`MvRewritePreprocessor` 对 `refresh_mode=INCREMENTAL` 或 `AUTO` 的 MV 直接拒绝查询改写，因此“增量刷新”不等于“可被透明改写”。
+- Runtime Min/Max 裁剪补充了一个正确性细节：`compute_env/runtime_range_pruner.hpp` 现在会把 `slot + c`、`slot - c`、`c + slot` 这类单调探针表达式反解回列上的范围，并用 `__builtin_sub_overflow` 检查溢出；一旦溢出就保持范围开放，避免把回绕后的前像当成单区间而误裁行。这对应 issue #76720（提交 d3002abafa9）。
+- Hash Table 布局选择与 Cache Miss 判断被澄清：布局由 `JoinHashMapSelector._determine_hash_map_method()` 按 Key 类型和值域选择；`calculate_ht_info()` 只计算 `used_buckets`、`keys_per_bucket` 和 `cache_miss_serious`，后者用于决定是否启用 Join Probe 的协程交错，不参与布局选择。正文对应段落已按此改写。
+- `DefaultCoordinator` 现在继承 `qe/scheduler/Coordinator`；`StatementPlanner` 增加了 `PlanningSnapshot`，在授权检查前释放元数据锁，并新增 `MergeIntoPlanner`。这些是控制面并发/功能的改动，不改变本文的四阶段规划模型。
+
+**没有跑的验证**：本轮没有编译 StarRocks，没有运行 FE/BE 单测，也没有重跑任何 Benchmark；上述结论来自源码阅读与 `git diff 0fd27fd f977b53`。涉及产品行为（默认值、版本号、商业化能力）的部分仍应以对应版本文档为准。
 
 ### 技术演进
 
@@ -226,7 +256,7 @@ Table
 **Distribution 策略**：
 - **Hash Distribution**：按 Hash 值分布到 Bucket，最常用，保证数据均匀分布
 - **Random Distribution**：随机分布，无需指定分布列的场景
-- <span style="color: rgb(44, 44, 43); background-color: rgb(255, 245, 184);">**Range Distribution**</span><span style="color: rgb(44, 44, 43); background-color: rgb(255, 245, 184);">：按范围分布，解决用户多租户场景下数据倾斜的问题，支持自动分裂、合并；</span>
+- <span style="color: rgb(44, 44, 43); background-color: rgb(255, 245, 184);">**Range Distribution**</span><span style="color: rgb(44, 44, 43); background-color: rgb(255, 245, 184);">：按范围分布，解决用户多租户场景下数据倾斜的问题，支持自动分裂、合并；Shared-Data 模式下建表未显式指定分布时会默认选择，见「Range Tablet」一节；</span>
 
 ### 表模型
 
@@ -373,7 +403,7 @@ StmtExecutor.execute()
                            │
                            ▼
 BE/CN InternalService
-  └── pipeline::FragmentExecutor
+  └── orchestration::FragmentExecutor（0fd27fd 里是 pipeline::）
          ├── prepare()：QueryContext、RuntimeState、Plan、Pipeline
          └── execute()
                 ├── FragmentContext.prepare_active_drivers()
@@ -382,7 +412,7 @@ BE/CN InternalService
 
 源码中的 `StatementPlanner.createQueryPlan()` 把规划阶段明确拆成 `Transformer`、`Optimizer` 和 `ExecPlanBuild` 三段，并通过 Tracer 记录耗时。[`PlanFragmentBuilder`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/plan/PlanFragmentBuilder.java) 将优化器的 `OptExpression` 转换为可序列化的 `PlanFragment`；[`DefaultCoordinator`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/qe/DefaultCoordinator.java) 再完成实例放置、Runtime Filter 合并节点选择和 RPC 下发。
 
-BE/CN 的 [`FragmentExecutor`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/fragment_executor.cpp) 在 `prepare()` 中恢复全局字典、RuntimeState、WorkGroup、算子与 Pipeline，在 `execute()` 中准备并提交 active drivers。这种分层的好处是：**计划语义由 FE 统一决定，节点内并发、依赖、背压和资源公平性由 BE/CN Runtime 决定。**
+BE/CN 的 [`FragmentExecutor`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/fragment_executor.cpp)（f977b53 已移到 `be/src/orchestration/`，命名空间从 `pipeline` 改为 `orchestration`）在 `prepare()` 中恢复全局字典、RuntimeState、WorkGroup、算子与 Pipeline，在 `execute()` 中准备并提交 active drivers。这种分层的好处是：**计划语义由 FE 统一决定，节点内并发、依赖、背压和资源公平性由 BE/CN Runtime 决定。**
 
 
 
@@ -674,11 +704,13 @@ StarRocks 的 Join 算法经历了两个主要版本的演进。
 
 
 
-自适应选择Hash Table:
-- V1/V2 触发条件需要同时满足两个维度：数据量与桶深的组合，当数据量较大&桶深（每个bucket包含的keys）较大时选择V2版本；
-- 根据数据的range范围及唯一性选择v3/v4;
+自适应选择Hash Table（f977b53 的 `JoinHashMapSelector._determine_hash_map_method()`）:
+- BOOLEAN / TINYINT / SMALLINT 直接走 `DIRECT_MAPPING`；
+- INT / BIGINT 单列 Key 先尝试 `RANGE_DIRECT_MAPPING` 系列：值域区间足够小且开关打开时用直接映射；无 other conjunct 的 LEFT ANTI/SEMI 在内存条件满足时用 `RANGE_DIRECT_MAPPING_SET`，区间更大但 2-bit 索引更省内存时用 `DENSE_RANGE_DIRECT_MAPPING`；
+- 否则在 `enable_hash_join_linear_chained_opt()` 打开且 bucket 数不超过上限时用 `LINEAR_CHAINED`（同一类 LEFT ANTI/SEMI 用 `LINEAR_CHAINED_SET`）；
+- 都不满足时回退 `BUCKET_CHAINED`；ASOF Join 回退 `LINEAR_CHAINED_ASOF`。
 
-源码把 Build 侧长期状态与 Probe 侧批次状态分开：`JoinHashTableItems` 保存 `build_chunk`、`first/next`、fingerprint、bitset 和 DenseGroup 等结构；`HashTableProbeState` 保存当前 Probe Chunk 的 hash、匹配位置、输出游标和协程句柄。`calculate_ht_info()` 根据 Build 行数、有效桶数、每桶 Key 数和 Probe 字节量判断是否存在严重 Cache Miss，再选择 Bucket-Chained、Linear 或更直接的布局。
+源码把 Build 侧长期状态与 Probe 侧批次状态分开：`JoinHashTableItems` 保存 `build_chunk`、`first/next`、fingerprint、bitset 和 DenseGroup 等结构；`HashTableProbeState` 保存当前 Probe Chunk 的 hash、匹配位置、输出游标和协程句柄。`calculate_ht_info()` 只计算 `used_buckets`、`keys_per_bucket` 和 `cache_miss_serious`，其中 `cache_miss_serious` 由 Build 行数、Probe 字节量和每桶 Key 数共同判断；它决定的是 Join Probe 的协程交错是否启用（Hash Table 足够大或桶内 Key 足够多时启用），并不选择布局。布局选择在同一份 Build 数据就绪后由 `JoinHashMapSelector` 完成，两者不要混为一谈。
 
 这类“自适应”发生在 Hash Table 已获得真实 Build 数据之后，比只依据 FE 统计信息更可靠；但它仍局限在算子内部，不会重新选择 Join 顺序或把 Broadcast Join 改成 Shuffle Join。换言之，CBO 决定宏观物理计划，Join Runtime 根据真实 Key 分布选择微观数据结构。
 
@@ -907,7 +939,9 @@ Query Logical Plan
               └── 不满足等价性：保留原计划
 ```
 
-刷新侧以 `MaterializedViewMgr`、`BaseMVRefreshProcessor`、`MVRefreshPartitionSelector` 和 `MVVersionManager` 为核心。分区级刷新会维护 MV 分区与基表分区的映射，并在成功后更新版本元数据；外表还要先刷新 Connector 元数据，否则“基表是否变化”的判断本身可能过期。
+刷新侧以 `MaterializedViewMgr`、`MVRefreshProcessor` 及其三个子类、`MVRefreshPartitionSelector` 和 `MVVersionManager` 为核心。分区级刷新会维护 MV 分区与基表分区的映射，并在成功后更新版本元数据；外表还要先刷新 Connector 元数据，否则“基表是否变化”的判断本身可能过期。
+
+`MVRefreshProcessor` 在 f977b53 里由 `MVRefreshProcessorFactory` 按 `RefreshMode` 选择具体实现：`PCT` 走 `MVPCTRefreshProcessor`，`INCREMENTAL` 走 `MVIVMRefreshProcessor`（基表缺少 TVR 基线时改用 `MVHybridRefreshProcessor` 重建），`AUTO` 直接走 Hybrid。初版使用的 `BaseMVRefreshProcessor` 及带 `Based` 后缀的类名已被替换。需要区分的是，增量刷新改善的是数据新鲜度；同一快照的 `MvRewritePreprocessor` 对 `refresh_mode=INCREMENTAL` 或 `AUTO` 的 MV 明确拒绝查询改写，因此这类 MV 不能同时承担透明加速。
 
 改写侧在 CBO 中由 [`MvRewritePreprocessor`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/MvRewritePreprocessor.java) 准备候选集，再由单表/多表 MV 规则处理谓词包含关系、列映射、聚合 Roll-up、Join 等价和分区补偿。改写成功后还会重新执行谓词下推与分区裁剪，因为 `UNION` 补偿会生成新的 Scan 分支。
 
@@ -991,14 +1025,16 @@ CN ── LocationProvider ───────┤
 - Compaction 策略优化（避免大 Tablet Compaction 阻塞）
 - 内存管理优化（减少大 Tablet 写入时的内存峰值）
 
-### Range Tablet （进行中）
+### Range Tablet（Shared-Data）
 
 **场景**：解决 Hash Tablet 数据分布倾斜的问题。
 
 **原理**：
 - 传统 Hash Tablet 按 Hash 值分布，可能导致某些 Tablet 数据量过大
-- Range Tablet 按 Key 的范围分布，保证数据均匀
+- Range Tablet 按 Key 的范围分布，并在数据增长后分裂、数据收缩后合并
 - 适用于有序 Key 的场景（如时间戳、自增 ID）
+
+f977b53 的实现状态比初版明确：Shared-Data 模式下 `Config.enable_range_distribution` 默认 `true`，建表未显式写 `DISTRIBUTED BY` 时会选择 Range Distribution；MV 侧另有 `enable_mv_range_distribution`（默认 `false`）单独控制，只有两个开关都为 `true` 时异步 MV 才默认走 Range Distribution。动态分裂/合并由 `TabletReshardJobMgr` 调度 `SplitTabletJob`/`MergeTabletJob`，目标 Tablet 大小由 `tablet_reshard_target_size` 控制（默认 10 GiB），单次最大分裂数 `tablet_reshard_max_split_count` 默认 1024。Shared-Nothing 模式下这些配置不生效，仍按 Hash/Random 分布。
 
 ### AutoScaling
 
@@ -1161,6 +1197,12 @@ Explain 展示计划结构和估计，只有带执行结果的分析才包含实
 ### AI Native
 
 AI 接口与智能运维属于不同集成层，需要分别检查数据访问权限、模型成本和输出验证。
+
+#### SQL 内 AI 函数
+
+f977b53 的优化器多了一层 AI 函数执行边界。`AIFunctionLoweringRule` 在谓词下推前把 Project、Filter、Values、Join 中的 AI 调用下沉成 `LogicalAIProjectOperator`；`AIFunctionPlacementValidator` 随后禁止 AI 调用出现在其他算子或嵌套表达式中，只允许它作为 AI Project 的直接输出。这样做的原因是 AI 调用带网络请求和费用，优化器不能像普通标量函数那样随意复制或合并。
+
+边界固化后，普通规则仍可围绕它做局部优化。`PushDownTopNBelowAIProjectRule` 在排序键只依赖透传列时把 TopN 推到 AI Project 之下，减少进入调用的行数（受 `enable_ai_topn_pushdown` 控制）；`ForceCTEReuseRule.forCallsMatching(AiFunctionExtractor::isAICall)` 让同一个 AI 调用在多个 CTE 引用间只执行一次。BE 侧由 `AISinkOperator`/`AISourceOperator` 与 `AIProjectProcessor` 承接，把行批次转成异步任务再回填结果，并传播取消状态。这条链路是 SQL 引擎内的算子，和下一节面向 DBA 的产品级 AI Agent 不是同一层。
 
 #### AI-Agent
 

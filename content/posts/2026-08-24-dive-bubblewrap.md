@@ -1,7 +1,7 @@
 ---
 title: "【源码】Bubblewrap：五千行 C 代码如何构建 Linux 用户态沙箱"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 slug: "dive-bubblewrap"
 categories:
   - AI Infra
@@ -13,7 +13,7 @@ tags:
   - Namespace
   - Seccomp
   - AI Agent
-description: "结合 Bubblewrap 0.12.0 开发分支源码，分析声明式挂载操作、User/Mount/PID Namespace、双重 pivot_root、Capability 收敛、进程监管、Seccomp 与安全策略边界。"
+description: "结合 Bubblewrap 0.13.x 源码，分析声明式挂载操作、User/Mount/PID Namespace、双重 pivot_root、mount_setattr 与 openat2、Capability 收敛、进程监管、Seccomp 与安全策略边界。"
 draft: false
 ---
 
@@ -48,21 +48,37 @@ AI Agent 可以读写文件、执行 Shell、调用编译器，甚至运行来�
 | 项目属性 | 当前源码 |
 |----------|----------|
 | 本地目录 | `~/xwork/bubblewrap` |
-| Commit | [`2f55bae`](https://github.com/containers/bubblewrap/tree/2f55bae38468d0c50cf5df87b1e481e882b63acb) |
-| Git Describe | `v0.11.2-11-g2f55bae` |
-| Meson Version | `0.12.0`，预发布开发分支 |
-| Commit 日期 | 2026-06-02 |
-| `.c` 实现规模 | 5,146 行 |
-| 加上项目头文件 | 约 5,440 行 |
-| 必选库依赖 | `libcap` |
+| Commit | [`0f8073d`](https://github.com/containers/bubblewrap/tree/0f8073dd9b547e15e8ec9451371f9729830b083d) |
+| Git Describe | `v0.13.0-4-g0f8073d` |
+| Meson Version | `0.13.1`，v0.13.0（2026-09-22）之后的开发线 |
+| Commit 日期 | 2026-09-25 |
+| `.c` 实现规模 | 5,640 行 |
+| 加上项目头文件 | 约 6,043 行 |
+| 必选库依赖 | `libcap`；内核头文件需提供 `__NR_pivot_root` |
 | 可选库依赖 | `libselinux` |
 
 | 文件 | 行数 | 主要职责 |
 |------|------|----------|
-| [`bubblewrap.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bubblewrap.c) | 3,255 | 参数解析、Namespace、挂载编排、权限与进程树 |
-| [`utils.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/utils.c) | 1,085 | FD、路径、内存、进程与通用系统调用（System Call）封装 |
-| [`bind-mount.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bind-mount.c) | 607 | Bind Mount、`mountinfo` 与递归 Remount |
-| [`network.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/network.c) | 199 | 最小 rtnetlink 客户端与 Loopback 配置 |
+| [`bubblewrap.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bubblewrap.c) | 3,568 | 参数解析、Namespace、挂载编排、权限与进程树 |
+| [`utils.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/utils.c) | 1,137 | FD、路径、内存、进程与通用系统调用（System Call）封装 |
+| [`bind-mount.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bind-mount.c) | 736 | Bind Mount、`mount_setattr`、`mountinfo` 与递归 Remount 回退 |
+| [`network.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/network.c) | 199 | 最小 rtnetlink 客户端与 Loopback 配置 |
+| [`safe_openat.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/safe_openat.c) | 333 | `openat2`/`O_PATH` 受限路径打开，从 crun 引入 |
+
+#### 2026-10 复核记录
+
+初版分析基点为 2f55bae（2026-06-02，`v0.11.2-11-g2f55bae`）；2026-10 在 0f8073d（2026-09-25，`v0.13.0-4-g0f8073d`）上复核。两版之间发布了 v0.12.0（2026-08-26）和 v0.13.0（2026-09-22）：30 个文件 `+2,893/−442`，其中 `bubblewrap.c` `+562/−249`、`bind-mount.c` `+176/−47`、`utils.c` `+69/−17`，并新增 `safe_openat.c`（333 行）。正文已按新快照更新行数与链接，下面只列影响机制判断的差异。
+
+- **安全 Mount 标志有两条落实路径**。v0.13.0 起，内核 5.12+ 上 `bind_mount_fd()` 改用 `mount_setattr(2)`：对目标目录重新 `open(O_PATH)`，然后以 `AT_EMPTY_PATH | AT_RECURSIVE` 和 `MOUNT_ATTR_RDONLY/NODEV/NOSUID` 一次覆盖整棵子挂载树。只有内核返回 `ENOSYS` 时才走原来的 `mountinfo` 解析 + 逐 Mount `MS_REMOUNT` 回退。其他错误（如 `EPERM`）不会触发回退，而是直接失败；提交 9232fa0 修的就是“非 `ENOSYS` 错误也把 `mount_attr_supported` 置假”的问题。下文「为什么 Bind Mount 需要七百行代码」已按此改写。
+- **Setup 阶段新增一次 `/proc` Bind Mount**。第一次 `pivot_root` 之后、`setup_newroot()` 之前，源码把 `oldroot/proc` 递归 Bind 到新根的 `/proc`，目的是让后续基于 FD 的 `mount()` 调用能使用 `/proc/self/fd/N`。这与用户可见的 `/proc` 是两件事：后者仍按 PID Namespace 是否新建走独立 procfs 或宿主 procfs。
+- **路径解析改用 `openat2` 的系统调用级约束**。`safe_openat()` 从 crun 引入：优先 `openat2(RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS)`，不可用时回退到逐段解析；构建时可用 `-Dassume_kernel=5.6.0` 把回退编译掉。`setup_newroot()` 中的 `openat_in_root()` 通过它访问 `/oldroot` 与 `/newroot`，每次重新 `open` 根目录，避免 `--bind / /` 覆盖 `/newroot` 后旧 `O_PATH` FD 看不到新挂载。
+- **空路径参数被拒绝**。`--bind`、`--overlay-src`、`--symlink` 等接受空字符串时会报 `does not take an empty path argument`（#771）；旧版本在部分路径上会把空串当根目录处理。
+- **回退与调试可显式触发**。`--debug-opt=force-openat-fallback`、`--debug-opt=force-mount-setattr-fallback` 用于测试两条回退路径；`-Ddebug_logging=true` 加运行时 `DEBUG_INVOCATION` 才输出 `debug()` 日志（提交 fd73997、433d2cf）。
+- **构建与修复**。`pivot_root` 从运行时可探测改为编译期硬依赖（需要 `__NR_pivot_root` 头文件）；修复了 remount 失败时 `resolved_dest` 的 use-after-free（94d4a48）、旧编译器与 musl 下的构建错误。
+
+**没有变的部分**：`SetupOp` 链式结构、双重 `pivot_root`、`resolve_symlinks_in_ops()` 在切根前解析、Monitor/PID 1/Target 三角色、`signalfd`+`eventfd` 退出码协议、Seccomp 安装在 `execvp()` 前的顺序，以及 `--not-a-security-boundary` 仅对 Bind Mount 传入 `BIND_FAIL_OPEN` 的范围，均与初版一致。
+
+**没有跑的验证**：本轮没有编译 bubblewrap，没有运行 `meson test` 或 `tests/test-run.sh`，也没有在旧内核上实测回退路径；上述结论来自源码阅读、`git diff 2f55bae 0f8073d` 与 `NEWS.md`。发行版实际启用的编译选项可能不同，例如 `-Dassume_kernel` 会把回退能力从二进制中移除。
 
 ### 项目定位与历史
 
@@ -105,7 +121,7 @@ systemd-nspawn 更接近“启动一个轻量系统容器”；Bubblewrap 更接
 
 #### 两种“安全边界”不能混淆
 
-[`SECURITY.md`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/SECURITY.md) 区分了两个问题。
+[`SECURITY.md`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/SECURITY.md) 区分了两个问题。
 
 第一，Bubblewrap 不是“当前用户与操作系统之间”的权限边界。普通用户能通过 Bubblewrap 完成的 Namespace 操作，理论上也可以编写自己的程序完成；它不应让用户获得宿主上原本没有的权限。
 
@@ -122,7 +138,7 @@ systemd-nspawn 更接近“启动一个轻量系统容器”；Bubblewrap 更接
 
 ### 整体架构：一条声明式沙箱编译流水线
 
-Bubblewrap 最终只生成一个 `bwrap` 可执行文件，入口是 [`main()`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bubblewrap.c)。整体可以理解为一条小型编译流水线：
+Bubblewrap 最终只生成一个 `bwrap` 可执行文件，入口是 [`main()`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bubblewrap.c)。整体可以理解为一条小型编译流水线：
 
 ```text
 CLI / FD Arguments
@@ -150,6 +166,10 @@ raw_clone(CLONE_NEWNS | ...)
           tmpfs + pivot_root #1
                    │
                    ▼
+        Bind oldroot/proc → /proc
+             （FD Mount 依赖）
+                   │
+                   ▼
              setup_newroot()
                    │
                    ▼
@@ -167,6 +187,14 @@ raw_clone(CLONE_NEWNS | ...)
 - **解析阶段不执行挂载。** 用户意图先变成数据结构；
 - **特权操作完成后不可回头。** 旧根被卸载、Capability 被丢弃、Seccomp 被应用，后续阶段只能继续收敛。
 
+![Bubblewrap 的启动阶段与不可逆收敛点](/images/bubblewrap-lifecycle.svg)
+
+图中把一次调用拆成四段：① 解析（只生成 `SetupOp`）、② 取得 Namespace 权限与身份映射、③ 构造新根（两次 `pivot_root`）、④ 收敛权限并 `execvp()`。红字是源码里无法回退的步骤：`PR_SET_NO_NEW_PRIVS`、旧根 `MNT_DETACH`、Capability 丢弃和 Seccomp 安装。图中省略了 `mountinfo` 树解析、Monitor 的 `poll()` 循环和 `--as-pid-1` 分支，这些在对应小节展开。
+
+这张图的[可交互版本](/diagrams/bubblewrap-startup.html)可以聚焦节点、搜索关系和切换深浅色；下面是它的静态预览。
+
+<a href="/diagrams/bubblewrap-startup.html"><img src="/images/bubblewrap-startup-interactive.png" alt="Bubblewrap 启动流程与权限收敛（交互版预览）" width="100%"></a>
+
 ## 准备阶段：编译挂载计划，取得局部权限
 
 ### SetupOp：把命令行编译为挂载计划
@@ -175,7 +203,7 @@ raw_clone(CLONE_NEWNS | ...)
 
 #### 数据结构
 
-几十个 CLI 选项最终被归一为 [`SetupOp`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bubblewrap.c)：
+几十个 CLI 选项最终被归一为 [`SetupOp`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bubblewrap.c)：
 
 ```c
 typedef enum {
@@ -478,6 +506,8 @@ Overlay Mount 参数由 `StringBuilder` 拼装，Source 路径通过 `strappend_
   → Bind 宿主 procfs
 ```
 
+这层用户可见的 `/proc` 之外，源码在 `pivot_root #1` 之后还会把 `oldroot/proc` 递归 Bind 到新根，供后续基于 FD 的 `mount()` 使用；`setup_newroot()` 里显式的 `--proc` 操作会覆盖或补充这层临时挂载。
+
 无论哪条路径，源码都会检查并只读遮盖：
 
 ```text
@@ -515,11 +545,26 @@ FD Data
 
 文件内容仍由 Mount 引用，但沙箱无法从其他路径重新找到临时文件。这种做法把内容生命周期绑定到 Mount，而不是可见文件名。
 
-### 为什么 Bind Mount 需要六百行代码
+### 为什么 Bind Mount 需要七百行代码
 
-只读或 `nosuid` 要求必须覆盖实际子挂载，不能只检查顶层路径；挂载树解析与递归 Remount 用于落实这类约束。
+只读或 `nosuid` 要求覆盖实际子挂载，不能只检查顶层路径。Bubblewrap 有两条落实路径：内核 5.12+ 用一次 `mount_setattr(2)` 递归设置属性；不可用时解析 `mountinfo` 并逐个 Remount。
 
-#### Bind 时传入的安全标记不会自动递归生效
+#### 主路径：一次 `mount_setattr(2)`
+
+`mount_setattr(2)` 接受一个已打开的目录 FD 和属性集合，`AT_RECURSIVE` 让它作用于整棵子挂载树，正好对应“递归 Bind 之后统一加安全标记”的需求：
+
+```text
+1. mount(src, dest, MS_BIND | MS_REC)
+2. open(dest, O_PATH | O_CLOEXEC)
+3. mount_setattr(fd, "", AT_EMPTY_PATH | AT_RECURSIVE,
+                 attr_set = MOUNT_ATTR_RDONLY | MOUNT_ATTR_NODEV | MOUNT_ATTR_NOSUID)
+```
+
+默认 Bind 强制 `nosuid`，非 Device Bind 还强制 `nodev`，只读 Bind 额外加 `MOUNT_ATTR_RDONLY`。这条路径不需要读取 `/proc/self/mountinfo`，也不依赖挂载树的遍历顺序。
+
+如果内核没有 `mount_setattr`（返回 `ENOSYS`），才进入回退路径；其他错误不会被当成“内核不支持”而静默降级。v0.13.0 的这一选择与 `-Dassume_kernel=5.12.0` 配套：后者会把回退代码从构建中移除。
+
+#### 回退路径：从 `mountinfo` 解析到逐个 Remount
 
 Linux Bind Mount 的历史行为是：
 
@@ -527,7 +572,7 @@ Linux Bind Mount 的历史行为是：
 mount(src, dest, MS_BIND | MS_REC)
 ```
 
-可以复制挂载关系，却不会可靠地把 `MS_RDONLY`、`MS_NOSUID`、`MS_NODEV` 应用到所有子挂载点。Bubblewrap 因此采用：
+可以复制挂载关系，却不会可靠地把 `MS_RDONLY`、`MS_NOSUID`、`MS_NODEV` 应用到所有子挂载点。没有 `mount_setattr` 时，Bubblewrap 采用：
 
 ```text
 1. 创建 Recursive Bind
@@ -538,11 +583,9 @@ mount(src, dest, MS_BIND | MS_REC)
 6. 对每个 Mount 执行 MS_BIND | MS_REMOUNT
 ```
 
-默认 Bind 强制 `nosuid`，非 Device Bind 还强制 `nodev`。只读 Bind 则额外增加 `MS_RDONLY`。
-
 #### `parse_mountinfo()` 是一个小型树解析器
 
-[`parse_mountinfo()`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bind-mount.c) 的步骤包括：
+[`parse_mountinfo()`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bind-mount.c) 的步骤包括：
 
 1. 解析 Mount ID、Parent ID、Mount Point 与 VFS Option；
 2. 反转义 `/proc/self/mountinfo` 的八进制路径；
@@ -573,7 +616,7 @@ open(resolved_dest, O_PATH)
 --not-a-security-boundary
 ```
 
-它不是“关闭安全检查”的总开关。当前实现只把 `BIND_FAIL_OPEN` 传入 Bind Mount；递归子 Mount 因 Automounter 等原因无法 Remount 时，可以告警并继续。
+它不是“关闭安全检查”的总开关。当前实现只把 `BIND_FAIL_OPEN` 传入 Bind Mount；递归子 Mount 因 Automounter 等原因无法 Remount 时，可以告警并继续。内核支持 `mount_setattr` 时，这层放宽不会生效：`mount_setattr` 失败直接返回错误，只有回退路径里的子挂载 Remount 才读取 `BIND_FAIL_OPEN`。
 
 以下关键失败依然 Fail-Closed：
 
@@ -664,7 +707,7 @@ PID 不是普通消息字段，而是 Kernel 随消息附带的 Credential。Mon
 
 ### Network Namespace：只提供 Loopback
 
-新的 Network Namespace 初始只有 Down 状态的 `lo`。[`network.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/network.c) 没有引入 libnl，而是实现最小 rtnetlink 客户端：
+新的 Network Namespace 初始只有 Down 状态的 `lo`。[`network.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/network.c) 没有引入 libnl，而是实现最小 rtnetlink 客户端：
 
 ```text
 socket(PF_NETLINK, NETLINK_ROUTE)
@@ -739,7 +782,7 @@ prctl(PR_SET_PDEATHSIG, SIGKILL);
 
 #### 用 Cleanup Attribute 模拟 RAII
 
-[`utils.h`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/utils.h) 定义：
+[`utils.h`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/utils.h) 定义：
 
 ```c
 #define cleanup_free __attribute__((cleanup(cleanup_freep)))
@@ -780,7 +823,7 @@ cleanup_fd int fd = -1;
 
 #### 编译期警告补充实现检查
 
-[`meson.build`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/meson.build) 开启了大量严格警告：
+[`meson.build`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/meson.build) 开启了大量严格警告：
 
 ```text
 -Werror=shadow
@@ -956,6 +999,7 @@ main()
         ├── Mount Tree → Slave
         ├── Tmpfs@/tmp
         ├── pivot_root #1
+        ├── Bind oldroot/proc → /proc
         ├── setup_newroot()
         ├── Detach oldroot
         ├── pivot_root #2
@@ -973,7 +1017,7 @@ main()
 
 ### 如何验证这类沙箱实现
 
-Bubblewrap 的 [`tests/test-run.sh`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/tests/test-run.sh) 不只验证“命令能运行”，还覆盖安全不变量：
+Bubblewrap 的 [`tests/test-run.sh`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/tests/test-run.sh) 不只验证“命令能运行”，还覆盖安全不变量：
 
 | 测试方向 | 示例 |
 |----------|------|
@@ -983,6 +1027,8 @@ Bubblewrap 的 [`tests/test-run.sh`](https://github.com/containers/bubblewrap/bl
 | 生命周期 | `--die-with-parent` |
 | 状态协议 | `--info-fd`、`--json-status-fd` |
 | Mount | Bind、Readonly、设备、Overlay 与路径转义 |
+| Mount 回退 | `--debug-opt=force-mount-setattr-fallback`；`openat2` 不可用时走 `--debug-opt=force-openat-fallback` |
+| 参数校验 | 空路径参数必须被拒绝 |
 | 数据传递 | `--file`、`--bind-data`、FD |
 | Seccomp | Allowlist、Denylist、无效 BPF |
 | 兼容降级 | `--not-a-security-boundary` |
@@ -1010,14 +1056,14 @@ Compatibility：Kernel 不支持时明确失败或按策略降级
 
 | 主题 | 源码入口 |
 |------|----------|
-| 项目定位与限制 | [`README.md`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/README.md) |
-| 安全模型 | [`SECURITY.md`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/SECURITY.md) |
-| 主流程与 SetupOp | [`bubblewrap.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bubblewrap.c) |
-| Bind Mount 与 Mountinfo | [`bind-mount.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bind-mount.c) |
-| Netlink 与 Loopback | [`network.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/network.c) |
-| FD、PID 与路径工具 | [`utils.c`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/utils.c) |
-| Cleanup/Ownership 宏 | [`utils.h`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/utils.h) |
-| CLI 语义 | [`bwrap.xml`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/bwrap.xml) |
-| 构建与依赖 | [`meson.build`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/meson.build) |
-| 主回归测试 | [`tests/test-run.sh`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/tests/test-run.sh) |
-| Seccomp 测试 | [`tests/test-seccomp.py`](https://github.com/containers/bubblewrap/blob/2f55bae38468d0c50cf5df87b1e481e882b63acb/tests/test-seccomp.py) |
+| 项目定位与限制 | [`README.md`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/README.md) |
+| 安全模型 | [`SECURITY.md`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/SECURITY.md) |
+| 主流程与 SetupOp | [`bubblewrap.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bubblewrap.c) |
+| Bind Mount 与 Mountinfo | [`bind-mount.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bind-mount.c) |
+| Netlink 与 Loopback | [`network.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/network.c) |
+| FD、PID 与路径工具 | [`utils.c`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/utils.c) |
+| Cleanup/Ownership 宏 | [`utils.h`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/utils.h) |
+| CLI 语义 | [`bwrap.xml`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/bwrap.xml) |
+| 构建与依赖 | [`meson.build`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/meson.build) |
+| 主回归测试 | [`tests/test-run.sh`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/tests/test-run.sh) |
+| Seccomp 测试 | [`tests/test-seccomp.py`](https://github.com/containers/bubblewrap/blob/0f8073dd9b547e15e8ec9451371f9729830b083d/tests/test-seccomp.py) |

@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="860" viewBox="0 0 1240 860" role="img"
+     aria-label="StarRocks QueryOptimizer.optimizeByCost 生命周期与 Cascades 任务栈">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+  <marker id="arrowWarm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#d98a35"/>
+  </marker>
+</defs>
+<rect width="1240" height="860" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328">StarRocks QueryOptimizer.optimizeByCost() 生命周期</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" fill="#5b6570">源码基线 f977b53（2026-09-22）· 与文中 0fd27fd 快照的差异见正文「复核记录」</text>
+<rect x="900" y="32" width="14" height="14" rx="3" fill="#e8f0fb" stroke="#4a7fd4"/>
+<text x="920" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">RBO</text>
+<rect x="962" y="32" width="14" height="14" rx="3" fill="#fdf0e3" stroke="#d98a35"/>
+<text x="982" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">CBO</text>
+<rect x="1024" y="32" width="14" height="14" rx="3" fill="#e9f5ec" stroke="#4d9c62"/>
+<text x="1044" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">CBO 后</text>
+<rect x="40" y="100" width="700" height="62" rx="10" fill="#f1f3f5" stroke="#9aa4ae" stroke-width="1.4"/>
+<text x="58" y="126" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">SQL Statement → Analyzer / Transformer</text>
+<text x="58" y="147" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">AST 解析与逻辑算子树构造</text>
+<rect x="40" y="188" width="700" height="62" rx="10" fill="#e8f0fb" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="58" y="214" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">① logicalRuleRewrite（RBO）</text>
+<text x="58" y="235" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">谓词下推/推导、列裁剪、子查询解关联、分区裁剪、CTE inline…</text>
+<rect x="40" y="276" width="700" height="62" rx="10" fill="#e8f0fb" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="58" y="302" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">② memo.init + deriveAllGroupLogicalProperty</text>
+<text x="58" y="323" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">逻辑树 → Memo / Group / GroupExpression</text>
+<rect x="40" y="364" width="700" height="62" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="58" y="390" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">③ memoOptimize（CBO，Cascades 任务搜索）★ 本文核心</text>
+<text x="58" y="411" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">规则装载 → 任务栈自顶向下 → 代价自底向上</text>
+<rect x="40" y="452" width="700" height="62" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="58" y="478" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">④ extractBestPlan(requiredProperty, rootGroup)</text>
+<text x="58" y="499" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">沿 (property → bestExpr → inputProperties) 递归提取</text>
+<rect x="40" y="540" width="700" height="62" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="58" y="566" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">⑤ physicalRuleRewrite（CBO 后）</text>
+<text x="58" y="587" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">SortAgg / PerBucket 标记、两阶段归并排序、冗余 shuffle 裁剪</text>
+<rect x="40" y="628" width="700" height="62" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="58" y="654" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">⑥ dynamicRewrite + PlanValidate → PlanFragmentBuilder</text>
+<text x="58" y="675" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" font-weight="normal" fill="#5b6570" text-anchor="start">物理树 → Fragment / Exchange，inputProperties 决定 join 分发</text>
+<line x1="390.0" y1="162" x2="390.0" y2="179" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<line x1="390.0" y1="250" x2="390.0" y2="267" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<line x1="390.0" y1="338" x2="390.0" y2="355" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<line x1="390.0" y1="426" x2="390.0" y2="443" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<line x1="390.0" y1="514" x2="390.0" y2="531" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<line x1="390.0" y1="602" x2="390.0" y2="619" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="790" y="100" width="410" height="716" rx="12" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.2"/>
+<text x="810" y="130" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">③ 内部：任务栈、挂起/恢复与剪枝闭环</text>
+<rect x="822" y="152" width="346" height="58" rx="8" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="836" y="176" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">OptimizeGroupTask(G, req)</text>
+<text x="836" y="195" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">入口：costLowerBound(req) ≥ UB → 直接返回</text>
+<line x1="995.0" y1="210" x2="995.0" y2="223" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="822" y="232" width="346" height="58" rx="8" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="836" y="256" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">OptimizeExpressionTask</text>
+<text x="836" y="275" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">transform promise=1，implement promise=2 先跑</text>
+<line x1="995.0" y1="290" x2="995.0" y2="303" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="822" y="312" width="346" height="58" rx="8" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="836" y="336" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">ApplyRuleTask × N</text>
+<text x="836" y="355" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">Binder 匹配 → check → transform → copyIn 去重</text>
+<line x1="995.0" y1="370" x2="995.0" y2="383" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="822" y="392" width="346" height="58" rx="8" fill="#ffffff" stroke="#9aa4ae" stroke-width="1.1"/>
+<text x="836" y="416" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">EnforceAndCostTask</text>
+<text x="836" y="435" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">子需求推导 → 子 best → 输出属性 → 登记/插 enforcer</text>
+<path d="M 1160 158 C 1206 198, 1206 390, 1160 430" fill="none" stroke="#d98a35" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrowWarm)"/>
+<text x="822" y="468" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11" font-weight="normal" fill="#b06f22" text-anchor="start">橙色虚线：任务挂起 / 恢复（clone() 保存栈帧）</text>
+<rect x="822" y="492" width="58" height="22" rx="11" fill="#fdf0e3" stroke="#d98a35" stroke-width="1"/>
+<text x="851" y="507" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#9a5f17" text-anchor="middle">剪枝</text>
+<text x="890" y="507" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">子 Group 无 best → clone() 挂起自己，</text>
+<text x="890" y="527" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">压 OptimizeGroupTask(child, UB-已用)</text>
+<rect x="822" y="560" width="58" height="22" rx="11" fill="#fdf0e3" stroke="#d98a35" stroke-width="1"/>
+<text x="851" y="575" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#9a5f17" text-anchor="middle">收紧</text>
+<text x="890" y="575" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">找到一个可行解且 curTotalCost &lt; UB</text>
+<text x="890" y="595" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">→ 收紧上界，后续分支更早放弃</text>
+<rect x="822" y="628" width="58" height="22" rx="11" fill="#fdf0e3" stroke="#d98a35" stroke-width="1"/>
+<text x="851" y="643" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#9a5f17" text-anchor="middle">放弃</text>
+<text x="890" y="643" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">子代价累加超上界 →</text>
+<text x="890" y="663" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">recordLowerBoundCost 后放弃该候选</text>
+<rect x="822" y="696" width="58" height="22" rx="11" fill="#fdf0e3" stroke="#d98a35" stroke-width="1"/>
+<text x="851" y="711" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#9a5f17" text-anchor="middle">提取</text>
+<text x="890" y="711" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">extractBestPlan 只读已登记的</text>
+<text x="890" y="731" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#1f2328" text-anchor="start">(property → cost, inputProperties)</text>
+<line x1="40" y1="812" x2="1200" y2="812" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="834" font-family="'JetBrains Mono','Menlo','Consolas',monospace" font-size="12.5" fill="#5b6570">realCost = 0.5 × cpu + 2.0 × memory + 1.5 × network<tspan font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif">　·　CostModel.getRealCost()，f977b53 未变</tspan></text>
+</svg>

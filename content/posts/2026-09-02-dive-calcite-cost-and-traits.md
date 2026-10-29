@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Calcite VolcanoPlanner：Cost 账本、两种 RuleDriver 与 Trait Enforcement"
 date: 2026-09-02T00:00:00+08:00
-lastmod: 2026-10-18T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 slug: "dive-calcite-cost-and-traits"
 categories:
   - 数据库
@@ -24,6 +24,10 @@ VolcanoPlanner 的代价比较、候选枚举与物理属性（Physical Property
 
 上一篇《[深入 Calcite 优化器：Hep、Volcano、谓词推导与 Join Reorder]({{< relref "2026-08-24-dive-calcite.md" >}})》讨论了优化器的接入边界。本文继续沿 `RelSubset` 的代价状态、两种 RuleDriver 和 Trait Enforcement 追踪一条查询，区分默认框架行为与集成方需要提供的能力。
 
+![VolcanoPlanner 的账本、两种 Driver 与 Trait 补偿](/images/calcite-cost-traits.svg)
+
+图从上到下对应本文的四个部分：注册与账本、两种 driver、Trait 补偿与提取。蓝线是默认的自底向上路径，橙线是 opt-in 的 top-down 路径；两条路径共用同一份 `RelSubset` 账本，差别在于谁读 `upperBound` / `taskState`，以及 Enforcer 是无穷代价的占位符还是带真实代价的物理算子。
+
 ## 源码基线与搜索入口
 
 ### 阅读范围与源码基线
@@ -40,6 +44,20 @@ Calcite 的代价接口、搜索驱动器和 Trait 协议可以分别扩展，�
 
 
 后文完整执行示例是在这个快照上**实际编译运行**得到的，计划、代价数字与任务 trace 都是程序真实输出，不是手工推演。但要强调：Rule 注册集合、Program 编排、Adapter 提供了哪些 Metadata，最终都由集成方决定；本文描述的是"用 `Programs.standard()` + Enumerable Convention 跑这个快照"时的行为。
+
+#### 2026-10 复核记录
+
+2026-10-28 在 Apache Calcite 的 `68f1613`（1.43.0 开发线）上复核本文引用的类。账本与比较器没有变：`RelSubset` 的 `best` / `bestCost` / `upperBound` / `taskState` / `state` / `enforceDisabled` / `timestamp`、`VolcanoCost.isLe()` / `isLt()` 的 `if (true)` 写法、`propagateCostImprovements` 的堆遍历、`CheapestPlanReplacer`，以及 `IterativeRuleDriver`（仍为 84 行）和 `RelMdLowerBoundCost` 都未改动。Trait 协议也未变：`RelSet.addConverters`、`AbstractConverter`、`RelTraitSet.satisfies` 的 `Math.min`、`RelCollationTraitDef`、`DeriveMode`、`PhysicalNode`、`EnumerableConvention.enforce()`、`EnumerableMergeJoinRule` 与 `EnumerableMergeJoin` 的 `passThroughTraits` / `deriveTraits` 都保持原样。开关仍是 `calcite.planner.topdown.opt=false`，`CalcitePrepareImpl.setTopDownOpt()` 与 `PlannerImpl` 第 184 行的 `new VolcanoPlanner(...)` 也都还在。
+
+有三处代码变化，都不改变本文对搜索机制的结构判断：
+
+- `TopDownRuleDriver` 把 `Stack<Task>` 换成 `ArrayDeque<Task>`，两处 `add()` 改成 `push()`。`Stack.push` 和 `ArrayDeque.push` 都插到队首，`pop()` 都从队首取，任务顺序不变；改动只是去掉 `Stack` 的过时告警。
+- `VolcanoPlanner.registerImpl()` 在 trait / Convention 校验之前新增 `checkEmptyRowType(rel)`：从 `Context` 读取 `EmptyRowTypePolicy`，缺省 `DISCOURAGED`；策略为 `FORBIDDEN` 且行类型字段数为 0 时抛出 `IllegalArgumentException`。这是注册期校验，不参与代价传播。
+- `EnumerableMergeJoin.implement()` 的两处 key lambda 显式指定 `Function1.class`。源码注释说明：单列 BOOLEAN 键会被推断成 `Predicate1`，与 `EnumerableDefaults.mergeJoin` 的签名不匹配。本文的例子按 `deptno`（整数）连接，不走这条分支。
+
+规则集方面，`Programs.RULE_SET` 新增了 `ENUMERABLE_IE_JOIN_RULE`，`Programs.subQuery()` 新增 `TABLE_FUNCTION_SCAN_SCALAR_QUERY_TO_CORRELATE`。`Programs.standard()` 本身不注册规则，规则仍由集成方提供；IEJoin 只匹配至少两个跨输入字段不等式的 inner join，本文的等值连接不匹配，因此后文的 trace 不受影响。
+
+未复核：没有在 `68f1613` 上重新编译运行示例，计划、代价和 trace 仍是 `e8e0dd5` 的真实输出；`CalcitePrepareImpl` / `PlannerImpl` 之外的连接配置路径没有逐条检查。
 
 ### `findBestExp()` 的生命周期
 
@@ -71,6 +89,8 @@ findBestExp()
 ```
 
 ③ 负责触发规则、注册候选，并在注册与代价传播过程中维护 `best`；⑤ 沿 `best` 指针提取结果。默认 driver 不以成本上界停止某个搜索分支，但这与搜索期间是否比较候选成本是两回事。
+
+1.43 开发线在注册入口多了一步校验：`registerImpl()` 在进入 trait / Convention 检查前调用 `checkEmptyRowType(rel)`。它从 `Context` 读取 `EmptyRowTypePolicy`，缺省 `DISCOURAGED`；当策略为 `FORBIDDEN` 且 `rel.getRowType().getFieldCount() == 0` 时抛出 `IllegalArgumentException`。这一步发生在 `RelDigest` 去重和 `RelSet` 创建之前，属于注册期约束，不改变后文的代价传播与搜索状态。
 
 `ensureRootConverters()` 有一个容易看错的细节：
 
@@ -110,7 +130,7 @@ for (RelSubset subset : root.set.subsets) {
 | `enforceDisabled` | `boolean` | 是否跳过为该 subset 生成 Enforcer | `disableEnforcing()` |
 | `timestamp` | `int` | 代价变更计数，用于 Metadata 缓存失效 | `propagateCostImprovements` |
 
-其中 `upperBound` / `taskState` / `state` / `enforceDisabled` **只在 top-down 路径下有实际读者**。默认 driver 跑完之后，`taskState` 一直是 `null`，`upperBound` 一直是 `infCost`。这正是结论 2 与 3 的结构性原因：账本上留好了剪枝用的字段，但默认没人去读。
+其中 `upperBound` / `taskState` / `state` / `enforceDisabled` **只在 top-down 路径下有实际读者**。默认 driver 跑完之后，`taskState` 一直是 `null`，`upperBound` 一直是 `infCost`。这正是默认路径不按上界剪枝的结构性原因：账本上留好了剪枝用的字段，但默认没人去读。
 
 #### 累计代价 vs 自身代价
 
@@ -244,8 +264,8 @@ super(costFactory == null ? VolcanoCost.FACTORY : costFactory, ...);
 
 - **cpu / io 是"会计科目"而不是"裁判依据"。** 它们被 `plus` 累加、被 `RelWriter` 打印进 `cumulative cost = {... rows, ... cpu, ... io}`，看起来很详细，但任何两个计划的胜负只由 rowCount 决定。
 - **rowCount 相同即为平局，胜负由搜索顺序决定。** 完整执行示例正好命中这一点：两种 driver 选出的 Merge Join 左右孩子完全相反，而累计代价一字不差。
-- **`minus` 在非 rowCount 维度上算出负数不会被发现。** 结论 6 的那条 trace 就是这样产生的。
-- **想要真正的多维代价，必须自带 `RelOptCostFactory`。** 这也是 Flink、Hive 等集成方普遍自定义代价的原因之一——不只是权重不合适，而是默认实现根本不比较除 rowCount 之外的维度。
+- **`minus` 在非 rowCount 维度上算出负数不会被发现。** 后文 trace 里的负 cpu 就是这样产生的。
+- **想要真正的多维代价，必须自带 `RelOptCostFactory`。** 这也是不少集成方自定义代价的原因之一——不只是权重不合适，而是默认实现根本不比较除 rowCount 之外的维度。
 
 几个常量也值得记住：`ZERO = (0,0,0)`、`TINY = (1,1,0)`、`HUGE`、`INFINITY`。`AbstractConverter.computeSelfCost` 返回 `makeInfiniteCost()`，后文 Trait Enforcement 一节会沿该占位符继续追踪。
 
@@ -272,7 +292,7 @@ CalciteSystemProperty.TOPDOWN_OPT
 
 #### `IterativeRuleDriver`：84 行，没有成本上界剪枝
 
-默认 driver 不根据当前候选成本截断枚举，但仍依赖候选注册时的代价传播维护最优解。以下循环应与RelSubset 一节的更新路径一起阅读。
+默认 driver 不根据当前候选成本截断枚举，但仍依赖候选注册时的代价传播维护最优解。以下循环应与 RelSubset 一节的更新路径一起阅读。
 
 ```java
 @Override public void drive() {
@@ -353,6 +373,8 @@ for (RelNode rel : physicals) {
 `add(0, rel)` 看起来像是提高优先级，实际相反：`physicals` 随后被顺序压入 `tasks` 栈，索引 0 的元素**最先入栈、最后出栈**。这与 `TopDownRuleQueue` 是同一种"写法与语义相反"的栈序技巧。
 
 降优先级的动机就在第二条注释里——先优化真实物理算子的孩子，才能拿到一个有限上界；若让无穷代价的 Enforcer 先跑，上界永远是 `inf`，剪枝无从下手。
+
+1.43 开发线把 `tasks` 从 `Stack<Task>` 换成 `ArrayDeque<Task>`，并把两处 `add()` 改成 `push()`。两种容器的 `push` / `pop` 都在队首操作，上面的栈序分析不变。
 
 **规则栈序被刻意反转。** `TopDownRuleQueue` 为每个 `RelNode` 维护一个 `Deque`：
 
@@ -616,6 +638,8 @@ if (!childCollationKeys.equals(keySet)) {
 }
 ```
 
+1.43 开发线还修了一处代码生成问题：`implement()` 里的两处 key lambda 以前不写返回类型，单列 BOOLEAN 键会被推断成 `Predicate1`，与 `EnumerableDefaults.mergeJoin` 需要的 `Function1` 不匹配；现在显式指定 `Function1.class`。这只影响生成代码的签名，不改变上面 `passThroughTraits` / `deriveTraits` 的判定。
+
 `EnumerableMergeJoinRule` 则负责准入与 collation 构造：拒绝 `IS NOT DISTINCT FROM`、拒绝不支持的 join 类型与笛卡尔积，然后为每个输入按 join key 构造 ASCENDING / NULLS LAST 的 collation，用 `convert(ord.e, traits)` 提出需求，最后把 join 自身的 traitSet `.replace(collations)`。
 
 `PhysicalNode` 的类注释本身就是一份"如何让自己的算子支持 top-down trait 传导"的六步清单，自定义 Convention 时值得逐条对照。
@@ -634,7 +658,7 @@ FROM emps e JOIN depts d ON e.deptno = d.deptno
 ORDER BY e.deptno;
 ```
 
-配置 `Frameworks.newConfigBuilder().programs(Programs.standard())`，目标 traitSet 为 `ENUMERABLE` + root collation。任务 trace 的开关是一个专用 logger：
+配置 `Frameworks.newConfigBuilder().programs(Programs.standard())`，规则集另行通过 `RelOptUtil.registerDefaultRules(...)` 注册，或在 programs 列表里加入 `Programs.ofRules(...)`（`Programs.standard()` 只编排阶段，不注册规则）；目标 traitSet 为 `ENUMERABLE` + root collation。任务 trace 的开关是一个专用 logger：
 
 ```properties
 # CalciteTrace.getPlannerTaskTracer()
@@ -757,9 +781,9 @@ Execute task: OptimizeGroup(group=rel#89:RelSubset#1.ENUMERABLE.[1],
                  upperBound={20003.02585092994 rows, 29540.48298140119 cpu, 0.0 io})
 ```
 
-Merge Join 的第 0 号孩子解出 winner 后，第 1 号孩子拿到的上界从 `inf` 收紧为 `45033.02` rows —— 第 7.3 节那个公式的真实运行结果。
+Merge Join 的第 0 号孩子解出 winner 后，第 1 号孩子拿到的上界从 `inf` 收紧为 `45033.02` rows —— `OptimizeInputs` 那个上界公式的真实运行结果。
 
-再往后就出现了结论 6 的证据：
+再往后就出现了负 cpu 的证据：
 
 ```text
 Execute task: OptimizeGroup(group=rel#98:RelSubset#3.ENUMERABLE.[2],
@@ -786,7 +810,7 @@ Execute task: ApplyRule(match=rule [ExpandConversionRule] rels [#42], exploring=
 Execute task: GroupOptimized(group=rel#41:RelSubset#5.ENUMERABLE.[0], upperBound={inf})
 ```
 
-最后一行闭合根 subset，`drive()` 返回，`buildCheapestPlan()` 沿 `best` 链条抽出 8.4 的计划。注意 `ExpandConversionRule` 在 top-down 路径下**依然被触发了一次**——就是为了展开 `ensureRootConverters()` 插入的那个根 `AbstractConverter`。
+最后一行闭合根 subset，`drive()` 返回，`buildCheapestPlan()` 沿 `best` 链条抽出上一节的物理计划。注意 `ExpandConversionRule` 在 top-down 路径下**依然被触发了一次**——就是为了展开 `ensureRootConverters()` 插入的那个根 `AbstractConverter`。
 
 ### 这一轮触发的规则分布
 
@@ -825,7 +849,7 @@ RootSingleRel(ENUMERABLE-like phys, ROOT_COLLATION)
     LeafRel(LEAF_COLLATION)
 ```
 
-这正是 5.3 节那张表左列的最小可运行形态。
+这正是 Trait Enforcement 小节那张表左列的最小可运行形态。
 
 ## 与 StarRocks 的对照
 
@@ -839,6 +863,8 @@ Calcite 与 StarRocks 都按物理属性区分子问题，但执行器耦合程�
 | Property 推导 | 分散在 `PhysicalNode.passThrough*` / `derive*` + DELIVERED/REQUIRED bit | 集中的 Required/Output Deriver + Guarantor 三件套 |
 | Enforcer 代价 | 默认路径是无穷代价占位符，需二次展开 | Exchange/Sort 直接带真实代价入竞争 |
 
+2026-10 在 StarRocks `f977b53`（2026-09-23）上复核，`Group.lowestCostExpressions`、`getRealCost()` 的 0.5 / 2 / 1.5 权重、`EnforceAndCostTask` 的上界收紧，以及 `RequiredPropertyDeriver` / `OutputPropertyDeriver` / `ChildOutputPropertyGuarantor` 三个组件都还在；`recordCostsAndEnforce` 的并发竞态修复不改变本表的结构差异。
+
 结构性的解释是**定位不同**。StarRocks 的优化器服务于一个已知的分布式执行器，分布属性是一等公民，Enforcer 就是 Exchange，代价公式可以针对自家执行器标定权重。Calcite 是要被 Flink、Hive、Druid 等各自不同的执行器复用的框架，它无法预设分布模型，也无法预设哪一维代价重要——其 trait 体系因此提供了扩展接口（`RelTraitDef` + `multiple()` + `RelCompositeTrait`）。默认代价仅按 rowCount 比较是该快照的事实；是否源于特定设计意图，不能只凭这段代码推断。
 
 这也给集成 Calcite 的人一份具体的清单：
@@ -846,7 +872,7 @@ Calcite 与 StarRocks 都按物理属性区分子问题，但执行器耦合程�
 1. **需要按 cpu / io 等维度排序时，自定义 `RelOptCostFactory`。** 默认比较器不使用这些维度，额外估算它们不会改变 `isLe` / `isLt` 的排序。
 2. **明确决定是否打开 `topDownOpt`。** 打开才有 branch-and-bound 与精确 trait 传导，但要求物理算子实现 `PhysicalNode`（`passThrough*` / `derive*` / `getDeriveMode`），否则 top-down 的优势用不上。
 3. **自定义 Convention 时实现好 `enforce()`。** 这是 top-down 路径下 Enforcer 的唯一来源；`useAbstractConvertersForConversion` 与 `canConvertConvention` 的返回值决定了搜索的形状。
-4. **换代价实现前先审计 `minus` 的使用。** 8.5 节的负 cpu 说明现有上下界减法只在 rowCount 维上自洽。
+4. **换代价实现前先审计 `minus` 的使用。** 上一节记录的负 cpu 说明现有上下界减法只在 rowCount 维上自洽。
 
 集成时应先固定 Rule Set、Metadata、Convention 和 CostFactory，再比较两种 driver 的计划质量与规划耗时。Top-down 增加状态管理和属性接口实现成本，并非仅打开开关就能获得收益；默认 rowCount 排序也不适合直接表达网络、内存或真实执行延迟。没有工作负载测量时，本文只能说明搜索机制，不能判断哪种 driver 在目标系统中更快。
 
