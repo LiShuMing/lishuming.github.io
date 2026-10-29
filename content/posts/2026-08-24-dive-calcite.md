@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Calcite 优化器：Hep、Volcano、谓词推导与 Join Reorder"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-18T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 slug: "dive-calcite-optimizer"
 categories:
   - 数据库
@@ -43,6 +43,43 @@ Apache Calcite 经常被称为“通用 SQL 优化器”，但这个称呼容易
 三个项目都在快速演进。本文结论以这些源码快照为准，尤其 Calcite 的 HyperGraph/DPHyp 仍标记为 Experimental，不应外推为所有 Calcite 应用的默认执行路径。
 
 本文使用的 Calcite 提交位于 1.41.0 之后、1.42.0 正式发布之前。Apache Calcite [1.42.0 发布记录](https://calcite.apache.org/docs/history.html#1420--2026-05-31) 显示该稳定版发布于 2026-05-31，因此本文应被理解为对一个确定 Git Snapshot 的源码分析，而不是“1.42.0 所有发行包都具有完全相同默认行为”的产品说明。Rule 是否注册、Program 如何编排以及 Adapter 覆盖了哪些 Metadata，仍由具体集成系统决定。
+
+2026-10 在更新快照上复核了本文引用的类：Calcite [`68f1613`](https://github.com/apache/calcite/tree/68f16139b5ca26a1519eae071ab217de3ae8c9df)（2026-10-28，`calcite.version=1.43.0` 开发线，尚未发布）、StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）。主体结论未变：三套系统在 Null-Rejecting、Outer Join 重排和运行期旁路反馈上的分工与正文一致。变化主要落在四处：Calcite 修掉了 Row 级 `IS DISTINCT FROM` 的翻译错误并新增 Row Type 校验，StarRocks 的物理后处理序列增加两条规则，Doris 把“替换为 NULL”的判据按谓词与聚合参数拆开，Doris 的 RF 剪枝开始保留可裁剪分区/分桶的过滤器。逐项记录见下文。
+
+#### 2026-10 复核记录
+
+复核方式是对每组快照做文件级 diff：Calcite 取 `e8e0dd5..68f1613`，StarRocks 取 `0fd27fd..f977b53`，Doris 取 `5202d06d..7ac0eb2f`。下面只列与本文论证相关的类，不包含各项目的 Adapter 模块与 BE（Backend）代码。
+
+**已核实未变**
+
+- `RelSubset`、`HepProgram`、`HepProgramBuilder`、`RelMetadataQuery` 没有改动，本文对等价类、Program 指令和 Metadata 调用的描述仍然成立。
+- `FilterJoinRule`、`JoinPushTransitivePredicatesRule`、`JoinToMultiJoinRule` 未改；`JoinDeriveIsNotNullFilterRule` 的 operand 仍只匹配 `JoinRelType.INNER`，Semi/Anti 的不对称结论成立。
+- `RelMdPredicates` 的 SEMI / INNER / LEFT / ANTI 分支未改：SEMI 仍上提左侧谓词与推导谓词，ANTI 仍只保留左侧谓词。
+- `JoinToHyperGraphRule` 仍用 `long` Bitmap 且显式拒绝超过 64 个输入；`ConflictDetectionHelper` 仍是 CD-C；`DphypJoinReorderRule` 仍以 `bloat=127`（按 `2^7-1` 设定）限制 DP Table，并仍标注 `@Experimental`。
+- `Programs.standard()` 的阶段序列未变，仍是 SubQuery → Decorrelate → Measure → TrimFields → `findBestExp()` → 第二次 `calc()`；`heuristicJoinOrder()` 的多阶段用法也未变。
+- StarRocks 的 `JoinPredicatePushdown`、`JoinReorderProperty` 未改，`memoOptimize()` 的 Join 数量阈值与策略选择未改。
+- Doris 的 `InferFilterNotNull`、`InferJoinNotNull`、`EliminateOuterJoin` 未改；Nereids 主链路（Analyze → RBO Rewrite → Pre-MV Rewrite → Memo → chooseBestPlan → PlanPostProcessors → PhysicalPlanTranslator）未改。
+
+**变化（影响正文表述）**
+
+- Calcite `HepPlanner`：`applyRule()` 内的图成员检查被移到 `depthFirstApply()` 与 fixpoint 循环的顶点迭代处，并对 operand 先做一次 `matches()` 预检；空 Rule 集直接返回。这是性能与健壮性重构，规则语义未变。
+- Calcite `VolcanoPlanner`：新增 `EmptyRowTypePolicy`，从 `Context` 读取；取值为 `FORBIDDEN` 时注册零字段 RelNode 会抛 `IllegalArgumentException`，默认值为 `DISCOURAGED`。这是新增输入校验，不影响等价类与 Trait 的搜索模型。
+- Calcite `RelOptUtil.isDistinctFrom()`：旧快照对多字段 Row 无论 `neg` 取值都用 `AND` 组合各字段，等于把 `IS DISTINCT FROM` 写成“所有字段都不同”；新实现改为 `neg ? AND : OR`，并递归处理嵌套 struct，同时修正了 `neg` 的 javadoc（`true` 才是 IS NOT DISTINCT FROM）。
+- Calcite `RelMdPredicates`：RIGHT 分支的推导谓词原来全部塞进左侧列表、右侧留空，现在按 `leftInferredPredicates` / `rightInferredPredicates` 分别归类。此前 RIGHT Join 的右侧推导谓词会在 Metadata 中错位。
+- Calcite `Strong` 新增 `SqlKind.COLON` 为 `Policy.ANY`；`Programs` 的 `RULE_SET` 新增 `ENUMERABLE_IE_JOIN_RULE`，`subQuery()` 新增 `TABLE_FUNCTION_SCAN_SCALAR_QUERY_TO_CORRELATE`。都不影响本文结论。
+- StarRocks `physicalRuleRewrite()`：新增 `PushDownNonGroupedAggregateBelowUnion` 与 `WidenProjectionNullableRule`；后者必须在 `GlobalLateMaterializationRewriter` 之前运行，因为 FETCH 直接从存储写目标 Slot，Projection 的输出可空性若比输入窄，late materialization 会按错误的可空性生成引用。`dynamicRewrite()` 未变。正文的序列是摘要，不是全量规则清单。
+- StarRocks 的 TVR 改写换成 `IvmRewriter`，Join 实现规则不再走 `isMVPlanner()` 分支。
+- StarRocks `RuntimeFilterDescription` 的 TopN RF 排序读取改为固定索引 0（`exprOrder` 是 group-by 位置，不是排序列位置）；`PlanTuningAdvisor` 只新增了 guide 生成计数指标。
+- Doris `ExpressionUtils`：`isNullRejecting()` 改为带判据参数的 `matchesWhenSlotIsNull()`。Filter 场景默认仍用“求值为 NULL 或 FALSE”，但新增的 `inferNotNullForNullIgnoringAggregate()` 只接受 NULL，因为 FALSE 是合法的聚合参数，不能按过滤谓词处理。
+- Doris `RuntimeFilterPruner`：行级过滤无效时不再删除该 Join 的全部 RF，而是保留 `canPruneScanRanges()` 为真的分区/分桶过滤；类注释新增第 5 条判据（RF 能否淘汰整个扫描范围）。
+- Doris `PlanPostProcessors`：在 `PrunePartitionPredicate` 之后新增 `AddMonotonicFunctionPruningPredicates`，把单调函数谓词转换为可裁剪谓词。
+- Doris `OuterJoinLAsscomProject` / `OuterJoinAssocProject`：`checkCondition()` 从 Pattern 前置条件移入变换体，先经 `ProjectJoinReorderHelper.normalize()` 规范化 Project 再检查 Null-Rejecting，前置的 `isAllSlots()` 约束被移除；检查失败仍返回 `null`。可匹配的 Join 形状变多，语义约束仍在。
+- Doris `ExpressionUtils` 其他改动：`isInjectiveAgg()` 收紧为要求参数经可逆 Cast 追溯到一个 Slot，SUM/AVG 还要求结果类型转换可逆；`deapAnyMatch()` / `deapNoneMatch()` 更名为 `deep*`，并去掉重复的嵌套 `anyMatch`。
+
+**未复核**
+
+- 各项目的 Adapter 集成、StarRocks BE 与 Doris BE 的执行侧实现。
+- 实际部署中 `EmptyRowTypePolicy` 是否被集成方覆盖为 `FORBIDDEN`；本文只描述 Core 代码的默认值。
 
 ### Calcite 的整体设计：先建立正确的心智模型
 
@@ -209,6 +246,8 @@ Calcite 当前实现体现了这种不对称：
 
 因此，从 Semi/Anti Join 条件统一推导 Not Null 不是安全规则，必须同时考虑输出侧、普通 Equality 与 Null-Safe Equality，以及 `NOT EXISTS` 和 `NOT IN` 的差异。
 
+Null-Safe Equality 的翻译本身就容易出错。Calcite 在 2026-10 的快照里修掉了 `RelOptUtil.isDistinctFrom()` 的一个多字段错误：旧快照对多字段 Row 无论 `neg` 取何值都用 `AND` 组合各字段判定，于是 `ROW(a, b) IS DISTINCT FROM ROW(c, d)` 被译成“两个字段都不同”，而正确语义是任一字段不同即整体不同，应该用 `OR`。新实现同时让嵌套 struct 递归展开，并改正了 `neg` 的注释方向。单列测试不会暴露这类问题，只有 Row 值或 struct 比较才会触发。
+
 #### StarRocks：在 JoinPredicatePushdown 中闭环
 
 StarRocks 将更多逻辑集中在 [`JoinPredicatePushdown`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rewrite/JoinPredicatePushdown.java)：
@@ -239,6 +278,8 @@ Doris 的 [`ExpressionUtils.inferNotNullSlots()`](https://github.com/apache/dori
 代码还限制表达式宽度、深度与参与 Slot 数量，避免规划时间爆炸。[`InferFilterNotNull`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/InferFilterNotNull.java) 为 Filter 生成 Not-Null；[`InferJoinNotNull`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/InferJoinNotNull.java) 处理 Inner/Semi Join；[`EliminateOuterJoin`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/EliminateOuterJoin.java) 收紧 Outer Join。
 
 Outer Join 转为 Inner Join 后，Doris 还从等值条件继续生成两侧 `IS NOT NULL`，使更深层 Outer Join 能在后续 Fixpoint 中递归消除。
+
+这套“替换为 NULL 再折叠”的判据有适用边界。2026-10 的代码把它拆成两个入口：Filter 谓词用 `isFalseOrNull` 判据（求值为 NULL 或 FALSE 都算拒绝），聚合参数则用 `inferNotNullForNullIgnoringAggregate()`，只承认 NULL。理由是 FALSE 作为过滤谓词不保留行，但作为 `SUM`、`COUNT` 之类聚合的参数是合法值，丢掉会改变结果。引用这条链路时要把“谓词”与“参数”分开，不能把同一个判据套到两处。
 
 ### Left Join Reorder：先证明合法，再比较代价
 
@@ -319,6 +360,8 @@ Doris Nereids 同时具备局部 Rule 和 HyperGraph：
 - [`ConflictRulesMaker`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/hypergraph/ConflictRulesMaker.java) 把不满足结合律的关系编码为 HyperEdge 依赖；
 - [`JoinOrderJob`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/JoinOrderJob.java) 使用 DPHyp；图过大时由 `GraphSimplifier` 简化。
 
+2026-10 的实现把 Null-Rejecting 检查移入变换体：规则先用 `ProjectJoinReorderHelper.normalize()` 规范化左侧的 Project，再判断条件是否成立，失败则返回 `null`。因此能进入候选的形状比本文快照更多，但语义门槛没有放松。
+
 支持 Outer Join 不代表所有形态都能任意重排，Projection、Hint、谓词范围和 Null-Rejecting 条件仍会缩小空间。
 
 ## 物理计划与执行反馈的交接边界
@@ -371,6 +414,8 @@ PreAggregate
   → Global Late Materialization
 ```
 
+2026-10 快照在这个序列里增加了两条规则：`PushDownNonGroupedAggregateBelowUnion`，以及必须在 `GlobalLateMaterializationRewriter` 之前运行的 `WidenProjectionNullableRule`。后者的注释解释了顺序约束：FETCH 直接从存储写目标 Slot，如果 Projection 的输出可空性比输入窄，late materialization 会按错误的可空性生成引用。这是一个“物理后处理必须服从执行层契约”的具体例子。
+
 随后 `dynamicRewrite()` 应用 Skew Shuffle Join Elimination 和历史 Tuning Guide。源码特意在 Physical Rewrite 前记录 Cost，因为后处理后的 Statistics 不再保证与原 CBO 阶段一致。
 
 #### Doris：PlanPostProcessors
@@ -411,10 +456,14 @@ Calcite 提供的支点包括：
 
 - 自定义 `RelMetadataProvider` 注入外部或历史统计；
 - 通过 `Context` 向 Rule 和 Cost Model 传递信息；
-- 自定义物理 RelNode 和 Rule 承载 Dynamic Filter 描述；
+- 自定义物理 RelNode 和 Rule 承载 Dynamic Filter 描述（由集成方实现，Core 不提供）；
 - 用 `Programs.sequence()` 或重新调用 Planner 组织阶段。
 
 而 Build 键收集、IN/MinMax/Bloom 选择、分区合并、跨节点传输、Probe 等待、Scan 下推和 Profile 必须由引擎实现。
+
+![Calcite 的职责边界：规划、执行与反馈各自由谁负责](/images/calcite-feedback-boundary.svg)
+
+图中的前两段分别是宿主引擎的规划层与执行侧：统计进入 CBO，Best Plan 提取后由集成方生成 RF 描述，执行侧完成 Build、Probe Scan 下推和 Profile；第三段是下一次规划收到的历史反馈。Calcite Core 只提供接入点，图中的 RF 描述不是它的内置能力。虚线框的执行中重规划，本文在三个快照里都没有找到完整闭环；底部两张卡片列出 Calcite Core 的接入点与引擎必须实现的闭环。这张图表达职责划分，不代表任何单一引擎的实际执行顺序。
 
 所以准确答案是：**Calcite 可以承载 Dynamic Filter 的规划表达，但 Calcite Core 没有完整执行实现。**
 
@@ -440,7 +489,7 @@ Doris Nereids 具有 HBO 基础设施：
 1. Bottom-Up 遍历 Physical Join；
 2. 从 Hash Conjunct 生成允许的 IN、MinMax、Bloom；
 3. PushDown Visitor 穿过 Project/Join 解析 Scan Target；
-4. `RuntimeFilterPruner` 删除无效过滤器；
+4. `RuntimeFilterPruner` 删除行级无效的过滤器，但保留能裁剪分区/分桶的过滤器（`canPruneScanRanges()`）；
 5. `RuntimeFilterTranslator` 绑定执行层 Fragment/Scan。
 
 这清晰划分了职责：CBO 决定 Join Tree 和 Build/Probe，Post Process 构造运行时旁路，执行层负责数据结构与等待协议。

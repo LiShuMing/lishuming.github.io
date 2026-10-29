@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Hash Join：从内存哈希表到分区 Spill"
 date: 2026-08-26T00:00:00+08:00
-lastmod: 2026-10-18T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 slug: "dive-hash-join"
 categories:
   - 数据库
@@ -47,6 +47,35 @@ Hash Join 用 Build 侧索引减少等值匹配的查找工作，但其资源边
 | DuckDB | [`1c4ecd81`](https://github.com/duckdb/duckdb/tree/1c4ecd8138ae0c63c73957a411e65484301bb300) | 行式 Tuple 布局、Radix 分区、External Hash Join、Perfect Hash Join |
 
 本文关注执行引擎的共性与差异。Spark 的 JoinSelection、`HashedRelation`、AQE 与「Hash Join 默认不可 Spill」边界见文末 [附录：Spark Hash Join 特有路径](#spark-hash-join)。
+
+2026-10 在更新快照上复核了 StarRocks、Doris、DuckDB 三套实现（见下文「2026-10 复核记录」）；ClickHouse 本地没有快照，未复核。源码仍在演进，文中类名、配置与默认路径不应外推为所有版本。
+
+#### 2026-10 复核记录
+
+2026-10-28 复核所用的快照：StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）、DuckDB `2bb5316a`（2026-10-12）。只记录已对过源码的部分。
+
+**StarRocks（`0fd27fd` → `f977b53`，join 相关目录 31 个提交）**
+
+- 哈希表构造从编译期展开改为运行时工厂表。`JoinHashTable::build()` 不再通过 `dispatch_join_hash_map` 展开约 80 个 `std::visit` 分支，而是用 `find_join_hash_map_factory()` 查静态注册表，取回 `make_join_hash_map<LT, CT, MT>` 指针；之后 `build_prepare`、`probe` 等都经 `JoinHashMapBase` 虚调用。源码注释给出的动机是编译期方案需要在该 TU 实例化全部组合，单组合约 8 秒编译成本。正文「两级选择」末尾的实现已按新路径改写。
+- Spill Build 的取消路径补了保护：`set_finishing()` 在 `state->is_cancelled()` 时直接取消 spiller 并返回；`_convert_hash_map_to_chunk()` 先把 Build Chunk 以 `shared_ptr` 快照，再同步 `reset()` 哈希表，异步 spill 遍历不再可能解引用已被 close 释放的 `JoinHashTable`。遍历同时跳过只有哨兵行的空分区。
+- Spill Probe 的恢复路径补了同类保护：`_status()` 对已释放的 build spiller 判空；`trigger_restore()` 返回后重新检查取消状态；`_restore_probe_partition()` 在读 Probe 分区前检查 `_probe_spiller->task_status()`，否则写了一半的分区会被当作完整分区读回。
+- 可用内存改为 `OperatorMemoryResourceManager::compute_available_memory_bytes(*state)` 与 `_spill_hash_join_probe_op_max_bytes / DOP` 取小；「内存分区优先、落盘分区按字节批量恢复」的选择逻辑未变。
+- `HALF_L3_CACHE_SIZE` 改用 `CpuInfo::get_l3_cache_size()`：L3 未上报时退到 L2，再退到默认 32 MiB；旧实现直接使用 32 MiB 默认值。
+- 结论：分区 Spill 的协议（同一分区函数、只落盘逻辑行、逐分区重建、Hybrid 保留内存分区）没有变，变化集中在取消安全与内存记账。
+
+**Apache Doris（`5202d06d` → `7ac0eb2f`）**
+
+- `partitioned_hash_join_sink_operator.cpp` 与 `partitioned_hash_join_probe_operator.cpp` 在两个快照之间没有改动，正文描述的递归分区与状态机仍然成立。
+- `hashjoin_build_sink.cpp` 的改动集中在 ASOF Join 的索引分组重构（`asof_column_dispatch` 换成按 `key_getter` 的泛型 lambda），不涉及普通等值 Hash Join 的 Build/Probe 路径。
+
+**DuckDB（`1c4ecd81` → `2bb5316a`）**
+
+- `join_hashtable.cpp` 与 `physical_hash_join.cpp` 合计约 2800 行增删，没有逐处审完。核对到一处与 Probe 语义直接相关的修复：`ScanStructure::ApplyResidualPredicate()` 原本先压缩 `match_sel` 再计算 `no_match_sel`，带重复等值键与 Residual Predicate 的 SEMI/ANTI Join 会读错未匹配行；修复把 `no_match_sel` 的计算移到压缩之前（duckdb#23952）。这说明「Residual Predicate 与重复链共用选择向量」是必须单独验证的边界，不能从键唯一的情况外推。
+- DuckDB 其余改动（TupleDataCollection、外部 Join 的 Spill 状态等）未复核，正文描述仍以 `1c4ecd81` 为准。
+
+**ClickHouse**
+
+- 本地没有 ClickHouse 快照，`c631f591` 之后的实现未复核，正文 ClickHouse 部分保持原快照结论。
 
 ### 比较方法
 
@@ -309,6 +338,10 @@ P_build(hash, level) == P_probe(hash, level)
 
 Hybrid 的含义是：并非所有数据都必须落盘。能够留在内存的分区直接完成 Join，可以少写一次 Build、少写一次 Probe，也少读两次文件。
 
+![外存 Hash Join 的分区与逐分区恢复协议](/images/hash-join-external-protocol.svg)
+
+*图 1：① Build 与 Probe 用同一个 `P(hash, level)` 分区，内存允许的分区留在内存（Hybrid），其余顺序落盘；② 恢复时按可用内存成批加载分区、重建局部哈希表，再读同号 Probe 分区。分区仍装不下时 `level + 1` 重分区，但同一热点键无法被拆开。*
+
 #### 源码阅读坐标：四层架构不要混在一起
 
 阅读四套代码时，最好始终区分以下四层，否则很容易把“算法选择”“Pipeline 调度”“哈希索引”和“Spill 文件”混成一个概念：
@@ -469,25 +502,24 @@ Range Direct Mapping 不是只比较 `max-min` 与行数。源码把 L2/L3 Cache
 - 普通 Join 要保存重复关系，比较 Direct Map 的值域内存与 `first/next` 成本；
 - Dense Range 使用约 2 bit 状态表示值域位置，再保留按行的 `first`，用于兼顾稠密度和重复行。
 
-最终 Build 通过双重 Dispatch 生成具体模板：
+最终 Build 通过工厂表构造具体模板。`0fd27fd` 用的是编译期的 `dispatch_join_hash_map`（约 80 个 `std::visit` 分支）；`f977b53` 改为静态注册表加多态基类：
 
 ```cpp
-// 简化自 JoinHashTable::build()
-tie(key_constructor, map_method) = selector.construct(...);
+// 简化自 f977b53 的 JoinHashTable::build()
+tie(key_constructor, map_method) =
+    JoinHashMapSelector::construct_key_and_determine_hash_map(state, table_items.get());
 
-dispatch_join_hash_map(key_constructor, map_method, [&]<CUT, MUT>() {
-    using LT = logical_type_of<CUT>;
-    using CT = key_constructor_of<CUT>;
-    using MT = map_method_of<MUT>;
-    hash_map = make_unique<JoinHashMap<LT, CT, MT>>(table_items, probe_state);
-});
+JoinHashMapFactoryFn factory =
+    find_join_hash_map_factory(key_constructor, map_method);   // 各 join_hash_map_*_inst.cpp 静态注册
+if (factory == nullptr) return Status::InternalError("no factory registered");
 
-hash_map->build_prepare(state);
-hash_map->probe_prepare(state);
-hash_map->build(state);
+_hash_map = factory(table_items, probe_state);                // unique_ptr<JoinHashMapBase>
+_hash_map->build_prepare(state);
+_hash_map->probe_prepare(state);
+_hash_map->build(state);
 ```
 
-外层运行时只做一次 Variant Dispatch，内层 Probe 热路径拿到的是确定的 `LT/CT/MT`，避免逐行判断 Key 类型和 Map 类型。
+外层只查一次表，Probe 热循环拿到的仍是确定的 `LT/CT/MT` 模板实例，逐行不做类型判断；区别在于 `probe`、`lazy_output_for_probe` 这类入口改为经 `JoinHashMapBase` 虚分发，粒度是 Chunk 而不是行。这次改动的理由写在源码注释里：编译期展开要求在 `build()` 所在 TU 实例化全部组合，每个组合约 8 秒。代价是类型错误从编译期推迟到运行期，因此 `factory == nullptr` 必须显式转成 `InternalError`。
 
 #### Probe：可暂停的重复链与延迟物化
 
@@ -593,6 +625,10 @@ probe rows ─► partition id ─► prober 1 / 2 / 3 / spill
 > Runtime Filter 希望尽早看到完整 Build Key 集合，Spill 希望尽早释放 Build 状态；两者对生命周期的要求相反。
 
 可行方向包括分区级 Filter、可增量合并的 Bloom Filter，或在分区元数据中维护低成本摘要，但都要权衡误判率、发布时间和额外内存。
+
+![StarRocks 可 Spill Hash Join 的模式切换与分区恢复](/images/hash-join-starrocks-spill.svg)
+
+*图 2：没有内存压力时走左侧普通路径；收到撤销请求后切到 `SPILL_ALL`，只切换一次，把已建哈希表还原成逻辑 Build 列，之后按可用内存成批恢复分区。底部两条补充两个边界：Spill Build 发布空 Runtime Filter 的原因，以及 `f977b53` 取消路径上的修复。*
 
 ### Apache Doris：把递归 Spill 做成显式状态机
 

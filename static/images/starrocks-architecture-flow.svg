@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="1000" viewBox="0 0 1320 1000" role="img"
+     aria-label="StarRocks 从 SQL 规划到 BE 执行与存储的四层路径">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+</defs>
+<rect width="1320" height="1000" fill="#ffffff"/>
+<text x="40" y="48" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328">StarRocks：从 SQL 到存储的四层路径</text>
+<text x="40" y="76" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" fill="#5b6570">蓝=FE 控制面，橙=跨层调度，绿=BE/CN 执行，灰=存储与外部数据；箭头是控制流或数据流</text>
+<rect x="40" y="100" width="1240" height="190" rx="12" fill="#fbfcfe" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="126" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start">① FE 规划（控制面）：一条 SQL 在这里变成 Fragment</text>
+<rect x="60" y="144" width="216" height="120" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="75" y="168" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#3c6e9e" text-anchor="start">SQL → AST</text>
+<text x="75" y="190" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Parser / Analyzer</text>
+<text x="75" y="210" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">权限与语义检查</text>
+<rect x="296" y="144" width="216" height="120" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="311" y="168" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#3c6e9e" text-anchor="start">RBO</text>
+<text x="311" y="190" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">子查询改写 / 谓词下推</text>
+<text x="311" y="210" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">列裁剪 / 分区裁剪 / MV 改写</text>
+<rect x="532" y="144" width="216" height="120" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="547" y="168" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#3c6e9e" text-anchor="start">Memo + CBO</text>
+<text x="547" y="190" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Group / GroupExpression</text>
+<text x="547" y="210" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">TaskScheduler + 物理属性</text>
+<rect x="768" y="144" width="216" height="120" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="783" y="168" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#3c6e9e" text-anchor="start">物理改写</text>
+<text x="783" y="190" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">低基数 / GLM / RF 描述</text>
+<text x="783" y="210" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">AI Project 边界</text>
+<rect x="1004" y="144" width="216" height="120" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="1019" y="168" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#3c6e9e" text-anchor="start">PlanFragment</text>
+<text x="1019" y="190" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Fragment DAG</text>
+<text x="1019" y="210" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Scan Range / 实例放置</text>
+<polyline points="278,204.0 292,204.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="514,204.0 528,204.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="750,204.0 764,204.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="986,204.0 1000,204.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="60" y="282" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.0" font-weight="normal" fill="#5b6570" text-anchor="start">MV 改写、UK/FK 裁剪和 AI 函数下沉都发生在这条链路里；代价模型依赖统计信息，统计失真仍会选错 Join 顺序。</text>
+<polyline points="640,290 640,306" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="310" width="1240" height="108" rx="12" fill="#fdfaf5" stroke="#e6d3b8" stroke-width="1.2"/>
+<text x="60" y="336" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b07a35" text-anchor="start">② 调度与部署：把 Fragment 变成节点上的实例</text>
+<rect x="60" y="348" width="380" height="54" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="75" y="369" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start">Coordinator</text>
+<text x="75" y="388" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.0" font-weight="normal" fill="#5b6570" text-anchor="start">ExecutionDAG / FragmentInstance 放置</text>
+<rect x="460" y="348" width="380" height="54" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="475" y="369" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start">RPC exec_plan_fragment</text>
+<text x="475" y="388" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.0" font-weight="normal" fill="#5b6570" text-anchor="start">FE → BE/CN，Thrift 参数</text>
+<rect x="860" y="348" width="380" height="54" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="875" y="369" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start">Runtime Filter Merge Node</text>
+<text x="875" y="388" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.0" font-weight="normal" fill="#5b6570" text-anchor="start">Global RF 的合并与广播</text>
+<polyline points="442,375.0 456,375.0" fill="none" stroke="#b07a35" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="842,375.0 856,375.0" fill="none" stroke="#b07a35" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="640,418 640,434" fill="none" stroke="#b07a35" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="438" width="1240" height="246" rx="12" fill="#fbfdfa" stroke="#cfe0c8" stroke-width="1.2"/>
+<text x="60" y="464" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#4d8a58" text-anchor="start">③ BE/CN 执行（数据面）：Pipeline 驱动算子</text>
+<rect x="60" y="482" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="75" y="506" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">FragmentExecutor</text>
+<text x="75" y="528" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">orchestration 命名空间</text>
+<text x="75" y="548" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">prepare / execute</text>
+<rect x="370" y="482" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="385" y="506" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">FragmentContext</text>
+<text x="385" y="528" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Pipeline 依赖图</text>
+<text x="385" y="548" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">prepare_active_drivers</text>
+<rect x="680" y="482" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="695" y="506" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">Pipeline × DOP</text>
+<text x="695" y="528" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">OperatorFactory 实例化</text>
+<text x="695" y="548" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Driver 状态机</text>
+<rect x="990" y="482" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="1005" y="506" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">GlobalDriverExecutor</text>
+<text x="1005" y="528" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">ready / blocked 队列</text>
+<text x="1005" y="548" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">时间片、背压与唤醒</text>
+<polyline points="352,520.0 366,520.0" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="662,520.0 676,520.0" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="972,520.0 986,520.0" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="60" y="578" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="75" y="602" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">Scan / Exchange</text>
+<text x="75" y="624" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Connector 或内表 Scan</text>
+<text x="75" y="644" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Sender / Receiver</text>
+<rect x="370" y="578" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="385" y="602" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">Hash Join</text>
+<text x="385" y="624" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Build / Probe 两侧</text>
+<text x="385" y="644" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Runtime Filter 生产</text>
+<rect x="680" y="578" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="695" y="602" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">Aggregate / Sort</text>
+<text x="695" y="624" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">自适应预聚合</text>
+<text x="695" y="644" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Spill / Merge Path</text>
+<rect x="990" y="578" width="290" height="76" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="1005" y="602" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#4d8a58" text-anchor="start">Sink / Result</text>
+<text x="1005" y="624" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Result Sink</text>
+<text x="1005" y="644" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Profile Counter 上报</text>
+<polyline points="205.0,558 205.0,574" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="515.0,558 515.0,574" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="825.0,558 825.0,574" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="1135.0,558 1135.0,574" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="60" y="674" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.0" font-weight="normal" fill="#5b6570" text-anchor="start">横切：CollectStats 自适应 DOP（Block → Passthrough / RoundRobin）；Runtime Filter Probe Collector；Join 内部 Coroutine Probe。</text>
+<polyline points="640,684 640,702" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="706" width="1240" height="190" rx="12" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.2"/>
+<text x="60" y="732" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#5b6570" text-anchor="start">④ 存储与外部数据：同一套执行引擎，不同的数据归属</text>
+<rect x="60" y="750" width="393" height="118" rx="9" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.4"/>
+<text x="75" y="774" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#5b6570" text-anchor="start">Shared-Nothing</text>
+<text x="75" y="796" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Tablet → Rowset → Segment/Page</text>
+<text x="75" y="816" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">本地盘；版本与 Compaction</text>
+<rect x="473" y="750" width="393" height="118" rx="9" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.4"/>
+<text x="488" y="774" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#5b6570" text-anchor="start">Shared-Data</text>
+<text x="488" y="796" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Lake Tablet → TxnLog → Metadata</text>
+<text x="488" y="816" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">对象存储 + Data Cache</text>
+<rect x="886" y="750" width="393" height="118" rx="9" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.4"/>
+<text x="901" y="774" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.6" font-weight="600" fill="#5b6570" text-anchor="start">External Catalog</text>
+<text x="901" y="796" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">ConnectorMetadata → RemoteFiles</text>
+<text x="901" y="816" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.2" font-weight="normal" fill="#5b6570" text-anchor="start">Hive / Iceberg / Hudi / Delta</text>
+<line x1="40" y1="914" x2="1280" y2="914" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="940" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.0" font-weight="normal" fill="#5b6570" text-anchor="start">图中省略了多 Fragment 并行、Exchange 网络细节和失败重试；点查可走 ShortCircuit，外部表扫描不进入内表 Tablet 路径。</text>
+<text x="40" y="962" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.0" font-weight="normal" fill="#5b6570" text-anchor="start">Profile 的 Operator Counter 沿 Driver → FragmentContext → Coordinator → FE Query Profile 汇总。</text>
+</svg>

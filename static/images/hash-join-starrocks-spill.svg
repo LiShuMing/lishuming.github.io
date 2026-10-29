@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1240" height="840" viewBox="0 0 1240 840" role="img"
+     aria-label="StarRocks 可 Spill Hash Join 的模式切换与分区恢复">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+  <marker id="arrowWarm" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#d98a35"/>
+  </marker>
+</defs>
+<rect width="1240" height="840" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328">StarRocks 可 Spill Hash Join：内存撤销后的模式切换</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" fill="#5b6570">源码快照 f977b53 · 普通路径与 Spill 路径共享 Build/Probe 语义，只替换状态所有权</text>
+<rect x="900" y="32" width="14" height="14" rx="3" fill="#e8f0fb" stroke="#4a7fd4"/>
+<text x="920" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">内存路径</text>
+<rect x="992" y="32" width="14" height="14" rx="3" fill="#fdf0e3" stroke="#d98a35"/>
+<text x="1012" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">Spill 路径</text>
+<rect x="1084" y="32" width="14" height="14" rx="3" fill="#e9f5ec" stroke="#4d9c62"/>
+<text x="1104" y="44" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" fill="#5b6570">Probe 恢复</text>
+<text x="40" y="112" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">A. 没有内存压力</text>
+<rect x="40" y="136" width="360" height="62" rx="10" fill="#e8f0fb" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="56" y="161" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Build 输入</text>
+<text x="56" y="182" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">append 到 build_chunk</text>
+<line x1="220.0" y1="198" x2="220.0" y2="224" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="40" y="228" width="360" height="62" rx="10" fill="#e8f0fb" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="56" y="253" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">set_finishing</text>
+<text x="56" y="274" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">build_ht → Runtime Filter → 唤醒 Probe 依赖</text>
+<line x1="220.0" y1="290" x2="220.0" y2="316" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="40" y="320" width="360" height="62" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="56" y="345" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Probe（只读 HT）</text>
+<text x="56" y="366" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">first/next 定位 Build 行，Gather 输出列</text>
+<line x1="220.0" y1="382" x2="220.0" y2="408" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="40" y="412" width="360" height="62" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="56" y="437" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">POST_PROBE（可选）</text>
+<text x="56" y="458" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">Right Outer / Right Anti / Full Outer 输出剩余行</text>
+<line x1="220.0" y1="474" x2="220.0" y2="500" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="40" y="504" width="360" height="62" rx="10" fill="#e8f0fb" stroke="#4a7fd4" stroke-width="1.4"/>
+<text x="56" y="529" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">EOS</text>
+<text x="56" y="550" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">释放 Hash Table 与 Build 列</text>
+<line x1="404" y1="213.0" x2="470" y2="213.0" stroke="#d98a35" stroke-width="1.6" stroke-dasharray="6 4" marker-end="url(#arrowWarm)"/>
+<text x="412" y="203.0" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" fill="#b06f22">内存撤销请求</text>
+<rect x="470" y="100" width="730" height="650" rx="12" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.2"/>
+<text x="490" y="130" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#1f2328" text-anchor="start">B. 收到内存撤销：策略切到 SPILL_ALL</text>
+<rect x="490" y="146" width="690" height="56" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="506" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">① 只切换一次：估算分区数</text>
+<text x="506" y="189" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">ht_mem_usage() 与 Spill MemTable 阈值决定分区数；不做在线扩容</text>
+<line x1="540" y1="202" x2="540" y2="211" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="490" y="214" width="690" height="56" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="506" y="237" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">② 把已建哈希表还原成数据</text>
+<text x="506" y="257" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">_convert_hash_map_to_chunk()：Bucket/Next 指针不落盘，只写逻辑 Build 列</text>
+<line x1="540" y1="270" x2="540" y2="279" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="490" y="282" width="690" height="56" rx="10" fill="#fdf0e3" stroke="#d98a35" stroke-width="1.4"/>
+<text x="506" y="305" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">③ 后续 Build 直接分区写盘</text>
+<text x="506" y="325" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">列式写出 + 追加分区 Hash；之前的内存分区仍可保留（Hybrid）</text>
+<line x1="540" y1="338" x2="540" y2="347" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="490" y="350" width="690" height="56" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="506" y="373" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">④ 选下一批分区（恢复循环）</text>
+<text x="506" y="393" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">内存分区优先；落盘分区按可用内存字节选一个或多个，异步并行恢复</text>
+<line x1="540" y1="406" x2="540" y2="415" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="490" y="418" width="690" height="56" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="506" y="441" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">⑤ 每个分区重建局部 Hash Table</text>
+<text x="506" y="461" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">Key/Map 形态按该分区数据重新选择；Probe 行按分区路由</text>
+<line x1="540" y1="474" x2="540" y2="483" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="490" y="486" width="690" height="56" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="506" y="509" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">⑥ 未加载分区写 Probe Spill</text>
+<text x="506" y="529" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">已加载 → 对应 Prober；未加载 → 同号 Probe Spill，稍后一起处理</text>
+<line x1="540" y1="542" x2="540" y2="551" stroke="#8a949e" stroke-width="1.6" marker-end="url(#arrow)"/>
+<rect x="490" y="554" width="690" height="56" rx="10" fill="#e9f5ec" stroke="#4d9c62" stroke-width="1.4"/>
+<text x="506" y="577" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">⑦ 分区处理完即释放</text>
+<text x="506" y="597" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#5b6570" text-anchor="start">释放局部 Builder/Prober 与读缓冲，再取下一批分区</text>
+<text x="490" y="632" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#3f7f52" text-anchor="start">④–⑦ 是循环：每取一批分区就重建、连接、释放，直到所有分区处理完。</text>
+<line x1="40" y1="772" x2="1200" y2="772" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="796" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" fill="#1f2328" font-weight="600">Runtime Filter 冲突：</text>
+<text x="180.37499999999997" y="796" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" fill="#5b6570">Spill Build 当前发布空 Filter，因为全局 Filter 需要完整 Build Key 集合，与尽早释放状态相反。</text>
+<text x="40" y="822" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" fill="#1f2328" font-weight="600">f977b53 复核：</text>
+<text x="135.375" y="822" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.5" fill="#5b6570">取消路径补了早退与空指针保护；Probe 恢复前先检查 _probe_spiller-&gt;task_status()，避免把写了一半的分区当作完整分区读回。</text>
+</svg>

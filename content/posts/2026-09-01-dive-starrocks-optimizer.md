@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 StarRocks Optimizer：Enforcer、Property 级联与 Cost 选型"
 date: 2026-09-01T00:00:00+08:00
-lastmod: 2026-10-18T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 slug: "dive-starrocks-optimizer"
 categories:
   - 数据库
@@ -45,40 +45,43 @@ StarRocks 用 `PhysicalPropertySet` 区分同一 Group 的搜索目标，并在�
 | 项目 | 源码快照 | 日期 | 重点范围 |
 |------|----------|------|----------|
 | StarRocks | [0fd27fd](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1) | 2026-03-30 | QueryOptimizer、Memo Task、Property、Enforcer、CostModel、Physical Rewrite |
+| StarRocks 复核快照 | [f977b53](https://github.com/StarRocks/starrocks/tree/f977b53c13eab90425f552675f3b3463ada8b2fc) | 2026-09-22 | 同上，用于 2026-10 复核 |
 
-本文结论对应这一确定源码快照。StarRocks 仍在快速演进，尤其 Join Implementation Rule 的默认注册集合、代价公式与后置物理规则可能继续变化，不应把本文描述外推为所有版本的固定行为。
+本文结论对应 0fd27fd 这一确定源码快照；2026-10 在 f977b53 上复核了文中引用的源码位置与关键系数（见下文「2026-10 复核记录」）。StarRocks 仍在快速演进，尤其 Join Implementation Rule 的默认注册集合、代价公式与后置物理规则可能继续变化，不应把本文描述外推为所有版本的固定行为。
+
+#### 2026-10 复核记录
+
+2026-10-28 在 f977b53（2026-09-22）上复核全文结论。两个快照之间 `fe/fe-core/src/main/java/com/starrocks/sql/optimizer` 有 254 个文件变更（2612 个提交，+15312/−3604 行），本文的机制描述没有被推翻，但有三类结果需要分开写。
+
+**未变（逐处核对源码）**
+
+- `CostModel.getRealCost()` 的权重仍是 0.5 / 2 / 1.5；
+- `HashJoinCostModel` 的 build、probe 结构，以及 `BOTTOM_NUMBER=100000`、`BROADCAST_MAT_RATIO=12`、`SHUFFLE_MAX_RATIO=3`；
+- `visitPhysicalMergeJoin` 的两条代价公式；
+- `addAutoJoinImplementationRule()` 中 Merge Join 仍被注释，Auto 模式仍不产生 Hash Join 与 Merge Join 的直接竞争；
+- `CboTablePruneRule` 的 `< 10` 门槛、`UseSortAGGRule` 的五条准入条件。
+
+**变化（只影响“规则集合随版本变化”这条边界）**
+
+- `memoOptimize` 中 `isMVPlanner()` 分支被删除。0fd27fd 时 MV planner 走 `addRealtimeMVRules()`，现在 join implementation 规则无条件按 `join_implementation_mode` 注册；
+- 规则包重组：`rule/stream/*`（4 个文件，删 190 行）与 `rule/tvr/*`（删 1096 行）被移除，新增 `rule/ivm/*` 的 12 条 delta/version 规则，以及 AI Project、Fluss scan 相关规则；
+- Enforcer 判定改成“只问一次”：`recordCostsAndEnforce` 先算 `satisfyOrderProperty` / `satisfyDistributionProperty`，再把结果传给 `enforceProperty`。原因是 `HashDistributionSpec.isSatisfy()` 会查询 `ColocateTableIndex`，colocate 组状态可能被 `ColocateTableBalancer` 并发改动，前后两次询问可能不一致，让 `enforceProperty` 走到空分支；
+- `canGenerateOneStageAgg` 的 local-shuffle 豁免多了一个条件：`enable_local_shuffle_agg && !enable_query_cache && 单 BE`；
+- 结论：半年内默认注册集合与 Enforcer 判定细节都变过，但 Cascades 搜索、Property 传导、上界剪枝的机制没有改。
+
+**三处精度修正（原文表述过粗）**
+
+1. Shuffle 模式的 cache penalty 不是 `log(mapSize/100000) - log(parallelFactor)`。源码用自然对数减以 2 为底的对数：`ln(mapSize/100000) - log₂(parallelFactor)`，再截断到 `[1, 3]`。
+2. 同一个名字 `parallelFactor` 在 build 与 probe 中不是同一个值：`getCpuCost()` 用 `max(BE+CN, DOP)`，`getAvgProbeCost()` 把它再乘 2。两者不能互相代入。
+3. `mapSize` 不是 `keySize × rightRows`，而是 `min(1, keySize) × rightRows`。`keySize` 是等值键列平均行宽之和；这个 `min(1, …)` 使键非空时 `mapSize` 基本等于右表行数，读公式时不应把它当作“键宽参与缩放”。
 
 ### 优化器生命周期总览
 
 逻辑改写、Memo 搜索与物理后处理分别拥有不同的决策权限，不能将最终计划中的所有变化都归因于 CBO。入口 `QueryOptimizer.optimizeByCost()` 组织以下六个阶段：
 
-```text
-SQL Statement
-  │  Analyzer / Transformer（AST → 逻辑算子树）
-  ▼
-┌──────────────────────────────────────────────────────────────┐
-│ ① logicalRuleRewrite（RBO）                                   │
-│    子查询解关联、谓词下推/推导、列裁剪、MV 文本改写、           │
-│    分区裁剪、聚合下推、CTE inline、limit 合并……（数十组规则）  │
-├──────────────────────────────────────────────────────────────┤
-│ ② memo.init + deriveAllGroupLogicalProperty                   │
-│    逻辑树 → Memo/Group/GroupExpression 结构                   │
-├──────────────────────────────────────────────────────────────┤
-│ ③ memoOptimize（CBO，Cascades 任务搜索）★ 本文核心            │
-│    规则装载（join reorder 分级）→ 任务栈自顶向下搜索           │
-├──────────────────────────────────────────────────────────────┤
-│ ④ extractBestPlan(requiredProperty, rootGroup)                │
-│    沿 (property → bestExpr → inputProperties) 链递归提取      │
-├──────────────────────────────────────────────────────────────┤
-│ ⑤ physicalRuleRewrite（物理树后处理）                          │
-│    PhysicalDistributionAggOptRule（SortAgg/PerBucket）、       │
-│    ExchangeSortToMergeRule、PruneShuffleDistributionNode、     │
-│    低基数字典编码（AddDecodeNode）、JoinLocalShuffle 等         │
-├──────────────────────────────────────────────────────────────┤
-│ ⑥ dynamicRewrite + PlanValidate → PlanFragmentBuilder         │
-│    物理树 → Fragment/Exchange，inputProperties 决定 join 分发  │
-└──────────────────────────────────────────────────────────────┘
-```
+![StarRocks QueryOptimizer.optimizeByCost() 的六个阶段与 Cascades 任务栈](/images/starrocks-optimizer-lifecycle.svg)
+
+*图 1：`optimizeByCost()` 的六个阶段，以及 ③ 内部的任务栈、挂起/恢复与剪枝闭环。颜色区分 RBO、CBO 搜索和 CBO 后处理；右侧栈中 `EnforceAndCostTask` 在孩子尚无最优解时挂起，子 Group 完成后从断点恢复。*
 
 #### 关键设计取舍
 
@@ -248,9 +251,12 @@ new GroupExpression(new PhysicalTopNOperator(spec, ...), Lists.newArrayList(chil
    - OutputPropertyDeriver 计算输出属性
 4. recordCostsAndEnforce：
    - setPropertyWithCost 登记 (requiredProperty → cost, inputProperties)
-   - outputProperty.isSatisfy(requiredProperty)？
-       满足 → 直接登记（一个表达式可同时满足多个 requirement）
-       不满足 → enforceProperty 插 enforcer：
+   - 先分别判定 sort / distribution 是否满足，再把两个布尔值传给 enforceProperty
+     （f977b53 起不再调用 outputProperty.isSatisfy() 再在 enforceProperty 里重算：
+      HashDistributionSpec.isSatisfy() 会查询 ColocateTableIndex，而 colocate 组
+      状态可能被 ColocateTableBalancer 并发改动；两次询问可能得到不同答案）
+       都满足 → 直接登记（一个表达式可同时满足多个 requirement）
+       任一不满足 → enforceProperty 插 enforcer：
          只缺分布且无顺序要求      → enforceDistribute
          只缺分布且有顺序要求      → 先清空旧属性再 Sort+Distribution
                                      （防止 [order,gather]→[order,shuffle] 死循环）
@@ -406,9 +412,9 @@ CPU = buildCost + probeCost + joinOutput.computeSize
   SHUFFLE:   build = rightOutput / parallelFactor   // 并行建局部 HT
 
 probeCost = leftOutput × cachePenaltyFactor
-  mapSize = keySize × rightRows
-  BROADCAST: penalty = min(12, max(1, log(mapSize/100000)))
-  SHUFFLE:   penalty = min(3,  max(1, log(mapSize/100000) - log(parallelFactor)))
+  mapSize = min(1, keySize) × rightRows        // keySize = 等值键列 getAverageRowSize() 之和
+  BROADCAST: penalty = min(12, max(1, ln(mapSize/100000)))
+  SHUFFLE:   penalty = min(3,  max(1, ln(mapSize/100000) - log₂(parallelFactor)))
 
 MEM = BROADCAST ? rightOutput × beNum : rightOutput
 ```
@@ -492,6 +498,8 @@ G_agg:
 #### 任务层硬闸门：`canGenerateOneStageAgg`
 
 代价之外，`EnforceAndCostTask` 在拿到子 best 后硬否决不稳健的单阶段全局聚合：统计未知 / 行数不准、含 distinct、多 group by 列（>1）——可被 `new_planner_agg_stage=1` 或单 BE local-shuffle 豁免。
+
+f977b53 上这个豁免多加了一个条件：`enable_local_shuffle_agg && !enable_query_cache && 单 BE`。打开 query cache 时，local-shuffle agg 不再放行单阶段计划。
 
 #### 聚合需求与 join 分布的级联复用
 

@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入表达式下推：StarRocks、Doris 与 Databend 如何减少 Scan I/O"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-07T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 slug: "dive-expression-pushdown"
 categories:
   - 数据库
@@ -43,6 +43,36 @@ draft: false
 
 由于三个项目都在快速演进，本文描述的是这些快照中的实现，不把类名、配置项或 TODO 外推为所有历史与未来版本的固定行为。
 
+2026-10 在更新快照上复核了三个项目（见下文「2026-10 复核记录」）。其中 Databend 的变化足以影响正文：它移除了 native 存储格式，本文原来描述的 Native Reader 页级裁剪已不存在，正文相关段落已按新快照改写。
+
+#### 2026-10 复核记录
+
+复核快照：StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）、Databend `17de870`（2026-10-12）。
+
+**StarRocks**
+
+- `SegmentIterator::_init_internal()` 被拆成「一次性初始化 + 可复用的扫描范围」。索引过滤序列整体移入 `_init_scan_range_and_context()`，顺序未变：RowId → Short Key → Tablet Range → Delete Vector → Bitmap Index → Zone Map → Bloom → Inverted Index；`_rewrite_predicates()` 之后的向量索引裁剪与数据采样保持不变。`_init_ann_reader()` 从 `_init_column_iterators()` 之后移到 `_check_low_cardinality_optimization()` 之前，即整个初始化段的前半部。原文引用的那句 `/// the calling order matters, do not change unless you know why.` 仍在。
+- 新增 `SegmentReadStateCache`：调用方可以传入一份已经折叠了 Page Zone Map / Bloom 的 `scan_range`，子迭代器走 `_init_reused_scan()` 直接应用，不再对子范围重跑 Page 过滤。数据采样（Data Sampling）被明确标注为非幂等，复用范围时跳过；向量索引则相反，必须重跑以恢复每个子迭代器的 `id2distance_map`。
+- 新增 `_apply_del_predicate()`，位置在索引过滤之后、`_rewrite_predicates()` 之前，只对 ANN 查询生效。
+- `runtime_filter_predicate.h` 的主体移到 `be/src/storage_primitive/`，`be/src/storage/` 下只剩包含它并声明改写器的兼容头；`runtime_range_pruner.hpp` 移到 `be/src/compute_env/`。语义未变：采样后最多保留 3 个过滤器，单个过滤率 ≥ 0.95 时只保留它；字典改写仍在。
+- `segment_iterator.cpp` 里 `TODO: support runtime bloom filter push down to page level` 仍在（f977b53 第 747 行），本文关于「Runtime Bloom 不能与持久化 Page Bloom 直接相交」的结论不变。
+
+**Doris**
+
+- 文中引用的 BE 路径全部还在。`_lazy_init()` 的主干变为 `_get_row_ranges_by_keys()`（Z-order 或带 Cluster Key 的表会跳过）→ `_get_row_ranges_by_column_conditions()` → `_vec_init_lazy_materialization()`。
+- 索引顺序变得有条件：当倒排索引的表达式能消费候选位图、且 `get_inverted_index_candidate_pushdown_ratio()` 在 (0, 1] 内时，先做 `_apply_scan_restrictions()` 再走倒排索引；否则相反。删除位图与 Row Ranges 现在都在 `_apply_scan_restrictions()` 里。
+- 新增倒排索引的候选行下推：`_index_query_context->candidate_rows` 指向当前 `_row_bitmap`，索引查询只在该位图内求值。这是「先用别的条件缩小范围，再查索引」的优化，不改变本文的层级结论。
+- `runtimeFilterWaitTimeMs` 默认值仍是 1000。
+
+**Databend**
+
+- **native 存储格式已被移除**（PR #19982，commit `9431970`，2026-06-10）。`FuseStorageFormat::Native` 改为 `Unsupported` 占位：这类表还能被实例化，`SHOW`、`DESC`、`DROP` 可用，但任何触碰数据的操作都会被 `check_format_supported()` 拒绝。`native_data_source_deserializer.rs`、`PagePruner`、以及基于 native Page Meta 的 Cluster Key 页级裁剪都已删除。
+- 因此正文原「Native Reader 按 Page 循环：TopK → Prewhere → Runtime Bloom → Remaining Columns」已改为 Parquet 路径的描述；Prewhere、Runtime Bloom、`ReadState`、`runtime_filter_wait.rs`（50 ms 轮询、30 s 上限）都还在。
+- `expr_runtime_pruner.rs` 的分工未变：MinMax/InList 用 Block 统计做 Domain Fold，InList 值数不超过阈值时再查持久化 Bloom Index。
+- Cluster Key 仍用于写入排序与 Recluster，但读取侧不再有 native 页级裁剪，收益只到 Block 一级。
+
+**未复核**：三个项目都没有本地集群，以上结论全部来自源码，没有执行结果验证；Doris `column_reader.cpp` 在两个快照间有约 1000 行改动，只确认了本文引用的 `get_row_ranges_by_bloom_filter()` 仍在并被 `segment_iterator.cpp` 调用，没有逐处审阅。
+
 本文使用以下术语区分优化发生的位置：
 
 | 层级 | 常见结构 | 能否避免数据 I/O | 典型代价 |
@@ -54,6 +84,10 @@ draft: false
 | 行值 | 向量化谓词、Runtime Bloom Probe | 不能撤销当前列的读取，可减少后续工作 | Hash、表达式计算 |
 
 这里的“避免 I/O”还需要进一步细分：命中本地 Data Cache 时，没有远端读取但仍有内存拷贝和解码；跳过 Payload 列时，谓词列已经发生 I/O；合并 Range 时，远端请求减少但字节数可能增加。本文会在具体实现中区分这些情况。
+
+![谓词下推的生效层级：I/O 在哪一级被真正省掉](/images/predicate-pushdown-levels.svg)
+
+*图 1：同一份谓词会先尝试文件/Segment 级裁剪，再退到 Block 与 Page，最后才在已读入的行上求值。上方三层决定“读不读”，下方两层只决定“读完之后少算多少”；宽度只表示候选集逐级缩小，不代表实测比例。*
 
 ### 一条统一的谓词下推链路
 
@@ -305,7 +339,7 @@ Databend Fuse Engine 的 [`PruningContext`](https://github.com/databendlabs/data
 |--------|----------|------|
 | Range Pruner | Segment/Block Column Statistics | 用表达式 Domain 判断 `MustFalse` |
 | Bloom Pruner | 独立 Bloom Index | 处理 Equality、InList 等点查询 |
-| Page Pruner | Native Page Meta、Cluster Key | 在 Block 内继续缩小 Page |
+| Page Pruner（已移除） | Native Page Meta、Cluster Key | 曾在 Block 内继续缩小 Page；随 native 格式一并删除 |
 | Inverted Index Pruner | 倒排索引 | 生成匹配行集合 |
 | TopN Pruner | Order/Limit 与统计信息 | 跳过不可能进入 TopN 的 Block |
 | Virtual/Spatial Pruner | 虚拟列或空间索引元数据 | 避免读取源列或无关空间块 |
@@ -321,7 +355,7 @@ Probe 侧不是让所有结构做同一件事：
 - [`RuntimeStatsPruner`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/expr_runtime_pruner.rs) 用 MinMax/InList 表达式与 Block Column Statistics 做 Domain Fold；结果恒为 `false` 时跳过整个 Block；
 - `ExprRuntimePruner` 在 Runtime InList 值数量不超过阈值时，还会调用持久化 Bloom Index；
 - Runtime Bloom 则进入 Prewhere/Preread 列集合，读取真实 Probe Column 后生成 Bitmap；
-- Native Reader 可以在 Page 阶段先应用 Bloom Runtime Filter，若整页无命中则不读剩余列。
+- baseline 的 Native Reader 可以在 Page 阶段先应用 Bloom Runtime Filter，若整页无命中则不读剩余列；该路径已随 native 格式移除，当前只剩 Parquet 路径的 Prewhere 与 RowSelection。
 
 Databend 的设计给出了一个很清晰的分工：**MinMax/InList 负责“读之前能否排除 Block”，Runtime Bloom 负责“读到 Probe Key 后还能否避免剩余列”。** 小型 InList 是两者之间的桥梁，因为它既能作为精确表达式查询 Statistics，也能逐值查询持久化 Bloom。
 
@@ -331,7 +365,7 @@ Databend 的设计给出了一个很清晰的分工：**MinMax/InList 负责“�
 
 当选择率达到配置阈值时，Bitmap 转换为 `RowSelection` 并下推给 Remaining Column Reader；否则先顺序反序列化剩余列，再在内存中过滤。这避免了低选择性场景中“为了少丢几行，却制造大量稀疏 Seek”的反优化。
 
-Native Reader 的 [`native_data_source_deserializer.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/native_data_source_deserializer.rs) 进一步按 Page 循环：TopK → Prewhere → Runtime Bloom → Remaining Columns。任一阶段判断当前 Page 全部不匹配，就直接进入下一组 Page。
+baseline 里的 Native Reader 曾按 Page 循环（TopK → Prewhere → Runtime Bloom → Remaining Columns，任一阶段判断整页不匹配就直接跳到下一组 Page）。这段实现在 `native_data_source_deserializer.rs`，随 #19982 移除 native 格式一并删除；当前快照只剩 Parquet 路径：`ReadState` 仍然负责 Prewhere 与 Runtime Bloom 的先后关系，由 [`parquet_data_source_deserializer.rs`](https://github.com/databendlabs/databend/blob/17de8708fd4095e6a062b6100789b9bc351a7230/src/query/storages/fuse/src/operations/read/parquet_data_source_deserializer.rs) 创建，粒度是 Data Block 而不是 Page。
 
 [`runtime_filter_wait.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/runtime_filter_wait.rs) 在该快照中以 50ms 轮询 Runtime Filter Ready，最长等待 30 秒，同时监听查询取消和下游结束。
 
@@ -350,9 +384,9 @@ Native Reader 的 [`native_data_source_deserializer.rs`](https://github.com/data
 
 | 能力 | StarRocks | Apache Doris | Databend |
 |------|-----------|--------------|----------|
-| Native 候选集合 | `SparseRange` | Roaring `_row_bitmap` | Segment/Block `PartInfo`、Page Selection |
-| 有序键裁剪 | Short Key / Sorted Key | Short Key / Key Range | Cluster Key + Range/Page Pruner |
-| Min/Max 粒度 | Segment/Page Zone Map；Parquet Row Group/Page | Segment/Page Zone Map；Parquet Row Group/Page | Segment/Block Statistics；Native Page Meta |
+| 读前候选集合 | `SparseRange` | Roaring `_row_bitmap` | Segment/Block `PartInfo`、Block 内 `RowSelection` |
+| 有序键裁剪 | Short Key / Sorted Key | Short Key / Key Range | Cluster Key + Range Pruner（页级裁剪已随 native 格式移除） |
+| Min/Max 粒度 | Segment/Page Zone Map；Parquet Row Group/Page | Segment/Page Zone Map；Parquet Row Group/Page | Segment/Block Statistics；Parquet `enable_parquet_page_index`（默认开启） |
 | 持久化 Bloom | Native Page、Parquet Row Group | Native Page、Parquet Row Group | 独立 Block Bloom Index |
 | Runtime MinMax/IN | 转 Index-only Predicate，继续查询 Zone Map | 可形成 Storage Predicate/Key Range，受类型和谓词形态约束 | 直接用 Statistics，阈值内 InList 还查询持久化 Bloom |
 | Runtime Bloom | Probe Column 行级过滤；可驱动延迟物化 | `BloomFilterColumnPredicate` 行级过滤；可驱动延迟物化 | Preread/Prewhere 行或 Page 过滤，再读剩余列 |

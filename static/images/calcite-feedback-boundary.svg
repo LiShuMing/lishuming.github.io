@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="900" viewBox="0 0 1280 900" role="img"
+     aria-label="Calcite 的职责边界：规划、执行与跨查询反馈各自由谁负责">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+</defs>
+<rect width="1280" height="900" fill="#ffffff"/>
+<text x="40" y="48" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328">Calcite 的职责边界：规划、执行与反馈各自由谁负责</text>
+<text x="40" y="76" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" fill="#5b6570">按时间从上到下；蓝色是宿主引擎的规划层，绿色是执行器侧；Calcite Core 只提供接口，虚线框是本文快照中未找到完整闭环的机制</text>
+<rect x="40" y="104" width="1200" height="176" rx="12" fill="#fbfcfe" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="130" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start">① 查询 N · 规划（宿主引擎侧）</text>
+<rect x="56" y="146" width="280" height="112" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="72" y="172" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">Static Statistics</text>
+<text x="72" y="196" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">表/列统计、HBO 缓存</text>
+<text x="72" y="217" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">→ 基数、选择率、代价</text>
+<rect x="352" y="146" width="280" height="112" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="368" y="172" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">CBO / Memo</text>
+<text x="368" y="196" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">Join Order、Trait 搜索</text>
+<text x="368" y="217" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">在候选之间比较代价</text>
+<rect x="648" y="146" width="280" height="112" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="664" y="172" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">Best Plan 提取</text>
+<text x="664" y="196" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">记录 CBO 阶段的 Cost</text>
+<text x="664" y="217" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">此后进入物理收尾</text>
+<rect x="944" y="146" width="280" height="112" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="960" y="172" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">Runtime Filter 描述（引擎生成）</text>
+<text x="960" y="196" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">集成方 Rule 产出，Core 无此内置</text>
+<text x="960" y="217" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">IN / MinMax / Bloom · Build/Target</text>
+<polyline points="338,202.0 348,202.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="634,202.0 644,202.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="930,202.0 940,202.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="316" width="1200" height="176" rx="12" fill="#fbfdfa" stroke="#cfe0c8" stroke-width="1.2"/>
+<text x="60" y="342" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#4d8a58" text-anchor="start">② 查询 N · 执行（执行器侧）</text>
+<rect x="80" y="358" width="360" height="112" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="96" y="384" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#4d8a58" text-anchor="start">RF Build / Merge</text>
+<text x="96" y="408" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">Build Side 收集键集</text>
+<text x="96" y="429" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">合并分区与桶过滤</text>
+<rect x="460" y="358" width="360" height="112" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="476" y="384" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#4d8a58" text-anchor="start">Probe Scan 下推</text>
+<text x="476" y="408" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">过滤尚未读取的数据</text>
+<text x="476" y="429" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">等待超时后按已有键集执行</text>
+<rect x="840" y="358" width="360" height="112" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="856" y="384" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#4d8a58" text-anchor="start">Profile</text>
+<text x="856" y="408" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">行数、等待时间、过滤命中</text>
+<text x="856" y="429" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">作为历史反馈的输入</text>
+<polyline points="442,414.0 456,414.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="822,414.0 836,414.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="1084,258 1084,292 260,292 260,354" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="700" y="284" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11.5" font-weight="normal" fill="#3c6e9e" text-anchor="start">RF 描述下发给执行层</text>
+<rect x="40" y="528" width="1200" height="150" rx="12" fill="#fdfaf5" stroke="#e6d3b8" stroke-width="1.2"/>
+<text x="60" y="554" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b07a35" text-anchor="start">③ 下一次规划 · 跨查询反馈</text>
+<rect x="60" y="568" width="560" height="96" rx="9" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.4" stroke-dasharray="6 5"/>
+<text x="76" y="594" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#5b6570" text-anchor="start">能力缺口：Mid-query Re-optimization（执行中重规划）</text>
+<text x="76" y="618" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">本文未在三套系统中找到完整闭环</text>
+<text x="76" y="639" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">Calcite Core 不提供状态迁移与算子恢复</text>
+<rect x="680" y="568" width="560" height="96" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="696" y="594" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#b07a35" text-anchor="start">History-Based（HBO / Tuning Guide）</text>
+<text x="696" y="618" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">Profile 与历史行数影响下一次规划</text>
+<text x="696" y="639" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">不改变当前查询已经执行的 Fragment</text>
+<polyline points="1020,470 1020,564" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="700" width="585" height="132" rx="10" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.2"/>
+<text x="60" y="728" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#1f2328" text-anchor="start">Calcite Core 提供了什么（接入点）</text>
+<text x="60" y="754" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">RelMetadataProvider 注入外部或历史统计，Context 向 Rule 与 Cost Model 传参</text>
+<text x="60" y="777" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">自定义物理 RelNode 与 Rule 承载 RF 描述，Programs.sequence() 组织阶段</text>
+<text x="60" y="800" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">只提供接口：没有 Fragment、Scan Reader 和运行状态，也就没有等待与恢复协议</text>
+<rect x="655" y="700" width="585" height="132" rx="10" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.2"/>
+<text x="675" y="728" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#1f2328" text-anchor="start">引擎必须自己实现什么（执行闭环）</text>
+<text x="675" y="754" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">Build 键收集、IN / MinMax / Bloom 选择、分区合并、跨节点传输</text>
+<text x="675" y="777" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">Probe 等待协议、Scan 下推、Profile 采集，以及历史反馈的存储与匹配</text>
+<text x="675" y="800" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">改造 Join 方向或分布时，还要重新进入代价搜索，而不是在收尾阶段直接替换</text>
+<line x1="40" y1="856" x2="1240" y2="856" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="880" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start">本图只表达本文三个快照中的职责边界；规则注册、RF 类型与等待参数仍由各引擎版本决定。</text>
+</svg>

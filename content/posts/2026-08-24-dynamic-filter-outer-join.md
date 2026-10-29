@@ -1,7 +1,7 @@
 ---
 title: "【源码】Dynamic Filter 穿越 Outer Join：StarRocks、Doris 与 Trino 的正确性边界"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-18T00:00:00+08:00
+lastmod: 2026-10-28T00:00:00+08:00
 slug: "dynamic-filter-through-outer-join"
 categories:
   - 数据库
@@ -61,6 +61,10 @@ INNER JOIN C ON coalesce(B.k, 0) = C.k;
 -- coalesce(NULL,0)=0 通过上层，结果多一行。
 ```
 
+![coalesce 反例：DF 进入 NULL 生成侧会改变匹配结果](/images/dynamic-filter-coalesce-counterexample.svg)
+
+*图 1：左侧是不下推时的正确执行，右侧是把 C 侧 `{0}` 推到 B 后的结果。差别不在少读多少行，而在 `B.k=1` 被删后 LEFT JOIN 合成了一条 `B=NULL` 的行，`coalesce` 把它映射成可匹配值，使它穿过了原本拒绝 NULL 的上层谓词。*
+
 下文钉问题边界与源码版本，再按 StarRocks / Doris / Trino 对照实现；**统一判据表与三系统对比表**仍是本文核心资产。
 
 ## 问题边界：生成过滤器与穿越 Outer Join
@@ -74,6 +78,26 @@ INNER JOIN C ON coalesce(B.k, 0) = C.k;
 | Trino | [68dae09](https://github.com/trinodb/trino/tree/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c) | 2026-08-22 | `PredicatePushDown`、`DynamicFiltersChecker` |
 
 本文结论以以上本地源码快照为准。RF/DF 相关代码变化较快，尤其是 Outer Join 和 Null-Safe Equality 的支持范围，阅读其他版本时应重新核对 Rule、Session Variable 与回归测试。
+
+2026-10 在更新快照上复核了三套实现（见下文「2026-10 复核记录」）。总体结论：本文描述的三种传播模型没有变，但 StarRocks 修掉了一个 TopN RF 的排序方向错误，Doris 新增了 RF 驱动的分区/分桶裁剪元数据。
+
+#### 2026-10 复核记录
+
+复核快照：StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）、Trino `6369330`（2026-10-06）。
+
+**已核实未变**
+
+- StarRocks `JoinNode.pushDownRuntimeFilters()` 的三级策略未变：仍是先 `pushDownRuntimeFilterBilaterally()`、失败后 `pushDownRuntimeFilterUnilaterally()`、最后在当前 Join 注册 Probe；`buildRuntimeFilters()` 的 Producer 限制、`checkRuntimeFilterOnNullValue()` 的 `equalForNull` 记录也仍在原位置。
+- 本文标记的待验证边界仍然成立：`pushDownRuntimeFilterBilaterally()` 依旧只要求 Probe Slot 参与某个 `BinaryType.EQ`，没有检查父 RF 的 `equalForNull`。文中给出的 `IS NOT DISTINCT FROM` 形态仍需用结果级回归确认是否真的生成错误计划。
+- Doris 的 `RuntimeFilterGenerator` 与 `RuntimeFilterPushDownVisitor` 主流程未变，`runtimeFilterPushDown` 的 Visitor 结构、生产者/消费者登记方式一致。
+- Trino `createDynamicFilters()` 的准入条件仍是 `INNER || RIGHT` 加 session 开关；`nullAllowed` 仍随 `DynamicFilterExpression` 保留。两个快照之间 `PredicatePushDown.java` 的 192 行改动（+65/−127）是 `DynamicFiltersResult` 等内部类改为 record、getter 改为访问器，不改变传播语义。
+
+**变化**
+
+- StarRocks `RuntimeFilterDescription.isTopNSortAsc()` / `isTopNullsFirst()` 改为固定读取排序键下标 0。旧实现用 `exprOrder` 索引 `sortInfo`，而 `exprOrder` 表示 group-by 位置、不是排序列位置；多列 TopN 且分组位置与排序列不一致时，可能把降序当成升序构造 TopN RF。这是 RF 正确性问题，不影响 Outer Join 传播模型。
+- StarRocks `canPushDownRuntimeFilterCrossExchange()` 增加 `DescriptorTable` 参数（跨 Exchange 下推时需要它做类型/表达式校验），调用点与语义不变。
+- Doris 新增 `RuntimeFilterPruneClassifier`：`RuntimeFilterPushDownVisitor` 在 DF 落到 Scan 后调用 `RuntimeFilterContext.generateRuntimeFilterPruneMetadata()`，尝试为这条 RF 生成目标侧的分区裁剪与分桶裁剪元数据。分桶裁剪要求 RF 类型为 IN / IN_OR_BLOOM、目标是 `PhysicalOlapScan` 上的直接列、且该列是单列 HASH 分布键；分区裁剪要求 RANGE/LIST 分区、目标表达式落在单个分区列上、RANGE 分区不接受 BLOOM，表达式还要能判定单调。`enable_runtime_filter_bucket_prune` 与 `enable_runtime_filter_partition_prune` 两个开关默认开启。这属于“DF 到 Scan 之后还能做什么”的新能力，不改变本文的穿越判据。
+- Trino 除上述重构外，未见 DF 方向推导逻辑变化；`processLimitedOuterJoin()` 仍要求父谓词先落到保留侧 Scope，再派生 NULL 生成侧副本。
 
 ### 建立正确的心智模型
 

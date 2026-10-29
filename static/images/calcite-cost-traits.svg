@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="940" viewBox="0 0 1280 940" role="img"
+     aria-label="VolcanoPlanner 的代价账本、两种 RuleDriver 与 Trait 补偿">
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+</defs>
+<rect width="1280" height="940" fill="#ffffff"/>
+<text x="40" y="48" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328">VolcanoPlanner 的代价账本、两种 Driver 与 Trait 补偿</text>
+<text x="40" y="76" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" fill="#5b6570">账本由两种 driver 共用；蓝=默认自底向上，橙=可选自顶向下，绿色=最终提取与 Enforcer</text>
+<rect x="40" y="104" width="1200" height="150" rx="12" fill="#fbfcfe" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="130" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start">① 注册与账本（两种 driver 共用）</text>
+<rect x="56" y="146" width="280" height="92" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="72" y="171" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">注册：RelNode → RelSet</text>
+<text x="72" y="193" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">RelDigest 去重，逻辑等价类</text>
+<text x="72" y="213" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">registerImpl 建 subset</text>
+<rect x="352" y="146" width="280" height="92" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="368" y="171" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">RelSubset = RelSet × TraitSet</text>
+<text x="368" y="193" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">同一逻辑集合按 trait 分桶</text>
+<text x="368" y="213" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">代价状态都挂在 subset 上</text>
+<rect x="648" y="146" width="280" height="92" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="664" y="171" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">账本字段</text>
+<text x="664" y="193" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">best / bestCost（累计）</text>
+<text x="664" y="213" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">upperBound / taskState（top-down）</text>
+<rect x="944" y="146" width="280" height="92" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="960" y="171" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">propagateCostImprovements</text>
+<text x="960" y="193" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">按代价优先级的向上堆遍历</text>
+<text x="960" y="213" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">更新 best 后清 Metadata 缓存</text>
+<polyline points="338,192.0 348,192.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="634,192.0 644,192.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="930,192.0 940,192.0" fill="none" stroke="#8a949e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="640,238 640,258 340,258 340,274" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="640,238 640,258 940,258 940,274" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="278" width="1200" height="300" rx="12" fill="#ffffff" stroke="#d7dde3" stroke-width="1.2"/>
+<rect x="56" y="278" width="568" height="300" rx="10" fill="#fbfcfe" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="76" y="304" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start">② 默认：IterativeRuleDriver（84 行）</text>
+<text x="76" y="326" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">FIFO 队列；没有按上界剪枝</text>
+<rect x="656" y="278" width="568" height="300" rx="10" fill="#fdfaf5" stroke="#e6d3b8" stroke-width="1.2"/>
+<text x="676" y="304" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b07a35" text-anchor="start">③ 可选：TopDownRuleDriver（opt-in）</text>
+<text x="676" y="326" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">任务栈；分支限界</text>
+<rect x="80" y="350" width="520" height="80" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="96" y="375" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">FIFO MatchList</text>
+<text x="96" y="397" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">preQueue：SubstitutionRule 优先</text>
+<text x="96" y="417" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">queue：其余规则，不排序</text>
+<rect x="80" y="452" width="520" height="80" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="96" y="477" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#3c6e9e" text-anchor="start">drive() 与账本</text>
+<text x="96" y="499" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">popMatch → onMatch → canonize</text>
+<text x="96" y="519" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">best 持续更新；taskState 恒为 null</text>
+<text x="80" y="562" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">结果：穷举式自底向上，只有超时会提前退出</text>
+<rect x="680" y="350" width="520" height="80" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="696" y="375" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#b07a35" text-anchor="start">任务栈</text>
+<text x="696" y="397" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">OptimizeGroup / OptimizeInputs</text>
+<text x="696" y="417" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">CheckInput / DeriveTrait</text>
+<rect x="680" y="452" width="520" height="80" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="696" y="477" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#b07a35" text-anchor="start">上界与 Winner</text>
+<text x="696" y="499" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">UB(child) = UB(parent) − self − LB(others)</text>
+<text x="696" y="519" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">COMPLETED &amp;&amp; bestCost ≤ upperBound</text>
+<text x="680" y="562" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">逻辑节点的 Lower Bound 返回 null，物理候选出现后才可剪枝</text>
+<polyline points="340.0,430 340.0,448" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="940.0,430 940.0,448" fill="none" stroke="#b07a35" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="602" width="1200" height="230" rx="12" fill="#fbfdfa" stroke="#cfe0c8" stroke-width="1.2"/>
+<text x="60" y="628" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#4d8a58" text-anchor="start">④ Trait 补偿与计划提取</text>
+<rect x="56" y="648" width="560" height="100" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="72" y="673" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#4d8a58" text-anchor="start">自底向上：AbstractConverter</text>
+<text x="72" y="695" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">自身代价 = infinite，永远选不中</text>
+<text x="72" y="715" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">ExpandConversionRule 展开成真实算子</text>
+<rect x="664" y="648" width="560" height="100" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="680" y="673" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#4d8a58" text-anchor="start">自顶向下：Convention.enforce()</text>
+<text x="680" y="695" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">EnumerableSort 直接带真实代价</text>
+<text x="680" y="715" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">passThrough / derive / DeriveMode</text>
+<rect x="56" y="770" width="1168" height="56" rx="9" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.4"/>
+<text x="72" y="795" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="15" font-weight="600" fill="#5b6570" text-anchor="start">buildCheapestPlan：沿 best 指针还原物理树</text>
+<text x="72" y="817" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12.3" font-weight="normal" fill="#5b6570" text-anchor="start">任一 subset 没有 best → CannotPlanException</text>
+<polyline points="340,578 340,644" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="940,578 940,644" fill="none" stroke="#b07a35" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="336,748 336,766" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="944,748 944,766" fill="none" stroke="#4d8a58" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<line x1="40" y1="858" x2="1240" y2="858" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="884" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start">VolcanoCost.isLe / isLt 只比较 rowCount；cpu / io 参与累计与打印，不参与排序。</text>
+</svg>
