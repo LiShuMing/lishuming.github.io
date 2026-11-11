@@ -15,6 +15,16 @@ Apply these rules when writing, researching, analyzing source code for, or revis
   - Paper reading: explain the assumption that fails, the proposed mechanism, the supporting experiments, and the limits of the evidence.
   - Practice notes: preserve the actual problem, failed attempts, corrections, and verification. Do not turn a partial experiment into a comprehensive theory.
 
+### Solution-Oriented Research Reports
+
+- For reports that investigate how to build a capability, organize the argument as **Background → Competitive Research → Alternative Approaches → Design → Feasibility Analysis**. This is a decision chain, not five independent inventories. Do not impose an implementation proposal on a literature review or research-only article whose scope explicitly excludes design.
+- **Background:** explain the existing workflow, concrete unmet need, intended users, and value of solving the problem. Establish requirements, constraints, non-goals, and success criteria before evaluating products.
+- **Competitive Research:** examine relevant open-source projects or commercial products against those requirements. For each, explain its actual function, the problem its implementation solves, reusable mechanisms, and mismatches with the target need. Link source claims to a version and code path; label documentation-only or unverified claims. Do not infer that an entire product lacks a feature merely because the inspected material does not describe it.
+- **Alternative Approaches:** derive viable routes from mechanisms demonstrated by the researched systems. Compare them using the same dimensions: requirement coverage, integration work, correctness and recovery, operating cost, extensibility, and unsuitable scenarios. Separate adopted mechanisms from new proposals.
+- **Design:** choose the best fit under the stated constraints, not a universally best architecture. Explain the decisive trade-offs, rejected alternatives, and conditions that would change the choice. Describe component responsibilities, interfaces, state and control flow, then give ordered implementation steps with dependencies and acceptance gates.
+- **Feasibility Analysis:** map the design to available components, required custom work, external prerequisites, and unresolved risks. Include a bounded proof of concept, failure tests, cost or resource accounting, stop conditions, and fallback options. If measurements or staffing estimates are unavailable, identify the missing evidence rather than inventing delivery dates, performance gains, or precise budgets.
+- Keep the chain traceable: each design choice should address a stated requirement or competitive gap; each feasibility test should validate a design assumption. A plausible design, a working prototype, and a verified production capability are different evidence levels.
+
 ### Language and Style
 
 - Avoid stock phrases such as “不可否认” (undeniably), “值得注意的是” (it is worth noting), “双刃剑” (a double-edged sword), and “注入新动能” (inject new momentum).
