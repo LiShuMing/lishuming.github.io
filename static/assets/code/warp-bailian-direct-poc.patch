@@ -1,0 +1,1321 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index ec03eb4dd..a5ac0a984 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -15499,6 +15499,7 @@ dependencies = [
+  "warp-command-signatures",
+  "warp-workflows",
+  "warp_assets",
++ "warp_bailian_client",
+  "warp_channel_config",
+  "warp_cli",
+  "warp_completer",
+@@ -15599,6 +15600,22 @@ dependencies = [
+  "warpui_core",
+ ]
+ 
++[[package]]
++name = "warp_bailian_client"
++version = "0.1.0"
++dependencies = [
++ "async-stream",
++ "futures",
++ "instant",
++ "prost-types",
++ "reqwest",
++ "serde_json",
++ "thiserror 2.0.17",
++ "tokio",
++ "uuid",
++ "warp_multi_agent_api",
++]
++
+ [[package]]
+ name = "warp_channel_config"
+ version = "0.0.0"
+diff --git a/Cargo.toml b/Cargo.toml
+index 1c1bb1de0..977d278e6 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -79,6 +79,7 @@ vim = { path = "crates/vim" }
+ virtual-fs = { path = "crates/virtual_fs" }
+ voice_input = { path = "crates/voice_input" }
+ warp = { path = "app" }
++warp_bailian_client = { path = "crates/warp_bailian_client" }
+ warp_assets = { path = "crates/warp_assets" }
+ warp_channel_config = { path = "crates/warp_channel_config" }
+ warp_cli = { path = "crates/warp_cli" }
+diff --git a/app/Cargo.toml b/app/Cargo.toml
+index 2a3061632..5150383f6 100644
+--- a/app/Cargo.toml
++++ b/app/Cargo.toml
+@@ -172,6 +172,7 @@ rayon.workspace = true
+ regex-automata.workspace = true
+ regex.workspace = true
+ reqwest.workspace = true
++warp_bailian_client.workspace = true
+ rust-embed.workspace = true
+ sentry-log = { workspace = true, optional = true }
+ inventory = "0.3"
+diff --git a/app/src/ai/agent/api.rs b/app/src/ai/agent/api.rs
+index 53267e843..9e0e1b714 100644
+--- a/app/src/ai/agent/api.rs
++++ b/app/src/ai/agent/api.rs
+@@ -136,6 +136,7 @@ impl TryFrom<ServerConversationToken>
+ 
+ #[derive(Debug, Clone)]
+ pub struct RequestParams {
++    pub(crate) direct_bailian: Option<crate::ai::direct_bailian::DirectBailianRequest>,
+     pub input: Vec<AIAgentInput>,
+     pub conversation_token: Option<ServerConversationToken>,
+     pub forked_from_conversation_token: Option<ServerConversationToken>,
+@@ -219,6 +220,7 @@ impl RequestParams {
+             forked_from_conversation_token: None,
+             ambient_agent_task_id: None,
+             tasks: vec![],
++            direct_bailian: None,
+             existing_suggestions: None,
+             metadata: None,
+             session_context: SessionContext::new_for_test(),
+@@ -427,6 +429,10 @@ impl RequestParams {
+ 
+         Self {
+             input: request_input.all_inputs().cloned().collect(),
++            direct_bailian: crate::ai::direct_bailian::DirectBailianRequest::snapshot(
++                request_input,
++                app,
++            ),
+             conversation_token: conversation.server_conversation_token,
+             forked_from_conversation_token: conversation.forked_from_conversation_token,
+             ambient_agent_task_id: conversation.ambient_agent_task_id,
+diff --git a/app/src/ai/agent/api/impl.rs b/app/src/ai/agent/api/impl.rs
+index 40d2cdde1..8a1171ac9 100644
+--- a/app/src/ai/agent/api/impl.rs
++++ b/app/src/ai/agent/api/impl.rs
+@@ -2,12 +2,13 @@ use std::collections::HashMap;
+ use std::sync::Arc;
+ 
+ use futures_util::StreamExt;
++use warp_bailian_client::{self as bailian, Error as BailianError};
+ use warp_core::features::FeatureFlag;
+ use warp_multi_agent_api as api;
+ 
+ use super::convert_to::convert_input;
+ use super::{ConvertToAPITypeError, RequestParams, ResponseStream};
+-use crate::ai::agent::redaction;
++use crate::ai::agent::{AIAgentInput, redaction};
+ use crate::ai::blocklist::video_recording_enabled;
+ use crate::server::server_api::{AIApiError, ServerApi};
+ use crate::server::team_scope::RequestTeamScope;
+@@ -19,6 +20,34 @@ pub async fn generate_multi_agent_output(
+     team_scope: RequestTeamScope,
+     cancellation_rx: futures::channel::oneshot::Receiver<()>,
+ ) -> Result<ResponseStream, ConvertToAPITypeError> {
++    if let Some(direct) = params.direct_bailian.take() {
++        if params.should_redact_secrets {
++            redaction::redact_inputs(&mut params.input);
++        }
++        let queries = params
++            .input
++            .into_iter()
++            .map(|input| match input {
++                AIAgentInput::UserQuery {
++                    query,
++                    referenced_attachments,
++                    ..
++                } if referenced_attachments.is_empty() => Ok(query),
++                _ => Err(BailianError::UnsupportedHistory),
++            })
++            .collect::<Result<Vec<_>, _>>();
++        let stream: ResponseStream = match queries {
++            Ok(queries) => Box::pin(
++                bailian::generate(direct.config, direct.task_id, params.tasks, queries).map(
++                    |result| result.map_err(|error| Arc::new(AIApiError::Other(error.into()))),
++                ),
++            ),
++            Err(error) => Box::pin(futures::stream::once(async move {
++                Err(Arc::new(AIApiError::Other(error.into())))
++            })),
++        };
++        return Ok(Box::pin(stream.take_until(cancellation_rx)));
++    }
+     let supported_tools = params
+         .supported_tools_override
+         .take()
+diff --git a/app/src/ai/agent/conversation.rs b/app/src/ai/agent/conversation.rs
+index bb128f048..27f10b1b2 100644
+--- a/app/src/ai/agent/conversation.rs
++++ b/app/src/ai/agent/conversation.rs
+@@ -465,7 +465,13 @@ impl AIConversation {
+         let driver = match (is_viewing_shared_session, is_cli_agent_transcript) {
+             (true, _) => ConversationDriver::SharedSessionViewer,
+             (false, true) => ConversationDriver::CliAgentTranscript,
+-            (false, false) => ConversationDriver::Native,
++            (false, false) => {
++                if crate::ai::direct_bailian::is_enabled() {
++                    ConversationDriver::DirectBailian
++                } else {
++                    ConversationDriver::Native
++                }
++            }
+         };
+         Self::with_driver(driver)
+     }
+@@ -2366,8 +2372,10 @@ impl AIConversation {
+             });
+         }
+ 
+-        self.server_conversation_token =
+-            Some(ServerConversationToken::new(init_event.conversation_id));
++        if self.driver != ConversationDriver::DirectBailian {
++            self.server_conversation_token =
++                Some(ServerConversationToken::new(init_event.conversation_id));
++        }
+         let run_id = Some(init_event.run_id).filter(|s| !s.is_empty());
+         self.task_id = run_id.as_deref().and_then(|id| id.parse().ok());
+         Ok(())
+diff --git a/app/src/ai/agent/conversation_driver.rs b/app/src/ai/agent/conversation_driver.rs
+index 476a1c639..17b9752ef 100644
+--- a/app/src/ai/agent/conversation_driver.rs
++++ b/app/src/ai/agent/conversation_driver.rs
+@@ -6,6 +6,8 @@ pub enum ConversationDriver {
+     /// Warp's agent loop: the MAA server streams events and this client executes tools.
+     #[default]
+     Native,
++    /// Text-only Bailian inference, held in memory without a Warp server identity.
++    DirectBailian,
+     /// Another client's conversation mirrored over a shared session; view-only here.
+     SharedSessionViewer,
+     /// A restored 3p CLI transcript rendered through a vehicle conversation; view-only here.
+@@ -21,7 +23,7 @@ impl ConversationDriver {
+     /// This client sends follow-ups, settles status from action results, and may cancel the turn.
+     pub fn owns_turn_lifecycle(self) -> bool {
+         match self {
+-            Self::Native => true,
++            Self::Native | Self::DirectBailian => true,
+             Self::SharedSessionViewer
+             | Self::CliAgentTranscript
+             | Self::RemoteChild
+@@ -34,6 +36,7 @@ impl ConversationDriver {
+         match self {
+             Self::Native => true,
+             Self::SharedSessionViewer
++            | Self::DirectBailian
+             | Self::CliAgentTranscript
+             | Self::RemoteChild
+             | Self::ExternalHarness => false,
+@@ -45,7 +48,9 @@ impl ConversationDriver {
+     pub fn reconstructs_inputs_from_messages(self) -> bool {
+         match self {
+             Self::SharedSessionViewer | Self::ExternalHarness => true,
+-            Self::Native | Self::CliAgentTranscript | Self::RemoteChild => false,
++            Self::Native | Self::DirectBailian | Self::CliAgentTranscript | Self::RemoteChild => {
++                false
++            }
+         }
+     }
+ 
+@@ -53,7 +58,7 @@ impl ConversationDriver {
+     pub fn reports_task_status(self) -> bool {
+         match self {
+             Self::Native | Self::CliAgentTranscript | Self::ExternalHarness => true,
+-            Self::SharedSessionViewer | Self::RemoteChild => false,
++            Self::DirectBailian | Self::SharedSessionViewer | Self::RemoteChild => false,
+         }
+     }
+ 
+@@ -62,7 +67,7 @@ impl ConversationDriver {
+     pub fn is_read_only_ui(self) -> bool {
+         match self {
+             Self::SharedSessionViewer | Self::CliAgentTranscript => true,
+-            Self::Native | Self::RemoteChild | Self::ExternalHarness => false,
++            Self::Native | Self::DirectBailian | Self::RemoteChild | Self::ExternalHarness => false,
+         }
+     }
+ 
+@@ -70,7 +75,7 @@ impl ConversationDriver {
+     pub fn is_persisted_locally(self) -> bool {
+         match self {
+             Self::Native | Self::CliAgentTranscript | Self::ExternalHarness => true,
+-            Self::SharedSessionViewer | Self::RemoteChild => false,
++            Self::DirectBailian | Self::SharedSessionViewer | Self::RemoteChild => false,
+         }
+     }
+ }
+diff --git a/app/src/ai/agent/conversation_driver_tests.rs b/app/src/ai/agent/conversation_driver_tests.rs
+index 075ce5882..f99fb709a 100644
+--- a/app/src/ai/agent/conversation_driver_tests.rs
++++ b/app/src/ai/agent/conversation_driver_tests.rs
+@@ -59,3 +59,14 @@ fn external_harness_owns_the_conversation_but_not_the_turn() {
+ fn default_driver_is_native() {
+     assert_eq!(ConversationDriver::default(), ConversationDriver::Native);
+ }
++
++#[test]
++fn direct_bailian_owns_text_turns_without_tools_or_server_sync() {
++    let driver = ConversationDriver::DirectBailian;
++    assert!(driver.owns_turn_lifecycle());
++    assert!(!driver.executes_tool_calls_locally());
++    assert!(!driver.reconstructs_inputs_from_messages());
++    assert!(!driver.reports_task_status());
++    assert!(!driver.is_read_only_ui());
++    assert!(!driver.is_persisted_locally());
++}
+diff --git a/app/src/ai/blocklist/controller.rs b/app/src/ai/blocklist/controller.rs
+index 9fe6b23aa..6c18d857e 100644
+--- a/app/src/ai/blocklist/controller.rs
++++ b/app/src/ai/blocklist/controller.rs
+@@ -48,7 +48,9 @@ use super::queued_query::{QueuedQueryEvent, QueuedQueryId, QueuedQueryModel, Req
+ use super::{BlocklistAIInputModel, ResponseStreamId};
+ use crate::ai::AIRequestUsageModel;
+ use crate::ai::agent::api::{self, ServerConversationToken};
+-use crate::ai::agent::conversation::{AIConversation, AIConversationId, ConversationStatus};
++use crate::ai::agent::conversation::{
++    AIConversation, AIConversationId, ConversationDriver, ConversationStatus,
++};
+ use crate::ai::agent::task::TaskId;
+ use crate::ai::agent::{
+     AIAgentActionResult, AIAgentActionResultType, AIAgentAttachment, AIAgentContext,
+@@ -819,7 +821,9 @@ impl BlocklistAIController {
+             self.cancel_conversation_progress(active_conversation_id, cancellation_reason, ctx);
+         }
+ 
+-        if let Some(slash_command_request) = SlashCommandRequest::from_query(query.as_str()) {
++        if !crate::ai::direct_bailian::is_enabled()
++            && let Some(slash_command_request) = SlashCommandRequest::from_query(query.as_str())
++        {
+             // Only fired queued rows carry `queued_query_id`. For those rows, keep slash commands
+             // (e.g. queued `/compact`) on the conversation they were queued on; direct slash
+             // submissions still re-derive their target from the current UI selection.
+@@ -3073,6 +3077,11 @@ impl BlocklistAIController {
+             };
+ 
+             let active_tasks = conversation.compute_active_tasks();
++            if crate::ai::direct_bailian::is_enabled()
++                && conversation.driver() != ConversationDriver::DirectBailian
++            {
++                return Err(anyhow!("Bailian PoC requires a new local conversation."));
++            }
+ 
+             (
+                 conversation.id(),
+@@ -3583,7 +3592,11 @@ impl BlocklistAIController {
+         conversation_id: AIConversationId,
+         ctx: &AppContext,
+     ) {
+-        if !FeatureFlag::AgentSharedSessions.is_enabled() {
++        if BlocklistAIHistoryModel::as_ref(ctx)
++            .conversation(&conversation_id)
++            .is_some_and(|conversation| conversation.driver() == ConversationDriver::DirectBailian)
++            || !FeatureFlag::AgentSharedSessions.is_enabled()
++        {
+             return;
+         }
+         let mut model = self.terminal_model.lock();
+diff --git a/app/src/ai/blocklist/controller/response_stream.rs b/app/src/ai/blocklist/controller/response_stream.rs
+index aeca0e22d..7bd8df90c 100644
+--- a/app/src/ai/blocklist/controller/response_stream.rs
++++ b/app/src/ai/blocklist/controller/response_stream.rs
+@@ -495,6 +495,10 @@ impl ResponseStream {
+         error: &Arc<AIApiError>,
+         ctx: &mut ModelContext<Self>,
+     ) -> RecoveryOutcome {
++        if self.params.direct_bailian.is_some() {
++            self.error_event_emitted = true;
++            return RecoveryOutcome::Surfaced;
++        }
+         let is_online = NetworkStatus::as_ref(ctx).is_online();
+         let action = recovery_action(
+             self.has_received_client_actions,
+@@ -576,6 +580,10 @@ impl ResponseStream {
+         cancellation_rx: oneshot::Receiver<()>,
+         ctx: &mut ModelContext<Self>,
+     ) {
++        if params.direct_bailian.is_some() {
++            Self::spawn_generate(request_id, params, team_scope, cancellation_rx, ctx);
++            return;
++        }
+         // The Grok subscription and its OAuth refresh are native-only.
+         #[cfg(not(target_family = "wasm"))]
+         {
+diff --git a/app/src/ai/blocklist/local_agent_task_sync_model.rs b/app/src/ai/blocklist/local_agent_task_sync_model.rs
+index fda5dc09a..c77a710ca 100644
+--- a/app/src/ai/blocklist/local_agent_task_sync_model.rs
++++ b/app/src/ai/blocklist/local_agent_task_sync_model.rs
+@@ -488,18 +488,7 @@ fn with_local_conversation<T>(
+ ) -> Option<(AmbientAgentTaskId, T)> {
+     let history = BlocklistAIHistoryModel::as_ref(ctx);
+     let conversation = history.conversation(&conversation_id)?;
+-    // Viewers of shared sessions must not report status — they don't
+-    // own the task. Currently also protected by the absence of task_id,
+-    // but this guard makes the intent explicit.
+-    if conversation.is_viewing_shared_session() {
+-        return None;
+-    }
+-    // Skip remote child placeholder conversations — the remote worker's
+-    // own client handles status reporting. Reporting here would
+-    // prematurely move remote tasks from QUEUED to IN_PROGRESS before
+-    // the worker can claim them. Local children are NOT skipped because
+-    // they execute in this client and have no separate reporter.
+-    if conversation.is_remote_child() {
++    if !conversation.driver().reports_task_status() {
+         return None;
+     }
+     let task_id = conversation.task_id()?;
+diff --git a/app/src/ai/blocklist/prompt/prompt_alert.rs b/app/src/ai/blocklist/prompt/prompt_alert.rs
+index 07086a893..d18b0e345 100644
+--- a/app/src/ai/blocklist/prompt/prompt_alert.rs
++++ b/app/src/ai/blocklist/prompt/prompt_alert.rs
+@@ -255,6 +255,9 @@ impl PromptAlertView {
+     }
+ 
+     pub fn determine_state<S: TeamScope + ?Sized>(scope: &S, app: &AppContext) -> PromptAlertState {
++        if crate::ai::direct_bailian::is_enabled() {
++            return PromptAlertState::NoAlert;
++        }
+         // First, if the user is offline, no AI features will work.
+         if !NetworkStatus::as_ref(app).is_online() {
+             return PromptAlertState::NoConnection;
+diff --git a/app/src/ai/llms.rs b/app/src/ai/llms.rs
+index 872ecf09b..9f1eea09b 100644
+--- a/app/src/ai/llms.rs
++++ b/app/src/ai/llms.rs
+@@ -947,6 +947,9 @@ impl LLMPreferences {
+         app: &'a AppContext,
+         terminal_view_id: Option<EntityId>,
+     ) -> &'a LLMInfo {
++        if crate::ai::direct_bailian::is_enabled() {
++            return direct_bailian_llm_info();
++        }
+         let models_by_feature = UserWorkspaces::as_ref(app).feature_model_choice_for_scope(scope);
+         if let Some(terminal_view_id) = terminal_view_id {
+             let raw_override = self.base_llm_for_terminal_view.get(&terminal_view_id);
+@@ -1312,6 +1315,9 @@ impl LLMPreferences {
+     /// Falls back to the user's custom-endpoint LLMs when the id isn't a server-known model
+     /// id (e.g. when it's a `config_key` UUID).
+     pub fn get_llm_info<'a>(&'a self, id: &LLMId, app: &'a AppContext) -> Option<&'a LLMInfo> {
++        if crate::ai::direct_bailian::is_enabled() && *id == direct_bailian_llm_info().id {
++            return Some(direct_bailian_llm_info());
++        }
+         let workspaces = UserWorkspaces::as_ref(app);
+         workspaces
+             .current_workspace()
+@@ -2410,6 +2416,30 @@ fn custom_llm_info_from(endpoint: &CustomEndpoint, model: &CustomEndpointModel)
+     }
+ }
+ 
++fn direct_bailian_llm_info() -> &'static LLMInfo {
++    static INFO: OnceLock<LLMInfo> = OnceLock::new();
++    INFO.get_or_init(|| LLMInfo {
++        display_name: format!("{} · 百炼直连 PoC", warp_bailian_client::MODEL),
++        base_model_name: warp_bailian_client::MODEL.to_owned(),
++        id: warp_bailian_client::MODEL.into(),
++        reasoning_level: None,
++        usage_metadata: LLMUsageMetadata {
++            request_multiplier: 1,
++            credit_multiplier: None,
++        },
++        description: Some(
++            "Direct text-only Bailian inference; tools and cloud history are disabled.".to_owned(),
++        ),
++        disable_reason: None,
++        vision_supported: false,
++        spec: None,
++        provider: LLMProvider::Unknown,
++        host_configs: HashMap::new(),
++        discount_percentage: None,
++        context_window: LLMContextWindow::default(),
++    })
++}
++
+ #[cfg(test)]
+ #[path = "llms_tests.rs"]
+ mod tests;
+diff --git a/app/src/ai/mod.rs b/app/src/ai/mod.rs
+index 8964b5b98..c42e7eb79 100644
+--- a/app/src/ai/mod.rs
++++ b/app/src/ai/mod.rs
+@@ -35,6 +35,7 @@ pub mod credit_availability;
+ pub(crate) mod custom_endpoints;
+ pub(crate) mod custom_model_router_editor;
+ pub(crate) mod custom_model_routers;
++pub(crate) mod direct_bailian;
+ pub(crate) mod document;
+ #[cfg(not(target_family = "wasm"))]
+ pub mod geap_credentials;
+diff --git a/app/src/ai/request_usage_model.rs b/app/src/ai/request_usage_model.rs
+index 370836cc1..d1a0ee3c8 100644
+--- a/app/src/ai/request_usage_model.rs
++++ b/app/src/ai/request_usage_model.rs
+@@ -518,6 +518,9 @@ impl AIRequestUsageModel {
+     /// Returns `true` if the user can start an interactive AI request.
+     /// Prefers the server decision when present; otherwise uses the pre-fetch fallback.
+     pub fn has_any_ai_remaining<S: TeamScope + ?Sized>(&self, scope: &S, ctx: &AppContext) -> bool {
++        if crate::ai::direct_bailian::is_enabled() {
++            return true;
++        }
+         if let Some(availability) = self.server_availability.latest {
+             return Self::server_availability_permits_ai(availability, scope, ctx);
+         }
+diff --git a/app/src/ai/direct_bailian.rs b/app/src/ai/direct_bailian.rs
+new file mode 100644
+index 000000000..113faac5e
+--- /dev/null
++++ b/app/src/ai/direct_bailian.rs
+@@ -0,0 +1,44 @@
++//! Explicit, process-scoped opt-in to the text-only direct inference PoC.
++
++use ai::api_keys::ApiKeyManager;
++use warp_bailian_client::{BASE_URL, Config};
++use warpui::{AppContext, SingletonEntity};
++
++use crate::ai::blocklist::RequestInput;
++
++pub(crate) fn is_enabled() -> bool {
++    !cfg!(target_family = "wasm")
++        && std::env::var("WARP_DIRECT_BAILIAN").is_ok_and(|value| value == "1")
++}
++
++#[derive(Clone, Debug)]
++pub(crate) struct DirectBailianRequest {
++    pub config: Config,
++    pub task_id: String,
++}
++
++impl DirectBailianRequest {
++    pub fn snapshot(input: &RequestInput, ctx: &AppContext) -> Option<Self> {
++        is_enabled().then(|| {
++            let api_key = std::env::var("LLM_API_KEY")
++                .ok()
++                .filter(|key| !key.trim().is_empty())
++                .or_else(|| {
++                    ApiKeyManager::as_ref(ctx)
++                        .custom_endpoints()
++                        .iter()
++                        .find(|endpoint| endpoint.url.trim_end_matches('/') == BASE_URL)
++                        .map(|endpoint| endpoint.api_key.clone())
++                })
++                .unwrap_or_default();
++            Self {
++                config: Config::new(api_key),
++                task_id: input
++                    .input_messages
++                    .first()
++                    .map(|(task_id, _)| task_id.to_string())
++                    .unwrap_or_default(),
++            }
++        })
++    }
++}
+diff --git a/crates/warp_bailian_client/Cargo.toml b/crates/warp_bailian_client/Cargo.toml
+new file mode 100644
+index 000000000..aa40db2b2
+--- /dev/null
++++ b/crates/warp_bailian_client/Cargo.toml
+@@ -0,0 +1,21 @@
++[package]
++name = "warp_bailian_client"
++version = "0.1.0"
++edition = "2024"
++authors.workspace = true
++publish.workspace = true
++license.workspace = true
++
++[dependencies]
++async-stream.workspace = true
++futures.workspace = true
++prost-types.workspace = true
++reqwest.workspace = true
++serde_json.workspace = true
++thiserror.workspace = true
++uuid = { workspace = true, features = ["v4"] }
++warp_multi_agent_api.workspace = true
++
++[dev-dependencies]
++instant.workspace = true
++tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+diff --git a/crates/warp_bailian_client/src/lib.rs b/crates/warp_bailian_client/src/lib.rs
+new file mode 100644
+index 000000000..0a85c257b
+--- /dev/null
++++ b/crates/warp_bailian_client/src/lib.rs
+@@ -0,0 +1,320 @@
++//! Text-only Bailian inference translated into Warp's native response events.
++
++use std::fmt;
++#[cfg(not(target_family = "wasm"))]
++use std::time::Duration;
++use std::time::SystemTime;
++
++use futures::StreamExt;
++use serde_json::{Value, json};
++use uuid::Uuid;
++use warp_multi_agent_api::client_action::{
++    Action, AddMessagesToTask, AppendToMessageContent, CreateTask,
++};
++use warp_multi_agent_api::message::{AgentOutput, Message as MessageKind, UserQuery};
++use warp_multi_agent_api::response_event::{
++    ClientActions, StreamFinished, StreamInit, Type, stream_finished,
++};
++use warp_multi_agent_api::{ClientAction, Message, ResponseEvent, Task};
++
++pub const BASE_URL: &str = "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1";
++pub const MODEL: &str = "deepseek-v4.1-flash";
++const MAX_EVENT_BYTES: usize = 1024 * 1024;
++
++#[cfg(not(target_family = "wasm"))]
++pub type OutputStream = futures::stream::BoxStream<'static, Result<ResponseEvent, Error>>;
++#[cfg(target_family = "wasm")]
++pub type OutputStream = futures::stream::LocalBoxStream<'static, Result<ResponseEvent, Error>>;
++
++#[derive(Clone)]
++pub struct Config {
++    api_key: String,
++}
++
++impl Config {
++    pub fn new(api_key: String) -> Self {
++        Self { api_key }
++    }
++}
++
++impl fmt::Debug for Config {
++    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
++        f.debug_struct("BailianConfig").finish_non_exhaustive()
++    }
++}
++
++#[derive(Debug, thiserror::Error)]
++pub enum Error {
++    #[error("Bailian API key is missing. Configure the Token Plan endpoint or set LLM_API_KEY.")]
++    MissingKey,
++    #[error("Bailian PoC supports plain text conversations only; start a new conversation.")]
++    UnsupportedHistory,
++    #[error("Bailian PoC requires a non-empty text prompt.")]
++    EmptyPrompt,
++    #[error("Bailian HTTP {0}; check the API key, Token Plan quota and model access.")]
++    Http(u16),
++    #[error("Bailian network request failed.")]
++    Network,
++    #[error("Bailian returned an invalid streaming response.")]
++    InvalidStream,
++    #[error("Bailian stream ended before [DONE]. Retry the prompt manually.")]
++    UnexpectedEof,
++    #[error("Bailian returned a tool call; tools are disabled in this PoC.")]
++    ToolCall,
++    #[error("Bailian response exceeded the output token limit.")]
++    TokenLimit,
++    #[error("Bailian rejected the request or returned an unsupported finish reason.")]
++    Provider,
++}
++
++/// Opens one model turn. Dropping this stream cancels the HTTP request; it never retries.
++pub fn generate(
++    config: Config,
++    task_id: String,
++    tasks: Vec<Task>,
++    queries: Vec<String>,
++) -> OutputStream {
++    generate_at(
++        config,
++        task_id,
++        tasks,
++        queries,
++        format!("{BASE_URL}/chat/completions"),
++    )
++}
++
++fn request_body(tasks: &[Task], queries: &[String]) -> Result<Value, Error> {
++    let mut messages = vec![json!({
++        "role": "system",
++        "content": "You are a helpful assistant in Warp. Answer in the user's language. You can only respond with text; you cannot execute commands, access files, or call tools."
++    })];
++    if tasks.len() > 1 {
++        return Err(Error::UnsupportedHistory);
++    }
++    for task in tasks {
++        for message in &task.messages {
++            let (role, content) = match message.message.as_ref() {
++                Some(MessageKind::UserQuery(query)) => ("user", query.query.as_str()),
++                Some(MessageKind::AgentOutput(output)) => ("assistant", output.text.as_str()),
++                Some(MessageKind::AgentReasoning(_) | MessageKind::ModelUsed(_)) | None => continue,
++                Some(_) => return Err(Error::UnsupportedHistory),
++            };
++            if !content.is_empty() {
++                messages.push(json!({"role": role, "content": content}));
++            }
++        }
++    }
++    if queries.is_empty() || queries.iter().any(|query| query.trim().is_empty()) {
++        return Err(Error::EmptyPrompt);
++    }
++    for query in queries {
++        messages.push(json!({"role": "user", "content": query}));
++    }
++    Ok(json!({
++        "model": MODEL,
++        "messages": messages,
++        "stream": true,
++        "stream_options": {"include_usage": true},
++        "enable_thinking": false,
++        "max_tokens": 2048
++    }))
++}
++
++fn generate_at(
++    config: Config,
++    task_id: String,
++    tasks: Vec<Task>,
++    queries: Vec<String>,
++    url: String,
++) -> OutputStream {
++    Box::pin(async_stream::try_stream! {
++        if config.api_key.trim().is_empty() {
++            Err(Error::MissingKey)?;
++        }
++        let body = request_body(&tasks, &queries)?;
++        let builder = reqwest::Client::builder();
++        #[cfg(not(target_family = "wasm"))]
++        let builder = builder.timeout(Duration::from_secs(120)).redirect(reqwest::redirect::Policy::none());
++        let client = builder.build().map_err(|_| Error::Network)?;
++        let response = client.post(url)
++            .bearer_auth(&config.api_key)
++            .header("Accept", "text/event-stream")
++            .json(&body)
++            .send().await.map_err(|_| Error::Network)?;
++        if !response.status().is_success() {
++            Err(Error::Http(response.status().as_u16()))?;
++        }
++        if !response.headers().get("content-type")
++            .and_then(|value| value.to_str().ok())
++            .is_some_and(|value| value.starts_with("text/event-stream")) {
++            Err(Error::InvalidStream)?;
++        }
++
++        let request_id = Uuid::new_v4().to_string();
++        let message_id = Uuid::new_v4().to_string();
++        let message = |id: String, kind| Message {
++            id,
++            task_id: task_id.clone(),
++            request_id: request_id.clone(),
++            timestamp: Some(prost_types::Timestamp::from(SystemTime::now())),
++            message: Some(kind),
++            ..Default::default()
++        };
++        yield ResponseEvent { r#type: Some(Type::Init(StreamInit {
++            request_id: request_id.clone(),
++            ..Default::default()
++        })) };
++        let mut actions = Vec::new();
++        if tasks.is_empty() {
++            actions.push(Action::CreateTask(CreateTask {
++                task: Some(Task { id: task_id.clone(), ..Default::default() }),
++            }));
++        }
++        let mut messages: Vec<_> = queries.into_iter().map(|query| {
++            message(Uuid::new_v4().to_string(), MessageKind::UserQuery(UserQuery {
++                query, ..Default::default()
++            }))
++        }).collect();
++        messages.push(message(message_id.clone(), MessageKind::AgentOutput(AgentOutput {
++            text: String::new(),
++        })));
++        actions.push(Action::AddMessagesToTask(AddMessagesToTask { task_id: task_id.clone(), messages }));
++        yield client_actions(actions);
++
++        let mut decoder = SseDecoder::default();
++        let mut chunks = response.bytes_stream();
++        let mut stopped = false;
++        let mut done = false;
++        while let Some(chunk) = chunks.next().await {
++            let chunk = chunk.map_err(|_| Error::Network)?;
++            for data in decoder.push(&chunk)? {
++                match decode_delta(&data)? {
++                    Delta::Text(text) => {
++                        if stopped { Err(Error::InvalidStream)?; }
++                        yield client_actions(vec![Action::AppendToMessageContent(AppendToMessageContent {
++                            task_id: task_id.clone(),
++                            message: Some(message(message_id.clone(), MessageKind::AgentOutput(AgentOutput { text }))),
++                            mask: Some(prost_types::FieldMask { paths: vec!["agent_output.text".to_owned()] }),
++                        })]);
++                    }
++                    Delta::Stop(text) => {
++                        if stopped { Err(Error::InvalidStream)?; }
++                        if !text.is_empty() {
++                            yield client_actions(vec![Action::AppendToMessageContent(AppendToMessageContent {
++                                task_id: task_id.clone(),
++                                message: Some(message(message_id.clone(), MessageKind::AgentOutput(AgentOutput { text }))),
++                                mask: Some(prost_types::FieldMask { paths: vec!["agent_output.text".to_owned()] }),
++                            })]);
++                        }
++                        stopped = true;
++                    }
++                    Delta::Done => { done = true; break; }
++                    Delta::Ignore => {}
++                }
++            }
++            if done { break; }
++        }
++        if !done || !stopped { Err(Error::UnexpectedEof)?; }
++        yield ResponseEvent { r#type: Some(Type::Finished(StreamFinished {
++            reason: Some(stream_finished::Reason::Done(stream_finished::Done {})),
++            ..Default::default()
++        })) };
++    })
++}
++
++fn client_actions(actions: Vec<Action>) -> ResponseEvent {
++    ResponseEvent {
++        r#type: Some(Type::ClientActions(ClientActions {
++            actions: actions
++                .into_iter()
++                .map(|action| ClientAction {
++                    action: Some(action),
++                })
++                .collect(),
++        })),
++    }
++}
++
++#[derive(Debug, PartialEq)]
++enum Delta {
++    Text(String),
++    Stop(String),
++    Done,
++    Ignore,
++}
++
++fn decode_delta(data: &str) -> Result<Delta, Error> {
++    if data.trim() == "[DONE]" {
++        return Ok(Delta::Done);
++    }
++    let value: Value = serde_json::from_str(data).map_err(|_| Error::InvalidStream)?;
++    if value.get("error").is_some() {
++        return Err(Error::Provider);
++    }
++    let choices = value["choices"].as_array().ok_or(Error::InvalidStream)?;
++    if choices.is_empty() {
++        return Ok(Delta::Ignore);
++    }
++    if choices.len() != 1 || choices[0]["index"] != 0 {
++        return Err(Error::InvalidStream);
++    }
++    let choice = &choices[0];
++    let delta = &choice["delta"];
++    if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
++        return Err(Error::ToolCall);
++    }
++    let content = match delta.get("content") {
++        None | Some(Value::Null) => String::new(),
++        Some(Value::String(text)) => text.clone(),
++        Some(_) => return Err(Error::InvalidStream),
++    };
++    match choice["finish_reason"].as_str() {
++        Some("stop") => Ok(Delta::Stop(content)),
++        Some("length") => Err(Error::TokenLimit),
++        Some("tool_calls" | "function_call") => Err(Error::ToolCall),
++        Some(_) => Err(Error::Provider),
++        None if content.is_empty() => Ok(Delta::Ignore),
++        None => Ok(Delta::Text(content)),
++    }
++}
++
++#[derive(Default)]
++struct SseDecoder {
++    line: Vec<u8>,
++    data: Vec<String>,
++    event_bytes: usize,
++}
++
++impl SseDecoder {
++    fn push(&mut self, chunk: &[u8]) -> Result<Vec<String>, Error> {
++        let mut events = Vec::new();
++        for &byte in chunk {
++            self.event_bytes += 1;
++            if self.event_bytes > MAX_EVENT_BYTES {
++                return Err(Error::InvalidStream);
++            }
++            if byte != b'\n' {
++                self.line.push(byte);
++                continue;
++            }
++            let line = std::str::from_utf8(&self.line).map_err(|_| Error::InvalidStream)?;
++            let line = line.strip_suffix('\r').unwrap_or(line);
++            if line.is_empty() {
++                if !self.data.is_empty() {
++                    events.push(self.data.join("\n"));
++                    self.data.clear();
++                }
++                self.event_bytes = 0;
++            } else if let Some(data) = line.strip_prefix("data:") {
++                self.data
++                    .push(data.strip_prefix(' ').unwrap_or(data).to_owned());
++            }
++            self.line.clear();
++        }
++        Ok(events)
++    }
++}
++
++#[cfg(test)]
++#[path = "lib_tests.rs"]
++mod tests;
+diff --git a/crates/warp_bailian_client/src/lib_tests.rs b/crates/warp_bailian_client/src/lib_tests.rs
+new file mode 100644
+index 000000000..9500ea1b0
+--- /dev/null
++++ b/crates/warp_bailian_client/src/lib_tests.rs
+@@ -0,0 +1,287 @@
++use std::io::{Read, Write};
++use std::net::TcpListener;
++use std::thread;
++
++use super::*;
++
++#[test]
++fn sse_preserves_utf8_split_across_network_chunks() {
++    let mut decoder = SseDecoder::default();
++    assert_eq!(
++        decoder.push(b": ping\r\ndata: \xe4\xbd").unwrap(),
++        Vec::<String>::new()
++    );
++    assert_eq!(
++        decoder
++            .push(b"\xa0\xe5\xa5\xbd\r\n\r\ndata: [DONE]\n\n")
++            .unwrap(),
++        ["你好", "[DONE]"]
++    );
++}
++
++#[test]
++fn sse_joins_multiline_data_and_ignores_other_fields() {
++    let mut decoder = SseDecoder::default();
++    assert_eq!(
++        decoder
++            .push(b"event: message\ndata: one\ndata:two\n\n")
++            .unwrap(),
++        ["one\ntwo"]
++    );
++}
++
++#[test]
++fn sse_rejects_unbounded_unterminated_events() {
++    assert!(matches!(
++        SseDecoder::default().push(&vec![b'x'; MAX_EVENT_BYTES + 1]),
++        Err(Error::InvalidStream)
++    ));
++}
++
++#[test]
++fn accepts_usage_only_chunk() {
++    assert_eq!(
++        decode_delta(r#"{"choices":[],"usage":{"total_tokens":7}}"#).unwrap(),
++        Delta::Ignore
++    );
++}
++
++#[test]
++fn preserves_content_on_final_stop_chunk() {
++    assert_eq!(
++        decode_delta(
++            r#"{"choices":[{"index":0,"delta":{"content":"OK"},"finish_reason":"stop"}]}"#
++        )
++        .unwrap(),
++        Delta::Stop("OK".to_owned())
++    );
++}
++
++#[test]
++fn rejects_tool_calls_instead_of_executing_them() {
++    assert!(matches!(
++        decode_delta(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{}]}}]}"#),
++        Err(Error::ToolCall)
++    ));
++}
++
++#[test]
++fn token_exhaustion_is_an_error() {
++    assert!(matches!(
++        decode_delta(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#),
++        Err(Error::TokenLimit)
++    ));
++}
++
++#[test]
++fn provider_error_does_not_echo_the_response_body() {
++    let error = decode_delta(r#"{"error":{"message":"secret prompt sk-sensitive"}}"#).unwrap_err();
++    assert_eq!(
++        error.to_string(),
++        "Bailian rejected the request or returned an unsupported finish reason."
++    );
++}
++
++#[test]
++fn request_contains_text_history_without_tools() {
++    let tasks = vec![Task {
++        id: "task".to_owned(),
++        messages: vec![
++            Message {
++                message: Some(MessageKind::UserQuery(UserQuery {
++                    query: "记住 42".to_owned(),
++                    ..Default::default()
++                })),
++                ..Default::default()
++            },
++            Message {
++                message: Some(MessageKind::AgentOutput(AgentOutput {
++                    text: "已记住".to_owned(),
++                })),
++                ..Default::default()
++            },
++        ],
++        ..Default::default()
++    }];
++    let body = request_body(&tasks, &["那个数字是多少？".to_owned()]).unwrap();
++    assert_eq!(body["model"], "deepseek-v4.1-flash");
++    assert_eq!(body["enable_thinking"], false);
++    assert_eq!(body["stream"], true);
++    assert_eq!(
++        body["messages"][1],
++        json!({"role":"user","content":"记住 42"})
++    );
++    assert_eq!(
++        body["messages"][2],
++        json!({"role":"assistant","content":"已记住"})
++    );
++    assert_eq!(
++        body["messages"][3],
++        json!({"role":"user","content":"那个数字是多少？"})
++    );
++    assert!(body.get("tools").is_none());
++    assert!(body.get("tool_choice").is_none());
++}
++
++#[test]
++fn rejects_tool_history_and_empty_prompts() {
++    let tasks = vec![Task {
++        messages: vec![Message {
++            message: Some(MessageKind::ToolCall(Default::default())),
++            ..Default::default()
++        }],
++        ..Default::default()
++    }];
++    assert!(matches!(
++        request_body(&tasks, &["hello".to_owned()]),
++        Err(Error::UnsupportedHistory)
++    ));
++    assert!(matches!(request_body(&[], &[]), Err(Error::EmptyPrompt)));
++}
++
++#[test]
++fn debug_config_redacts_key() {
++    assert_eq!(
++        format!("{:?}", Config::new("sk-sensitive".to_owned())),
++        "BailianConfig { .. }"
++    );
++}
++
++fn http_server(
++    status: &str,
++    content_type: &str,
++    body: &str,
++) -> (String, thread::JoinHandle<String>) {
++    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
++    let url = format!("http://{}/chat/completions", listener.local_addr().unwrap());
++    let response = format!(
++        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
++        body.len()
++    );
++    let handle = thread::spawn(move || {
++        let (mut socket, _) = listener.accept().unwrap();
++        socket
++            .set_read_timeout(Some(Duration::from_secs(5)))
++            .unwrap();
++        let mut request = Vec::new();
++        let mut byte = [0];
++        while !request.ends_with(b"\r\n\r\n") {
++            socket.read_exact(&mut byte).unwrap();
++            request.push(byte[0]);
++        }
++        let headers = String::from_utf8(request.clone()).unwrap();
++        let length = headers
++            .lines()
++            .find_map(|line| {
++                line.to_ascii_lowercase()
++                    .strip_prefix("content-length: ")
++                    .map(|value| value.parse::<usize>().unwrap())
++            })
++            .unwrap();
++        let mut body = vec![0; length];
++        socket.read_exact(&mut body).unwrap();
++        request.extend(body);
++        socket.write_all(response.as_bytes()).unwrap();
++        String::from_utf8(request).unwrap()
++    });
++    (url, handle)
++}
++
++fn generate_test(url: String) -> OutputStream {
++    generate_at(
++        Config::new("test-only-key".to_owned()),
++        "task-1".to_owned(),
++        vec![],
++        vec!["hello".to_owned()],
++        url,
++    )
++}
++
++#[tokio::test]
++async fn real_http_stream_maps_into_native_init_append_and_finished_events() {
++    let (url, server) = http_server(
++        "200 OK",
++        "text/event-stream",
++        concat!(
++            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好\"}}]}\n\n",
++            "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
++            "data: {\"choices\":[],\"usage\":{\"total_tokens\":10}}\n\n",
++            "data: [DONE]\n\n"
++        ),
++    );
++    let events: Vec<_> = generate_test(url).collect().await;
++    assert_eq!(events.len(), 4);
++    let Some(Type::Init(init)) = &events[0].as_ref().unwrap().r#type else {
++        panic!("missing init")
++    };
++    assert!(
++        init.conversation_id.is_empty(),
++        "local identity must not be used as a server token"
++    );
++    let Some(Type::ClientActions(actions)) = &events[1].as_ref().unwrap().r#type else {
++        panic!("missing messages")
++    };
++    assert!(matches!(
++        &actions.actions[0].action,
++        Some(Action::CreateTask(_))
++    ));
++    let Some(Action::AddMessagesToTask(add)) = &actions.actions[1].action else {
++        panic!("missing messages")
++    };
++    let Some(Type::ClientActions(actions)) = &events[2].as_ref().unwrap().r#type else {
++        panic!("missing append")
++    };
++    let Some(Action::AppendToMessageContent(append)) = &actions.actions[0].action else {
++        panic!("missing append")
++    };
++    assert_eq!(append.message.as_ref().unwrap().id, add.messages[1].id);
++    assert_eq!(
++        append.message.as_ref().unwrap().message,
++        Some(MessageKind::AgentOutput(AgentOutput {
++            text: "你好".to_owned()
++        }))
++    );
++    assert!(matches!(
++        &events[3].as_ref().unwrap().r#type,
++        Some(Type::Finished(_))
++    ));
++    let request = server.join().unwrap();
++    assert!(request.starts_with("POST /chat/completions HTTP/1.1"));
++    assert!(request.contains("authorization: Bearer test-only-key\r\n"));
++}
++
++#[tokio::test]
++async fn http_401_is_not_retried_or_reported_as_warp_credits() {
++    let (url, server) = http_server("401 Unauthorized", "application/json", "sensitive body");
++    let events: Vec<_> = generate_test(url).collect().await;
++    assert_eq!(events.len(), 1);
++    assert!(matches!(&events[0], Err(Error::Http(401))));
++    server.join().unwrap();
++}
++
++#[tokio::test]
++async fn truncated_stream_never_emits_success() {
++    let (url, server) = http_server(
++        "200 OK",
++        "text/event-stream",
++        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n",
++    );
++    let events: Vec<_> = generate_test(url).collect().await;
++    assert_eq!(events.len(), 4);
++    assert!(matches!(&events[3], Err(Error::UnexpectedEof)));
++    server.join().unwrap();
++}
++
++#[tokio::test]
++async fn missing_key_fails_without_opening_a_request() {
++    let events: Vec<_> = generate(
++        Config::new(String::new()),
++        "task".to_owned(),
++        vec![],
++        vec!["hello".to_owned()],
++    )
++    .collect()
++    .await;
++    assert_eq!(events.len(), 1);
++    assert!(matches!(&events[0], Err(Error::MissingKey)));
++}
+diff --git a/crates/warp_bailian_client/examples/smoke.rs b/crates/warp_bailian_client/examples/smoke.rs
+new file mode 100644
+index 000000000..1178f876e
+--- /dev/null
++++ b/crates/warp_bailian_client/examples/smoke.rs
+@@ -0,0 +1,86 @@
++use futures::StreamExt;
++use instant::Instant;
++use warp_bailian_client::{Config, MODEL, generate};
++use warp_multi_agent_api::Task;
++use warp_multi_agent_api::client_action::Action;
++use warp_multi_agent_api::message::Message as MessageKind;
++use warp_multi_agent_api::response_event::Type;
++
++#[tokio::main]
++async fn main() -> Result<(), Box<dyn std::error::Error>> {
++    let config = Config::new(std::env::var("LLM_API_KEY")?);
++    let task_id = "bailian-smoke".to_owned();
++    let mut tasks: Vec<Task> = vec![];
++    for (prompt, expected) in [
++        (
++            "Remember the number 42 for this conversation. Reply only OK.",
++            "OK",
++        ),
++        (
++            "What number did I ask you to remember? Reply only with that number.",
++            "42",
++        ),
++    ] {
++        let started = Instant::now();
++        let mut first_text_ms = None;
++        let mut text = String::new();
++        let mut finished = false;
++        let mut stream = generate(
++            config.clone(),
++            task_id.clone(),
++            tasks.clone(),
++            vec![prompt.to_owned()],
++        );
++        while let Some(event) = stream.next().await {
++            match event?.r#type {
++                Some(Type::ClientActions(actions)) => {
++                    for action in actions.actions {
++                        match action.action {
++                            Some(Action::CreateTask(create)) => {
++                                tasks.push(create.task.ok_or("missing task")?)
++                            }
++                            Some(Action::AddMessagesToTask(add)) => tasks
++                                .first_mut()
++                                .ok_or("missing task")?
++                                .messages
++                                .extend(add.messages),
++                            Some(Action::AppendToMessageContent(append)) => {
++                                let message = append.message.ok_or("missing message")?;
++                                if let Some(MessageKind::AgentOutput(output)) = message.message {
++                                    first_text_ms
++                                        .get_or_insert_with(|| started.elapsed().as_millis());
++                                    text.push_str(&output.text);
++                                    let target = tasks
++                                        .first_mut()
++                                        .ok_or("missing task")?
++                                        .messages
++                                        .iter_mut()
++                                        .find(|candidate| candidate.id == message.id)
++                                        .ok_or("missing output")?;
++                                    if let Some(MessageKind::AgentOutput(current)) =
++                                        target.message.as_mut()
++                                    {
++                                        current.text.push_str(&output.text);
++                                    }
++                                }
++                            }
++                            _ => return Err("unexpected action in text-only PoC".into()),
++                        }
++                    }
++                }
++                Some(Type::Init(init)) if init.conversation_id.is_empty() => {}
++                Some(Type::Finished(_)) => finished = true,
++                _ => return Err("unexpected native event".into()),
++            }
++        }
++        if !finished || text.trim() != expected {
++            return Err("smoke response or completion check failed".into());
++        }
++        println!(
++            "model={MODEL} expected={expected} matched=true finished={finished} first_text_ms={} total_ms={}",
++            first_text_ms.unwrap_or_default(),
++            started.elapsed().as_millis()
++        );
++    }
++    Ok(())
++}
+diff --git a/script/run-bailian b/script/run-bailian
+new file mode 100755
+index 000000000..5d030b686
+--- /dev/null
++++ b/script/run-bailian
+@@ -0,0 +1,68 @@
++#!/usr/bin/env python3
++"""Run the direct Bailian PoC; keep remote credentials in process memory only."""
++
++import json
++import os
++from pathlib import Path
++import subprocess
++import sys
++
++root = Path(__file__).resolve().parent.parent
++args = sys.argv[1:]
++env = os.environ.copy()
++env["WARP_DIRECT_BAILIAN"] = "1"
++env["WARP_SKIP_COMMON_SKILLS_INSTALL"] = "1"
++
++if "--from-dev1" in args:
++    args.remove("--from-dev1")
++    remote = r'''
++import json, pathlib, shlex
++values = {}
++for raw in (pathlib.Path.home() / ".env").read_text().splitlines():
++    line = raw.strip()
++    if line.startswith("export "):
++        line = line[7:]
++    key, sep, value = line.partition("=")
++    if sep and key.strip() == "LLM_API_KEY":
++        parts = shlex.split(value, comments=True)
++        values["LLM_API_KEY"] = parts[0] if parts else ""
++if not values.get("LLM_API_KEY"):
++    raise SystemExit("LLM_API_KEY missing in dev1 ~/.env")
++print(json.dumps(values))
++'''
++    result = subprocess.run(["ssh", "dev1", "python3", "-"], input=remote, text=True, capture_output=True)
++    if result.returncode:
++        raise SystemExit("Unable to load LLM_API_KEY from dev1 ~/.env; check SSH and the remote file.")
++    env.update(json.loads(result.stdout))
++
++if "--no-build" in args:
++    args.remove("--no-build")
++    if args:
++        raise SystemExit("--no-build accepts only --from-dev1")
++    if sys.platform != "darwin":
++        raise SystemExit("--no-build currently supports the macOS debug app bundle only.")
++    metadata = subprocess.run(
++        ["cargo", "metadata", "--no-deps", "--locked", "--format-version", "1"],
++        cwd=root,
++        env=env,
++        text=True,
++        capture_output=True,
++        check=True,
++    )
++    target_dir = Path(json.loads(metadata.stdout)["target_directory"])
++    executable = target_dir / "debug/bundle/osx/WarpOss.app/Contents/MacOS/warp-oss"
++    if not executable.is_file():
++        raise SystemExit("Build WarpOss.app before using --no-build.")
++    command = [str(executable)]
++elif "--smoke" in args:
++    args.remove("--smoke")
++    if args:
++        raise SystemExit("--smoke accepts only --from-dev1")
++    if not env.get("LLM_API_KEY"):
++        raise SystemExit("Set LLM_API_KEY or use --from-dev1 for the standalone smoke test.")
++    command = ["cargo", "run", "-p", "warp_bailian_client", "--example", "smoke"]
++else:
++    command = [str(root / "script" / "run"), *args]
++
++os.chdir(root)
++os.execvpe(command[0], command, env)
