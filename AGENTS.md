@@ -1,74 +1,52 @@
 # Blog Writing Guidelines
 
-## Technical Articles
+## Core Philosophy: First Principles & Lucid Prose
 
-Apply these rules when writing, researching, analyzing source code for, or revising technical articles intended for professional engineers.
+Technical articles on this blog are written for curious engineers who want to truly understand *why* a system, algorithm, or bug behaves the way it does — not to read a defensive audit report or a directory listing.
 
-### Structure
+1. **Reason from First Principles (从第一性原理出发)**
+   - Before introducing internal class names, paper acronyms, or module trees, state the fundamental tension in plain language.
+   - Ask: *If we built this in the simplest, most naive way, what would break first?* Identify the underlying physical, mathematical, or state-consistency constraint — memory/network hierarchy, combinatorial search explosion, concurrent state ownership across untrusted/async processes, or semantic edge cases (`NULL`, skew, partial failure).
+   - Let the architecture, data structure, or algorithm emerge as the inevitable answer to that constraint, so the reader understands *why it has to be designed this way* rather than memorizing *what exists*.
 
-- Build a progressive argument: establish the problem and constraints, explain the mechanisms, then discuss outcomes, trade-offs, and applicability. Each section must advance the argument rather than assemble disconnected terms, systems, or source summaries.
-- State each major section's technical or business judgment early and support it with facts or a causal explanation. A subsection may begin with a concrete observation, counterexample, or code snippet when that is the clearest route to the judgment; explain its significance promptly. Do not mechanically prepend a generic thesis sentence to every heading.
-- Organize around one main question and a chain of dependencies. Use headings for meaningful advances in the argument, not for every term or implementation detail. Merge neighboring sections when removing their headings produces a coherent paragraph without losing a distinct argument.
-- Adapt the structure to the article rather than forcing one template on every post:
-  - Source analysis: follow a request, operation, or state transition; explain control flow, state ownership, invariants, and failure paths.
-  - Comparative research: establish common questions and constraints before comparing systems; compare mechanisms and cost allocation rather than assembling product summaries.
-  - Paper reading: explain the assumption that fails, the proposed mechanism, the supporting experiments, and the limits of the evidence.
-  - Practice notes: preserve the actual problem, failed attempts, corrections, and verification. Do not turn a partial experiment into a comprehensive theory.
+2. **Concrete Before Abstract (先具体场景，后抽象概念)**
+   - Walk through one concrete example — a 5-row join, a single IPC call interrupted mid-flight, a 114-character string mutating into 136 characters — before stating the general rule or invariant.
+   - Unpack dense jargon. Instead of stacking four abstract nouns in one clause (e.g., "能力可见性、服务启动和关闭态读取"), explain the actual runtime behavior in clear, everyday engineering language.
 
-### Solution-Oriented Research Reports
+3. **Fluent, Natural Chinese (语言通俗易懂、行文自然通畅)**
+   - Write like a senior engineer explaining a hard problem clearly to a smart colleague at a whiteboard.
+   - Connect paragraphs through genuine causal flow ("既然最朴素的做法会在 X 处卡住，最自然的想法是改成 Y；但一旦引入 Y，又会撞上 Z……"). Do not fragment arguments into isolated one-sentence paragraphs, bullet slogans, or 50+ micro-headings.
+   - Never mechanically prepend a stiff one-line thesis summary under every `###` heading, and never leave raw template labels (`主张：/ 机制：/ 适用：/ 不适用：`) in published prose.
+   - Avoid stock clichés (`不可否认`、`值得注意的是`、`双刃剑`、`注入新动能`) and overused rhetorical formulas (`真正重要的不是……而是……`、`本质上是一种……`).
 
-- For reports that investigate how to build a capability, organize the argument as **Background → Competitive Research → Alternative Approaches → Design → Feasibility Analysis**. This is a decision chain, not five independent inventories. Do not impose an implementation proposal on a literature review or research-only article whose scope explicitly excludes design.
-- **Background:** explain the existing workflow, concrete unmet need, intended users, and value of solving the problem. Establish requirements, constraints, non-goals, and success criteria before evaluating products.
-- **Competitive Research:** examine relevant open-source projects or commercial products against those requirements. For each, explain its actual function, the problem its implementation solves, reusable mechanisms, and mismatches with the target need. Link source claims to a version and code path; label documentation-only or unverified claims. Do not infer that an entire product lacks a feature merely because the inspected material does not describe it.
-- **Alternative Approaches:** derive viable routes from mechanisms demonstrated by the researched systems. Compare them using the same dimensions: requirement coverage, integration work, correctness and recovery, operating cost, extensibility, and unsuitable scenarios. Separate adopted mechanisms from new proposals.
-- **Design:** choose the best fit under the stated constraints, not a universally best architecture. Explain the decisive trade-offs, rejected alternatives, and conditions that would change the choice. Describe component responsibilities, interfaces, state and control flow, then give ordered implementation steps with dependencies and acceptance gates.
-- **Feasibility Analysis:** map the design to available components, required custom work, external prerequisites, and unresolved risks. Include a bounded proof of concept, failure tests, cost or resource accounting, stop conditions, and fallback options. If measurements or staffing estimates are unavailable, identify the missing evidence rather than inventing delivery dates, performance gains, or precise budgets.
-- Keep the chain traceable: each design choice should address a stated requirement or competitive gap; each feasibility test should validate a design assumption. A plausible design, a working prototype, and a verified production capability are different evidence levels.
+4. **Technical Rigor Without Disclaimer Spam (严谨靠事实与机制，而非免责声明轰炸)**
+   - **Do not** append defensive caveats (`这不代表……`、`不能据此推出……`、`更不能推广到……`) at the end of every other paragraph. Readers already know a single benchmark or PoC is not a universal law.
+   - **Baseline at the end, short commit prefixes only:** Never block the opening hook with version tables, cutoff timestamps, or `源码基线说明` / `环境说明` callouts — place baseline/version/environment notes concisely at the **end** of the article. When referencing Git commits in prose or tables, use **short prefix fingerprints** (7–8 hex characters, e.g., `` `b1d73b1` ``) rather than 40-character full SHA-1 strings.
+   - When discussing boundaries and trade-offs, explain the **concrete mechanism of failure or cost** (e.g., *why* splitting a join loses money when key degrees are uniform, or *why* materializing a CTE hurts when consumer predicates are disjoint) instead of repeating generic legalistic disclaimers.
 
-### Language and Style
+---
 
-- Avoid stock phrases such as “不可否认” (undeniably), “值得注意的是” (it is worth noting), “双刃剑” (a double-edged sword), and “注入新动能” (inject new momentum).
-- Avoid empty lyrical parallelism. Prefer concrete nouns and verbs; use fewer adjectives and adverbs.
-- Develop reasoning in coherent paragraphs. Do not fragment an argument into isolated short sentences, slogans, or excessive subheadings.
-- Use transitions to explain why the next mechanism or question follows. Do not replace a fragmented list with a longer list of generic introductory claims.
-- Avoid repeatedly using contrast formulas such as “真正重要的不是……而是……” or “本质上是一种……”. State the mechanism or constraint directly when the contrast adds no information.
-- Give the introduction, analysis, and conclusion different jobs: establish the question and scope, develop the evidence, then state decision conditions or remaining verification work. Do not repeat the same list of conclusions at all three points.
-- Use tables for comparisons with stable dimensions and diagrams for relationships or state transitions. Use prose for causal reasoning. Avoid introducing a table or diagram merely to restate the adjacent paragraph.
-- End with explicit applicability limits or actionable recommendations. Do not add unsupported predictions, generic outlooks, or rhetorical uplift.
+## Adapting Structure to the Genre
 
-### Evidence and Applicability
+Choose a structure that serves the article's core question rather than forcing a uniform template:
 
-- Support every claim with a concrete industry example, engineering parameters, or an explicit logical derivation.
-- For source-code analysis, identify the relevant version, code locations, call paths, and mechanisms. Link to traceable sources for papers and public materials.
-- Preserve the experimental conditions, workloads, and version assumptions needed to interpret engineering parameters, performance figures, and conclusions. Distinguish verified facts, deductions, and assumptions. Never invent examples, parameters, or measurements.
-- Explain each proposed approach's trade-offs and scenarios where it does not apply, including the mechanisms behind those limits. Do not list only advantages.
-- Treat code as evidence: explain why a snippet matters, identify the decisive branch or state transition, and state what it does and does not establish. Keep complete structures, long call inventories, and repetitive field descriptions in a reference section when they interrupt the argument; preserve useful technical detail rather than deleting it to achieve brevity.
-- Preserve the author's reasoning process when it is documented: an initial assumption, the observation that challenged it, and the resulting change in judgment. Never invent experiments, mistakes, personal experiences, or epiphanies to make a narrative more engaging.
-- Distinguish evidence levels without labeling every paragraph mechanically: source-confirmed behavior, a paper's reported result, the author's deduction, and an unvalidated design proposal are not interchangeable.
+- **Source & Architecture Analysis (源码与架构剖析)**
+  Start from the core engineering contradiction the software must solve. Trace one end-to-end lifecycle (an input message, a query plan, a memory allocation, a packet) across boundaries. Show *who owns which state* and *where failure recovery lines are drawn*, using pinned source links and focused snippets as evidence rather than cataloging every file in the repository.
 
-## Proper Names and Technical Terms
+- **Engineering Practice & Troubleshooting (工程实践与排障复盘)**
+  Follow the real investigative chain: the Concrete Symptom → Initial Hypothesis (and why it failed) → Controlled Isolation Experiment → Root Cause & Fix → Remaining Open Risks. Keep real observations, hashes, commands, and unverified gaps honest; never invent fake detours or measurements.
 
-Apply these naming conventions to technical articles, travel writing, and personal essays.
+- **Papers, Optimizers & Systems Research (论文精读与技术调研)**
+  Organize around a unified cost or correctness model (e.g., *where unnecessary work is generated, paid for, or deferred*), not a conference reading log. Do not bury the opening under 40 lines of retrieval-window audit tables — hook the reader on the core technical shift first, and keep bibliographic scope notes concise. When investigating how to build a new system capability, lead the reader naturally from real workflow pain → why existing tools only solve part of it → architectural trade-offs → concrete design & verification.
 
-- At the first occurrence of a Chinese proper name or specialized term in an article, append its established English name in parentheses: `中文名称（English Name）`.
-- Cover people, places, institutions, projects, named algorithms, and specialized concepts where the English name helps identification. Examples: `普拉多博物馆（Prado Museum）` and `谓词下推（Predicate Pushdown）`.
-- Use official or widely accepted English names and preserve their spelling and capitalization. If no established English name exists, use the original-language name and make that distinction clear rather than inventing a translation.
-- After the first annotation, use the Chinese name consistently without repeating the parenthetical at every mention. Keep established English project names and code identifiers unchanged; do not add redundant English annotations to them.
-- Annotate complete terms rather than substrings of compound words. Do not add English glosses to ordinary verbs or common words when they do not identify a specialized concept, and do not alter quoted text or code identifiers to insert annotations.
+- **Travel Writing & Personal Essays (游记与随笔)**
+  Let concrete memories, sensory observations, and historical context carry the narrative in the author's natural voice. Never impose engineering templates or forced philosophical morals after every stop.
 
-## Travel Writing and Personal Essays
+---
 
-- Do not mechanically apply technical-article requirements for technical judgments, engineering parameters, or solution trade-offs to travel writing or personal essays.
-- Preserve the author's concrete memories, wording, and line of thought. Expand verifiable history, context, and biographical information; do not invent experiences, feelings, or epiphanies on the author's behalf.
-- Let the itinerary and actual observations carry the narrative. Connect related memories into paragraphs rather than manufacturing lyrical transitions or a lesson after every stop.
-- A philosophical quotation may introduce a question when the author wants it, but do not repeatedly echo it throughout the article or force the ending to return to it.
+## Craft, Terminology & Validation
 
-## Editorial Workflow and Validation
-
-- Before editing, identify the article's main question, genre, intended reader, evidence boundaries, and repeated material. Revise the outline before polishing individual sentences when the problem is structural.
-- For style experiments, prefer a small, explicitly scoped set of representative recent posts before applying the same changes broadly. Preserve publication dates, URLs, useful source material, and unrelated working-tree changes unless requested otherwise.
-- Separate automated checks from editorial judgment:
-  - Automated checks: front matter, code fences, tables, bold and math rendering, local links and anchors, unresolved TODOs, duplicate passages, terminology consistency, and moving-branch source links. Flag findings for review rather than treating every match as an error.
-  - Editorial review: does this section advance the question, does the citation support the claim, are performance conditions preserved, are proposals distinguished from implementation, and would removing a paragraph lose necessary information?
-- Do not use an “AI-writing score” as an acceptance criterion. Evaluate evidence, coherence, precision, and fidelity to the author's voice instead.
-- Build the site and inspect the changed articles' rendered output in proportion to the changes. Report checks actually performed and separate dependencies that were not executed; a successful site build is not a reproduction of the articles' experiments.
+- **Headings, Tables, and Visual Flowcharts:** Use headings only for meaningful turns in the argument (typically 5–10 top-level sections, not dozens of fragmented subheadings). Use tables for multi-dimensional comparisons and **visual flowcharts / architecture / lifecycle / sequence / dataflow diagrams** (generated via the local `archify` skill into standalone light-theme SVGs under `static/images/diagrams/` and optional interactive views under `static/diagrams/`, rather than wall-of-text descriptions or brittle ASCII art) whenever tracing state transitions, query/execution pipelines, memory/network hierarchies, or cross-process call chains. Never add a table or diagram that merely repeats a trivial adjacent sentence.
+- **Terminology:** On the first appearance of a specialized concept or proper name where the English term aids clarity, include it naturally in parentheses — e.g., `因子化执行（Factorized Execution）`, `谓词下推（Predicate Pushdown）`. Keep established English project names and code identifiers as-is; do not gloss ordinary words.
+- **Factual & Link Integrity:** Preserve publication dates, URLs/slugs, series navigation links, pinned commit hashes, and real experimental conditions. Never fabricate benchmarks, code behavior, or personal experiences.
+- **Build & Render Check:** After creating or revising articles, run `hugo` to verify clean compilation and inspect the rendered HTML of changed posts (title hierarchy, TOC/anchor resolution, math/table rendering, and static asset paths).

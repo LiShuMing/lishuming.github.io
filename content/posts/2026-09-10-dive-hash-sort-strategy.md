@@ -12,1006 +12,285 @@ tags:
   - 执行引擎
   - CBO
   - 自适应查询执行
-description: "结合 CockroachDB、TiDB、OceanBase、Trino 与 Apache Doris 源码，系统分析优化器与执行器如何在 Hash、Sort、数据分布、物理属性、内存风险和运行时自适应之间做出选择，并沿经典论文到 2026 年研究梳理其演进路线。"
+description: "从随机访存与顺序归并的硬件对偶性出发，结合 CockroachDB、TiDB、OceanBase、Trino 与 Apache Doris 源码及三十年论文脉络，拆解优化器与执行引擎如何在物理属性、内存悬崖、数据倾斜和运行时自适应之间做出选择。"
 draft: false
+toc: true
+math: true
 ---
 
 > 本系列第 2/3 篇 · Join 执行 · [上一篇]({{< relref "2026-08-26-dive-hash-join.md" >}}) · [下一篇]({{< relref "2026-08-24-dynamic-filter-outer-join.md" >}})
 
-## 调研问题：比较完整路径，而非孤立算法
+算法教科书上有一道看似毫无悬念的算术题：哈希表的单次查找期望复杂度是 `O(1)`，把 `N` 行数据连起来或按组聚合只需 `O(N)`；而基于比较的排序至少要付 `O(N log N)` 的代价。既然如此，数据库内核为什么不干脆把所有等值连接和分组聚合统统交给 Hash，还要大费周章地保留 Sort-Merge Join 和 Stream Aggregate？
 
-### 摘要
+如果我们用最朴素的方式在现代硬件上跑一条一亿行的连接查询，答案很快就会在两个极端场景里暴露出来。
 
-Hash 与 Sort 的选择必须比较完整执行路径，而不是只比较内核复杂度；前置排序、数据交换和内存溢写（Spill）都可能改变结果。本文从四个层面组织调研：
+假设内存宽裕、连接键分布均匀，Hash 确实快得惊人——它不在乎全序关系，只靠 `key → hash → bucket` 把相等的键聚拢到一起，省下了成千上万次键值比较。可一旦优化器把不同值个数（NDV）低估了十倍，或者遇到了几个拥有百万条记录的超级热点键，Hash 表就会撞上一连串物理瓶颈：首先是探测阶段的**随机内存跳跃**频繁击穿末级缓存（LLC）与 TLB，热点桶退化成长长的冲突链；紧接着，当哈希表体积逼近算子内存上限 `M` 时，系统不再是平滑变慢，而是发生剧烈的**内存溢写（Spill）相变**——原本一次过内存的探测被迫拆成“分区写盘 → 读回重建 → 二次探测”，要是热点键因为数值完全相同、怎么换哈希种子（Hash Seed）都切不小，递归哈希分区还会原地卡死。
 
-- **物理算法**：Hash Join、Merge Join、Hash Aggregate、Stream Aggregate；
-- **数据组织**：无序、局部有序、全局有序、Hash 分区、Range 分区；
-- **资源行为**：CPU、缓存、内存峰值、磁盘 I/O、网络、并发和尾延迟（Tail Latency）；
-- **不确定性处置**：统计误差、数据倾斜（Data Skew）、内存波动、spill 与运行时改判。
+反过来再看 Sort。它在启动阶段确实要付出 `O(N log N)` 的键归一化（Key Normalization）与归并代价，但它把杂乱的随机访存彻底改造成了**顺序读写与多路归并（k-way Merge）**：即便内存吃紧，外部归并排序也能按固定大小的有序顺串（Run）平稳落盘，退化斜率高度可预测；更重要的是，排序产出了一份可以顺流而下的物理资产——**有趣顺序（Interesting Ordering）**。
 
-因此，正确的问题不是“`O(N)` 是否一定小于 `O(N log N)`”，而是：
-
-> 在当前物理属性（Physical Property）、资源预算和估计可信度下，哪条执行路径的整体收益最高；如果判断错误，系统又能否把损失限制在可接受范围内？
-
-后文以 CockroachDB、TiDB、OceanBase、Trino 与 Apache Doris 的固定源码快照，对照属性搜索、算法准入和运行时降级；论文部分进一步讨论内存、倾斜与资源变化如何移动算法交叉点。
-
-### 先拆掉一个伪命题：Hash 与 Sort 不是一对互斥算子
-
-算法标签不足以描述执行策略，因为分区、排序和查找可以在同一个算子内部组合。先分清这些原语的作用，才能比较优化期选择与运行期降级。
-
-#### 两种基础的数据重组方式
-
-Hash 与 Sort 可以在同一执行路径组合使用，因为二者分别提供按键分区和按键有序的能力：
+看一个日常报表里极其典型的四步流水线：先按用户 `k` 关联订单与行为表，再按 `k` 做分组汇总，最后在每个用户的窗口内按时间 `ts` 排序计算留存：
 
 ```text
-Hash
-  key -> hash value -> bucket / partition
-  擅长：等值查找、分组、去重、重分区
+路径 A（局部贪心选 Hash）：
+  Scan → HashJoin(k) → HashAgg(k) → Sort(k, ts) → Window(k ORDER BY ts)
+         [随机建表探测]   [再建一张哈希表]  [最后全量阻塞重排]
 
-Sort
-  key -> total / prefix order -> run / range
-  擅长：顺序归并、范围处理、顺序聚合、Top-N、Window
+路径 B（前置一次顺序投资，下游连续免单）：
+  OrderedScan(k, ts) → MergeJoin(k) → StreamAgg(k) → Window(k ORDER BY ts)
+                       [顺序双指针归并]  [单组状态即算即吐] [直接复用已有顺序]
 ```
 
-一个物理算子往往组合多个原语。Grace Hash Join 会先 Hash Partition，再对能放入内存的分区建立 Hash Table；外部 Sort 会生成多个有序 run，再做多路归并；分布式 Merge Join 之前还可能需要 Range Exchange；Hash Join 生成的 Runtime Filter 又能改变下游 Scan 的实际输入规模。
+如果只盯着连接算子本身比快慢，路径 A 的 `HashJoin` 大概率赢过带排序负担的 `MergeJoin`；但把账算到整条流水线，路径 B 倘若能直接借用底层存储引擎按 `(k, ts)` 组织好的索引或微分区顺序，后面的 `MergeJoin`、`StreamAgg` 和 `Window` 几乎全是流式顺序扫描，峰值内存压到只有“当前正在处理的那一个分组”，把路径 A 里的两张大哈希表和最后一次全量 `Sort` 一笔勾销。
 
-甚至同一个算子内部也可能从 Hash 过渡到 Sort。CockroachDB 的 External Hash Join 就是直接证据：它先递归 Hash Partition；如果继续换 Hash Seed 仍不能有效缩小分区，说明倾斜或重复键使递归失去进展，于是该分区改走 Disk-backed Sort + Merge Join。
+由此可见，“选 Hash 还是选 Sort”从来不是两个孤立算子的单挑，而是在**随机访存的分区能力**与**顺序归并的定序能力**之间算一笔端到端总账。下面我们顺着硬件与代价物理模型、五套工业级引擎（CockroachDB、TiDB、OceanBase、Trino、Apache Doris）的源码取舍、内存与倾斜引发的交叉点漂移，以及运行时自适应降级与三十年研究演进，把这笔账彻底算清楚。
 
-```text
-输入
- ├─ Hash Partition A
- │    ├─ 可装入内存的分区 -> In-memory Hash Join
- │    └─ 仍然过大
- │          ├─ Hash Partition B -> 继续递归
- │          └─ 分区不再有效缩小 -> Sort(left/right) -> Merge Join
- └─ 输出
-```
+---
 
-这意味着“Hash 与 Sort 选择”至少包含三类不同决策：
+## 一、硬件与算法对偶：为什么 `O(N)` 与 `O(N log N)` 算不出真实胜负
 
-1. **优化期算子选择**：Hash Join 还是 Merge Join，Hash Aggregate 还是 Stream Aggregate；
-2. **优化期属性选择**：是否值得提前建立 Ordering/Distribution 并由后续多个算子复用；
-3. **运行期退化路径选择**：继续分区、局部 spill、算法切换，还是在 stage 边界重新优化。
+在真实的执行引擎里，Hash 和 Sort 甚至不是互斥的阵营，而是两种可以自由嵌套的数据重组原语：**Hash 负责按键分桶（Partitioning），把大问题切成互不相干的独立子集；Sort 负责按键定序（Ordering），把同键元组在空间上紧挨着排成顺串。**
 
-#### 复杂度只描述了很小一部分事实
+翻开任何一个支持落盘的现代算子，都能看到两者的混搭：Grace Hash Join 先用 Hash 把左右输入切成几十个磁盘分区，再对能塞进内存的小分区建哈希表；分布式 Merge Join 往往要先靠 Hash Shuffle 把相同键发往同一个计算节点，再在节点内部做局部排序归并；更有甚者，在 CockroachDB 的外部哈希连接（[`external_hash_joiner.go`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/colexec/colexecdisk/external_hash_joiner.go#L24-L55)）里，同一个算子跑着跑着还会自己“叛变”——先按哈希函数递归切分落盘，一旦发现某个分区换了哈希种子也缩不小（说明撞上了大量重复键），就干脆只把这一个坏分区交给磁盘外排加 Merge Join 处理，其余健康分区照常走内存 Hash Join。
 
-等值 Join 的复杂度没有计入属性准备与跨层搬运，比较时需要把这些成本补回。下面是用于解释机制的粗略模型，不是五个系统共享的公式：
+既然底层原语都在互相借力，评价一条等值连接路径就不能只抄大 `O` 符号，而要把跨网络交换（Exchange）、溢写风险期望与下游顺序复用全都塞进成本方程里：
 
-```text
-C_hash_join
-  = C_build
-  + C_probe
-  + C_exchange
-  + E[C_spill]
+$$
+C_{\text{hash\_join}} = C_{\text{build}} + C_{\text{probe}} + C_{\text{exchange}} + \mathbb{E}[C_{\text{spill}}]
+$$
 
-C_merge_join
-  = C_sort(left)
-  + C_sort(right)
-  + C_merge
-  + C_exchange
-  - B_order_reuse
-```
+$$
+C_{\text{merge\_join}} = C_{\text{sort}}(L) + C_{\text{sort}}(R) + C_{\text{merge}} + C_{\text{exchange}} - B_{\text{order\_reuse}}
+$$
 
-其中：
+把这两条管线的内存布局与外存 I/O 轨迹并排摊开，就能直观看到常数项与非线性拐点究竟长在哪里：
 
-```text
-C_build ~= N_build * (hash + insert + materialize)
-C_probe ~= N_probe * (hash + lookup + predicate)
+![Hash 与 Sort 的内存访存及外存 I/O 执行管线对偶对比](/images/diagrams/exec-hash-vs-sort-mechanics.svg)
 
-C_sort(N) ~= N * log(N) * compare_cost + external_IO
-C_merge ~= (N_left + N_right + N_matches) * sequential_cost
-```
+- **访存局部性与内存放大**：Hash Join 的建表阶段不仅要存键值和有效载荷（Payload），还要承担桶目录负载因子（Load Factor）、冲突链指针以及内存分配器对齐开销，实际占用的字节数往往是原始列宽的好几倍；一旦哈希目录溢出 CPU 的 L3 缓存，每次探测都会退化成高延迟的随机 DRAM 访问。而现代排序早已不是教科书里逐字段调用虚函数比较器的慢速快排——借助前缀键归一化（把多列拼成定长无符号整数按 `memcmp` 或寄存器直接比较）、基数排序（Radix Sort）与 SIMD 排序网络，顺序带宽利用率极高。
+- **下游属性复利（`B_order_reuse`）**：Hash 产出的哈希表是一次性消费品，连接做完就得销毁（最多把分桶分布属性传给下游同键算子免除一次 Shuffle）；而 Sort 产出的有序性可以沿算子树一路向上传递，连续省掉后续聚合、窗口或最终 `ORDER BY` 的重排开销。
+- **首行延迟与流水线阻塞边界**：“Merge Join 是流式算子、Hash Join 是阻塞算子”是另一个流传甚广的片面印象。算子能不能边读边吐、快速响应 `LIMIT 10`，取决于它吐出第一行结果前必须攒够多少状态：
 
-真正决定结果的不是大 O，而是常数、非线性拐点和可复用属性：
+| 物理算子 | 吐出首行前的必要阻塞状态 | 容易踩坑的边界条件 |
+| --- | --- | --- |
+| **Hash Join** | 必须完整消费完 Build 侧并建好哈希表 | Probe 侧可逐批流式穿过；但 `RIGHT` / `FULL OUTER JOIN` 若需最后扫描未匹配 Build 行，尾阶段仍会停顿 |
+| **Merge Join** | 左右两侧输入必须已按连接键有序到达 | 若上游挂着全量 `Sort`，整条链路照样被阻塞；且遇到多对多重复键组时需在内存或磁盘缓冲右侧匹配段 |
+| **Hash Aggregate** | 通常需攒齐全部输入以维护完整分组表 | 局部预聚合（Streaming Pre-Aggregation）遇到高基数键无法有效减量时，可直接退化为透传以止损 |
+| **Stream Aggregate** | 输入已按分组键连续聚集，仅保留当前单组状态 | 内存占用极小且一结组就向下游吐行，但强依赖上游提供严格分组序 |
+| **Sort 家族** | 传统全排需读完全部输入才能吐出最小行 | 若带 `LIMIT K`（Top-N 堆）、或上游已有前缀序（Prefix / Incremental Sort），启动延迟与内存都会骤降 |
 
-- Hash Table 是否进入 LLC，探测是连续访问还是随机访问；
-- key、payload、pointer、load factor 和 allocator overhead 共同造成多大内存放大；
-- build side 是否估反，是否存在大量重复键或 hot partition；
-- 排序键能否使用 radix/key normalization/SIMD，而不是昂贵的通用 comparator；
-- 输入是否已按 Join Key 有序，或者只需补齐一段前缀；
-- 排序结果是否会被后续 Aggregate、Window、Merge Join 或最终 `ORDER BY` 复用；
-- 分布式执行中，Broadcast、Hash Shuffle 与 Range Shuffle 谁主导成本；
-- 内存不足后，是一次顺序 spill，还是多轮递归分区和随机 I/O。
+正因为首行耗时、峰值内存与总吞吐的权重随场景剧变，交互式点查（`LIMIT 10`）与夜间全量宽表 ETL 面对同一组输入统计，完全可能挑出截然相反的赢家。
 
-只看 `row_count` 的模型仍然可以比较候选，但无法区分同样行数下的行宽、倾斜与属性差异，其有效性取决于这些变量是否足够稳定。
+---
 
-#### “流式”也不能只贴算子标签
+## 二、优化器的三维棋盘：算法、数据分布与有趣顺序
 
-流式输出取决于输入准备与状态边界，不能只由算子名称判断。Merge Join 如果需要先排序，整条路径仍可能阻塞：
-
-| 算子 | 首行输出前的必要状态 | 关键边界 |
-|---|---|---|
-| Hash Join | 至少完成 build side | Probe 可以流水；Full/Outer Join 可能还需扫描未匹配 build rows |
-| Merge Join | 两侧必须满足顺序 | 重复键组可能需要缓存；若上游要排序，整体仍然阻塞 |
-| Hash Aggregate | 通常维护全部 group state | Partial/Streaming Pre-Aggregation 可以提前减量，但不等于最终结果可提前输出 |
-| Stream Aggregate | 输入须按 group key 聚集 | 可以按组完成即输出，状态接近“当前 group” |
-| Sort | 传统全排阻塞 | Top-N、Prefix Sort、Incremental Sort 的状态和启动成本明显不同 |
-
-因此，`LIMIT 10`、交互式查询和全量 ETL 不应共享同一套单一权重。
-
-### 优化器实际要搜索的是三维空间
-
-算法、数据移动和执行模式共同决定计划成本；省掉一次 Exchange 的收益可能超过局部查表优化。候选描述因此需要保留相关物理属性。
-
-#### 算法、移动与执行模式必须联合决定
-
-同一 Hash Join 在 Broadcast 与 Partitioned 模式下具有不同的网络和内存成本。为比较源码中的这些决策，可用以下分析维度描述候选；这不是待实现的统一接口：
+走进分布式或并行数据库的代价优化器（CBO），你会发现它从来不会孤立地问“这步用 Hash 还是 Merge”，而是在一个由**本地算法、数据分布（Distribution）与排序属性（Ordering）**张成的三维空间里联合选型：
 
 ```text
 JoinCandidate {
-    algorithm: HASH | MERGE | LOOKUP | NESTED_LOOP
-    build_side: LEFT | RIGHT | NONE
+    algorithm:    HASH | MERGE | LOOKUP | NESTED_LOOP
+    build_side:   LEFT | RIGHT | NONE
     distribution: COLOCATED | BROADCAST | HASH_SHUFFLE | RANGE_SHUFFLE
-    ordering: required/provided order
-    runtime_mode: IN_MEMORY | SPILLABLE | PARTITIONED | ADAPTIVE
+    ordering:     required / provided sort prefix & collation
+    runtime_mode: IN_MEMORY | SPILLABLE | ADAPTIVE
 }
 ```
 
-原因很直接：
+为什么要把这几个维度绑在一起搜？设想一张 50 MiB 的维表关联一张 500 GiB 的事实表。如果走广播哈希连接（Broadcast Hash Join），事实表一行都不用过网卡，每个工作节点各自在本地内存建一张 50 MiB 的小哈希表就能流式跑完；要是换成重分区连接（Partitioned Hash Join 或分布式 Merge Join），500 GiB 事实表瞬间就要全量序列化塞进网络做 Shuffle——省掉一次全表网络交换的收益，比你在本地哈希探测循环里抠掉十条 CPU 指令大出好几个数量级。反过来，如果 Build 侧涨到了 20 GiB，继续在 32 个节点上做广播，集群总内存消耗就会平白放大 32 倍，直接把节点打进 OOM。
 
-- Broadcast Hash Join 与 Partitioned Hash Join 的网络、内存和并发行为完全不同；
-- Merge Join 若能复用 Scan Ordering，可能几乎没有额外 Sort Cost；若要两侧全局排序，代价又完全不同；
-- 同一个 Hash Join，在“每个 worker 都复制 build side”和“build side 按 key 分区”下，峰值内存差一个集群规模因子；
-- spillable 并不意味着 spill 免费，它只是把 OOM 变成了可能很贵但可完成的执行。
+在放进代价公式打分之前，优化器还必须先过一道硬性的**语义准入筛子**，把根本算不对结果的非法组合剔除出局：
 
-#### 先做可行性过滤，再比较代价
+1. **相等性与排序规则语义**：连接条件里有没有 `NULL`-safe 等值（`<=>` 或 `IS NOT DISTINCT FROM`）？左右两侧字符串列的字符集排序规则（Collation）是否一致？如果排序器的大小写/口音折叠规则与等值判定不一致，Merge Join 按字典序归并就会漏匹配。
+2. **连接方向与复制合法性**：假设做的是 `A RIGHT JOIN B`，且执行引擎固定拿右侧 `B` 建哈希表。此时**绝不允许把 `B` 广播复制到多台机器上**——因为每台机器只拥有左表 `A` 的一部分分片，某行 `b` 在节点 1 没配对成功，不代表它在节点 2 也没配对成功；一旦各节点各自输出“未匹配的右表行”，最终结果就会冒出成堆幽灵重复行。
 
-Cost Model 不应该替代语义约束。候选生成至少要先回答：
+跨过语义准入后，优化器内部（尤其是基于 Cascades / Volcano 框架的 Memo 搜索器，详见[《深入 Calcite VolcanoPlanner：Cost 账本、两种 RuleDriver 与 Trait Enforcement》]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}})）靠**属性生产与消费机制**来算清前文提到的“跨算子复利”。在 Memo 组里，每一个等价逻辑表达式不仅记录“不要求任何顺序时的最便宜计划”，还会按上层索要的物理属性（Required Property）分开建账：Sort 和 Exchange 扮演**属性强制器（Enforcer）**，负责花钱制造顺序或分区；Merge Join 和 Stream Aggregate 则扮演**属性消费者**，负责把这份投资兑现成更低的算子成本。只有把 `Ordering` 和 `Distribution` 留在 Memo 状态签名里，局部略贵、全局更省的有序流水线才不会被贪心剪枝早早误杀。
 
-```text
-Merge Join:
-  - 是否存在可归并的等值条件？
-  - key 的类型、collation、NULL 语义是否支持？
-  - 两侧能否提供兼容 Ordering？
+---
 
-Hash Join:
-  - 是否存在可 Hash 的等值条件？
-  - Join Type 是否允许当前 build/probe 方向？
-  - 运行时是否有可用的内存与 spill 实现？
+## 三、五套工业引擎的工程分野：把复杂度预算花在哪里？
 
-Distribution:
-  - Join Type 是否允许复制一侧？
-  - build bytes 是否在 broadcast 上限内？
-  - child distribution 是否已满足 colocate？
-```
+虽然理论棋盘是同一个，但打开主流开源数据库的源码，会看到两条泾渭分明的工程路线：**CockroachDB、TiDB 和 OceanBase** 把 Ordering 属性和 Merge/Stream 算子完整纳入优化器竞争；而 **Trino 和 Apache Doris** 等现代向量化 MPP 引擎在通用等值连接路径上干脆不生成 Sort-Merge Join，把全部工程筹码压在了数据分布选型、Runtime Filter 与分区化 Hash Spill 上。
 
-TiDB 源码就是一个很清楚的例子：Merge Join 不只是“算一遍成本”。候选生成阶段会检查 join key、`NULL-safe equality`、左右已有属性、排序前缀与 collation；条件不成立时，它根本不进入竞争集合。
+### 3.1 全路径竞争派：CockroachDB、TiDB 与 OceanBase
 
-#### Physical Property 不是附属信息
-
-排序属性可被后续算子复用，因此子计划自身最便宜不一定使完整计划最便宜：
-
-```text
-Plan A: 局部 Hash 更便宜
-
-HashJoin(k)
-   -> HashAgg(k)
-      -> Sort(k, ts)
-         -> Window(k ORDER BY ts)
-
-Plan B: 前面多维护一点顺序，后面连续复用
-
-OrderedScan(k, ts)
-   -> MergeJoin(k)
-      -> StreamAgg(k)
-         -> Window(k ORDER BY ts)
-```
-
-如果只给 Join 算子独立计价，Plan A 很容易胜出；如果 Memo 的状态包含 `required/provided ordering`，Plan B 才可能被正确保留。
-
-Ordering 的价值也不能用一个固定 bonus 表示。它是一个可消费的物理属性：
-
-```text
-B_order_reuse
-  = avoided_sort
-  + avoided_shuffle_or_merge
-  + lower_aggregation_state
-  + lower_startup_latency
-  - cost_to_preserve_order
-```
-
-同样的思路也适用于 Distribution：一个当前 Join 产生的 Hash Partitioning，可能让下一个 Join 或 Aggregate 免于再次 Shuffle。
-
-## 源码剖析
-
-五个系统的候选集合和运行时退路不同，只有限定源码快照才能比较其职责划分。下文所有实现判断对应参考链接中的固定提交，不代表所有版本；比较围绕三个问题展开：
-
-1. 哪些候选进入优化器？
-2. 成本与物理属性如何参与选择？
-3. 估计错误后由谁兜底？
-
-### CockroachDB：属性驱动候选，执行器允许 Hash 转 Sort
-
-CockroachDB 的规则 `GenerateMergeJoins` 明确使用 interesting ordering 生成 Merge Join 候选。也就是说，Merge Join 不是扫描到等值谓词就机械生成，而是与可获得的顺序属性绑定。源码见 [GenerateMergeJoins](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/rules/join.opt#L253-L258)。
-
-Cost Model 对两条路径的刻画也保留了执行实现特征。下面是 `computeHashJoinCost` 与 `computeMergeJoinCost` 的核心行，变量名为源码原名：
+先看 **CockroachDB**（基线 `8812064`）。它的探索规则 [`GenerateMergeJoins`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/rules/join.opt#L253-L258) 并不是见到等值连接就无脑塞一个双侧全排的 Merge Join，而是紧盯输入端能够提供的有趣顺序（Interesting Ordering）来派生候选。到了代价估算器 [`coster.go`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/coster.go#L1062-L1136) 里，两条路径的不对称开销写得非常直白：
 
 ```go
-// Hash Join：右侧进入 hash table，因此系数更高，并额外计入 buffering 与 spill 压力。
+// Hash Join：右侧固定作为 Build 侧写入哈希表，赋予更高的 CPU 系数并叠加行缓冲开销
 cost := memo.Cost{C: (1.25*leftRowCount + 1.75*rightRowCount) * cpuCostFactor}
 cost.Add(c.rowBufferCost(rightRowCount))
 
-// Merge Join：向量化实现下左侧更接近 streaming，右侧在部分场景缓存重复键组。
+// Merge Join：向量化流水线下左侧近似流式读取，右侧可能因重复键组产生局部缓冲
 cost := memo.Cost{C: (0.9*leftRowCount + 1.1*rightRowCount) * cpuCostFactor}
 ```
 
-两个函数还有一处容易被忽略的共同处理：当 Join 是 Semi 或 Anti 且 `leftRowCount < rightRowCount` 时，代码直接交换两侧行数。原因是执行引擎总是把 hash table 建在右侧，execbuilder 会把基数更小的一侧换到右边，而优化器没有表示 right semi/anti join 的表达式，只能在计价时模拟这个交换。这正是 §2.1 所说“build side 必须是候选维度”的一个具体代价：**成本函数若不知道执行器会怎么选边，同一棵计划树的代价就会算反。**
+这段代码上方还藏着一处极易被忽略的细节：当连接类型是 `Semi` 或 `Anti` 且 `leftRowCount < rightRowCount` 时，计价函数会悄悄把左右行数对调。原因在于 CockroachDB 执行器总是拿右表建哈希表，计划构建器（`execbuilder`）在落地时会自动把更小的一侧换到右边，但优化器代数里偏偏没有定义 `Right Semi/Anti Join` 节点——如果计价函数不提前模拟这次换边，优化器就会误以为大表进了哈希表，把好计划的成本算反。而在执行兜底上，前文提到的 [`external_hash_joiner.go`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/colexec/colexecdisk/external_hash_joiner.go#L83-L138) 给出了漂亮的分区级退路：正常分区走 Grace Hash，唯独递归哈希切不开的倾斜分区才单独拉起磁盘外排器转走 Merge Join，决不牵连整条查询重头再来。
 
-这不是一个精确的硬件模拟器，但至少把非对称 build side 和 memory pressure 放入了决策。源码见 [CockroachDB Hash/Merge Join cost](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/coster.go#L1062-L1136)。
+**TiDB**（基线 `fe7ae36`）同样围绕顺序属性做精细准入。在 [`physical_merge_join.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_merge_join.go#L49-L124) 与属性推导逻辑（[`L425-L453`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_merge_join.go#L425-L453)）中，优化器会逐项核验连接键是否完整命中子节点的排序前缀、`ENUM/SET` 类型与字符集规则是否兼容、是否含暂不支持的 `NULL-safe` 比较；[`physical_stream_agg.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_stream_agg.go#L39-L155) 也严格区分“天然顺路消费子节点顺序”的免排候选与“主动要求子节点补排分组键”的强制候选，并在 [`plan_cost_ver2.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/plan_cost_ver2.go#L737-L820) 中结合行宽、键数、内存与并发因子计价。
 
-运行时的 External Hash Join 还提供分区不收敛后的退路：
+而在执行端，TiDB 的 [`hash_join_v2.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/executor/join/hash_join_v2.go#L654-L767) 没有切去排序，而是把分区化落盘恢复（[`L1103-L1164`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/executor/join/hash_join_v2.go#L1103-L1164)）打磨得很扎实：向 `MemTracker` 注册 `spillAction` 回调，一旦内存告急就把选定分区刷盘，并让探测端对应分区的行一并落盘，随后从 `spillHelper.stack` 栈里逐个弹出分区重建探测。最讲究的是它的终止条件 `initMaxSpillRound`——按 `log(1024) / log(partitionNumber)` 计算最大递归轮数，也就是**锁死累计分区总数不超过 1,024**。因为真正决定磁盘随机 I/O 放大和文件句柄开销的是裂变出来的总分区个数，而不是抽象的递归层数。
 
-```text
-Phase 1: 两侧按 hash A 分区并落盘
-Phase 2: 成对读取分区，以 hash B 做内存 Hash Join
-Fallback: 若递归分区无法显著缩小分区，改用两侧外排 + Merge Join
-```
+**OceanBase**（基线 `ae69064`）则展示了如何把白盒代价模型拆到足够可解释的粒度。翻开 [`ob_opt_est_cost_model.cpp`](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L285-L430)，`cost_hashjoin` 逐项累加 Build 物化、哈希计算、桶插入、Probe 哈希、查表、Join Filter 构建与过滤、残余谓词及输出成本，`cost_mergejoin` 与分组聚合成本（[`L1125-L1187`](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L1125-L1187)）也各自独立建模。尤其精彩的是排序计价入口 [`cost_sort`](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L510-L576) 里那串严格保序的六路分支：
 
-实现会为左右分区分别创建 Disk-backed Sorter，再构造 Merge Join Operator。源码见 [external_hash_joiner.go](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/colexec/colexecdisk/external_hash_joiner.go#L24-L55) 与 [Sort-Merge fallback 构造](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/colexec/colexecdisk/external_hash_joiner.go#L83-L138)。
+1. `is_local_merge_sort_`（局部归并排序）
+2. `prefix_pos_ > 0`（利用已有前缀的增量排序 Prefix Sort）
+3. `part_cnt_ > 0 && topn_ >= 0`（窗口分区内 Top-N）
+4. `topn_ >= 0`（全局 Top-N 堆排序）
+5. `part_cnt_ > 0`（分区排序）
+6. `Normal Sort`（兜底全量外排）
 
-这个设计给出了一个很重要的边界：**运行时切换不必重做整个查询计划，它可以只针对已经隔离出来的坏分区。** 已完成分区仍然走 Hash，缺乏进展的分区才付 Sort 成本。
+为什么要排得这么细？试想如果优化器偷懒，把所有 `Sort` 统统按全量 `N log N` 计价，那么原本只需维护小顶堆的 `Top-N`、或者只需在相同前缀组内微调的 `Prefix Sort` 就会被严重高估；一旦前置排序被高估，下游一整串依赖顺序的 `Merge Join` 与 `Stream Group` 都会跟着被连坐淘汰。
 
-### TiDB：Merge/Stream 依赖属性，Hash 负责通用路径与 spill
+### 3.2 收缩搜索空间派：Trino 与 Apache Doris
 
-TiDB 的 `GetMergeJoin` 先读取逻辑 Join 的左右可提供属性，再检查：
+换到 **Trino**（基线 `68dae09`）和 **Apache Doris**（基线 `5202d06`），画风立刻变了：你在通用连接规则里根本找不到 Sort-Merge Join 的身影。这不是“漏写了算法”，而是一笔深思熟虑的工程账——少维护一套连接与外排融合内核，把省下来的复杂度全投进分布式 Shuffle 选型、动态过滤（Dynamic/Runtime Filter）与向量化哈希表特化上。
 
-- 两侧 join key 是否能完整命中排序前缀；
-- `ENUM/SET` 与 collation 是否兼容；
-- 当前是否含尚未支持的 null-safe join key；
-- 上层 Required Property 能否传给两侧。
+在 Trino 的 [`DetermineJoinDistributionType.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/DetermineJoinDistributionType.java#L80-L169) 中，核心博弈是“左右谁做 Build 侧”乘以“`REPLICATED`（广播）还是 `PARTITIONED`（重分区）”。它先用 `mustPartition` 把 `RIGHT` / `FULL` 连接的广播选项直接封死（防止前面说的右表未匹配行重复输出）；等遇到统计信息缺失、只能退回 `getSizeBasedJoin` 靠已知字节数盲猜时，代码设了一个耐人寻味的阈值 `SIZE_DIFFERENCE_THRESHOLD = 8`——因为残缺统计可能漏算了上游过滤或聚合的缩减率，**只有当一侧比另一侧小足足 8 倍以上、误差再大也不可能颠倒大小关系时，才敢动手翻转 Build 侧**。到了本地物理规划阶段（[`LocalExecutionPlanner.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/LocalExecutionPlanner.java#L2869-L2983) 与 [`SpillingJoinProcessor.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/operator/join/spilling/SpillingJoinProcessor.java#L47-L155)），落盘开关除了检查会话配置，还严卡 `!buildOuter` 且要求固定并发度（`getDriverInstanceCount` 存在），因为一旦 Build 侧需要追踪外连接未匹配标志位，跨轮次落盘恢复极易破坏状态一致性。
 
-关键实现见 [PhysicalMergeJoin candidate generation](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_merge_join.go#L49-L124) 和 [child required property derivation](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_merge_join.go#L425-L453)。这说明 Merge Join 的核心优势不是“比较成本常数更小”，而是**能够消费并继续传递顺序**。
+Doris 的 Nereids 优化器同样聚焦在连接次序、分布方式（Colocate / Bucket Shuffle / Broadcast / Shuffle）与 Runtime Filter 穿透力上。翻看 [`CostModel.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/CostModel.java#L257-L444) 里的 `visitPhysicalHashJoin`，会看到一段非常务实的“微扰破平局”代码：
 
-Stream Aggregate 沿用了同一套属性逻辑：只有 Group By 是可排序列、child 能提供匹配顺序、task type 支持时才生成普通候选；另一路 enforced candidate 会显式给 child 增加 Group Key Ordering。源码见 [PhysicalStreamAgg candidate generation](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_stream_agg.go#L39-L155)。这也澄清了一个术语误区：Stream Aggregate 不是 Hash Aggregate 的“低内存开关”，而是建立在 Ordering 之上的另一条物理路径。
+- 当左右估计行数打平且统计不可信时，比较连接图连通度 `computeConnectivity`，给较弱一侧加上 `leftRowCount += 1`；
+- 若连通度也相同，再比元组字节宽度，给把宽行放进 Build 侧的方案加上 `leftRowCount += 1e-3`；
+- 若单表 Build 侧能产出高效的 Runtime Filter，则直接从 `leftRowCount` 里扣掉一笔 `bonus`，诱导优化器优先拼出能尽早裁剪大表的连接次序。
 
-TiDB 的 Cost Model V2 则表现出另一个现实：模型仍然包含经验参数，但状态表达已经比标量行数丰富。Hash Join 区分 build/probe，使用 build row size、join key 数、CPU/Memory factor 与并发；Merge Join 分别计算 filter/group 成本，并有独立 cost factor。源码见 [Hash/Merge cost V2](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/plan_cost_ver2.go#L737-L820)。
+你看，Doris 根本没假装把连通度或行宽折算成精准的纳秒数，而是用 `1` 与 `1e-3` 的数量级差直接编码了启发式优先级——既然优化器最终只看谁排在前面，诚实地控制相对次序远比捏造虚假的绝对耗时管用。在后端执行器 [`pipeline_fragment_context.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/pipeline/pipeline_fragment_context.cpp#L1761-L1810) 中，只有非广播且允许落盘的连接才会实例化 `PartitionedHashJoinProbeOperatorX` / `SinkOperatorX`；至于 Broadcast Join，既然每个实例都要持有全量右表，切分区落盘省不下多少内存，Doris 选择用 `enable_share_hash_table_for_broadcast_join` 让同节点多实例共享同一张内存哈希表来化解压力。
 
-执行侧的 Hash Join V2 把内存错误变成了一个分区化恢复过程：
+把五套系统的职责切分摆在一起，就能看清两派各自的得失：
 
-```text
-build rows -> partitions -> row tables -> hash table
-                     |
-                     +-- memory pressure -> spill selected partitions
-                                              |
-probe rows -----------------------------------+-> matching probe partitions spill
-                                              |
-                                  restore one partition -> rebuild -> reprobe
-```
+| 数据库系统 | 优化期主博弈空间 | 重点追踪的物理属性 | 执行期兜底武器 | 架构取舍的代价 |
+| --- | --- | --- | --- | --- |
+| **CockroachDB** | Hash / Merge / Lookup 全面竞争 | `Ordering` 深入 Memo 状态 | Grace Hash + 坏分区转外排 Merge | 经验成本系数仍需随算子演进调校 |
+| **TiDB** | Hash / Merge / Index 连接；Hash / Stream 聚合 | `Ordering` 前缀与字符集准入 | `HashJoinV2` 分区落盘（1,024 分区封顶） | 优化期对潜在落盘轮数的预判仍较粗略 |
+| **OceanBase** | 细粒度拆解 Join / 六种 Sort / Group 成本 | `Ordering` 与 `Distribution` 并重 | 自适应工作区（Work Area）与外存执行 | 白盒公式分支繁多，跨硬件校准门槛高 |
+| **Trino** | 左右翻转 × `REPLICATED` / `PARTITIONED` | `Distribution` 与外连接合法性 | 分区化 `SpillingJoinProcessor`（禁 `buildOuter`） | 放弃双侧有序直连红利与排序内存稳定性 |
+| **Apache Doris** | 连接次序 + 四种分布 + Runtime Filter | `Distribution` 与过滤连通度 | 分区 Hash Spill + 广播共享哈希表 | 排序算子独立服务语义，较少参与连接属性接力 |
 
-它把 `spillAction` 注册到 `MemTracker`（`FallbackOldAndSetNewAction`），由内存压力触发分区 spill；`collectSpillStats` 记录每轮 bytes、spilled partition 数和 round；恢复阶段从 `spillHelper.stack` 中逐个 `pop` 分区，重建 hash table 后 reprobe。源码见 [HashJoinV2 spill initialization](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/executor/join/hash_join_v2.go#L654-L767) 和 [partition restore loop](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/executor/join/hash_join_v2.go#L1103-L1164)。
+---
 
-递归分区还带一个明确的终止条件。`initMaxSpillRound` 按 `log(1024) / log(partitionNumber)` 计算最大轮数，即允许分区总数递归扩张到 1024 为止；若初始分区数已超过 1024，则 `maxSpillRound = 1`，直接放弃继续细分。§6.3 会把“自适应是否有终止条件”列为一个通用风险，这里可以看到一个具体答案：用**分区总数上界**而非轮数上界兜底，因为决定 I/O 放大的是累计分区数，不是递归深度。
+## 四、移动的交叉点：内存相变、数据倾斜与成本账本的盲区
 
-这里也暴露出模型与执行器之间常见的断层：执行器已经知道 spill round、每轮字节数与分区数，优化器却未必把这些分布作为一等反馈信号。真正有价值的闭环，不是只收集“该 Join 用时多少”，而是把这些结构化运行指标反馈到下一次 crossover 判断。
+为什么明明在实验室里标定好的成本系数，一上生产环境还是会频繁选错？因为 Hash 与 Sort 的胜负交叉点（Crossover）根本不是固定在“某几百万行”的一个点，而是一张随**真实内存字节、键分布偏斜度与运行时配额**剧烈起伏的曲面。
 
-### OceanBase：显式拆开 Hash、Merge、Sort 与 Group 成本
+### 4.1 内存悬崖与长尾倾斜：平均值掩盖了什么
 
-OceanBase 分别估算建表、探测、物化与排序操作，使不同数据路径的成本可以独立分析，而不只是给算法设置一个常数权重。
-
-Hash Join 成本显式包含：
+第一个容易把只看行数（Cardinality）的优化器坑惨的变量，是**哈希表的真实物理体积与内存悬崖**：
 
 ```text
-build materialization
-+ build hash key computation
-+ build hash-table insertion
-+ probe hash key computation
-+ probe lookup
-+ join filter build/use
-+ residual predicate
-+ output cost
+hash_table_bytes ≈ directory_bytes(load_factor)
+                 + distinct_key_bytes
+                 + payload_rows × payload_width
+                 + duplicate_chain_or_adjacency_bytes
+                 + allocator_and_alignment_overhead
 ```
 
-Merge Join 则包含左右取数、条件比较、输出和一侧 materialization。源码见 [cost_mergejoin](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L285-L351) 与 [cost_hashjoin](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L353-L430)。
+哪怕两个子计划输出的 `build_rows` 一模一样，512 字节宽的变长字符串行与 8 字节定长整数行占用的内存天差地别；低基数（低 NDV）在分组聚合里能压缩状态，但在必须保留全部匹配行载荷的 Hash Join 里，成千上万条同键记录照样得全塞进内存挂成链表或邻接数组。
 
-Sort 也不是一个公式包打天下。`cost_sort` 的入口是一串按优先级排列的 `else if`：
+一旦 `hash_table_bytes` 顶穿当前算子分到的有效内存预算 `M`，代价曲线就会出现断崖式跳变：在 `bytes < M` 时它是微秒级纯内存流水，越过 `bytes ≈ M` 的瞬间就被迫付出整轮磁盘读写（`partition → write → read → rebuild → reprobe`）。而在高并发共享集群里，单条查询能拿到的 `M` 本身就在随邻居负载实时波动——编译期写死一个常数内存假设，在内存水位线附近几乎必然踩雷。
 
-- `is_local_merge_sort_` -> Local Merge Sort；
-- `prefix_pos_ > 0` -> Prefix Sort；
-- `part_cnt_ > 0 && topn_ >= 0` -> Partition Top-N；
-- `topn_ >= 0` -> Top-N；
-- `part_cnt_ > 0` -> Partition Sort；
-- 其余 -> Normal Sort。
+第二个隐形杀手是**数据倾斜（Data Skew）与网络搬运**。分布式 Stage 的完工时间从来不取决于平均每个分区有多少行，而取决于最慢的那个热点桶：
 
-这个顺序本身承载语义：Partition Top-N 必须先于 Top-N 判断，否则带 `part_cnt_` 的计划会被当成全局 Top-N 计价；Prefix Sort 又必须先于两者，因为已排序前缀会直接改变需要排序的行数。源码见 [cost_sort dispatch](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L510-L576)。这种细分非常重要：若把 Top-N 也按全量 `N log N` 估算，或忽略已排序前缀，Sort 会被系统性高估——而按 §4.2 的逻辑，系统性高估 Sort 就等于系统性否决所有依赖 Ordering 的 Merge/Stream 路径。
+$$
+T_{\text{stage}} \approx \max_{1 \le i \le p} T(\text{partition}_i) + T_{\text{coordination}}
+$$
 
-Group By 侧则分别存在 `cost_merge_group` 与 `cost_hash_group`。Hash Group 会计入结果物化、build/probe hash 与 key hash；Merge Group 更接近顺序扫描与聚合函数求值。源码见 [group cost](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L1125-L1187)。
+只存总行数和总 NDV 的统计直方图看不到重尾（Heavy Hitters）：同样是 1 亿行、100 万个不同键，均匀分布时每个分区轻快跑完；要是某一个默认空值或爆款商品独占了 3,000 万行，Hash Shuffle 不仅会把这 3,000 万行全砸向同一个倒霉的下游节点引发单点落盘，还会在多对多连接（`n:m`）时瞬间炸出天文数字般的乘积输出。相比之下，基于采样的范围切分（Range Partitioning）与归并虽然多一步边界探测，却能更直观地看清值域跨度并拆解热点区间。再加上硬件代际更迭——AVX-512 宽向量加速基数排序、NUMA 跨插槽访存惩罚，或是 CXL 远端内存池的延迟分层（参见[《从芯片到数据中心：2026 AI Infra 与现代系统技术雷达》]({{< relref "2026-09-10-system-ai-infra-hardware-distributed-systems.md" >}})）——都在不断改写两条路径的底层斜率。
 
-它带来的启发不是照搬系数，而是：**一个可校准模型必须先有足够细的成本项；把所有差异压成 `rows * factor` 后，再多训练数据也很难解释错误来自哪里。**
+### 4.2 成本向量的折叠时机与风险定价
 
-### Trino：不比较 Merge Join，把问题转成 Join Distribution
+既然影响交叉点的维度这么多，现有数据库的成本数据结构接得住吗？翻开前面五个引擎的 `Cost` 定义，会看到一幅很有意思的演进图景——分歧不在“算不算 CPU、内存和网络分项”，而在**“分项在哪一步被拍扁成一个标量浮点数”**：
 
-Trino 当前通用 Join 路径以 Hash/Lookup Join 为核心。它的关键选择不是 Hash 与 Merge，而是：
+- **Doris（构造即折叠）**：[`Cost.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/Cost.java#L31-L52) 虽然持有 `cpuCost`、`memoryCost`、`networkCost` 三个字段，但在构造函数里就立刻乘上会话权重加总成了单一 `cost` 标量参与 Memo 淘汰。
+- **Trino（延迟到比较器折叠）**：[`LocalCostEstimate.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/cost/LocalCostEstimate.java#L33-L35) 把三维分项一路保留到 [`CostComparator.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/cost/CostComparator.java#L54-L71) 的 `compare` 方法里，先用 `checkArgument` 拒绝拿含未知维度的残缺成本瞎比，最后才做加权求和。更有意思的是源码里留下的那行 `TODO`：
+  ```java
+  // TODO when one left.getMaxMemory() and right.getMaxMemory() exceeds query memory limit
+  //      * configurable safety margin, choose the plan with lower memory usage
+  ```
+  这句话一针见血地道出了线性加权和的软肋：一个 CPU 极便宜但内存超限的 Hash 计划，加权总分依然可能压过稳健的备选方案，结果一跑起来就直接落盘甚至 OOM！正因为 Trino 把分项留到了比较前一刻，它才看得到 `maxMemory` 去动这把手术刀。
+- **TiDB（标量比大小，旁路留账本）**：[`cost_misc.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/util/costusage/cost_misc.go#L49-L68) 里的 `CostVer2` 用单一 `float64` 参与竞选，同时挂着一个 `CostTrace` 记录各因子明细与可读公式（如 `hashmem(rows*size*factor)`），专门服务于 `EXPLAIN ANALYZE` 排障与离线成本校准。
+- **CockroachDB（位掩码字典序优先）**：[`memo/cost.go`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/memo/cost.go#L17-L58) 在浮点数 `C` 之上垫了一个 `uint8` 的 `Penalties` 位掩码（涵盖强制 Hint、全表扫描惩罚、无界基数惩罚等），`Less` 函数先比掩码高低，同级之内再用 `ulpTolerance = 1000`（相对浮点精度的容差）比大小，彻底杜绝了“给危险计划硬编一个 `1e100` 魔数”导致的浮点溢出与精度丢失。
 
-```text
-build side = left or right
-distribution = REPLICATED or PARTITIONED
-spill = enabled or disabled
-dynamic filter = produce/consume
-```
+然而，哪怕把这五套实现最精细的部分拼起来，离理想的风险感知决策仍然缺了四块关键拼图：**预期溢写字节与轮数（`expected_spill_bytes / rounds`）、启动首行耗时（`startup_ns`）、下游属性变现净值，以及基数估计本身的置信度（`confidence`）**。
 
-`DetermineJoinDistributionType` 会枚举左右翻转以及 Broadcast/Partitioned 候选，用 input/exchange/build/probe cost 比较。但在比较之前，它先做了 §2.2 所说的可行性过滤：`mustPartition` 在 Join Type 为 `RIGHT` 或 `FULL` 时直接排除 REPLICATED，因为此时 build side 是右侧，复制它会把未匹配的右表行重复多份；`mustReplicate` 则反向排除 PARTITIONED。只有两侧都合法的候选才进入成本比较。
+这也正是近两年优化器前沿研究发力的靶心：
 
-成本未知时，规则退回 `getSizeBasedJoin`：先用源表大小与 `join-max-broadcast-size` 判断能否 REPLICATED，两侧都超限时再用 `getFirstKnownOutputSizeInBytes` 比较，并以 `SIZE_DIFFERENCE_THRESHOLD = 8` 决定哪一侧做 build。这个 8 倍不是调优参数，而是对估计不可信的防御：源码注释指出，该函数可能因为缺乏估计而没有扣除 filter 或 aggregation 带来的缩减，因此**只有当差异大到不可能被这层误差解释时，才敢翻转 build side**。这与 §5.2 的主题完全一致：信号强度应该随估计可信度调整，而不是固定阈值。源码见 [DetermineJoinDistributionType](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/DetermineJoinDistributionType.java#L80-L169)。
+- **给不确定性定风险价**：PVLDB 2024 的 **[PARQO](https://www.vldb.org/pvldb/vol17/p4627-xiu.pdf)** 不再假装基数点估计是真值，而是引入选择率误差分布，用候选计划 `p` 在不同真实状态 `s` 下的期望后悔惩罚（Expected Penalty）与尾部风险来选型：
+  $$
+  \operatorname{RiskAwareScore}(p) = \mathbb{E}_s[\operatorname{Cost}(p, s)] + \lambda \cdot \operatorname{TailRisk}\!\left(\operatorname{Cost}(p, s) - \min_q \operatorname{Cost}(q, s)\right)
+  $$
+  通过敏感性分析锁定最致命的两三个变量（比如 `build_bytes` 与可用内存之比），就能识别出那种“估准了快 15%、一旦估低两倍落盘就慢 10 倍”的脆弱 Hash 计划，在延迟敏感场景下主动换用退化曲线更平缓的路径。
+- **盯住成对排序与后悔率，而非拟合绝对秒数**：PVLDB 2023 的 **[Lero](https://www.vldb.org/pvldb/vol16/p1466-zhu.pdf)** 点破了另一个度量误区——哪怕成本模型预测耗时的平均百分比误差（MAPE）很低，只要在 Hash 与 Sort 的交叉点附近把冠亚军排反了，照样选出烂计划；反过来，只要成对排序准确率（Pairwise Accuracy）高、最坏后悔比 \(\operatorname{Regret} = \frac{T(\text{chosen})}{T(\text{best})}\) 受控，绝对数值差十倍也无伤大雅。
 
-执行计划构造阶段决定是否启用 Spilling Join 时，除了 session 开关与 `node.isSpillable()`，还有一个容易忽略的条件：`!buildOuter`。当 build 侧需要输出未匹配行（RIGHT/FULL Join）时直接禁用 spill，因为匹配状态无法跨分区安全恢复；同时开启 spill 会强制要求 fixed distribution（`getDriverInstanceCount` 必须存在），否则分区号在 driver 间对不上。启用后 build side 创建 `PartitionedLookupSourceFactory`，probe side 则按 spill partition 分批消费和恢复。源码见 [LocalExecutionPlanner join path](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/LocalExecutionPlanner.java#L2869-L2983) 与 [SpillingJoinProcessor](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/operator/join/spilling/SpillingJoinProcessor.java#L47-L155)。
+---
 
-这条路线常被误解为“算法不完整”。更准确的说法是：Trino 选择了较小的实现集合，用更少的策略分叉换取一致的分布式执行、Dynamic Filter 和 spill 语义；省下的复杂度并没有消失，而是转移到了 Join Type 与 distribution、spill 的语义合法性矩阵上——而这些约束即使引入 Merge Join 也一条都少不了。真正的代价是无法直接利用双方已有顺序做 Merge Join，也无法用一种内存更稳定的 Join 算法对冲 Hash 风险。
+## 五、运行时自适应：在状态边界上安全换挡
 
-### Apache Doris：向量化 Hash Join + 分区 spill，排序服务于独立语义
+哪怕优化器引入了风险模型，面对包含复杂 UDF、多表相关过滤的陌生查询，编译期照样可能看走眼。这时候压力就传到了执行引擎手里：**跑了一半发现不对劲，还能不能反悔？**
 
-Doris 的 Nereids Cost Model 对 Join 的核心输入是 probe/build/output rows，并加入统计可信度、Join Cluster width 与 Runtime Filter 连通性的启发式调整；Quick Sort/Top-N 则单独计价，并对单阶段 Gather Sort 增加显著惩罚。源码见 [PhysicalQuickSort cost](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/CostModel.java#L257-L284) 与 [PhysicalHashJoin cost](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/CostModel.java#L384-L444)。
+答案是能，但绝不是“直接把建了一半的哈希表扔掉重排”那么鲁莽。在流式管道里随意重启算子，不仅白白烧掉已完成的 CPU 与 I/O，一旦上游已经向客户端吐出过部分连接结果，或者算子内部正维护着 `LEFT/RIGHT/ANTI JOIN` 的“某行是否匹配过”状态位，贸然切换就会立刻酿成重复输出或丢行错数。
 
-`visitPhysicalHashJoin` 里有几处值得单独拿出来看，因为它们把 §5.3 “Cost Model 的任务是选对相对顺序”落到了字面上：
+因此，工业界真正落地的运行时自适应，全都严守着**三条天然的状态隔离边界（Adaptive Barriers）**：
 
-- 当两侧行数相等且统计不可信时，代码比较两侧的 `computeConnectivity`，并对较弱一侧做 `leftRowCount += 1`；
-- 当两侧行数与 Join Cluster width 都相等时，再比 tuple size，对 build 侧数据更多的一方做 `leftRowCount += 1e-3`；
-- 若 build 侧宽度为 1 且能产生有效 Runtime Filter，则从 `leftRowCount` 中减去一个 `bonus`，以偏好 `A-B-filter(C)` 而非 `A-filter(C)-B` 的 Join Order。
+1. **算子内部的独立分区与微批边界**：这是粒度最细、止损最精准的一道防线。无论是连接算子触碰内存配额，还是局部预聚合遭遇高基数输入导致缩减率暴跌，执行器都只在干净的状态隔离点上切换策略——前面拆解过的 CockroachDB `ExternalHashJoiner` 之所以敢在运行中从 Hash 切到 Sort-Merge，正是因为首轮哈希落盘已经把左右输入按键值严格隔离成了互不相干的分区对（Partition Pair）：
 
-也就是说，它并不试图把这些启发式折算成真实的毫秒或字节，而是**直接对行数做微量扰动，只为了改变候选的排序结果**。`+= 1` 与 `+= 1e-3` 的量级差别还表达了优先级：connectivity 强于 tuple size。这种做法在建模上并不优雅，却恰好说明一件事：既然优化器只消费相对顺序，那么在排序信息上直接编码意图，比构造一个虚假的绝对成本更诚实。
+![CBO 编译期选型与运行时状态边界自适应降级](/images/diagrams/exec-hash-sort-adaptive-fallback.svg)
 
-执行器在允许 spill 且非 Broadcast Join 时构造 `PartitionedHashJoinProbeOperatorX` 与 `PartitionedHashJoinSinkOperatorX`，否则使用普通 Hash Join pipeline。注意这里 Broadcast 被排除在 spill 之外：各 instance 持有完整的 build side 副本，分区 spill 并不能降低单个 instance 的峰值内存，而 Broadcast 另有 `enable_share_hash_table_for_broadcast_join` 一路共享 hash table 来缓解同一问题。源码见 [Doris partitioned hash join construction](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/pipeline/pipeline_fragment_context.cpp#L1761-L1810)。
+注意这里切换的触发判据不是单纯“内存不够”，而是**“继续哈希递归已经失去缩小分区的进展”**；并且切换范围被死死关在尚未输出任何结果的单个坏分区笼子里，外连接标记与已完成分区毫发无损。类似的思路也体现在流式预聚合（Streaming Pre-Aggregation）里：先在 L1/L2 缓存大小的微型哈希表里攒批聚合，一旦实时监测到分组消减率（Reduction Ratio）低于阈值，立刻把当前攒好的批次刷向下游，随后直接切为无状态透传，绝不在高基数输入上硬撑一张注定溢出的大表。
 
-这再次说明，现代向量化 MPP 引擎可能不把 Sort-Merge Join 放进常规竞争集合，而是把主要复杂度投入：
+2. **跨阶段（Stage / Shuffle）物化边界**：在 Spark AQE、Flink Adaptive Batch 或 Trino 容错执行模式下（详见姊妹篇[《查询并行度的三次决策：从初始分区到 AQE 与历史反馈》]({{< relref "2026-09-12-dive-dop.md" >}})），上游 Shuffle 写盘结束的那一刻，真实的分区字节分布、最大桶体积与行数全部水落石出，而下游消费算子尚未拉起。这时把原本规划的 Shuffle Hash / Sort-Merge Join 动态降级成 Broadcast Hash Join，或者把倾斜的热点桶拆成多段范围并行处理，既零浪费地复用了上游物化成果，又绕开了算子半途变轨的状态泥潭。
 
-- Join Order 与 build side；
-- Colocate/Bucket Shuffle/Broadcast/Shuffle；
-- Runtime Filter；
-- 向量化 Hash Table 特化；
-- Partitioned Spill。
+3. **跨执行的查询画像边界**：对于每天成百上千次跑同一模板的报表或微服务 SQL，执行器在运行期攒下的结构化遥测指标——真实 `build_bytes`、最大桶频率、落盘轮数（`spill_rounds`）、外排归并趟数、以及下游算子是否真的消费了排序属性——只要绑定好“规范化子计划签名 + 数据快照代际 + 硬件规格”，就能在下一次编译时直接把优化器拉回正确轨道。
 
-### 五个系统的决策边界
+更进一步看，算法自适应底下其实还垫着一层更基础的**资源自适应**。如果同一台机器上并发跑着四条查询，每条算子都死守着编译期静态切分的内存配额，就会出现荒诞的一幕：左边查询差 50 MiB 内存就能避开整轮磁盘落盘，右边查询却抱着 2 GiB 空闲配额在慢悠悠等网络。CIDR 2025 的 **[Paged Memory Management](https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf)** 把 Sort、Hash Table 和 Aggregate 的工作区统一收归页式内存池调度，支持按边际收益在算子间动态腾挪内存甚至做轻量级查询上下文切换——当可用内存 `M` 本身能按需伸缩时，很多原本处于溢写悬崖边缘的 Hash 算子根本不用走到落盘那一步。
 
-同样支持 spill 的系统也未必支持 Hash-to-Merge 切换，不能把一种实现的退路外推给其他项目。以下按优化期和运行期分别比较。
+---
 
-| 系统 | 优化期主决策 | Physical Property | 运行时兜底 | 主要盲区/代价 |
-|---|---|---|---|---|
-| CockroachDB | Hash/Merge/Lookup 竞争 | Ordering 进入 Memo | Grace Hash；坏分区转 Sort-Merge | 成本仍有经验系数 |
-| TiDB | Hash/Merge/Index；Hash/Stream Agg | Ordering 决定候选与传递 | Hash Join V2 分区 spill/restore | 优化期 spill 风险表达仍有限 |
-| OceanBase | 丰富的 Join/Sort/Group 成本 | Ordering、Distribution 共同影响 | Work Area/外部执行 | 模型复杂，校准成本高 |
-| Trino | Build side + Broadcast/Partitioned | 重点是 Distribution | Partitioned spilling | 不直接利用 Merge Join 算法空间 |
-| Doris | Join Order + Distribution + Hash Join | Distribution/Runtime Filter 更突出 | Partitioned Hash Join spill | Sort 与 Join 的属性复用空间较窄 |
+## 六、三十年学术脉络与实验验证标尺
 
-没有哪个系统提供了“标准答案”。它们更像五种工程预算分配：搜索空间越丰富，优化器状态与成本校准越复杂；算法集合越窄，执行器的鲁棒性要求越高。
+回头串联过去三十多年的数据库顶会文献，会发现学术界围绕“Hash 还是 Sort”的追问，早已走过了“争论谁是宇宙第一”的青涩期，演进了整整四代问题意识：
 
-## 交叉点为何移动：数据、成本与纠偏边界
+- **第一代：外存 I/O 模型与参数化规划（1990s）**。Graefe 在 1993 年的经典综述 [《Query Evaluation Techniques for Large Databases》](https://doi.org/10.1145/152610.152611) 奠定了沿用至今的对偶定理：外部归并排序的分段顺串生成与多路合并，在数学结构上同构于哈希连接的分区裂变与逐桶探测，内存与输入之比决定了读写趟数。几乎同一时期，Ioannidis 等人的 [参数化查询优化（PQO，1992）](https://www.vldb.org/dblp/db/conf/vldb/IoannidisNSS92.html) 指出可用缓冲池大小在编译期未知，应当预备覆盖不同参数区间的计划集；Kabra 与 DeWitt 的 [执行期重优化（1998）](https://www.vldb.org/dblp/db/conf/sigmod/KabraD98.html) 则首开在物化点收集统计修正后续计划的先河。
+- **第二代：多核 SIMD 与内存墙之争（2009–2013）**。当大容量内存成为主流，瓶颈从磁盘磁头挪到了 CPU 缓存行与寄存器宽度。2009 年 Kim 等人在 [《Sort vs. Hash Revisited》](https://www.vldb.org/pvldb/vol2/vldb09-257.pdf) 中提出更宽的 SIMD 向量将助推 Sort-Merge 反超；紧接着 2013 年 Balkesen 等人在 [《Multi-Core, Main-Memory Joins》](https://www.vldb.org/pvldb/vol7/p85-balkesen.pdf) 中在同一硬件平台上把两派都压榨到极致，测出多趟基数分区哈希（Radix Hash Join）在绝大多数规模下依然领先，Sort-Merge 仅在超大数据集上逼近。这场论战最大的遗产是证明了**微架构常数（TLB 页大小、NUMA 拓扑、SIMD 宽度）会实实在在移动交叉点**。
+- **第三代：走出孤立微基准，算全链路真账（2021）**。微基准里的冠军放进完整 SQL 引擎里还是冠军吗？2021 年慕尼黑工业大学团队在 Umbra 引擎中做了著名的对照实验 [《To Partition, or Not to Partition, That is the Join Question in a Real System》](https://db.in.tum.de/~bandle/papers/bandle-partitionVsNonPartition.pdf)：在单算子窄列测试里大杀四方的 Radix Partitioned Join，一放进完整的 TPC-H 流水线就频频吃瘪——因为提前按基数做多趟物理分区，等于强迫 CPU 把所有输入元组（包括那些在探测时根本连不上、本该被 Bloom Filter 一眼筛掉的废数据，以及宽重载荷列）统统搬运物化了好几遍！反倒是不预分区的哈希连接配合过滤穿透在全链路上表现更稳。
+- **第四代：数据结构自免疫、运行时采样与异构内存（2024–2026）**。最近三年，研究重心彻底下沉到了消灭最坏情况退化：DaMoN 2024 的 **[Unchained Hash Table](https://db.in.tum.de/~birler/papers/hashtable.pdf)** 用分区构建 + 连续邻接数组 + 流水化探测 + Bloom Filter 兼顾主外键快路径与高重复键倾斜；CIDR 2024 的 **[Perfect Hashing](https://www.vldb.org/cidrdb/2024/is-perfect-hashing-practical-for-olap-systems.html)** 评估了完美哈希在 OLAP 密集查表中的构建与探测平衡；CIDR 2025 的 **[Adaptive Factorization](https://www.vldb.org/cidrdb/papers/2025/p21-gro.pdf)** 利用 Hash Build 阶段顺手构建轻量级度数草图（Sketch），在运行时动态拍板要不要启用因子化压缩以躲避多对多展开爆炸（详见[《深入 Hash Join：从内存哈希表到分区 Spill》]({{< relref "2026-08-26-dive-hash-join.md" >}})及 [Spark 附录]({{< relref "2026-08-26-dive-hash-join.md" >}}#spark-hash-join)）；而 CIDR 2026 的 **[Hash Joins Meet CXL](https://www.vldb.org/cidrdb/2026/hash-joins-meet-cxl-a-fresh-look.html)** 则揭示在 DRAM + CXL 分层内存上，盲目把数据全搬回本地 DRAM 未必划算，按访存热度做部分迁移才能榨干双侧总带宽。
 
-### 真正决定 crossover 的变量
+把源码与这三十年的实验教训浓缩成日常内核研发的排查准则，最管用的是在动手做性能评测或改优化器规则前，先拿下面这把标尺过一遍常见的认知陷阱：
 
-最优算法的切换点随状态大小、已有顺序与资源条件变化，单一行数阈值会隐藏这些变量。下面分别分析其因果机制。
+| 似是而非的经验口诀 | 真实物理机制下的翻车现场 | 正确的验证与设计姿势 |
+| --- | --- | --- |
+| **“Hash 是 `O(N)`，闭眼无脑选 Hash”** | 撞上宽行内存放大、Build/Probe 估反或重尾热点键时，随机访存失速叠加多轮落盘，延迟瞬间劣化十倍 | 联合考察 `build_bytes / M` 水位、Top-K 频率与外连接语义，测绘多维交叉曲面而非单条曲线 |
+| **“Merge Join 流式低内存，不怕 OOM”** | 若输入原本无序，前置全量 `Sort` 既阻塞又照样外排；且右侧遇到百万级同键组仍需缓冲回退 | 把上游 `Enforcer` 排序费和下游顺序复用红利绑成整棵子树一起算账 |
+| **“算子支持 Spill 就绝不会挂”** | 外连接未匹配追踪可能直接禁掉 Spill（如 Trino），且最小工作页缓冲、1,024 分区句柄与并发磁盘争抢仍有硬底线 | 在 `M / input_bytes` 为 `0.1 / 0.25 / 0.5 / 1.0` 多档压力下实测落盘轮数与尾延迟 |
+| **“只要把 Cost 耗时拟合准了就行”** | 绝对误差再小，只要交叉点附近冠亚军排反照样选烂计划；且线上日志只录了当选计划，缺失备选反事实样本 | 在相同快照与配额下强制固定 Hash / Merge / Broadcast 跑反事实对照，盯紧 Pairwise 排序率与 P99 Regret |
+| **“内核塞进的算法越多越先进”** | 每多一套算子，规则枚举、属性传递、Spill 测试矩阵和校准面就翻一倍（对比 Trino/Doris 的精简路线） | 只有当新算法能稳稳覆盖现有路径搞不定的盲区（如已有序流或极端倾斜兜底）时才值得入列 |
 
-#### Cardinality 不够，还要有 bytes、NDV 与 multiplicity
+说到底，现代查询引擎早已不再指望优化器在查询启动前的那几毫秒里扮演全知全能的先知。最稳健的系统架构，总是让**优化器算清跨算子的物理属性复利与风险边界，让哈希表与排序内核各自收窄最坏退化幅度，再在分区、Stage 与历史反馈三道关卡上留好体面的退路**——哪怕统计信息偶尔撒了谎，查询依然能稳稳当当地跑过终点线。
 
-Hash Table 的内存并不与输出行数简单相等：
+---
 
-```text
-hash_table_bytes
-  ~= directory_bytes(load_factor)
-   + distinct_key_bytes
-   + payload_rows * payload_width
-   + duplicate_chain_or_adjacency_bytes
-   + allocator_and_alignment_overhead
-```
+## 参考资料与源码基线
 
-至少要区分：
+> **源码基线说明**：文中五个开源系统的实现细节与行号均固定在以下阅读快照——CockroachDB `8812064`、TiDB `fe7ae36`、OceanBase `ae69064`、Trino `68dae09`、Apache Doris `5202d06`。
 
-- `build_rows` 与 `probe_rows`；
-- `build_bytes` 与 `probe_bytes`；
-- join/group key NDV；
-- 最大频次、Top-K 频次与重复度；
-- key width、payload width 和变长字段比例；
-- Join Selectivity 与输出 multiplicity。
+### 源码入口索引
 
-例如，`NDV` 很低并不一定让 Hash Join 更省：若保留全部 build payload，大量相同 key 仍需存储，并可能形成很长的匹配列表；若结果是 `n:m`，真正危险的是 output expansion，而非 Hash Table directory。
+- **CockroachDB (`8812064`)**：[Join 探索规则 `join.opt`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/rules/join.opt#L253-L258) · [Hash/Merge Join 成本 `coster.go`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/coster.go#L1062-L1136) · [外部 Hash Join 与 Sort-Merge 降级 `external_hash_joiner.go`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/colexec/colexecdisk/external_hash_joiner.go#L24-L138) · [`memo.Cost` 与分层比较函数 `cost.go`](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/memo/cost.go#L17-L58)
+- **TiDB (`fe7ae36`)**：[`PhysicalMergeJoin` 候选生成](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_merge_join.go#L49-L124) 与 [子节点属性推导](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_merge_join.go#L425-L453) · [`PhysicalStreamAgg` 候选生成](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_stream_agg.go#L39-L155) · [Cost Model V2 `plan_cost_ver2.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/plan_cost_ver2.go#L737-L820) · [`CostTrace` 结构 `cost_misc.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/util/costusage/cost_misc.go#L49-L68) · [`HashJoinV2` 分区 Spill 与恢复 `hash_join_v2.go`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/executor/join/hash_join_v2.go#L654-L767)（恢复循环见 [`L1103-L1164`](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/executor/join/hash_join_v2.go#L1103-L1164)）
+- **OceanBase (`ae69064`)**：[Merge/Hash Join 成本模型 `ob_opt_est_cost_model.cpp`](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L285-L430) · [六类 Sort 计价分支](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L510-L576) · [Merge/Hash Group 聚合成本](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L1125-L1187)
+- **Trino (`68dae09`)**：[连接分布选择 `DetermineJoinDistributionType.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/DetermineJoinDistributionType.java#L80-L169) · [三维成本 `LocalCostEstimate.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/cost/LocalCostEstimate.java#L33-L35) 与 [比较折叠 `CostComparator.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/cost/CostComparator.java#L54-L71) · [本地物理规划 `LocalExecutionPlanner.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/LocalExecutionPlanner.java#L2869-L2983) 与 [`SpillingJoinProcessor.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/operator/join/spilling/SpillingJoinProcessor.java#L47-L155)
+- **Apache Doris (`5202d06`)**：[Nereids 排序与哈希连接计价 `CostModel.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/CostModel.java#L257-L444) · [构造折叠 `Cost.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/Cost.java#L31-L52) · [分区化 Hash Join Spill 管线 `pipeline_fragment_context.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/pipeline/pipeline_fragment_context.cpp#L1761-L1810)
 
-#### Existing Ordering 的价值必须跨算子计算
+### 参考文献
 
-已有顺序可以减少当前 Sort 工作，也可能被下游复用，因此它的价值要在完整子树上计算。排序成本可拆为：
-
-排序成本应拆成：
-
-```text
-full_sort
-prefix_sort
-incremental_sort
-top_n
-merge_runs
-order_preservation
-```
-
-并区分以下情况：
-
-| 输入状态 | Join/Agg 需要 | 真实附加成本 |
-|---|---|---|
-| 两侧按完整 Join Key 有序 | Merge Join | 接近线性 merge |
-| 仅一侧有序 | Merge Join | 另一侧 Sort + merge |
-| 两侧仅有相同前缀 | Merge Join | 对各 prefix group 补排 |
-| Group Key 已聚集 | Stream Aggregate | 单组状态，近似线性 |
-| 无序但下游最终要求同一顺序 | Sort + Merge/Stream | Sort 成本可被下游复用 |
-| 无序且无下游顺序需求 | Hash | 通常更有利 |
-
-核心原则是：**Sort 是生产属性的 Enforcer，Merge/Stream 是消费属性的 Operator。** 不把二者分开，模型就无法表达“为后续算子提前投资”。
-
-#### Memory Budget 产生的不是线性惩罚，而是相变
-
-Hash 工作集接近可用内存时，少量估计误差就可能把一次 build/probe 推入分区和落盘路径，因此成本在阈值附近不宜按线性惩罚外推：
-
-```text
-estimated_hash_bytes / effective_memory_budget ~= 1
-```
-
-一旦越界，执行路径可能从一次 build/probe 变成：
-
-```text
-partition -> write -> read -> rebuild -> reprobe
-```
-
-若某些分区仍过大，还会出现递归轮次。Sort 也会 spill，但外排更接近可预测的 run generation + k-way merge。两者都不是“spill 一次加固定 penalty”。
-
-建议保留 operator memory curve：
-
-```text
-Cost(op, M) -> expected runtime under memory M
-```
-
-而不是只存一个 `peak_memory`。在多查询并发下，`M` 是运行时变量，优化器应看到一个区间或分布，而非编译时常数。
-
-#### Skew 的本质是 max，而平均数会掩盖它
-
-分布式 Hash 的阶段完成时间受最慢分区约束，因为下游汇合必须等待该分区结束；平均分区大小无法表达这一长尾：
-
-```text
-T_stage ~= max(T_partition_1 ... T_partition_p) + coordination
-```
-
-所以 `avg_rows_per_partition` 对尾延迟不够。至少需要：
-
-```text
-max_partition_ratio
-top_k_frequency
-HHI or entropy
-heavy_hitter_bytes
-estimated_output_multiplicity
-```
-
-倾斜同时放大四种风险：单分区内存、spill rounds、网络不均衡和 probe 长链。Sort/Range Partition 也会受倾斜影响，但更容易通过采样 boundary、局部切分与多路 merge 显式观察范围大小。
-
-#### 网络经常比本地算法更先决定胜负
-
-数据分布决策会改变 Join 的传输量和等待时间，因此相同的本地算法也可能表现出不同的端到端成本。下面列出通信路径的分析维度；它们量纲不同、阶段可能重叠，并非可直接相加的时延公式：
-
-```text
-communication_path:
-  partition_or_range_cpu
-  serialization
-  compression
-  bytes_on_wire
-  receiver_deserialization
-  backpressure
-  straggler_wait
-```
-
-Broadcast 的成本不是 `build_bytes`，而接近 `build_bytes * receiver_count`；Hash Shuffle 与 Range Shuffle 都要发送两侧数据，但 range boundary 的采样与全局顺序可能为下游带来收益。
-
-这也是为什么在 Trino、Doris 一类系统中，“Broadcast 还是 Partitioned”往往比“Hash 还是 Merge”更重要。
-
-#### Hardware Profile 会移动边界
-
-Hash 与 Sort 对随机访问、顺序带宽和 SIMD 的依赖不同，更换硬件会改变常数项而不是改写算法复杂度。
-
-Hash 热路径依赖：
-
-- hash instruction throughput；
-- random access latency；
-- cache/TLB miss；
-- prefetch 效果；
-- load factor 与冲突处理；
-- NUMA placement；
-- probe branch predictability。
-
-Sort/Merge 热路径依赖：
-
-- comparator/key normalization；
-- SIMD sorting network/radix sort；
-- sequential bandwidth；
-- merge fan-in；
-- materialization bytes；
-- storage read/write bandwidth。
-
-同一套常数不能跨 CPU 代际、DRAM/CXL/NVMe、压缩格式和向量宽度长期有效。Cost Model 应绑定 hardware profile，并通过微基准周期性重校准。
-
-### 成本表示的缺口：从资源分项到风险
-
-保留资源分项有助于诊断和校准，但不等于模型已经表达了内存超限或尾延迟风险。源码中的折算位置与论文中的不确定性模型需要分开讨论。
-
-#### 为什么一个数字不够
-
-优化器最后需要排序 Candidate，但不意味着分析时只能观察一个标量。把五个系统的成本表示拉出来看，它们恰好构成了一个谱系：分歧不在“要不要分项”，而在“分项在哪一步被折叠，以及折叠前能不能被利用”。
-
-Trino 的 `LocalCostEstimate` 是三维结构：
-
-```java
-private final double cpuCost;
-private final double maxMemory;
-private final double networkCost;
-```
-
-它向上汇总为 `PlanCostEstimate` 时还会带上 `inputDataSize`。真正的比较发生在 `CostComparator.compare`：它先用 `checkArgument(!left.hasUnknownComponents() && !right.hasUnknownComponents(), "cannot compare unknown costs")` 拒绝比较任一维度未知的候选，然后才做加权求和：
-
-```java
-double leftCost = left.getCpuCost() * cpuWeight
-        + left.getMaxMemory() * memoryWeight
-        + left.getNetworkCost() * networkWeight;
-```
-
-其中 `checkArgument` 那一步是 §2.2 “先做可行性过滤”的另一种形式——**维度缺失时不要用一个编出来的标量继续比较**。源码见 [LocalCostEstimate](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/cost/LocalCostEstimate.java#L33-L35) 与 [CostComparator.compare](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/cost/CostComparator.java#L54-L71)。
-
-`compare` 里还有一条比实现更能说明问题的 TODO：
-
-```java
-// TODO when one left.getMaxMemory() and right.getMaxMemory() exceeds query memory limit
-//      * configurable safety margin, choose the plan with lower memory usage
-```
-
-翻译过来就是：当某个候选的 `maxMemory` 超过查询内存上限乘以一个安全边距时，应当直接选内存更低的那个，而不是继续比加权和。这与 §5.2 讨论的风险问题相关，但硬性内存约束不等于其中的期望惩罚评分，也是 §4.3 “内存不足是相变而不是线性惩罚”的直接推论：加权和允许一个内存超限但 CPU 很便宜的计划胜出，而它实际上会 spill 或失败。Trino 把这件事写成 TODO 而不是已实现，恰好说明**维度保留下来了，并不等于风险建模已经跟上**。
-
-Doris 的 `Cost` 同样是三维（`cpuCost`/`memoryCost`/`networkCost`），但它在构造函数里就立即折成了标量：
-
-```java
-CostWeight costWeight = CostWeight.get(sessionVariable);
-this.cost = costWeight.cpuWeight * cpuCost + costWeight.memoryWeight * memoryCost
-        + costWeight.networkWeight * networkCost;
-```
-
-三个权重分别来自 `cbo_cpu_weight`、`cbo_mem_weight` 与 `cbo_net_weight` 会话变量。也就是说，本文后面当作示意公式写出的 `score = w_cpu * cpu + w_mem * memory + ...`，在 Doris 里就是一次生产代码的构造调用。分项虽然作为字段保留下来并有 getter，但参与排序的是那个 `cost`。源码见 [Doris Cost](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/Cost.java#L31-L52)。
-
-把 Trino 与 Doris 并置，才能看出真正的差别：两者都是三维，分歧在于**折叠发生在哪一步**。Doris 在构造函数里就把分项折成 `cost`，调用方拿到对象时分项已经混在一起；Trino 则把分项一路传递到 comparator 才折叠，因此它能按 session 调整权重，也能在比较前看到完整分项。这也解释了为什么 Trino 能在 `compare` 里留下那条关于内存上限的 TODO——它至少还看得到 `maxMemory`。
-
-TiDB 的 `CostVer2` 则把分项彻底移出了成本值本身：
-
-```go
-type CostVer2 struct {
-    cost  float64
-    trace *CostTrace
-}
-
-// CostTrace record the basic factor and formula in cost est.
-type CostTrace struct {
-    factorCosts map[string]float64 // map[factorName]cost, used to calibrate the cost model
-    formula     string             // It used to trace the cost calculation.
-}
-```
-
-参与比较的仍是一个 `float64`；分项存在 `trace.factorCosts` 里，按 factor 名（`cpuFactor`、`memFactor`、`netFactor`、`scanFactor`、`requestFactor`）累加，另有一条供 `EXPLAIN ANALYZE` 输出的可读 `formula`（如 `hashmem(rows*size*factor)`）。源码注释把用途写得很直接：`used to calibrate the cost model`。这里的职责区分是：**分项不改善本次选择，它改善的是下一次校准**，而这恰好就是 §3.2 所说“把结构化运行指标反馈回 crossover 判断”的优化器侧入口。源码见 [CostVer2 与 CostTrace](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/util/costusage/cost_misc.go#L49-L68)。
-
-剩下两个系统用标量，但各自用不同方式补回标量丢掉的约束。OceanBase 的所有 `cost_*` 函数都把结果写回一个 `double &cost` 输出参数，细分体现在**函数入口的分支**（§3.3 的六种 Sort）而不是输出的维度上。CockroachDB 的 `memo.Cost` 主体也是标量 `C float64`，但比较函数 `Less` 是字典序的：
-
-```go
-func (c Cost) Less(other Cost) bool {
-    if c.Penalties != other.Penalties {
-        return c.Penalties < other.Penalties   // 先比位掩码
-    }
-    const ulpTolerance = 1000
-    return math.Float64bits(c.C)+ulpTolerance <= math.Float64bits(other.C)
-}
-```
-
-`Penalties` 是一个 `uint8` 位掩码，`HugeCostPenalty`（被 hint 强制）、`FullScanPenalty`、`UnboundedCardinalityPenalty` 等按位从高到低排列。只要两个候选的掩码不同，标量 `C` 根本不参与比较。这又是 §2.2 的一种实现：与其给不可行候选算一个极大 cost，不如把它们放到一个独立的、优先级更高的比较层级。它还用 ULP（units of least precision）而非固定 epsilon 处理浮点相等，因为允许的误差应当与数量级成正比。源码见 [memo.Cost 与 Less](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/memo/cost.go#L17-L58)。
-
-把这五种形态与 Hash/Sort 决策所需的信息放在一起，才能看出真正的缺口在哪：
-
-```text
-CostVector {
-    startup_ns              <- 五个系统均无
-    total_cpu_ns            <- cpuCost / cpuFactor
-    io_read_bytes           <- scanFactor（仅 TiDB 区分）
-    io_write_bytes          <- 五个系统均无
-    network_bytes           <- networkCost / netFactor
-    peak_memory_bytes       <- maxMemory / memoryCost / memFactor
-    expected_spill_bytes    <- 五个系统均无
-    expected_spill_rounds   <- 五个系统均无
-    output_property_value   <- 五个系统均无（Ordering 收益不在成本里）
-    confidence              <- 五个系统均无
-}
-```
-
-这张对照表比抽象出一个理想模型更有用：Trino、Doris、TiDB 已经证明分项表示是可行的工程实践，但它们的维度集中在 cpu/mem/net 这类**已经发生的资源消耗**；而 Hash/Sort crossover 真正需要的 `spill_bytes`、`spill_rounds`、`output_property_value` 和 `confidence` 恰好都不在里面。§3.2 提到的断层在这里得到印证：执行器已经统计出 spill round 与每轮字节数，成本表示却没有对应的维度去承接它们。
-
-如果把不同维度折算成标量，其关系可以示意为：
-
-```text
-score
-  = w_startup * startup
-  + w_cpu     * cpu
-  + w_io      * io
-  + w_net     * network
-  + w_mem     * memory_pressure
-  + w_tail    * tail_risk
-  - w_prop    * downstream_property_benefit
-```
-
-这两种表达方式揭示了一个区别：标量负责给候选排序，分项成本负责解释排序。在分析错误计划时，只有保留分项视角，才能区分 `build_bytes` 误估、spill 曲线失真、Ordering 收益漏算和网络成本偏差。对照上面那张表可以看到，真正的差距不在“要不要分项”，而在“分项里少了哪几维”：把 spill 与属性收益纳入同一套表示，才是让 crossover 可解释的前提。
-
-#### 用期望惩罚表达不确定性
-
-真实基数与资源状态具有不确定性，但现有优化器未必显式维护概率分布。若研究中能够估计这种分布，便可用期望成本与尾部损失比较候选；这里是分析假设，不是统一方案设计。设 `s` 为运行时真实状态，候选计划为 `p`：
-
-```text
-ExpectedCost(p) = E_s[Cost(p, s)]
-
-Penalty(p, s) = Cost(p, s) - min_q Cost(q, s)
-
-RiskAwareScore(p)
-  = E_s[Cost(p, s)]
-  + lambda * TailRisk(Penalty(p, s))
-```
-
-这里的 `TailRisk` 是研究问题的抽象表达，并不意味着前述五个系统已经实现了相同的风险评分。P95/P99 penalty、CVaR 或超过 SLA 的概率分别代表不同的目标；它们共同提醒我们，一个平均值略好但一旦 spill 就慢十倍的 Hash Plan，未必适合高并发或延迟敏感场景。
-
-2024 年的 PARQO 把鲁棒计划选择定义为基于选择率误差分布的 expected penalty，并使用敏感性分析降低参数维数。这与 Hash/Sort crossover 非常契合：无需为所有统计量构造高维分布，只需优先分析最敏感的几个维度，例如 build bytes、heavy hitter ratio 与可用内存。论文见 [PARQO: Penalty-Aware Robust Plan Selection in Query Optimization](https://www.vldb.org/pvldb/vol17/p4627-xiu.pdf)。
-
-#### 优化目标应该看 ranking 和 regret
-
-对候选选型而言，排序正确性比绝对成本拟合更直接；若模型还服务资源分配或 SLO 预测，绝对误差仍然重要。本文用以下指标评价选型：
-
-```text
-pairwise_accuracy
-  = P(score(chosen) < score(alternative)
-      agrees with runtime ordering)
-
-regret
-  = runtime(chosen) / runtime(best_candidate)
-```
-
-`MAPE(cost, runtime)` 可以很低，仍然可能在 crossover 附近频繁选错；反过来，绝对成本偏差很大，只要候选排序正确，也能产生好计划。2023 年 Lero 的核心观点正是：直接学习计划的 pairwise ranking，往往比回归绝对 latency 更贴近优化目标。论文见 [Lero: A Learning-to-Rank Query Optimizer](https://www.vldb.org/pvldb/vol16/p1466-zhu.pdf)。
-
-从这些研究可以得到一个更审慎的判断：学习模型能够改善候选排序，却不能消除语义、物理属性和内存可行性的约束。它究竟应承担成本校正、候选重排还是更大范围的搜索责任，仍取决于训练数据、候选覆盖率和失效边界，不能仅凭预测精度下结论。
-
-### 运行时自适应：不要把“切换算法”理解为重启算子
-
-运行时调整只有在能保持已完成工作和输出语义时才有收益。切换位置决定了可复用状态、额外物化以及重复或遗漏结果的风险。
-
-#### 三种安全的 adaptive barrier
-
-并不是任何时刻都适合从 Hash 切到 Sort。Hash Table 建了一半后直接丢弃并重排两侧，通常会浪费大量工作。更可行的边界是：
-
-1. **Operator 内部分区边界**：只对尚未处理或无法收敛的 spill partition 切换；
-2. **Pipeline/Stage 边界**：Shuffle 已物化后，用真实 rows/bytes/NDV 重新选择下一阶段；
-3. **重复查询边界**：保留结构化运行画像，下一次编译调整策略。
-
-```text
-Plan Time
-  candidate generation
-    -> initial plan + alternatives metadata
-
-Run Time
-  build/sample/shuffle
-    -> observe rows, bytes, skew, memory
-      -> continue
-      -> repartition/spill
-      -> per-partition Hash -> Sort-Merge
-      -> next-stage reoptimize
-
-Feedback Time
-  profile by plan signature + data epoch + hardware class
-```
-
-#### 运行时需要观察什么
-
-仅记录 rows 无法区分行宽、倾斜和分区不收敛，需要联合观察状态与数据移动。下列指标用于分析机制，不代表每个系统已经完整暴露了这些 telemetry：
-
-| 维度 | 指标 | 用途 |
-|---|---|---|
-| 输入 | actual rows/bytes/row width | 修正 cardinality 与 materialization |
-| Key | NDV、Top-K、NULL ratio、max frequency | 预测 Hash collision、长链与 skew |
-| Hash | table bytes、load factor、probe count、chain length | 校准 build/probe 成本 |
-| Spill | trigger bytes、partition count、rounds、read/write bytes | 学习内存曲线与失败模式 |
-| Sort | run count、merge passes、compare/key-normalize time | 校准内排/外排边界 |
-| Network | send/receive bytes、compression ratio、straggler | 校准 distribution 代价 |
-| Property | input/output ordering、reused-by operators | 衡量 Ordering 实际收益 |
-
-这些指标的可比性依赖逻辑表达式、数据版本/分区和 hardware profile。只按 SQL 文本比较运行画像，容易把参数变化、数据演化和硬件差异混在一起，从而把资源变化误判为算法优劣。
-
-#### 从外部 Hash Join 观察降级路径
-
-前述 CockroachDB 外部 Hash Join 的实现展示了一种分区级退路：先尝试分区和恢复 Hash；当递归分区无法继续缩小工作集时，改用外排和 Merge Join。下面只概括这条执行路径，不是跨项目通用状态机，也不表示 TiDB、Trino 或 Doris 具备相同的 Hash-to-Merge fallback。
-
-```text
-                 +----------------------+
-                 | IN_MEMORY_HASH_BUILD |
-                 +----------+-----------+
-                            |
-                 memory pressure / skew
-                            v
-                 +----------------------+
-                 | PARTITION_AND_SPILL  |
-                 +----------+-----------+
-                            |
-             +--------------+---------------+
-             |                              |
-       partition fits              no progress / too many rounds
-             v                              v
-    +------------------+          +---------------------+
-    | REBUILD_AND_PROBE|          | SORT_PARTITION_PAIR |
-    +------------------+          +----------+----------+
-                                             |
-                                             v
-                                  +---------------------+
-                                  | MERGE_JOIN_PARTITION|
-                                  +---------------------+
-```
-
-阅读这类路径时，关键不只是能否切换，而是如何维持执行不变量：
-
-- 只在语义等价的候选间切换；
-- 已输出结果不能重复或遗漏，Outer/Semi/Anti Join 尤其需要匹配状态；
-- 切换依据必须包含“继续 Hash 是否有进展”，而不是只看内存超限；
-- spill round 和重试是否有终止条件，否则自适应本身可能成为抖动源；
-- 切换原因是否可观测，否则难以区分统计错误、资源压力和分区不收敛。
-
-#### 资源自适应比算法自适应更基础
-
-如果多个算子都把内存视为固定配额，单算子即使能 spill，也可能发生集体抖动。2025 年 CIDR 的 Paged Memory Management 工作把 Sort、Aggregate、Hash Table 等 stateful operator 的 scratch space 放到统一 page 管理下，探索按成本动态转移内存和 query context switch。它的意义在于：Hash/Sort crossover 本身依赖 `M`，而 `M` 应当是一个可被调度的运行时资源。见 [Resource-Adaptive Query Execution with Paged Memory Management](https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf)。
-
-## 学术界的演进：问题从算法胜负走向鲁棒执行
-
-论文结论随存储介质、数据布局和完整查询环境变化，不能按年份累积成某个算法的永久优势。以下按实验所解决的约束组织研究。
-
-### 经典阶段：外存模型与参数化选择
-
-Graefe 在 1993 年的综述系统化整理了 Sort、Hash、Hybrid Hash、Merge 与磁盘 I/O 的关系。经典外存模型建立了今天仍然有效的框架：内存大小决定 run/partition 数，溢写轮数决定 I/O；但当时的主要瓶颈仍以磁盘页和顺序/随机 I/O 为中心。见 [Query Evaluation Techniques for Large Databases](https://doi.org/10.1145/152610.152611)。
-
-1992 年 Parametric Query Optimization 已经认识到 buffer size 等参数在优化时可能未知：与其只产出一个点最优计划，不如求一组在不同参数区域最优的计划。见 [Parametric Query Optimization](https://www.vldb.org/dblp/db/conf/vldb/IoannidisNSS92.html)。这可以直接映射到今天的 Hash/Sort 问题：为 memory、build bytes、skew 构造少量决策区域，而不是用单一阈值。
-
-1998 年的 Mid-Query Re-Optimization 则讨论如何在执行中检测次优计划并纠正。见 [Efficient Mid-Query Re-Optimization of Sub-Optimal Query Execution Plans](https://www.vldb.org/dblp/db/conf/sigmod/KabraD98.html)。现代 stage-level AQE 延续了同一思想，只是 barrier 从 materialization point 扩展到了 Shuffle、pipeline 和 spill partition。
-
-### 多核阶段：硬件改变常数，但没有宣布永久胜者
-
-2009 年 Kim 等人同时高度优化 Hash Join 与 Sort-Merge Join。他们当时测得 Hash 更快，但分析认为更宽 SIMD 与更低的单核内存带宽可能让 Sort-Merge 获得优势。见 [Sort vs. Hash Revisited: Fast Join Implementation on Modern Multi-Core CPUs](https://www.vldb.org/pvldb/vol2/vldb09-257.pdf)。
-
-2013 年 Balkesen 等人在共同平台重新实现并对比多种算法，结论是 Radix Hash 在大多数测试中仍更快，Sort-Merge 只在非常大的输入上接近；输入规模、并行度（Degree of Parallelism）、NUMA、skew 和实现细节都会改变结论。见 [Multi-Core, Main-Memory Joins: Sort vs. Hash Revisited](https://www.vldb.org/pvldb/vol7/p85-balkesen.pdf)。
-
-两篇论文并不矛盾。它们共同证明：**crossover 会随硬件和实现移动，论文中的胜负不能直接固化成优化器规则。**
-
-### 真实系统阶段：最漂亮的微基准未必是最好默认值
-
-2021 年 Bandle、Giceva 与 Neumann 把 Radix Join 集成到 Umbra，并与优化的 Non-partitioned Hash Join 比较。虽然 Radix Join 在窄 payload、单 Join 微基准上很强，TPC-H 中对最终不会命中的 tuple 做 partition/materialization 的成本却经常抵消收益；加入 Bloom Filter 后改善明显，但 Non-partitioned Hash Join 仍更稳定。见 [To Partition, or Not to Partition, That is the Join Question in a Real System](https://db.in.tum.de/~bandle/papers/bandle-partitionVsNonPartition.pdf)。
-
-这项工作对策略选择有三个直接启发：
-
-1. benchmark 必须覆盖完整 pipeline，而非只测 kernel throughput；
-2. join selectivity 与 payload width 是一等变量；
-3. 默认算法应优化“稳定表现”，专用算法只在可判定区域启用。
-
-### 鲁棒性阶段：优化 Hash 内部结构，也改变选择边界
-
-2024 年的 Unchained Hash Table 将 build-side partitioning、adjacency array、pipelined probes、Bloom Filter 与 software write-combine buffer 组合起来，目标不是某个单点最快，而是同时应对选择性 probe、重复键、并行 build 和 skew。论文报告其在关系查询上平均优于 open addressing，并在含大量重复的图查询上显著改善。见 [Simple, Efficient, and Robust Hash Tables for Join Processing](https://db.in.tum.de/~birler/papers/hashtable.pdf)。
-
-同年 CIDR 的 Perfect Hashing 研究在真实 OLAP 系统中评估 PHF，报告 Join 与 Aggregate 的端到端收益，同时指出 build time 与 probe throughput 仍需共同优化。见 [Is Perfect Hashing Practical for OLAP Systems?](https://www.vldb.org/cidrdb/2024/is-perfect-hashing-practical-for-olap-systems.html)。
-
-这两项进展说明：优化器的 `HASH` 不应永远指向一个实现。内部还可选择：
-
-```text
-generic hash table
-open addressing
-chaining / adjacency layout
-radix partitioned hash
-perfect/direct hash
-skew-specialized partition
-```
-
-如果执行器具备多种 Hash Table，外层 Hash-vs-Sort 模型就必须先知道“Hash 的哪个实现”参与比较。
-
-### 2025-2026：决策继续下沉到运行时和内存层级
-
-2025 年 Adaptive Factorization 工作把因子化（Factorization）聚合与 Worst-case Optimal Join 集成到 DuckDB，并把是否启用的决定推迟到运行时：Hash build 阶段顺便构造轻量 sketch，再由启发式或模型判断是否值得避免中间结果展开。见 [Adaptive Factorization Using Linear-Chained Hash Tables](https://www.vldb.org/cidrdb/papers/2025/p21-gro.pdf)。它提示我们：**build phase 不只是不可撤销的成本，也可以是低成本采样点。**
-
-2026 年 CIDR 的 CXL Hash Join 研究进一步把问题从“在哪执行”推进到“哪些数据值得移动”：将全部 CXL 数据搬到 DRAM-interleaved tier 并非总是最优，部分搬移可能以更少数据移动获得更均衡的带宽。见 [Hash Joins Meet CXL: A Fresh Look](https://www.vldb.org/cidrdb/2026/hash-joins-meet-cxl-a-fresh-look.html)。
-
-截至 2026 年，研究路线已经从：
-
-```text
-Hash vs Sort
-    -> partitioned vs non-partitioned Hash
-    -> hash-table layout / filter / factorization
-    -> robust plan under estimation error
-    -> adaptive memory and heterogeneous memory placement
-```
-
-这不是说 Sort 不再重要，而是说明“算法选择”的粒度不断细化，运行时状态与数据移动正成为第一公民。
-
-## 如何验证：实验条件、反例与开放问题
-
-### 如何阅读实验：从 crossover point 到 crossover surface
-
-实验需要同时覆盖算法内核与完整查询，否则可能把物化、交换或排序复用的成本排除在外。可比性应先于速度排名。
-
-#### 单条曲线遗漏了哪些变量
-
-单条输入规模曲线不足以定位 Hash/Sort 的适用边界，因为内存预算、行宽和已有排序可以独立改变最优路径。外推论文或 benchmark 时，应检查下列维度是否被覆盖。表中的范围用于说明可能的负载跨度，不是一份产品实施或验收清单：
-
-| 维度 | 典型变化范围 |
-|---|---|
-| Build rows | `10^3` 到 `10^9`，对数采样 |
-| Probe/build ratio | `1`, `4`, `16`, `64`, `256` |
-| Row width | `8B`, `32B`, `128B`, `512B`, 变长字符串 |
-| NDV/build rows | `1.0`, `0.5`, `0.1`, `0.01` |
-| Skew | uniform；Zipf 多档；单 heavy hitter |
-| Selectivity | `0%`, `1%`, `10%`, `100%` |
-| Memory/input bytes | `0.1`, `0.25`, `0.5`, `1`, `2` |
-| Ordering | none；单侧；双侧；prefix；reverse |
-| Distribution | colocated；broadcast；hash/range shuffle |
-| Concurrency | 单查询到内存/带宽饱和 |
-| Hardware | CPU/SIMD/NUMA、DRAM、NVMe、CXL class |
-
-“数据量 - 时间”二维曲线只能展示其余条件固定时的一个切片。更完整的研究对象是条件区域：
-
-```text
-best_strategy
-  = f(build_bytes,
-      probe_bytes,
-      memory_ratio,
-      skew,
-      selectivity,
-      existing_order,
-      network,
-      concurrency,
-      hardware)
-```
-
-#### 三层 Benchmark 回答不同问题
-
-Kernel、Operator 和 Query 实验分别隔离常数项、算子状态和上下游组合，三者不能互相替代。
-
-**Kernel 层**验证实现常数：
-
-- hash key、insert、probe throughput；
-- sort key normalization、run generation、merge throughput；
-- 不同 Hash Table layout 的 collision/duplicate 行为。
-
-**Operator 层**验证资源曲线：
-
-- 首行/总耗时；
-- peak memory；
-- spill bytes/rounds；
-- skew 下最慢 partition；
-- Outer/Semi/Anti Join 的额外状态。
-
-**Pipeline/Query 层**验证全局属性收益：
-
-- Join 后继续 Aggregate/Window/ORDER BY；
-- Runtime Filter 是否让 partition work 失去价值；
-- 多 Join 是否产生大中间结果；
-- 并发下内存与 I/O 是否互相干扰。
-
-微基准决定公式中的基础常数，完整查询决定候选是否值得存在。两者不能互相替代。
-
-#### Counterfactual：未被选中的计划如何评价
-
-只记录被选计划，无法知道备选计划会有多快。这也是 cost model 和学习优化器研究中的反事实（Counterfactual）难题：在相同 snapshot 与 resource class 下比较强制候选，才能把算法差异和环境变化尽量分开。
-
-这类比较可以概括为：
-
-```text
-same query + same snapshot + same resource class
-  force hash
-  force merge/sort
-  force broadcast/partitioned
-  vary memory budget
-```
-
-分析结果时值得区分的维度包括：
-
-```text
-chosen_strategy
-best_observed_strategy
-regret
-pairwise_label
-reason_code
-estimated/actual cost vector
-```
-
-这类证据可以帮助研究者区分“候选没生成”“成本排错”“统计错误”和“运行时资源变化”四类问题。但强制执行备选计划也会增加实验成本，且很难完整覆盖生产中的并发与资源状态，因此 counterfactual 数据本身仍有采样偏差。
-
-#### Benchmark 结论的外推边界
-
-缺少缓存、并发与编译条件的实验无法把算法收益和环境收益分开，需要核对：
-
-- warm/cold cache；
-- CPU frequency 与 NUMA binding；
-- 存储队列深度；
-- 并发查询背景流量；
-- 编译/JIT 时间是否计入；
-- materialization 与输出消费；
-- 数据压缩和解码；
-- 是否只测单 Join 而忽略上下游。
-
-否则，所谓 crossover 只是某台机器、某次缓存状态下的偶然点。
-
-### 常见但危险的简化
-
-仅凭复杂度、NDV 或 spill 支持作选型，会遗漏完整路径的约束。以下逐项给出这些判断失效的机制。
-
-#### “Hash 是 O(N)，所以默认 Hash”
-
-忽略了 Hash Table 内存放大、随机访问、spill、skew 与 build side 误判。Hash 可以是很好的默认算法，但默认值来自真实 workload 的稳定性，不是只来自复杂度。
-
-#### “Merge Join 是流式，所以内存总是小”
-
-若输入无序，前置 Sort 本身阻塞且可能外排；重复键组也可能要求缓存。正确比较对象是完整属性路径，不是 Merge 内核。
-
-#### “spillable 等于没有 OOM 风险”
-
-spill 增加了内存不足时继续执行的路径，但不保证一定完成：不可溢写状态、最小工作内存、磁盘空间和恢复缓冲仍可能导致失败。递归分区和磁盘竞争也可能扩大 regret。
-
-#### “NDV 足够表达 skew”
-
-相同 NDV 可以有完全不同的 Top-K 频率。平均分布估计无法预测 hot partition、长 duplicate chain 和 `n:m` expansion。
-
-#### “Cost 预测越准，计划一定越好”
-
-优化器需要的是候选排序。应优先评价 pairwise accuracy、top-k coverage、P95/P99 regret，而不是只看绝对误差。
-
-#### “实现更多算法一定更好”
-
-每增加一种算法，都增加候选生成、属性推导、成本校准、语义测试、spill 与可观测性成本。Trino/Doris 的路线提醒我们：缩小搜索空间也可能是合理设计。新算法应证明它覆盖了现有路径无法稳定处理的区域。
-
-### 调研总结与开放问题
-
-比较算法需要固定语义、输入属性和资源条件；跨算子属性复用、动态内存与恢复成本，使单一阈值难以解释源码中的不同选择。尚待验证的问题包括：
-
-- 当 Ordering 的收益跨越多个算子时，局部成本比较能在多大程度上保留全局优势？
-- 在并发和动态内存分配下，离线测得的 crossover surface 有多少仍然有效？
-- 如何区分“统计误差导致选错”和“执行期间资源变化导致退化”，而不把两者都归因于 cost model？
-- 鲁棒计划是否值得牺牲平均性能，取决于怎样的 SLO、负载分布和 regret 定义？
-- 增加一个备选算法，何时真正扩大了稳定执行区域，何时只是增加搜索和维护成本？
-
-本文不提出跨系统统一实现。继续研究时，应先固定语义、输入属性、资源与版本，再测候选的端到端耗时和失败路径；没有这些条件，单内核加速比不能作为替换算法的依据。风险评分与运行时切换也需要额外的分布假设和状态协议，不能由一个 crossover 阈值替代。
-
-## 参考源码
-
-以下链接均固定到本次阅读的 commit，避免后续主干变更造成行号漂移。
-
-- [CockroachDB - Join exploration rules](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/rules/join.opt#L253-L258)
-- [CockroachDB - Hash/Merge Join cost](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/xform/coster.go#L1062-L1136)
-- [CockroachDB - External Hash Join and Sort-Merge fallback](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/colexec/colexecdisk/external_hash_joiner.go#L24-L138)
-- [CockroachDB - memo.Cost 与分层比较函数 Less](https://github.com/cockroachdb/cockroach/blob/8812064a015d2faf99d3fc7e15880f94042954b0/pkg/sql/opt/memo/cost.go#L17-L58)
-- [TiDB - Physical Merge Join candidate generation](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_merge_join.go#L49-L124)
-- [TiDB - Physical Stream Aggregate candidate generation](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/operator/physicalop/physical_stream_agg.go#L39-L155)
-- [TiDB - Hash/Merge Join cost V2](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/planner/core/plan_cost_ver2.go#L737-L820)
-- [TiDB - Hash Join V2 spill and restore](https://github.com/pingcap/tidb/blob/fe7ae3611c83bdf64c911d496ec0509ef63cb27a/pkg/executor/join/hash_join_v2.go#L654-L767)
-- [OceanBase - Hash/Merge Join cost](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L285-L430)
-- [OceanBase - Sort cost variants](https://github.com/oceanbase/oceanbase/blob/ae69064f9b3f9424997a92934978a14ad5e097ce/src/sql/optimizer/ob_opt_est_cost_model.cpp#L510-L576)
-- [Trino - Join distribution selection](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/DetermineJoinDistributionType.java#L80-L169)
-- [Trino - LocalCostEstimate 的三维成本结构](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/cost/LocalCostEstimate.java#L33-L35)
-- [Trino - Spilling Join execution](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/operator/join/spilling/SpillingJoinProcessor.java#L47-L155)
-- [Apache Doris - Hash Join and Sort cost](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/CostModel.java#L257-L444)
-- [Apache Doris - Cost 的三维结构与加权折算](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/cost/Cost.java#L31-L52)
-- [Apache Doris - Partitioned Hash Join spill path](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/pipeline/pipeline_fragment_context.cpp#L1761-L1810)
-
-## 参考论文
-
-论文中的实验条件决定结论适用范围，以下文献分别研究成本、实现和鲁棒性，不构成跨系统直接性能排名。
-
-- Goetz Graefe, 1993, [Query Evaluation Techniques for Large Databases](https://doi.org/10.1145/152610.152611)
-- Yannis E. Ioannidis et al., 1992, [Parametric Query Optimization](https://www.vldb.org/dblp/db/conf/vldb/IoannidisNSS92.html)
-- Navin Kabra, David J. DeWitt, 1998, [Efficient Mid-Query Re-Optimization of Sub-Optimal Query Execution Plans](https://www.vldb.org/dblp/db/conf/sigmod/KabraD98.html)
-- Changkyu Kim et al., 2009, [Sort vs. Hash Revisited: Fast Join Implementation on Modern Multi-Core CPUs](https://www.vldb.org/pvldb/vol2/vldb09-257.pdf)
-- Cagri Balkesen et al., 2013, [Multi-Core, Main-Memory Joins: Sort vs. Hash Revisited](https://www.vldb.org/pvldb/vol7/p85-balkesen.pdf)
-- Maximilian Bandle et al., 2021, [To Partition, or Not to Partition, That is the Join Question in a Real System](https://db.in.tum.de/~bandle/papers/bandle-partitionVsNonPartition.pdf)
-- Rong Zhu et al., 2023, [Lero: A Learning-to-Rank Query Optimizer](https://www.vldb.org/pvldb/vol16/p1466-zhu.pdf)
-- Altan Birler et al., 2024, [Simple, Efficient, and Robust Hash Tables for Join Processing](https://db.in.tum.de/~birler/papers/hashtable.pdf)
-- Haibo Xiu et al., 2024, [PARQO: Penalty-Aware Robust Plan Selection in Query Optimization](https://www.vldb.org/pvldb/vol17/p4627-xiu.pdf)
-- Kevin P. Gaffney, Jignesh M. Patel, 2024, [Is Perfect Hashing Practical for OLAP Systems?](https://www.vldb.org/cidrdb/2024/is-perfect-hashing-practical-for-olap-systems.html)
-- Riki Otaki et al., 2025, [Resource-Adaptive Query Execution with Paged Memory Management](https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf)
-- Paul Groß et al., 2025, [Adaptive Factorization Using Linear-Chained Hash Tables](https://www.vldb.org/cidrdb/papers/2025/p21-gro.pdf)
-- Wentao Huang et al., 2026, [Hash Joins Meet CXL: A Fresh Look](https://www.vldb.org/cidrdb/2026/hash-joins-meet-cxl-a-fresh-look.html)
-
-## 站内相关文章
-
-本文讨论“选 Hash 还是选 Sort”，以下几篇分别从算子内部实现、优化器机制与资源维度补齐上下文：
-
-- [深入 Hash Join：从内存哈希表（Hash Table）到分区 Spill]({{< relref "2026-08-26-dive-hash-join.md" >}})：本文 §4.3 把 spill 当成一个相变点讨论，那篇把相变前后的哈希表结构与分区恢复拆开细看。
-- [Hash Join 主文 Spark 附录]({{< relref "2026-08-26-dive-hash-join.md" >}}#spark-hash-join)：JoinSelection / HashedRelation / AQE / Spill 边界，可与本文 §3.6 对照。
-- [深入 Calcite VolcanoPlanner：Cost 账本、两种 RuleDriver 与 Trait Enforcement]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}})：本文 §2.3 说“Ordering 是可消费的物理属性”，那篇回答这个属性在 Cascades 搜索里到底如何被强制与传播。
-- [查询并行度的三次决策：从初始分区到 AQE 与历史反馈（History-Based Feedback）]({{< relref "2026-09-12-dive-dop.md" >}})：本文 §6.1 把 stage 边界列为一种 adaptive barrier，那篇讨论在这些边界上还能调什么。
-- [从芯片到数据中心：2026 AI Infra 与现代系统技术雷达]({{< relref "2026-09-10-system-ai-infra-hardware-distributed-systems.md" >}})：本文 §4.6 提到硬件会移动 crossover 边界，那篇把 CXL、带宽层级这些变量放到更大的图里。
+1. Yannis E. Ioannidis et al., *Parametric Query Optimization*, [VLDB 1992](https://www.vldb.org/dblp/db/conf/vldb/IoannidisNSS92.html).
+2. Goetz Graefe, *Query Evaluation Techniques for Large Databases*, [ACM Computing Surveys 1993](https://doi.org/10.1145/152610.152611).
+3. Navin Kabra, David J. DeWitt, *Efficient Mid-Query Re-Optimization of Sub-Optimal Query Execution Plans*, [SIGMOD 1998](https://www.vldb.org/dblp/db/conf/sigmod/KabraD98.html).
+4. Changkyu Kim et al., *Sort vs. Hash Revisited: Fast Join Implementation on Modern Multi-Core CPUs*, [PVLDB 2009](https://www.vldb.org/pvldb/vol2/vldb09-257.pdf).
+5. Cagri Balkesen et al., *Multi-Core, Main-Memory Joins: Sort vs. Hash Revisited*, [PVLDB 2013](https://www.vldb.org/pvldb/vol7/p85-balkesen.pdf).
+6. Maximilian Bandle, Jana Giceva, Thomas Neumann, *To Partition, or Not to Partition, That is the Join Question in a Real System*, [SIGMOD 2021](https://db.in.tum.de/~bandle/papers/bandle-partitionVsNonPartition.pdf).
+7. Rong Zhu et al., *Lero: A Learning-to-Rank Query Optimizer*, [PVLDB 2023](https://www.vldb.org/pvldb/vol16/p1466-zhu.pdf).
+8. Altan Birler, Thomas Neumann, Viktor Leis, *Simple, Efficient, and Robust Hash Tables for Join Processing*, [DaMoN 2024](https://db.in.tum.de/~birler/papers/hashtable.pdf).
+9. Haibo Xiu et al., *PARQO: Penalty-Aware Robust Plan Selection in Query Optimization*, [PVLDB 2024](https://www.vldb.org/pvldb/vol17/p4627-xiu.pdf).
+10. Kevin P. Gaffney, Jignesh M. Patel, *Is Perfect Hashing Practical for OLAP Systems?*, [CIDR 2024](https://www.vldb.org/cidrdb/2024/is-perfect-hashing-practical-for-olap-systems.html).
+11. Riki Otaki et al., *Resource-Adaptive Query Execution with Paged Memory Management*, [CIDR 2025](https://www.vldb.org/cidrdb/papers/2025/p2-otaki.pdf).
+12. Paul Groß et al., *Adaptive Factorization Using Linear-Chained Hash Tables*, [CIDR 2025](https://www.vldb.org/cidrdb/papers/2025/p21-gro.pdf).
+13. Wentao Huang et al., *Hash Joins Meet CXL: A Fresh Look*, [CIDR 2026](https://www.vldb.org/cidrdb/2026/hash-joins-meet-cxl-a-fresh-look.html).

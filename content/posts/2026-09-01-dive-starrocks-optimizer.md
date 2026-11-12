@@ -12,570 +12,282 @@ tags:
   - CBO
   - Enforcer
   - Physical Property
-description: "结合 StarRocks 源码，分析 QueryOptimizer 全生命周期、Cascades 任务调度、Property 级联、Enforcer 插入、Join 分发和聚合阶段选型，并澄清 Merge Join 与 Sort Aggregate 的实际决策边界。"
+description: "从分布式 MPP 引擎为什么不能只存“单一最便宜子计划”出发，结合 StarRocks FE 源码剖析 Cascades 协程任务栈、PhysicalPropertySet 级联传导、Exchange/Sort Enforcer 计价闭环，以及 Join 与聚合的真实选型边界。"
 draft: false
+toc: true
+math: true
 ---
 
 > 本系列第 4/4 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
 
-> **与 optd 对照（3–6 行）**  
-> 本篇重点是生产路径上的 **Enforcer / Property 级联 / 分发与聚合选型**。教学骨架（Memo、OptimizeGroup、Winner）见 [optd Cascades]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) 与系列第 1–2 篇；下文默认读者已熟悉这些名词，只展开 StarRocks 在 Required Property 不满足时如何插入 Exchange/Sort 并计入 Cost。
+在[上一篇剖析 optd]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) 的结尾，我们撞上了一道横亘在教学原型与分布式生产内核之间的分水岭：单机原型里每个等价类（`Group`）只需要记住唯一一个最便宜的物理子计划（`Winner`）；可一旦放进多机并行的 MPP 引擎，**“谁是最便宜的子计划”这个问题本身就不再有唯一答案**。
 
-在 Cascades 查询优化器（Query Optimizer）中，物理算子的成本必须连同满足输入要求的成本一起比较。父节点还会要求孩子提供特定的数据分布、排序或 CTE 属性；孩子已有的输出属性如果不能满足要求，优化器必须插入 Exchange 或 Sort，并把这些额外成本计入完整计划。只有把 **Operator、Required Property、Enforcer 与 Cost** 放在一起，所谓“最优物理计划”才有完整含义。
+不妨在白板上算一笔最直观的账。假设查询要先做两表连接，再按列 `b` 做全局分组聚合：
 
-StarRocks 的优化器是一份很适合研究这一问题的生产级实现。它不只用 `Memo / Group / GroupExpression` 保存逻辑等价空间，还以 `PhysicalPropertySet` 为维度记录 Winner，通过显式任务栈完成需求下传、子计划优化、属性推导、Enforcer 插入和代价回传。与较精简的 Cascades 教学实现相比，这条链路更能解释分布式优化器为什么不能只保存“每个 Group 一个最佳计划”。
+```sql
+SELECT b, COUNT(*)
+FROM (
+    SELECT t1.a, t2.b
+    FROM t1 JOIN t2 ON t1.a = t2.a
+) s
+GROUP BY b;
+```
 
-本文沿着 `QueryOptimizer.optimizeByCost()` 的生命周期，重点回答四个问题：
+设想在下层的连接 `Group` 里，有两个合法的物理连接方案：
 
-1. StarRocks 如何调度 Cascades 搜索任务，并在规划超时前持续收紧搜索上界？
-2. Required/Output Property 如何在 Join、Aggregate 与 Scan 之间级联传导？
-3. Exchange 与 Sort Enforcer 在什么时机插入，又如何参与同一个 Cost 闭环？
-4. Join 实现、Join 分发、聚合阶段和 Sort Aggregate 分别在哪一层决策？
+- **方案甲**：算子自身与扫描总代价只要 **`100`**，但吐出的数据在集群中是按 `Hash(a)` 分布的；
+- **方案乙**：利用了某侧分桶布局，算子总代价略贵，需要 **`120`**，但吐出的数据天然就是按 `Hash(b)` 分布的。
 
-## 阅读基线与优化器生命周期
+如果连接 `Group` 只留一个“最便宜擂主”，方案甲（`100`）就会把方案乙（`120`）淘汰出局。可等到上层的 `GROUP BY b` 算子接手时，麻烦来了：做全局分组聚合要求输入数据必须按 `Hash(b)` 落到同一台机器上！面对按 `a` 分布的方案甲，优化器被迫在连接与聚合之间强插算子——做一次跨网重洗牌（Shuffle `Exchange`），额外花掉 **`50`** 的网络与序列化成本，整棵树总账飙升到 `100 + 50 = 150`；反观刚才差点被扔掉的方案乙，因为输出分布直接命中了上层聚合的胃口，一分钱网络税都不用交，总账定格在 **`120 + 0 = 120`**，反败为胜！
 
-### 阅读范围与源码基线
+哪怕连接列与聚合列就是同一个等价键（比如 `t1 JOIN t2 ON t1.a = t2.b` 后紧跟 `GROUP BY t1.a`），下层连接究竟选“广播右表（Broadcast）”还是“双侧重分桶（Shuffle）”，也直接决定了上层聚合能不能白嫖连接吐出的数据分布。
 
-StarRocks 用 `PhysicalPropertySet` 区分同一 Group 的搜索目标，并在候选计价时加入 Enforcer。理解这条主线之后，还需区分默认规则准入、Memo 内竞争和 CBO 后置改写：它们共同决定最终计划，不能全部归因于成本模型。
+看清这笔跨算子的网络账单，分布式 Cascades 优化器的核心设计就呼之欲出了：
 
-#### 源码分析基线
+1. **多维擂台账本**：每个 `Group` 绝不能只存一个最优解，必须以**物理属性集（`PhysicalPropertySet`：数据分布 + 排序顺序 + CTE 作用域）**为键，分桶保存不同物理契约下的最优子计划；
+2. **双向属性传导**：父算子自顶向下提出“我希望孩子满足什么物理属性（`Required Property`）”，子算子自底向上汇报“我实际交付了什么物理属性（`Output Property`）”；
+3. **强制补偿计价（`Enforcer`）**：当子计划交付的属性满足不了父算子要求时，优化器自动插入 `Exchange`（重分布）或 `Sort`（重排序）补偿算子，并把这笔路费一分不少地算进候选总成本里同台比价。
 
-默认规则和代价系数属于版本行为，以下结论仅覆盖该提交；不把源码系数解释为跨硬件通用的性能参数。
+StarRocks FE 的查询优化器把这套机制实现得极为清晰紧凑。下面我们就沿着 `QueryOptimizer.optimizeByCost()` 的完整生命周期，拆解任务栈挂起恢复、属性级联、Enforcer 插入，以及生产排障时最常踩坑的 Join 与聚合选型边界。
 
-| 项目 | 源码快照 | 日期 | 重点范围 |
-|------|----------|------|----------|
-| StarRocks | [0fd27fd](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1) | 2026-03-30 | QueryOptimizer、Memo Task、Property、Enforcer、CostModel、Physical Rewrite |
-| StarRocks 复核快照 | [f977b53](https://github.com/StarRocks/starrocks/tree/f977b53c13eab90425f552675f3b3463ada8b2fc) | 2026-09-22 | 同上，用于 2026-10 复核 |
+---
 
-本文结论对应 0fd27fd 这一确定源码快照；2026-10 在 f977b53 上复核了文中引用的源码位置与关键系数（见下文「2026-10 复核记录」）。StarRocks 仍在快速演进，尤其 Join Implementation Rule 的默认注册集合、代价公式与后置物理规则可能继续变化，不应把本文描述外推为所有版本的固定行为。
+## 一、全局鸟瞰：`optimizeByCost()` 的六阶段流水线与决策边界
 
-#### 2026-10 复核记录
+很多同学第一次排查 StarRocks 的 `EXPLAIN COSTS` 时容易犯一个归因错误：看到最终计划里少了某个 Shuffle，或者多了一个 `SortAgg` 标记，就跑去 `CostModel.java` 里翻代价公式。实际上，CBO 搜索只是整条规划流水线的中间一环，大量计划变形发生在进 Memo 之前或出 Memo 之后。
 
-2026-10-28 在 f977b53（2026-09-22）上复核全文结论。两个快照之间 `fe/fe-core/src/main/java/com/starrocks/sql/optimizer` 有 254 个文件变更（2612 个提交，+15312/−3604 行），本文的机制描述没有被推翻，但有三类结果需要分开写。
-
-**未变（逐处核对源码）**
-
-- `CostModel.getRealCost()` 的权重仍是 0.5 / 2 / 1.5；
-- `HashJoinCostModel` 的 build、probe 结构，以及 `BOTTOM_NUMBER=100000`、`BROADCAST_MAT_RATIO=12`、`SHUFFLE_MAX_RATIO=3`；
-- `visitPhysicalMergeJoin` 的两条代价公式；
-- `addAutoJoinImplementationRule()` 中 Merge Join 仍被注释，Auto 模式仍不产生 Hash Join 与 Merge Join 的直接竞争；
-- `CboTablePruneRule` 的 `< 10` 门槛、`UseSortAGGRule` 的五条准入条件。
-
-**变化（只影响“规则集合随版本变化”这条边界）**
-
-- `memoOptimize` 中 `isMVPlanner()` 分支被删除。0fd27fd 时 MV planner 走 `addRealtimeMVRules()`，现在 join implementation 规则无条件按 `join_implementation_mode` 注册；
-- 规则包重组：`rule/stream/*`（4 个文件，删 190 行）与 `rule/tvr/*`（删 1096 行）被移除，新增 `rule/ivm/*` 的 12 条 delta/version 规则，以及 AI Project、Fluss scan 相关规则；
-- Enforcer 判定改成“只问一次”：`recordCostsAndEnforce` 先算 `satisfyOrderProperty` / `satisfyDistributionProperty`，再把结果传给 `enforceProperty`。原因是 `HashDistributionSpec.isSatisfy()` 会查询 `ColocateTableIndex`，colocate 组状态可能被 `ColocateTableBalancer` 并发改动，前后两次询问可能不一致，让 `enforceProperty` 走到空分支；
-- `canGenerateOneStageAgg` 的 local-shuffle 豁免多了一个条件：`enable_local_shuffle_agg && !enable_query_cache && 单 BE`；
-- 结论：半年内默认注册集合与 Enforcer 判定细节都变过，但 Cascades 搜索、Property 传导、上界剪枝的机制没有改。
-
-**三处精度修正（原文表述过粗）**
-
-1. Shuffle 模式的 cache penalty 不是 `log(mapSize/100000) - log(parallelFactor)`。源码用自然对数减以 2 为底的对数：`ln(mapSize/100000) - log₂(parallelFactor)`，再截断到 `[1, 3]`。
-2. 同一个名字 `parallelFactor` 在 build 与 probe 中不是同一个值：`getCpuCost()` 用 `max(BE+CN, DOP)`，`getAvgProbeCost()` 把它再乘 2。两者不能互相代入。
-3. `mapSize` 不是 `keySize × rightRows`，而是 `min(1, keySize) × rightRows`。`keySize` 是等值键列平均行宽之和；这个 `min(1, …)` 使键非空时 `mapSize` 基本等于右表行数，读公式时不应把它当作“键宽参与缩放”。
-
-### 优化器生命周期总览
-
-逻辑改写、Memo 搜索与物理后处理分别拥有不同的决策权限，不能将最终计划中的所有变化都归因于 CBO。入口 `QueryOptimizer.optimizeByCost()` 组织以下六个阶段：
+入口方法 [`QueryOptimizer.optimizeByCost()`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java) 把一次查询规划严格切成了六个阶段：
 
 ![StarRocks QueryOptimizer.optimizeByCost() 的六个阶段与 Cascades 任务栈](/images/starrocks-optimizer-lifecycle.svg)
 
-*图 1：`optimizeByCost()` 的六个阶段，以及 ③ 内部的任务栈、挂起/恢复与剪枝闭环。颜色区分 RBO、CBO 搜索和 CBO 后处理；右侧栈中 `EnforceAndCostTask` 在孩子尚无最优解时挂起，子 Group 完成后从断点恢复。*
+*图 1：`optimizeByCost()` 的六个阶段（左）与阶段 ③ 内部的任务栈挂起/恢复及剪枝闭环（右）。蓝色为前置确定性改写（RBO），橙色为基于 Memo 的代价搜索（CBO），绿色为提取最优树后的物理后处理。*
 
-#### 关键设计取舍
+为什么要摆出“前 RBO → 中 CBO → 后物理改写”的三段式阵型？核心考量是**把 Memo 的搜索预算花在刀刃上**。
 
-前置规范化压缩搜索空间，也会放弃被不可逆改写掉的备选；StarRocks 将连接顺序（Join Order）等需要成本比较的选择保留在 Memo 中，并按 Join 数量控制搜索范围。
+在阶段 ① `logicalRuleRewrite` 里，谓词下推（Predicate Pushdown）、列裁剪、子查询解关联、分区裁剪与简单单次 CTE 内联等“做了大概率稳赚不赔”的规范化工作被先行消化，力求把送进阶段 ② `memo.init` 的初始逻辑树压到最精简。同时，优化器把全链路所需的输出列集合放进 `TaskContext.requiredColumns` 随任务一路下传。
 
-- **RBO 前置、CBO 收窄**：大部分确定性规范化（谓词下推（Predicate Pushdown）、列裁剪等）在进入 Memo 前完成，让搜索空间尽可能小；需要保留备选的 Join Reorder、物理实现、聚合阶段以及部分 MV 改写继续留在 Memo 中搜索。
-- **`requiredColumns` 全程携带**：列裁剪需求放进 `TaskContext`，贯穿整个搜索。
-- **规则分级装载**（`QueryOptimizer.memoOptimize`）：
-  - join 数 ≥ `cbo_max_reorder_node` → 关闭 CBO reorder；
-  - \> `cbo_max_reorder_node_use_exhaustive` → 贪心 `ReorderJoinRule` + 只加交换律；
-  - 小规模才加交换律 + 结合律穷举；
-  - `CboTablePruneRule` 仅当 join 数 < 10 时注册。
+即便如此，一旦进入阶段 ③ `memoOptimize` 面对十几张表关联的复杂报表，无节制地展开连接交换律和结合律依然会把内存撑爆。因此 `memoOptimize` 在装载规则集时设了明确的分级熔断阀：
 
-## 搜索协议：任务、属性传导与 Enforcer
+- 当连接表数量达到 `cbo_max_reorder_node` 时，干脆关掉 CBO 内的连接重排，完全仰仗前置启发式顺序；
+- 当连接数超过 `cbo_max_reorder_node_use_exhaustive` 时，退化为贪心 `ReorderJoinRule` 加单向交换律，不再做结合律穷举；
+- 只有小规模连接才同时放开交换律与结合律探索完整空间，且外键表裁剪规则 `CboTablePruneRule` 也只在连接数小于 `10` 时挂载；
+- 连接物理实现规则则按会话变量 `join_implementation_mode` 统一装载（早期的 `isMVPlanner()` 特殊分支已在主干移除）。
 
-### Cascades 任务调度框架
+等阶段 ④ `extractBestPlan` 沿着属性指针把胜出的物理树从 Memo 里抽出来，阶段 ⑤ `physicalRuleRewrite` 和阶段 ⑥ `dynamicRewrite` 还会做最后一轮“局部外科手术”——比如给满足底层存储有序性的单阶段聚合打上流式 `SortAgg` 标记、把全局单点排序拆成两阶段归并排序、裁剪冗余 Shuffle，最后交由 `PlanFragmentBuilder` 切成跨节点并行执行的 Fragment。
 
-同一 Group 可以因父节点要求不同而被多次优化，任务上下文必须携带属性和代价上界。显式栈负责保存尚未完成的父任务，避免把孩子的未完成状态误当成失败。
+---
 
-#### 数据结构
+## 二、显式任务栈与协程挂起：`EnforceAndCostTask` 如何把上下界拧成闭环
 
-Group 保存按属性区分的最优结果，GroupExpression 保存具体候选及其输入属性组合；这种拆分使计划提取能够重建当时参与计价的子计划。
+走进最核心的阶段 ③ `memoOptimize`，我们先看清 StarRocks 在内存里搭起的五张核心状态表：
 
-| 结构 | 职责 |
-|---|---|
-| `Memo` | Group 集合 + 表达式去重（`copyIn`）+ enforcer 注册表（`insertEnforceExpression`） |
-| `Group` | 逻辑等价类；`lowestCostExpressions: Map<PhysicalPropertySet, (cost, GroupExpression)>` 每个 property 维度各记一个最优解；`costLowerBounds` 记代价下界；`statistics` |
-| `GroupExpression` | 一个算子 + 子 Group 指针；记录 `(outputProperty → inputProperties)`、`(property, cost)`、`appliedRules` 位图 |
-| `TaskContext` | `requiredProperty` + `requiredColumns` + `upperBoundCost`（代价上界，初始 `MAX_VALUE`） |
-| `PhysicalPropertySet` | Distribution + Sort + CTE 三元组 |
+| 核心对象 | 承载的搜索状态与职责 |
+| --- | --- |
+| `Memo` | 管理全部 `Group`，负责新表达式结构去重（`copyIn`）与补偿算子登记（`insertEnforceExpression`） |
+| `Group` | 逻辑等价类；核心账本是 `lowestCostExpressions: Map<PhysicalPropertySet, Pair<Double, GroupExpression>>`（按物理属性分桶记录当前最优解）及 `costLowerBounds`（记录各属性下的已知成本下界） |
+| `GroupExpression` | 单个算子加子 `Group` 指针；维护 `(outputProperty → inputProperties)` 映射表（供最终回溯提取子树）、各属性下的计价结果，以及防重入的 `appliedRules` 位图 |
+| `PhysicalPropertySet` | 物理契约三元组：`DistributionProperty`（数据分布）+ `SortProperty`（排序方向与空值位置）+ `CTEProperty`（已消费的 CTE ID 集合） |
+| `TaskContext` | 单次子目标上下文：携带父节点要求的 `requiredProperty`、`requiredColumns` 以及剪枝天花板 `upperBoundCost`（初始为 `Double.MAX_VALUE`） |
 
-#### 五类任务与调用链
+与 `optd` 借用扩栈异步函数递归不同，StarRocks 的 [`TaskScheduler`](https://github.com/StarRocks/starrocks/tree/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/task) 采用了教科书级的显式任务栈 `Stack<OptimizerTask>`：每次从栈顶 `pop` 出一个任务执行前先调 `checkTimeout()` 检查规划超时，彻底杜绝了深层递归爆栈与失控卡死。
 
-`TaskScheduler` 用 `Stack<OptimizerTask>` 做自顶向下深度优先搜索，每弹一个任务调 `checkTimeout()` 防超时：
+栈里流转的五类任务，按后进先出（LIFO）的压栈次序精密配合：
 
 ```text
-OptimizeGroupTask(G, req)
- ├─ 剪枝：costLowerBound(req) >= UB 或 hasBestExpression(req) → return
- ├─ 每个逻辑表达式 → OptimizeExpressionTask      （后压，后执行）
- └─ 每个物理表达式 → EnforceAndCostTask          （先压，先执行）
+OptimizeGroupTask(G, req, UB)
+ ├─ 入口剪枝：若 costLowerBound(req) >= UB 或已存在满足上界的 bestExpr → 直接返回
+ ├─ 压入组内逻辑表达式 → OptimizeExpressionTask       （后出栈：晚展开新空间）
+ └─ 压入组内物理表达式 → EnforceAndCostTask           （先出栈：早算出可行上界！）
         │
-        ├─ RequiredPropertyDeriver → 子节点候选需求组合
-        ├─ 子 Group 尚无 best expr？
-        │    → pushTask(clone())                    ← 把自己挂起在栈里
-        │    → pushTask(OptimizeGroupTask(child, childReq, UB - curTotalCost))
-        │    → return（先优化子树）                  【递归下降】
-        ├─ 子 Group 有 best expr → 累加代价；超上界即放弃
-        ├─ 全部子节点就绪 → ChildOutputPropertyGuarantor + OutputPropertyDeriver
-        └─ recordCostsAndEnforce → 登记 best / 不满足则插 enforcer
+        ├─ RequiredPropertyDeriver 枚举对子节点的候选需求组合
+        ├─ 检查当前子 Group 是否已有对应 childReq 的最优解？
+        │    ├─ 尚无最优解：
+        │    │    1. pushTask(this.clone())            ← 保存当前游标，把自己挂起在栈底
+        │    │    2. pushTask(OptimizeGroupTask(child, childReq, UB - curTotalCost))
+        │    │    3. return                            ← 让出执行权，先去求解子 Group！
+        │    └─ 已有最优解：累加子代价；一旦突破 UB 立即登记下界并放弃当前组合
+        ├─ 全部孩子就绪 → ChildOutputPropertyGuarantor 修正 + OutputPropertyDeriver 推导输出
+        └─ recordCostsAndEnforce → 满足父需求则直接登记；不满足则追加 Enforcer 算入总账后登记
 ```
 
-- `OptimizeExpressionTask`：收集 transform + implement 规则，**按 `rule.promise()` 排序**（implement 规则 promise=2 > transform 规则 promise=1，物理实现先行以尽快建立代价上界）；依次压入 `ApplyRuleTask × N`、`DeriveStatsTask`、每个子 Group 的 `ExploreGroupTask`。
-- `ApplyRuleTask`：Binder 模式匹配 → `rule.check` → `rule.transform` → `memo.copyIn` 去重；`rule.exhausted()` 防死循环/耗时失控；新逻辑表达式压 `OptimizeExpressionTask`，**新物理表达式直接压 `EnforceAndCostTask`**。
-- `DeriveStatsTask`：`StatisticsCalculator` 推导统计，幂等（Idempotency）标记 `isStatsDerived`。
+读懂这张图，有三个工程细节最值得拍案叫绝。
 
-#### "自顶向下"的准确含义
+第一是 **`rule.promise()` 塑造的探路顺序**。当 `OptimizeExpressionTask` 展开一个逻辑表达式时，会同时收集逻辑变换规则（`promise = 1`）和物理实现规则（`promise = 2`）并按优先级排序，确保物理实现规则先跑；而 `ApplyRuleTask` 一旦产出新的物理表达式，绝不傻等下一轮遍历，当场携带当前 `TaskContext` 压入一个 `EnforceAndCostTask`。两招合用，就是要以最快速度打穿一条到底的物理可行路径，把 `upperBoundCost` 从无穷大拉回真实数字，激活后续全图的分支限界（Branch-and-Bound）剪枝。
 
-**需求自顶向下传播，代价自底向上累积**。`EnforceAndCostTask` 通过 `clone()` + 任务栈模拟协程挂起/恢复：栈即调用栈，`curChildIndex / prevChildIndex / curPropertyPairIndex / curTotalCost` 即栈帧。每次挂起时子任务拿到 `UB - curTotalCost`，代价上界沿树逐层收紧——先找到的可行解越好，后续分支被剪得越狠（Branch-and-Bound）。
+第二是 **`EnforceAndCostTask` 手搓的无栈协程（Stackless Coroutine）**。因为 Java 普通方法无法在循环算到第 `i` 个孩子时直接 `yield` 出去等子任务跑完再回来，这个类在成员变量里显式保存了 `curChildIndex`、`prevChildIndex`、`curPropertyPairIndex` 和 `curTotalCost` 四个游标。一旦发现某个子 Group 还没算出 `childReq` 对应的最优解，它就调 `clone()` 把携带当前游标的自己重新压回任务栈，再在头顶压入子 Group 的优化任务（预算收紧为 `UB - curTotalCost`）然后直接返回。等子任务大功告成弹出栈顶，挂起的父任务重见天日，顺着刚才的游标无缝往下累加！
 
-### Property 的生成与级联传导
+第三是**上下界剪枝闭环**。每当一条物理路径顺利算出总成本且低于当前 `UB`，上下文上界就会立刻收紧；反过来，若累加子成本中途超标，或者恢复执行时发现子任务被上界剪得一个解都没吐出来（`childBestExpr == null`），父任务就会调用 `recordLowerBoundCost` 记下“在这个属性要求下，成本至少超过 `UB`”，下次别的分支带着更紧的预算再撞上来时，在 `OptimizeGroupTask` 第一行就会被直接挡回去。
 
-子计划便宜并不足以构成合法父计划，两个输入还必须满足同一算子的分布或排序契约。需求推导、输出推导与兼容性修正分别处理这三个环节。
+---
 
-#### 三个推导器
+## 三、物理属性级联与 Enforcer 账单：从需求下推到并发安全的补偿插入
 
-需求生成与输出验证分开，才能在孩子优化完成后判断是否仍需额外 Exchange。三个推导器的职责如下。
+搞清了任务怎么跑，我们来看最核心的物理属性（Property）是怎么在算子树里上下穿梭的。StarRocks 没有把这摊逻辑散落在几十个算子类里，而是抽出了职责分明的“三驾马车”：
 
-| 类 | 方向 | 职责 |
-|---|---|---|
-| `RequiredPropertyDeriver` | 自顶向下 | 算子"对子节点的需求候选组合"（interesting properties） |
-| `OutputPropertyDeriver` | 自底向上 | 根据子输出 + 算子自身语义推导输出属性 |
-| `ChildOutputPropertyGuarantor` | 横向兜底 | 子输出组合不合法时修正（colocate/bucket-shuffle 转换） |
+- **[`RequiredPropertyDeriver`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/RequiredPropertyDeriver.java)（自顶向下提要求）**：绝不盲目枚举所有属性组合，只根据父节点传下来的 `requirementsFromParent` 和当前算子自身的执行契约，生成有限的几组子需求候选（例如 Hash Join 只提“左任意 + 右广播 `[ANY, BROADCAST]`”与“双侧按等值键哈希 `[hash(leftEq), hash(rightEq)]`”两套方案；Merge Join 在此基础上给两侧额外加上等值列 `SortProperty`；全局 `HashAgg` 按分组列提 `SHUFFLE_AGG`，无分组列则提单点汇聚 `GATHER`）；
+- **[`OutputPropertyDeriver`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/OutputPropertyDeriver.java)（自底向上报实情）**：根据子计划真实交付的属性和算子物理行为推导输出——比如 Broadcast Join 直接继承左表分布（右表只是复制品），Shuffle Join 按主导侧（Inner 取左、Right Outer 取右、Full Outer 取左并打上空值放宽标记）生成 `SHUFFLE_JOIN` 分布，而一旦开启落盘（Spill）或分区连接，就调用 `resetSortProperty` 诚实抹掉原本的有序属性；
+- **`ChildOutputPropertyGuarantor`（横向协同修正）**：等所有孩子都拿到最优解后做最后一轮配对升级——如果发现连接左右两侧都是本地分桶扫描（`LOCAL`）且同属一个 Colocate 组，当场升级为零网络传输的 **Colocate Join**；若左表是 `LOCAL` 而右表需移动，则尝试改造成只搬运右表单侧数据的 **Bucket-Shuffle Join**。
 
-#### Required property 的生成
+为了让下层算子辛苦建立的数据分布尽可能被上层白嫖，`PropertyDeriverBase` 里还埋了两个极聪明的级联对齐机关：
 
-StarRocks **不做任意 property 枚举**，候选来源只有两类：父节点传下来的 `requirementsFromParent` + 算子自身语义的有限候选集。典型规则：
+1. **列序主动对齐**：在多列哈希分布里，`Hash(a, b)` 和 `Hash(b, a)` 算出的分桶号完全不同。如果上层按 `(a, b)` 连接、下层按 `(b, a)` 聚合（或反过来），只要集合相等，`computeShuffleJoinRequiredProperties` 与 `computeAggRequiredShuffleProperties` 就会主动把本层的哈希列顺序拨成和父需求一模一样（外连接场景下还支持 `canRelaxGroupByCols` 空值语义对齐），凭空省掉一层重洗牌。
+2. **等价列并查集（`EquivalentDescriptor`）**：`HashDistributionSpec` 内部挂着一个并查集。每经过一层内连接 `t1.a = t2.b`，左右等值列就会被 `unionDistributionCols` 合并（外连接走 `unionNullRelaxCols`）。这样哪怕下层是按 `t1.a` 分布的，到了上层有人点名要 `Hash(t2.b)` 时，一查并查集发现是一家子，直接放行复用！
 
-| 算子 | 子需求候选 |
-|---|---|
-| Hash Join | 方案A `[ANY, BROADCAST]`；方案B `[hash(leftEq), hash(rightEq)]`（有等值列时）；`JoinHelper.onlyBroadcast/onlyShuffle` 按类型与 hint 裁剪 |
-| Merge Join | 同 Hash Join，但**两侧额外要求按等值列的 SortProperty** |
-| NestLoop Join | `[ANY, BROADCAST]`；right/full outer 双侧 `GATHER` |
-| Hash Agg（GLOBAL） | 无 group by → `GATHER`；有 → `hash(groupBy)` SHUFFLE_AGG；LOCAL → `EMPTY` |
-| Window | `sort(partitionBy+orderBy)` + 按 partition 列分布（无则 GATHER） |
-| Limit / AssertOneRow | `GATHER` |
-| CTE Anchor/NoCTE | 携带 `CTEProperty`（已用 CTE id 集合）做正确性约束 |
+那么，万一子计划吐出来的 `OutputProperty` 还是没能满足父节点的 `RequiredProperty` 怎么办？这就轮到 **Enforcer（属性补偿算子）** 出手收钱了。
 
-两个级联对齐机制（`PropertyDeriverBase`）：
+在 StarRocks 里，Enforcer 没有任何魔法特权，就是实打实的普通物理算子：缺数据分布就由 [`DistributionProperty.appendEnforcers`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/base/DistributionProperty.java) 包一层 `PhysicalDistributionOperator`（落地为 Shuffle / Broadcast / Gather Exchange）；缺有序性就由 [`SortProperty.appendEnforcers`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/base/SortProperty.java) 包一层 `PhysicalTopNOperator`。整套属性协商、满足性判定与多维账本入库的闭环如下：
 
-1. **列序对齐**：`computeShuffleJoinRequiredProperties` 若父需求的 `SHUFFLE_JOIN` 列集与本层等值列相同，按父列序调整本层 shuffle 列——下层分布可被上层直接复用，省一层 exchange。`computeAggRequiredShuffleProperties` 对聚合同理（`shouldAdjustGroupByOrder`），并支持 `canRelaxGroupByCols` 的 null-relax 放宽。
-2. **等价类并查集**：`HashDistributionSpec` 携带 `EquivalentDescriptor`，join 时把等值列做 `unionDistributionCols`（inner）/`unionNullRelaxCols`（outer）。这使得"按 `t1.a` shuffle 的输出"可以满足上层"按 `t2.b` 分布"的需求（当 `t1.a = t2.b` 是连接条件）——**分布属性穿越 join 向上传导**的核心。
+![StarRocks EnforceAndCostTask 物理属性协商与 Enforcer 计价闭环](/images/diagrams/opt-starrocks-property-enforcement.svg)
 
-#### Output property 的推导（`OutputPropertyDeriver`）
+*图 2：`EnforceAndCostTask` 内部的双向物理属性协商——父需求经列序对齐下推、子最优解经并查集与 Colocate 升级回传后，若满足父契约则零补偿直通，否则按序追加 `Distribution` / `Sort` Enforcer 并连同路费一起写入 `lowestCostExpressions`。*
 
-输出属性必须反映算子实际保留的分布和顺序，不能直接沿用父节点的期望。例如 Broadcast Join 可继承未复制侧的分布，而开启 spill 的路径可能需要清除排序属性。
+在 `EnforceAndCostTask` 的收官方法 `recordCostsAndEnforce` 里，补偿算子的插入顺序和并发安全都抠到了极致：
 
-- broadcast join → 输出 = 左孩子属性（右孩子被复制，无分布信息）；
-- shuffle join → 按主导侧（inner 取左、right join 取右、full outer 取左侧的 null-relax 版本）构造 `SHUFFLE_JOIN` 分布 + 等价类合并；
-- OlapScan → `LOCAL` 分布 + 表/分区等价信息（colocate 识别基础）；
-- Hash Agg / Project / Filter / Limit → 透传子属性；
-- TopN(FINAL) → 输出 SortProperty（+ split 时 GATHER）；
-- spill / partition join 开启时 `resetSortProperty`（落盘破坏顺序）。
+- **“只问一次”的并发防竞态设计**：在主干 `f977b53` 中，`recordCostsAndEnforce` 会先把 `satisfyOrderProperty` 和 `satisfyDistributionProperty` 算成两个确定的布尔值传进 `enforceProperty`，而不再像早期版本那样外层判一次 `isSatisfy()`、进函数里又重算一次。为什么要改？因为 `HashDistributionSpec.isSatisfy()` 底层会去查全局的 `ColocateTableIndex`，而后台均衡线程 `ColocateTableBalancer` 随时可能并发把某个正在迁移的 Colocate 组标为不稳定——前后问两次一旦拿到相反答案，就会掉进空分支漏插 Exchange！
+- **防死循环的插入次序**：当分布与顺序双双缺失时，如果目标是单点汇聚 `GATHER`，必须**先各节点局部 Sort、再 Gather 归并**；如果是其他分布（如 Shuffle 会打乱顺序），则必须**先做 Distribution 重分区、再在目标端 Sort**。更微妙的是“当前已有序且是 Gather，但新需求既要保持有序又要改成 Shuffle”的边角场景——代码会先重置旧属性再依次补上 `Sort + Distribution`，防止在 `[order, gather]` 与 `[order, shuffle]` 之间死循环横跳。Enforcer 自身一旦包上去，当场通过 `CostModel.calculateCost(enforcer)` 结算路费计入 `Group.lowestCostExpressions`，绝不再递归触发新一轮 `EnforceAndCostTask`。
 
-#### 级联传导全景图
+---
 
-分布复用依赖需求列序与等价列信息共同匹配，而不只是两层算子都使用 Hash。以下调用关系展示聚合如何复用 Join 的输出分布。
+## 四、端到端推演：一条两表连接聚合 SQL 的 15 步栈帧演化
 
-```text
-                  requiredProperty 自顶向下
-    root[EMPTY / sort+gather]
-        │ RequiredPropertyDeriver
-        ▼
-    agg[EMPTY] ──需求──> hash(groupBy) SHUFFLE_AGG
-        │                     │ 列序对齐父层
-        ▼                     ▼
-    join ──需求──> [ANY, BROADCAST] 或 [hash(l), hash(r)]
-        │                     │
-        ▼                     ▼
-    scan ──输出──> LOCAL(分布列, equivDesc)   outputProperty 自底向上
-        ▲                     │
-        └── equivDesc 并查集：t1.a = t2.b 使分布属性穿越 join 向上传导
-```
-
-### Enforcer：触发过程与执行协议
-
-Enforcer 将属性差距转换为可计价的物理工作，例如重分区或排序。插入位置与顺序必须符合执行协议，否则成本正确也可能产生不合法的属性组合。
-
-#### 物理形态
-
-Enforcer 就是普通物理算子（`PhysicalProperty.appendEnforcers`）：
-
-```java
-// DistributionProperty.appendEnforcers
-new GroupExpression(new PhysicalDistributionOperator(spec), Lists.newArrayList(child));
-// SortProperty.appendEnforcers
-new GroupExpression(new PhysicalTopNOperator(spec, ...), Lists.newArrayList(child));
-```
-
-分布不满足 → `PhysicalDistributionOperator`（翻译为 Exchange：shuffle/broadcast/gather/round-robin）；顺序不满足 → `PhysicalTopNOperator`（Sort）。
-
-#### 触发入口与任务恢复
-
-存量物理表达式和规则新生成的物理表达式都必须进入估价任务，否则新候选会错过 Group 初始枚举。孩子尚未就绪时，任务通过克隆状态恢复执行。
-
-| 触发点 | 时机 |
-|---|---|
-| `OptimizeGroupTask.execute()` | Group 被（重新）优化时，对**存量**物理表达式逐个压入（同一物理算子在不同需求下反复估价） |
-| `ApplyRuleTask.execute()` | implement 规则**新生成**物理表达式时立即压入（携带当前需求上下文 + 代价上界） |
-| `clone()` 自恢复 | 子 Group 优化完成后从断点续跑（不算新触发） |
-
-为什么新物理表达式必须立刻压入：逻辑表达式无代价，物理表达式的代价只能在"需求上下文"下计算（子需求取决于父需求）；且它错过了 `OptimizeGroupTask` 的存量快照，若不自己压任务就会漏估。
-
-**注意**：enforcer 本身不会再触发 `EnforceAndCostTask`——其代价在 `CostModel.calculateCost(enforcer)` 就地结算后直接登记。
-
-#### 执行协议（`EnforceAndCostTask.execute` 四步）
-
-只有取得孩子 Winner 并验证组合属性后，父候选的总代价才完整。任务按以下顺序完成计价、补偿和最优解登记。
-
-```text
-1. initRequiredProperties：RequiredPropertyDeriver 得候选需求组合列表
-2. 逐候选、逐子节点优化（状态机，可挂起/恢复）：
-   - 查 childGroup.getBestExpression(childReq)；没有 → 挂起自己 + 压子任务
-   - 累加子代价，任何时刻超上界 → recordLowerBoundCost 放弃该候选
-   - 熔断：canGenerateOneStageAgg / checkBroadcastRowCountLimit
-3. 全部子节点就绪：
-   - ChildOutputPropertyGuarantor 保证组合合法（可能补插 bucket-shuffle 等）
-   - OutputPropertyDeriver 计算输出属性
-4. recordCostsAndEnforce：
-   - setPropertyWithCost 登记 (requiredProperty → cost, inputProperties)
-   - 先分别判定 sort / distribution 是否满足，再把两个布尔值传给 enforceProperty
-     （f977b53 起不再调用 outputProperty.isSatisfy() 再在 enforceProperty 里重算：
-      HashDistributionSpec.isSatisfy() 会查询 ColocateTableIndex，而 colocate 组
-      状态可能被 ColocateTableBalancer 并发改动；两次询问可能得到不同答案）
-       都满足 → 直接登记（一个表达式可同时满足多个 requirement）
-       任一不满足 → enforceProperty 插 enforcer：
-         只缺分布且无顺序要求      → enforceDistribute
-         只缺分布且有顺序要求      → 先清空旧属性再 Sort+Distribution
-                                     （防止 [order,gather]→[order,shuffle] 死循环）
-         只缺顺序                  → enforceSort
-         都缺                      → GATHER 需求先 Sort 后 Gather；否则先 Distribution 后 Sort
-   - curTotalCost < UB → 收紧上下文上界（全局剪枝发动机）
-```
-
-#### 上界/下界剪枝闭环
-
-候选的已知下界达到当前可行解上界时，继续展开不会改善结果。该判定依赖成本累计和下界记录正确，不能用任意估计值代替安全下界。
-
-- `OptimizeGroupTask` 入口：`costLowerBound(req) >= upperBoundCost` → 直接返回；
-- `EnforceAndCostTask` 每累加一个子代价都检查超上界 → `recordLowerBoundCost` 并放弃；
-- 子任务被上界剪掉（恢复后 `childBestExpr == null`）→ 父任务记 `costLowerBound = UB + 1` 退出。
-
-## 一个完整示例：Optimizer 生命周期走读
-
-Join 的分布选择可能同时决定上层聚合是否需要 Exchange，因此必须比较完整子树。下面用两表等值连接后的分组聚合说明这条依赖链。
+把上面的任务栈、属性并查集和 Enforcer 串起来，我们亲手走读一条经典的连接加聚合查询：
 
 ```sql
-SELECT t1.a, count(*) FROM t1 JOIN t2 ON t1.a = t2.b GROUP BY t1.a;
+SELECT t1.a, COUNT(*)
+FROM t1 JOIN t2 ON t1.a = t2.b
+GROUP BY t1.a;
 ```
 
-这是调用链示例，不是一次实测 Trace。假设 `t1` 按 `a` 列 hash 分布，且分区、桶映射等条件使其可复用；`t2` 分布与 `b` 无关。是否可省 Exchange 仍由属性兼容性检查决定，不能仅看分布列名。
-
-### Memo 结构（RBO 后）
-
-聚合与连接属于不同 Group，聚合通过对连接 Group 提出分布要求来取得可执行输入，而不是固定引用某个 Join 实现。
+假设基表 `t1` 在存储层本身就按 `a` 列哈希分桶（且单分区桶映射满足本地复用条件），而 `t2` 的分桶列与 `b` 无关。经过前置 RBO 归约后，Memo 里生成了四个干净的 Group：
 
 ```text
-G0: LogicalAgg(group by a)            → children: [G1]
-G1: LogicalJoin(t1.a = t2.b)          → children: [G2, G3]
+G0: LogicalAgg(group by a)       ──▶ children: [G1]
+G1: LogicalJoin(t1.a = t2.b)     ──▶ children: [G2, G3]
 G2: LogicalScan(t1)
 G3: LogicalScan(t2)
 ```
 
-### 任务时序（按栈顶执行顺序）
+省去无关旁支规则后，任务栈从根节点 `G0` 一路下钻、挂起、触底反弹再提取最优树的 15 个关键瞬间如下：
 
-父任务在孩子 Winner 缺失时暂停，孩子完成后才能累计成本并验证输出分布。以下顺序省略其他规则分支，用于说明这一依赖，不保证实际 Trace 的每次任务顺序相同。
+| 步序 | 弹出栈顶的任务 | 核心状态变迁与协程动作 |
+| --- | --- | --- |
+| 1–4 | `OptimizeGroupTask(G0, EMPTY, UB=∞)` 及展开任务 | 探索子组 `G1` 的连接交换，调用 `DeriveStatsTask` 算出各组基数统计 |
+| 5 | `ApplyRuleTask(AggImplementRule)` | 在 `G0` 生成 `PhysicalHashAggregate`，当场压入 `EnforceAndCostTask(G0-Agg)` |
+| 6 | `EnforceAndCostTask(G0-Agg)` | 全局聚合向子组 `G1` 索要 `hash(a) SHUFFLE_AGG`；查账本发现 `G1` 尚无此解 → **`clone()` 挂起自己，压入 `OptimizeGroupTask(G1, hash(a), UB - aggCost)`** |
+| 7–8 | `OptimizeGroupTask(G1, hash(a))` → `JoinImplementRule` | 在 `G1` 生成 `PhysicalHashJoin`，压入 `EnforceAndCostTask(G1-Join)` |
+| 9 | `EnforceAndCostTask(G1-Join)`（试跑方案 A：广播） | 提出首套子需求 `[ANY, BROADCAST]`；`G2`、`G3` 均无最优解 → **再次挂起自己，下钻叶子 `G2` 与 `G3`** |
+| 10 | `EnforceAndCostTask(G2-ScanT1, ANY)` | `t1` 吐出 `LOCAL(a)`，天然满足 `ANY` → 零补偿登记 `G2.best[ANY] = Scan(t1)` |
+| 11 | `EnforceAndCostTask(G3-ScanT2, BROADCAST)` | `t2` 本地扫描不满足广播要求 → **追加 `Exchange(BROADCAST)` Enforcer**，以 `scan + broadcast` 总成本登记 `G3.best[BROADCAST]` |
+| 12 | `EnforceAndCostTask(G1-Join)` **第 1 次恢复** | 方案 A 双侧就绪！Broadcast Join 继承左孩子 `t1` 的 `LOCAL(a)` 输出，恰好直接满足父任务索要的 `hash(a)`！免插外层 Exchange，登记 `G1.best[hash(a)] = Join(broadcast)` 并收紧成本上界 |
+| 13 | `EnforceAndCostTask(G1-Join)`（续跑方案 B：重分布） | 游标切到第二套子需求 `[hash(a), hash(b)]`：左孩子 `G2` 的 `LOCAL(a)` 免网络直通，右孩子 `G3` 插入 `Exchange(SHUFFLE hash(b))`；连接输出 `SHUFFLE_JOIN(a)` 同样满足 `hash(a)`，与方案 A 比拼总成本后保留更便宜者为 `G1.best[hash(a)]` |
+| 14 | `EnforceAndCostTask(G0-Agg)` **恢复收官** | 终于拿到 `G1.best[hash(a)]`！累加聚合自身成本，输出满足根要求 `EMPTY`，登记 `G0.best[EMPTY]` |
+| 15 | `extractBestPlan(EMPTY, G0)` | 顺着 `GroupExpression` 里记好的 `inputProperties` 链条自顶向下拼出最终物理树 |
 
-**阶段 1：从根下降到叶子**
-
-| # | 任务 | 动作 |
-|---|---|---|
-| 1 | `OptimizeGroupTask(G0, EMPTY, UB=MAX)` | 压入 `OptimizeExpressionTask(G0)` |
-| 2 | `OptimizeExpressionTask(G0)` | 压入 `ApplyRuleTask`、`DeriveStatsTask`、`ExploreGroupTask(G1)` |
-| 3 | `ExploreGroupTask(G1)` | 探索 join 交换律等逻辑变换 |
-| 4 | `DeriveStatsTask(G0)` | 推导统计 |
-| 5 | `ApplyRuleTask(AggImplementRule)` | 生成 `PhysicalHashAggregate` → 压入 `EnforceAndCostTask(G0-Agg)` |
-| 6 | `EnforceAndCostTask(G0-Agg)` | GLOBAL agg → 子需求 `[[hash(a) SHUFFLE_AGG]]`；G1 无 best → **挂起 + 压 `OptimizeGroupTask(G1, hash(a), UB-aggCost)`** |
-| 7 | `OptimizeGroupTask(G1, hash(a))` | 压 join 的 `OptimizeExpressionTask` |
-| 8 | `ApplyRuleTask(JoinImplementRule)` | 生成 `PhysicalHashJoin` → 压 `EnforceAndCostTask(G1-Join)` |
-| 9 | `EnforceAndCostTask(G1-Join)` | 候选：A `[ANY,BROADCAST]`、B `[hash(a),hash(b)]`；先走 A，G2 无 best → 挂起，下钻叶子 |
-
-**阶段 2：叶子产出 best（代价自底向上）**
-
-| # | 任务 | 动作 |
-|---|---|---|
-| 10 | `EnforceAndCostTask(G2-ScanT1, ANY)` | 输出 `LOCAL(a)`，满足 ANY → `G2.best[ANY]=scanT1`；**收紧上界** |
-| 11 | `EnforceAndCostTask(G3-ScanT2, BROADCAST)` | scan 不满足 BROADCAST → `enforceDistribute` 插 broadcast exchange，代价 = scan + broadcast，登记 `G3.best[BROADCAST]` |
-
-**阶段 3：Join 逐方案收敛**
-
-| # | 任务 | 动作 |
-|---|---|---|
-| 12 | `EnforceAndCostTask(G1-Join)` 恢复 | 两子就绪：Guarantor（broadcast 合法）→ OutputDeriver（输出 = 左孩子 `LOCAL(a)`）→ 满足 `hash(a)` → 登记 `G1.best[hash(a)] = Join(broadcast)` |
-| 13 | 方案 B（shuffle） | 重置状态重估：G2 的 `LOCAL(a)` 直接满足 `hash(a)`（免 shuffle）；G3 需插 shuffle enforcer；本例不满足双侧 colocate 前提。代价竞争取低者 |
-
-**阶段 4：回到根并提取**
-
-| # | 任务 | 动作 |
-|---|---|---|
-| 14 | `EnforceAndCostTask(G0-Agg)` 恢复 | `G1.best[hash(a)]` 存在 → 累加；agg 输出透传；满足根需求 `EMPTY` → 登记 `G0.best[EMPTY]` |
-| 15 | `extractBestPlan(EMPTY, G0)` | 沿 `inputProperties` 递归：Agg → `G1.best[hash(a)]`（inputProps `[ANY, BROADCAST]`）→ scanT1 / broadcast(scanT2) |
-
-若 Broadcast 候选总代价最低，可提取为：
+看看第 12 步和第 13 步的精妙之处：如果右表 `t2` 只有几千行，广播方案胜出，提取出的是 `HashAgg → HashJoin(broadcast) → [Scan(t1), Exchange(BROADCAST) ← Scan(t2)]`；如果右表 `t2` 有几千万行，广播内存惩罚暴涨，方案 B 逆袭胜出，提取出：
 
 ```text
-HashAggregate (group by a)
-  └─ HashJoin (broadcast)
-       ├─ OlapScan(t1)
-       └─ Exchange(BROADCAST)          ← enforcer 产物
+HashAggregate (group by a)                 ← 索要 SHUFFLE_AGG(hash(a))，分文未花直接复用下层输出！
+  └─ HashJoin (shuffle, 输出 SHUFFLE_JOIN(a))
+       ├─ OlapScan(t1)                     ← LOCAL(a) 原地满足 hash(a)，省掉左表网络重洗牌
+       └─ Exchange(SHUFFLE hash(b))        ← Enforcer 唯一插下的一刀
             └─ OlapScan(t2)
 ```
 
-若 shuffle 方案总代价更低（右表大、左表按 a 分布可免一侧交换），则提取为：
+整棵树里原本可能出现的三次网络洗牌（左表进连接、右表进连接、连接结果进聚合），靠着 `LOCAL(a)` 属性透传与连接输出分布复用，硬生生砍到只剩右表 `t2` 这一处 `Exchange`——而且这一切不是靠哪条写死的启发式特判，完全是 `PhysicalPropertySet` 与 `Enforcer` 统一算总账的自然结果。
+
+---
+
+## 五、Join 选型真相：为什么代码里有 Merge Join 公式，默认却不会选它？
+
+理解了搜索引擎怎么比价，接下来必须擦亮眼睛看清**“到底有哪些选手拿到了入场券”**。如果一个物理算子压根没被实现规则放进 `Group`，它的代价公式写得再漂亮也是空气。
+
+翻开 [`rule/implementation`](https://github.com/StarRocks/starrocks/tree/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/implementation) 目录，确实躺着三条连接实现规则：`HashJoinImplementationRule`（非笛卡尔积且含等值谓词）、`MergeJoinImplementationRule`（含等值谓词）以及兜底非等值连接的 `NestLoopJoinImplementationRule`。但去看 `RuleSet.addAutoJoinImplementationRule()` 就会发现真相：在默认的 `join_implementation_mode = "auto"` 下，**`MergeJoinImplementationRule` 的注册语句至今仍被注释掉（留着 `TODO: implement merge join`）！**
+
+这意味着在默认生产环境里，根本不存在“Hash Join 与 Merge Join 靠 Cost 自动二选一”这回事——等值连接由 Hash Join 独挑大梁，非等值或 Cross Join 由 Nested Loop Join（配合巨额惩罚系数 `EXECUTE_COST_PENALTY × cross_join_cost_penalty`）兜底；只有当你手动把会话变量切成 `SET join_implementation_mode = "merge"` 时，Merge Join 才会入场，通过 `RequiredPropertyDeriver` 向左右两侧索要等值列排序属性，并在缺失有序性时把 `Sort Enforcer` 的账单算进计划里（顺带一提，CBO 后处理里的 [`ExchangeSortToMergeRule`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/tree/ExchangeSortToMergeRule.java) 名字里虽然也有 Merge，干的却是把 `Gather` 之上的全局单点排序拆成“各节点局部排序 + 汇聚归并排序”，和 `PhysicalMergeJoinOperator` 八竿子打不着；而 `CostModel.visitPhysicalTopN` 对未拆分的单阶段全量排序直接判 `infinite()` 无穷大代价，也是为了倒逼这套两阶段归并落地）。
+
+因此，默认模式下 CBO 在连接上的全部火力，其实集中在**连接顺序重排**与 **Hash Join 内部的分发形态博弈（Broadcast vs Shuffle vs Colocate / Bucket-Shuffle）**。在进入具体的哈希连接计价公式之前，不妨先看清 StarRocks 是如何横跨 RBO 与 CBO 治理多表连接搜索空间的：前置阶段先把连续连接拍平进 `MultiJoinNode`，按表规模挑选动态规划（DP）、贪心或左深树定出保底顺序；进入 Memo 后再按表数阈值分级放行 `JoinAssociativityRule` 与 `JoinCommutativityRule`，并靠变换位掩码封死 `A⋈B ↔ B⋈A` 的死循环往复：
+
+![StarRocks 多表 Join 搜索治理：RBO 启发式重排与 CBO 位掩码防环](/images/diagrams/opt-starrocks-join-reorder.svg)
+
+*图 3：多表连接的两段式搜索治理——RBO 阶段利用 `MultiJoinNode` 按表规模给出启发式基线连接树，CBO 阶段在小表群放开结合律与交换律（靠变换位掩码防乒乓环路）、在大表群逐级熔断，最终统一交由 `HashJoin` 物理分发竞价。*
+
+对照 [`HashJoinCostModel.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/cost/HashJoinCostModel.java) 与 [`CostModel.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/cost/CostModel.java)，物理分发这笔账算得非常讲究：
+
+1. **哈希表构建（Build）与内存账单**：
+   Broadcast 模式下每台 BE 都要独立建一份完整的右表哈希表，因此构建 CPU 为 `rightOutput`，集群总内存按节点数放大为 `rightOutput × beNum`（且一旦右表行数超过硬红线 `broadcast_row_count_limit` 而左表又不够小，`EnforceAndCostTask.checkBroadcastRowCountLimit` 会在进代价比较前直接一票否决广播方案！）；Shuffle 模式下数据切分到各并行度，构建 CPU 摊薄为 `rightOutput / parallelFactor`（此处 `parallelFactor = max(BE + CN, DOP)`），总内存仅为单份 `rightOutput`。
+2. **探测（Probe）的 CPU 缓存未命中惩罚**：
+   当右表哈希表膨胀到装不进 CPU 缓存时，左表每次探测都会遭遇随机内存访问延迟。源码用 `mapSize = min(1, keySize) × rightRows` 衡量规模（注意 `keySize` 为等值键平均字节宽之和，套了 `min(1, ...)` 后只要键非空，`mapSize` 实际上就退化为右表行数 `rightRows`），并以 `BOTTOM_NUMBER = 100,000` 行为起征点计算惩罚倍数：
+   - **Broadcast 模式**：惩罚因子为 `min(12, max(1, ln(mapSize / 100000)))`，封顶放大 12 倍；
+   - **Shuffle 模式**：由于哈希表被并行度切小了，惩罚因子按自然对数减以 2 为底的对数折减为 `min(3, max(1, ln(mapSize / 100000) - log₂(parallelFactor)))`（注意在 `getAvgProbeCost()` 内部，传入的 `parallelFactor` 还额外乘了 `2`），封顶仅放大 3 倍。
+
+最后，算子自身的 CPU 与内存开销，叠加上 Enforcer 产生的跨网传输字节，统一送进 `CostModel.getRealCost()` 按固定权重折算成最终标量总分：
+
+$$\text{realCost} = 0.5 \times \text{CPU} + 2.0 \times \text{Memory} + 1.5 \times \text{Network}$$
+
+看一眼这三个权重系数（内存 `2.0` 最高、网络 `1.5` 次之、CPU `0.5` 最低）就能瞬间理解 StarRocks CBO 的脾气：**它宁可多烧一点本地 CPU，也极度厌恶多机重复驻留大哈希表（重罚 Broadcast 内存）和无谓的全网大表重洗牌（重罚 Shuffle 网络）。**
+
+---
+
+## 六、聚合选型双轨制：Memo 内的多阶段博弈与 Memo 外的 Sort Aggregate
+
+再看分析查询的另一大支柱——分组聚合（Aggregate）。StarRocks 处理聚合选型采用了非常典型的“双轨制”：**拆几个阶段跑，在 Memo 里凭代价硬碰硬；用哈希表还是流式有序聚合，出了 Memo 再看存储脸色。**
+
+先看 Memo 内部的阶段拆分博弈。在规则集初始化时，`SplitTwoPhaseAggRule` 和 `SplitMultiPhaseAggRule` 作为逻辑变换规则挂载进来，把原始的一阶段全局聚合 `GLOBAL agg` 裂变成两阶段 `GLOBAL(split) ← LOCAL(split)`（遇到多个 `COUNT(DISTINCT)` 时还会裂变出三阶段乃至四阶段形态），并把它们全都塞进**同一个 `Group`** 里比价：
 
 ```text
-HashAggregate (group by a)              ← 其 SHUFFLE_AGG(hash(a)) 需求
-  └─ HashJoin (shuffle, 输出 SHUFFLE_JOIN(a))   ← 经列序对齐 + 等价类，免掉聚合侧交换
-       ├─ OlapScan(t1)                  ← LOCAL(a) 直接满足 hash(a)
-       └─ Exchange(SHUFFLE hash(b))
-            └─ OlapScan(t2)
+Group_Agg:
+  ├─ 候选 1：GLOBAL agg                             （一阶段：直接按分组键 Shuffle 后全局聚合）
+  ├─ 候选 2：GLOBAL(split) ← LOCAL(split)           （二阶段：先本地预聚合压缩行数，再 Shuffle 全局汇总）
+  └─ 候选 3：三/四阶段打散形态                       （针对多列 Distinct 或热点数据倾斜）
 ```
 
-## 候选范围：Join 与聚合如何选型
+既然都在同一个 `Group` 里，怎么防止基数估计偏高时选出“本地预聚合一行都没压掉、白建一次哈希表还得全量发网”的蠢计划，或者反过来在含 `DISTINCT` 和高并发下误选单阶段把单节点打爆？StarRocks 用“任务层硬闸门 + 代价层软硬兼施”上了双保险：
 
-### Join 的实现与分发：Cost 能决定什么，不能决定什么
+- **任务层硬闸门（`canGenerateOneStageAgg`）**：在 `EnforceAndCostTask` 里，只要发现统计信息缺失、包含 `DISTINCT` 或分组列超过 1 个，除非用户强行指定 `new_planner_agg_stage = 1`，或者命中“单 BE 节点 + 开启 `enable_local_shuffle_agg` + **未开启 `enable_query_cache`**（`f977b53` 新增约束）”的本地洗牌豁免，否则一阶段聚合候选当场出局。
+- **代价层政策性奖惩（`visitPhysicalHashAggregate`）**：除了对非法一阶段判无穷大（`invalidOneStageAggCost`），一旦发现当前 Group 已经求出了更优的一阶段直通解，再跑出来的冗余二阶段组合会被 `redundantTwoStageAggCost` 直接判死；而在常规场景下，二阶段里的 `LOCAL` 预聚合节点以及它头顶紧挨着的那层 `Exchange` 都会享受 **`× 0.1` 的一折优惠**，鼓励能显著压缩行数的本地预聚合优先胜出。
 
-Cost 只能比较已注册且通过准入的实现，不能绕过规则集合选择算子。该快照的 Auto 模式不注册 Merge Join，因此需要区分算法选择与 Hash Join 内部的分发选择。
+至于很多人关心的 **Sort Aggregate（流式排序聚合）**，翻遍整个 Memo 你都找不到一个叫 `PhysicalSortAggregate` 的算子——因为它根本不参与 CBO 代价竞争！它的真身藏在阶段 ⑤ `physicalRuleRewrite` 的 [`PhysicalDistributionAggOptRule.UseSortAGGRule`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/tree/PhysicalDistributionAggOptRule.java) 里。只有当 `enable_sort_aggregate = true` 且同时满足以下**五条铁律**时，后置规则才会把胜出的 `PhysicalHashAggregateOperator` 原地打上 `useSortAgg = true` 标记，并通知底下的 `OlapScan` 按 Tablet 内主键有序吐数据（`setNeedSortedByKeyPerTablet(true)`）：
 
-#### Implementation Rule 的能力与注册方式
+1. 聚合本身是一阶段全局聚合（`isGlobal && groupBy 非空`）；
+2. 直接子算子就是基表扫描 `OlapScan`；
+3. **只命中了单个物理分区**（一旦跨多个分区，不同分区的相同 Key 散落在不同 Tablet 文件里，没法直接流式归并）；
+4. 所有 `GROUP BY` 列都是基表的排序键（Key 列）；
+5. `GROUP BY` 列集合恰好覆盖表 Schema 的最左 Key 前缀。
 
-实现规则的注册和准入条件决定 Cost 能比较的候选集合，代码中存在某种算子并不代表默认开启。该快照包含三条 Join Implementation Rule：
+为什么不把 Sort Aggregate 放进 Memo 靠 `SortProperty` 通用推导？道理非常务实：StarRocks 绝不会为了做一个普通聚合去凭空全表排序（哈希聚合快得多），流式聚合唯一的适用甜点就是**免费借用底层存储 Tablet 物理主键前缀的天然有序性**，免掉构建全量分组哈希表的内存开销（同样在这个后置规则里顺手处理的还有按分桶局部性减少冲突的 `usePerBucketOptmize`）。既然只看存储物理事实就能确定性拍板，放在 CBO 之后做轻量标记替换，既省去了 Memo 搜索维度膨胀，又干净利落。
 
-| 规则 | 物理算子 | `check()` 准入 |
-|---|---|---|
-| `HashJoinImplementationRule` | `PhysicalHashJoinOperator` | 非 cross join **且有等值谓词** |
-| `MergeJoinImplementationRule` | `PhysicalMergeJoinOperator` | **存在等值谓词** |
-| `NestLoopJoinImplementationRule` | `PhysicalNestLoopJoinOperator` | 没有等值谓词，并检查 Join Type 与功能开关 |
+---
 
-但“代码中存在三条规则”不等于“三种实现会同时进入同一 Group 竞价”。`QueryOptimizer.memoOptimize` 根据 `join_implementation_mode` 注册规则：
+## 七、全景排障清单与关键源码索引
 
-| 模式 | 实际注册的实现规则 | 含义 |
-|------|--------------------|------|
-| `auto`（默认） | Hash Join + Nested Loop Join | 等值连接走 Hash，非等值/Cross 由 NLJ 兜底 |
-| `hash` | Hash Join | 强制只生成 Hash Join 能处理的物理实现 |
-| `merge` | Merge Join | 显式启用 Merge Join 路径 |
-| `nestloop` | Nested Loop Join | 强制只生成 NLJ 能处理的物理实现 |
-
-`RuleSet.addAutoJoinImplementationRule()` 中的 Merge Join 注册目前仍被注释，并保留 `TODO: implement merge join`。因此在本文源码快照中，标准 Auto 模式没有发生 Hash Join 与 Merge Join 的直接 Cost 竞争。当前 Cost 主要决定的是：
-
-- 一个已注册 Join 实现采用哪组 Child Required Properties；
-- Broadcast、Shuffle、Colocate、Bucket Shuffle 等分发形态的完整成本；
-- 同一 Required Property 下，不同 Join Order 与子计划组合谁成为 Winner。
-
-#### Hash 与 Merge 的 Property 需求差异
-
-即使两者当前不会在 Auto 模式中直接竞价，`RequiredPropertyDeriver` 仍完整表达了两种算子的物理契约：
+走完这趟源码之旅，以后在线上遇到“为什么 StarRocks 没走我期望的 Colocate Join / 一阶段聚合 / 流式聚合”时，千万别一上来就盲猜统计信息不准。把整套优化器的三层筛子摆在手边，按顺序逐层排除，五分钟就能抓到真凶：
 
 ```text
-HashJoin 候选：
-  方案A: [ANY,                BROADCAST]
-  方案B: [hash(leftEq),       hash(rightEq)]
-
-MergeJoin 候选：
-  方案A: [sort(leftEq),       BROADCAST + sort(rightEq)]
-  方案B: [hash(leftEq)+sort(leftEq), hash(rightEq)+sort(rightEq)]
+第一层：硬准入筛子（进不了代价比较）
+  ├─ 规则压根没注册？（如 auto 模式下 Merge Join 未启用；表超阈值关闭详尽 Join Reorder）
+  ├─ 规则 check() 或任务硬闸门拦住了？（无等值条件、超 broadcast_row_count_limit、canGenerateOneStageAgg 否决）
+  │
+第二层：Memo 代价与属性擂台（0.5·CPU + 2.0·MEM + 1.5·NET 数字裁决）
+  ├─ 子计划的 OutputProperty 能否靠列序对齐或 EquivalentDescriptor 满足父需求？
+  ├─ 补插 Exchange / Sort Enforcer 后的总成本是否反超了另一条看似算子更贵的路径？
+  ├─ ChildOutputPropertyGuarantor 是否满足 Colocate 组稳定或 Bucket-Shuffle 转换前提？
+  │
+第三层：CBO 后置确定性改写（Memo 不可见的局部手术）
+  └─ SortAgg 的“单分区 + 最左 Key 前缀 + 一阶段直连 Scan”五条铁律是否全中？两阶段归并排序是否触发？
 ```
 
-即：**Merge Join 的每个方案都比 Hash Join 多一对按等值列的 Sort 需求**。在 `merge` 模式中，如果子树没有现成有序性，优化器就会为孩子插入 Sort Enforcer，并把代价加入该 Merge Join 计划。
+如果你想亲自打开 IDE 断点跟踪某条慢 SQL 的规划全过程，下面这组按调用链排列的源码入口就是最好的路标：
 
-#### 两套代价模型如何评价各自候选
+| 核心模块 | 关键源码路径 |
+| --- | --- |
+| 优化器六阶段总控 | [`QueryOptimizer.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java) |
+| 显式任务栈与挂起恢复 | [`optimizer/task/`](https://github.com/StarRocks/starrocks/tree/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/task)（重点看 `OptimizeGroupTask`、`EnforceAndCostTask`） |
+| 双向物理属性推导 | [`RequiredPropertyDeriver.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/RequiredPropertyDeriver.java)、[`OutputPropertyDeriver.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/OutputPropertyDeriver.java) |
+| Enforcer 算子构造 | [`DistributionProperty.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/base/DistributionProperty.java)、[`SortProperty.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/base/SortProperty.java) |
+| 算子与哈希连接代价模型 | [`CostModel.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/cost/CostModel.java)、[`HashJoinCostModel.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/cost/HashJoinCostModel.java) |
+| 连接实现与聚合裂变规则 | [`rule/implementation/`](https://github.com/StarRocks/starrocks/tree/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/implementation)、[`rule/transformation/`](https://github.com/StarRocks/starrocks/tree/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/transformation) |
+| 后置 SortAgg 与归并排序改写 | [`PhysicalDistributionAggOptRule.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/tree/PhysicalDistributionAggOptRule.java)、[`ExchangeSortToMergeRule.java`](https://github.com/StarRocks/starrocks/blob/f977b53c13eab90425f552675f3b3463ada8b2fc/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/tree/ExchangeSortToMergeRule.java) |
 
-两种 Join 的局部公式只有加上孩子与 Enforcer 的成本后才具有计划层面的含义。以下是源码模型而非耗时测量，其中权重和惩罚项不能直接当作真实 CPU 时间或内存占用。
+---
 
-**Hash Join**（`HashJoinCostModel`，执行模式由子节点实际输入属性反推）：
-
-```text
-CPU = buildCost + probeCost + joinOutput.computeSize
-  BROADCAST: build = rightOutput                    // 每 BE 并行度 1 建全量 HT
-  SHUFFLE:   build = rightOutput / parallelFactor   // 并行建局部 HT
-
-probeCost = leftOutput × cachePenaltyFactor
-  mapSize = min(1, keySize) × rightRows        // keySize = 等值键列 getAverageRowSize() 之和
-  BROADCAST: penalty = min(12, max(1, ln(mapSize/100000)))
-  SHUFFLE:   penalty = min(3,  max(1, ln(mapSize/100000) - log₂(parallelFactor)))
-
-MEM = BROADCAST ? rightOutput × beNum : rightOutput
-```
-
-**Merge Join**（`visitPhysicalMergeJoin`）：
-
-```text
-有等值谓词: CPU = (leftSize + rightSize/2), MEM = 0
-无等值谓词: CPU = leftSize + rightSize,  MEM = rightSize × EXECUTE_COST_PENALTY × 100  // 接近判死
-```
-
-单看算子本体，Merge Join 的 CPU 公式是线性的；但它的计划总代价必须加上 Sort Enforcer。Sort Enforcer 以 TopN 物理算子表达，其代价包含输入 CPU、输出内存与输入网络量。如果两侧都要从零排序，Merge Join 路径的总成本会显著增加。
-
-这里应避免一个错误推论：**两套公式同时存在，不代表当前默认模式会用它们完成 Hash-vs-Merge 自动选型。** `CostModel` 只会评价已经被当前 Rule Set 生成的物理表达式；候选没有被注册和生成，Cost 再精细也无法选择它。
-
-最终折算统一走：
-
-```text
-realCost = cpu × 0.5 + memory × 2.0 + network × 1.5
-```
-
-#### Merge Join 路径如何复用已有顺序
-
-在显式 `merge` 模式下，Merge Join 是否需要 Sort Enforcer，仍取决于孩子 Output Property 能否满足等值列排序要求：
-
-```text
-MergeJoin(leftKey=a, rightKey=b)
-  ├─ child output 已满足 sort(a) → 直接复用
-  └─ child output 不满足 sort(b) → 插入 Sort Enforcer
-```
-
-Property 复用仍然有价值：已有顺序可以避免重复排序，使强制 Merge Join 路径更便宜；但这属于 **Merge Join 方案内部的 Property/Enforcer 优化**，不是默认 Auto 模式下与 Hash Join 的胜负比较。
-
-两个重要的相关机制：
-
-- **`CostModel.visitPhysicalTopN` 的 ∞ 惩罚**：非 enforced、非 split 的单阶段全量 FINAL sort（即无 limit 的全局排序）被判 `CostEstimate.infinite()`——强制排序拆成两阶段（各节点局部排序 + gather 后归并），防止产生天价单阶段 sort；
-- **`physicalRuleRewrite` 的 `ExchangeSortToMergeRule`**（CBO 后）：把 `Exchange(GATHER) 之上的 FINAL sort` 改写为 `PARTIAL sort → Exchange → FINAL sort(split)` 的两阶段归并排序。这里的“Merge”指分布式有序流归并，不是 `PhysicalMergeJoinOperator`。
-
-#### NestLoop 与防御性代价
-
-硬性准入和代价惩罚不能互相替代：前者删除候选，后者只改变已生成候选的排序。源码分别在规则、任务和 Cost 层实施这些约束。
-
-- `visitPhysicalNestLoopJoin`：`cpu = leftSize × rightSize × EXECUTE_COST_PENALTY`，cross join 再乘 `cross_join_cost_penalty`；right join 右表过大额外惩罚。惩罚提高候选代价；是否允许生成 NLJ 仍由实现规则的准入条件决定，不能由惩罚系数保证；
-- `EnforceAndCostTask.checkBroadcastRowCountLimit`：右表行数超 `broadcast_row_count_limit` 且左表不够小 → 硬性否决 broadcast 方案（不走代价）；
-- `JoinHelper.onlyBroadcast()/onlyShuffle()`：right outer/anti 等类型裁剪候选集。
-
-#### Join 分发的第三/四/五种形态：colocate / bucket-shuffle
-
-除 broadcast/shuffle 两个候选外，`ChildOutputPropertyGuarantor` 在子输出就绪后把组合修正为更省的形态（不改 Memo 搜索结构，只改 enforcer 形态与代价）：
-
-- 双侧 `LOCAL` 且 colocate 组对齐 → **colocate join，零 exchange**；
-- 左 `LOCAL` + 右 `SHUFFLE`/`LOCAL` → `transToBucketShuffleJoin`：只按左表分布路由右表（单边交换）。
-
-### 聚合选型：Memo 内阶段竞争与 Memo 外 Sort Aggregate
-
-聚合阶段数由 Memo 内候选与代价共同决定，Sort Aggregate 则依赖 CBO 后的存储有序性检查。这两条路径的优化机会和限制不同。
-
-#### 关键事实：聚合阶段拆分发生在 CBO 内部
-
-`SplitTwoPhaseAggRule` / `SplitMultiPhaseAggRule` 注册在 `RuleSet` 构造器（transform 规则），在 Memo 搜索中把单阶段 `GLOBAL agg` 变形成 `GLOBAL(split) → LOCAL(split)` 两层，与原形态放进**同一个 Group 竞争**：
-
-```text
-G_agg:
-  Expr1: GLOBAL agg                        ← 原始（一阶段）
-  Expr2: GLOBAL(split) → LOCAL(split)      ← Split 规则生成（二阶段）
-  Expr3: 多 distinct 时的三/四阶段形态      ← SplitMultiPhaseAggRule
-```
-
-`SplitTwoPhaseAggRule.check` 要求 `isGlobal() && !isSplit`（防循环）；`isSuitableForTwoStageDistinct` 用统计做预筛（`isTwoStageMoreEfficient`：group by 基数 × 系数 < 输入行数才值得拆）。
-
-#### Hash Aggregate 的代价竞争（`visitPhysicalHashAggregate`）
-
-基础代价 = `input.computeSize × factor`（cpu）+ `output.computeSize × factor`（mem），其上叠加三组政策性代价：
-
-1. **`invalidOneStageAggCost` → ∞**：必须多阶段的场景却生成非 split 单阶段 GLOBAL，判死；
-2. **`redundantTwoStageAggCost` → ∞**：Group 已有 `input → GLOBAL` 一阶段最优解时，`input → LOCAL(split) → GLOBAL(split)` 被判"多余的 local 步骤"——防止统计高估基数时选出"先本地无效聚合再全量交换"的坏计划；
-3. **`factor = 0.1`（软奖励）**：`isSplit && LOCAL` 的 local 阶段代价打一折；配套 `setExchangeCostFactor` 把 local agg 上方的 exchange 代价也 ×0.1（注释：*"In most scenes, local agg → exchange → global agg is better than exchange → global agg"*）。
-
-另有倾斜场景系数 `computeDataSkewPenaltyOfGroupByCountDistinct`（0.2 / 0.5 / 1.5）引导三阶段拆分。
-
-#### 任务层硬闸门：`canGenerateOneStageAgg`
-
-代价之外，`EnforceAndCostTask` 在拿到子 best 后硬否决不稳健的单阶段全局聚合：统计未知 / 行数不准、含 distinct、多 group by 列（>1）——可被 `new_planner_agg_stage=1` 或单 BE local-shuffle 豁免。
-
-f977b53 上这个豁免多加了一个条件：`enable_local_shuffle_agg && !enable_query_cache && 单 BE`。打开 query cache 时，local-shuffle agg 不再放行单阶段计划。
-
-#### 聚合需求与 join 分布的级联复用
-
-聚合键与 Join 分布键兼容时，沿用下层分布可以省去再次交换；兼容性还包含列序和空值语义。`computeAggRequiredShuffleProperties` 负责调整这些要求。
-
-`visitPhysicalHashAggregate` 生成 `hash(groupBy) SHUFFLE_AGG` 需求时，`computeAggRequiredShuffleProperties` 会：
-
-- 若父层（上层 join）要求 `SHUFFLE_JOIN` 且列集一致 → **按父列序调整 group by 的 shuffle 列**（`shouldAdjustGroupByOrder`）；
-- `canRelaxGroupByCols`：父层列是 null-relax 时，本层也放宽——保证 outer join 之上的聚合不额外插一次交换。
-
-反方向同样成立：聚合的 `SHUFFLE_AGG` 输出经等价类并查集可被上层 `SHUFFLE_JOIN` 需求满足（详见完整示例的 shuffle 变体）。
-
-#### Sort Aggregate：不是 Memo 算子，而是 CBO 后的执行方式替换
-
-StarRocks **没有 `PhysicalSortAggregate` 算子**参与代价竞争；"sort aggregate" 是 `physicalRuleRewrite` 阶段 `PhysicalDistributionAggOptRule.UseSortAGGRule` 的执行层替换，当 `enable_sort_aggregate = true` 且满足全部条件时，把 `PhysicalHashAggregateOperator` 打上 `useSortAgg=true` 标记：
-
-```text
-准入条件（全部满足）：
-  1. agg 是一阶段全局聚合（isGlobal && group by 非空）
-  2. 孩子是 OlapScan
-  3. 仅命中单个分区（多分区同 key 不在同 tablet，无法流式）
-  4. 所有 group by 列都是表的 key 列（前缀对齐）
-  5. group by 列恰好覆盖 schema 的 key 前缀
-满足 → scan.setNeedSortedByKeyPerTablet(true)
-      BE 按 tablet 内 key 有序输出，agg 退化为流式（不维护全部分组的 hash 表，仍需聚合状态及输入缓冲）
-```
-
-同规则还处理 `enable_per_bucket_compute_optimize`：单阶段全局聚合 + scan 直连时打 `usePerBucketOptmize` 标记，按 bucket 分组执行（本质仍是 hash agg，但利用分桶局部性减少冲突）。
-
-#### Hash Agg vs Sort Agg 的选型小结
-
-Sort Aggregate 用输入有序性换取较小的分组索引状态，但不能脱离单分区、键前缀和聚合阶段等准入条件使用。它也不保证聚合函数自身的状态有界。
-
-| 维度 | Hash Aggregate | Sort Aggregate |
-|---|---|---|
-| 决策位置 | CBO 内（阶段拆分 + 代价竞争） | CBO 后 physicalRuleRewrite（条件满足即替换） |
-| 决策依据 | 统计（基数/聚合率/倾斜）+ 代价权重 | 物理布局事实（key 列、单分区、单阶段） |
-| 内存 | 有 hash 表，依赖阶段拆分与 spill 缓解 | 无需保存全部分组的 hash 表；单组聚合状态仍可能较大 |
-| 依赖的 property | 分布（SHUFFLE_AGG/GATHER/EMPTY） | **有序性隐含在存储层**（按 key 有序读），不经 Memo 传导 |
-
-关键差异：Sort Agg 的"有序性"来自存储引擎（tablet 内数据按 key 有序），而不是 Memo 里的 SortProperty——所以它不产生/消费 enforcer，CBO 对它是"盲"的，由后置规则做确定性判定。
-
-## 总结：决策层次与 Property 级联的全景
-
-最终执行计划由硬性准入、成本竞争和后置改写共同产生，任一层都可能解释某个候选为何未出现。排查时应先定位决策层，再分析统计误差或成本系数。
-
-```text
-┌─ 硬排除（规则/任务层，不进代价）────────────────────────────┐
-│ implement rule.check()、JoinHelper.onlyXxx、                │
-│ checkBroadcastRowCountLimit、canGenerateOneStageAgg、CTE 校验 │
-├─ 代价竞争（CBO 内，数字裁决）───────────────────────────────┤
-│ Auto 模式下的 Join Order、Hash/NLJ 准入与分发方案            │
-│ Merge 模式下 Merge Join 的 Property/Enforcer 组合           │
-│ broadcast vs shuffle vs colocate/bucket（需求候选+enforcer） │
-│ Agg 一阶段/二阶段/多阶段（Split 规则 + ∞ 代价 + 0.1 奖励）    │
-│ realCost = 0.5·cpu + 2·mem + 1.5·net                        │
-├─ 确定性后处理（CBO 后，条件替换）───────────────────────────┤
-│ SortAgg / PerBucket 标记、两阶段归并排序、冗余 shuffle 裁剪、  │
-│ 低基数字典编码                                                │
-└─────────────────────────────────────────────────────────────┘
-```
-
-实际排查应按“候选是否注册 → 准入是否通过 → 子属性是否兼容 → Enforcer 成本 → 后置改写”的顺序追踪。不能因为模型里存在 Merge Join 公式，就断言 Auto 模式会选择它；也不能把 Sort Aggregate 的条件替换解释成 Hash-vs-Sort 成本竞争。Broadcast 的代价是复制与内存放大，Shuffle 的代价是传输与重分区，Colocate 则依赖布局约束；缺少这些前提时，局部算子成本不具备可比性。
-
-## 附：关键源码索引
-
-复核上述决策需要同时阅读规则注册、属性推导和计划后处理；单看 CostModel 会遗漏未生成的候选。以下链接固定到同一提交。
-
-| 主题 | 文件 |
-|---|---|
-| 优化器入口/流水线 | [QueryOptimizer.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java) |
-| 任务调度 | [optimizer/task](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/task) |
-| Property 推导 | [RequiredPropertyDeriver.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/RequiredPropertyDeriver.java)、[OutputPropertyDeriver.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/OutputPropertyDeriver.java) |
-| Enforcer 形态 | [DistributionProperty.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/base/DistributionProperty.java)、[SortProperty.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/base/SortProperty.java) |
-| 代价模型 | [CostModel.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/cost/CostModel.java)、[HashJoinCostModel.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/cost/HashJoinCostModel.java) |
-| Join 实现规则 | [rule/implementation](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/implementation) |
-| 聚合拆分规则 | [rule/transformation](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/transformation) |
-| SortAgg/PerBucket | [PhysicalDistributionAggOptRule.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/tree/PhysicalDistributionAggOptRule.java) |
-| 两阶段归并排序 | [ExchangeSortToMergeRule.java](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/tree/ExchangeSortToMergeRule.java) |
+> **源码基线说明**：本文初稿基于 `StarRocks/starrocks` 提交 `0fd27fd`（2026-03-30），并于 2026-10-28 对照上游提交 `f977b53`（2026-09-22）完成了全量源码复核与链接对齐。两快照间优化器目录共有 254 个文件演进，核心 Cascades 任务栈、Property 传导与 `CostModel` 系数（`0.5 / 2.0 / 1.5` 权重、`BOTTOM_NUMBER = 100000`、`12 / 3` 缓存惩罚上限、Auto 模式注释 Merge Join、`UseSortAGGRule` 五条件）均保持不变；主干新增及调整处（移除 `memoOptimize` 中的 `isMVPlanner()` 分支、将 `rule/tvr/*` 演进为 `rule/ivm/*`、`recordCostsAndEnforce` 单次判定属性防 `ColocateTableBalancer` 并发竞态，以及 `canGenerateOneStageAgg` 增加 `!enable_query_cache` 约束）均已同步融入正文。

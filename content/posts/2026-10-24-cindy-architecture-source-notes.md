@@ -11,129 +11,154 @@ tags:
   - Agent
   - TypeScript
   - Source Code
-description: "沿一次任务的创建、发送、模型选路与恢复，解析 Cindy 的 Electron 进程边界、Maker/Session、Codex/Pi 适配、SQLite 状态及远程控制，并解释本地定制应落在哪些层。"
+description: "从桌面多引擎 Agent 客户端的四个核心矛盾出发，拆解 Cindy 如何隔离界面意图与宿主特权、用输入事务消解并发发送与中断竞态、解耦模型与协议路由，并在重启后恢复未完成任务。"
 draft: false
 toc: true
 math: false
 ---
 
-Cindy 把多个 Agent 引擎、模型供应商、项目文件、工具和任务历史放进同一个客户端。理解它的关键，是找出每种状态由谁持有，以及一条输入在哪个时刻真正交给底层引擎。界面上的模型名称、数据库里的任务状态、原生 CLI 的会话编号，分别回答不同的问题；混用这些概念，会同时影响模型接入、失败恢复和功能裁剪。
+如果只做一个最简单的桌面 Agent 套壳工具，两百行代码就够了：用 Electron 画一个聊天框，用户按下回车时启动底层的命令行进程，把标准输出流式渲染成气泡，顺手存进本地数据库。
 
-这次阅读源码的实际起点，是制作一个保留原版界面的本地定制构建：留下 Codex、Pi 和公司模型接口，将不需要的云服务及后台集成默认关闭。最初的独立精简界面没有保留足够的原版体验，后续改造转向原生产入口。具体补丁、鉴权故障和运行核验放在[下一篇实践记录]({{< ref "2026-10-24-cindy-company-local-build-notes.md" >}})；本篇先说明这些改动为什么应落在对应的架构层。
+但只要把它放进真实的日常研发里，这个朴素模型马上就会在四个地方出问题：
 
-分析基线是本地 checkout 的上游提交 `b1d73b1f79ae812d0950c632db4785b1f06d48e7`，个人改动截至 `61db88572f`，日期为 2026-10-24。上游源码链接固定到基线提交；个人提交仅保存在本地，不能假定已经进入上游。本文主要深入 Desktop 的生产调用链，Mobile、SSH、插件与协同只解释客户端边界；独立服务端仓库不在此次分析范围内。[项目仓库](https://github.com/makecindy/cindy)也明确把自身界定为 desktop、mobile 和共享 packages 的客户端仓。
+1. **特权边界失守**：Agent 会读取外部网页、第三方仓库和不可信的模型输出。如果前端渲染层直接持有文件系统、子进程和 API 密钥权限，任何前端注入都可能演变成宿主机命令执行。
+2. **发送与中断竞态**：当底层 Agent 正在改代码时，用户可能连续追问、插话（Steer）、点击停止，或者进程恰好在发送瞬间崩溃。如果界面刚点发送就落库，会出现“气泡还在、底层根本没收到”，或者重试时把同一句话发两遍。
+3. **“选模型”不再是一个名字**：当客户端同时容纳 Claude Code、Codex、Pi 等多种引擎，又允许接入自建网关时，“用 Codex 跑公司网关上的 DeepSeek”其实横跨了执行引擎、传输协议、凭证注入位置和上游型号四个独立维度。
+4. **跨进程状态分裂**：界面上的会话卡片、SQLite 里的产品记录，以及 Codex/Pi 各自维护的原生会话文件（Transcript），生命周期并不一致；合上电脑再打开时，谁说了算？
 
-## 第一层边界：界面表达意图，Main 持有特权
+[Cindy](https://github.com/makecindy/cindy) 把多 Agent 引擎、模型目录、工具审批、本地任务历史和远程控制整合在同一个客户端里，它的架构几乎就是围绕上述四个矛盾长出来的。这次读源码的起因很实际：我想基于原版界面做一个本地定制构建——只保留 Codex、Pi 和公司内部的模型接口，同时把云账号、插件市场、语音和外设等后台集成默认关掉。最初我试过另起炉灶写一套极简界面，很快发现排队、审批、中断恢复这些脏活全得重做一遍，于是退回原版主干做减法。具体的改造过程和排障细节记在[下一篇实践笔记]({{< ref "2026-10-24-cindy-company-local-build-notes.md" >}})里，本篇先沿着一条消息的生命周期，把这套客户端的骨架讲清楚。
 
-Cindy 使用 pnpm 工作区组织客户端代码。`apps/desktop` 是 Electron 桌面端，`apps/mobile` 是 Expo / React Native 手机端，`packages/` 提供编排、模型目录、调度、远程协议和工具等共享能力。Desktop 内部又分成 Main、preload、Renderer 和 shared。这些目录不是同一种业务代码的随意拆分，而是对权限和状态归属的约束。
+---
+
+## 一、特权边界：界面只表达“我想做什么”，Main 决定“能不能做”
+
+在 Electron 应用里，目录划分本质上是权限划分。Cindy 使用 pnpm Workspace 管理代码：`apps/desktop` 是桌面端，`apps/mobile` 是手机端，`packages/` 存放与宿主解耦的编排、模型目录、调度和远程协议。单看 `apps/desktop` 内部，代码被严格切成了四块：**Renderer**、**preload**、**Main** 和 **shared**。
 
 ![Cindy 客户端的进程、编排、引擎和存储边界](/assets/images/cindy-source-notes/architecture.svg)
 
-*箭头表示主要依赖和请求方向；返回的 Agent 事件会沿宿主桥重新投影到界面。右下方模型服务在客户端进程之外，本地运行 Agent 不代表模型推理离线。*
+*箭头表示主要依赖和请求方向；Agent 产生的事件流会沿宿主桥反向推回界面。右下方的模型推理运行在远端或外部服务上——“本地运行 Agent”指的是本地宿主掌控工具与会话，不代表大模型离线推理。*
 
-Renderer 负责 React 组件、表单、消息展示、模型选择和可重建缓存。它经由 preload 暴露的窄接口，通过进程间通信（Inter-Process Communication，IPC）向 Main 提交操作。Main 负责窗口、进程、文件、SQLite、凭证、受控网络以及授权裁决；shared 则保存跨进程类型、常量和纯判据。可复用领域逻辑进入 packages，通过宿主注入与 Electron 解耦。
+为什么要切得这么碎？因为聊天窗口里展示的内容天然不可信。模型返回的一段 Markdown、预览窗口打开的网页，或者某个插件渲染的视图，都活在 Renderer（浏览器渲染进程）里。因此 Cindy 把所有带副作用的资源——窗口管理、子进程拉起、本地文件读写、SQLite 数据库、密钥读取和网络代理——全部收归 **Main（主进程）** 持有。Renderer 只能管 React 视图、表单输入和随时可丢弃的内存缓存；它想做任何越界操作，都必须穿过 `preload/preload.ts` 暴露的窄接口，通过进程间通信（Inter-Process Communication，IPC）向 Main 发起请求。
 
-从 [`src/main/index.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/index.ts) 进入，可以看到 profile、日志、环境清理和启动编排；后续的 [`bootstrap-electron.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/bootstrap-electron.ts) 完成大量窗口与服务接线。React 入口在 `renderer/main-entry.tsx`，跨进程接口集中于 `preload/preload.ts`。读一个功能时，应沿接口反查 Main 的注册和实际副作用，不能停在组件是否渲染。
+翻开 [`trustedAppRenderer.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/security/trustedAppRenderer.ts) 就能看到这道防线是怎么落地的：当一条特权 IPC 消息到达 Main 时，宿主绝不轻信前端传来的任何“我是主窗口”参数，而是直接核查 Electron 底层持有的 `sender`、`senderFrame`、顶层 URL 和已登记的应用窗口表。只有验明正身之后，具体业务才会继续检查路径、归属权和审批状态。这样一来，哪怕内嵌网页或模型输出试图伪造前端调用，也拿不到宿主的系统权限。
 
-这也是“隐藏设置项”不能等价于“禁用功能”的原因。界面不再展示某个页签，不会自动阻止 Main 的启动定时器、系统事件回调或者原生助手。反过来，仅删除 Main 的 handler，也可能让原版 Renderer 在每次挂载时反复报错。保留原界面的裁剪需要同时处理能力可见性、服务启动和关闭态读取。
+理解了“前端只发意图、Main 持有实体”，就能明白启动链路和“功能开关”该怎么看。应用从 [`src/main/index.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/index.ts) 起步，先敲定运行配置（Profile）、日志和环境清理，随后交给 [`bootstrap-electron.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/bootstrap-electron.ts) 把窗口与各类后台服务逐一接好。
 
-[`trustedAppRenderer.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/security/trustedAppRenderer.ts) 进一步说明了信任边界。特权 IPC 的来源判断取自 Electron 持有的 `sender`、`senderFrame`、顶层页面位置和应用窗口登记，不接受 Renderer 自报“我是可信窗口”。这道检查解决来源问题，具体操作仍须校验参数、路径、归属和权限。模型返回的文字、内嵌网页和插件页面都不能凭一段前端调用获得宿主权力。
+这也给本地裁剪提了个醒：**在 React 里把某个设置页藏起来，根本不等于关掉了这项功能。** 只要 Main 里的定时器、系统睡眠唤醒回调或原生硬件助手还在照常初始化，后台行为就一点没少；反过来，如果只粗暴删掉 Main 里的 IPC 处理函数，原版前端组件每次挂载读取状态时就会疯狂报错。想在不破坏原版界面的前提下做裁剪，必须让 Main 停止后台服务、让设置项处于关闭态，同时保留安全的空状态返回——这三步缺一不可。
 
-## 一条消息跨过的是输入事务
+---
 
-用户点击发送之后，真正困难的部分是协调排队、可见消息、持久化和底层派发。请求可能在任务正在运行时到达，也可能要求插话、停止后继续、重试或恢复。让 Renderer 同时决定这几份状态，会产生“气泡已经出现，实际没有发出”或“重试时把同一条输入再落库”的问题。
+## 二、输入事务：为什么点下“发送”不能直接调 CLI？
 
-[`AgentInputCoordinator`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-ipc/agent-input-coordinator.ts) 把这件事作为 Main 侧的输入事务（Input Transaction）处理。Renderer 准备可序列化的文本、附件和引用；宿主负责排序、派发、回滚与持久化。`maker-ipc/register.ts` 的 `sendToSessionInternal` 是宿主发送的重要接线入口，不能把它误认为所有步骤都在其中同步完成的一条直线。
+假设用户正在让 Agent 重构一个模块，看了一半觉得方向偏了，立刻敲入一句补充说明并回车；或者干脆点了“停止”，改两个字重发。如果前端点下发送的瞬间就直接往数据库写死一条用户消息、同时往子进程管道里塞文本，一旦撞上上一轮尚未收尾、权限弹窗被拒或者进程异常退出，界面看到的对话历史就会和底层引擎实际收到的上下文彻底错位。
 
-把普通发送路径压缩后，可以得到下面的关系：
+为了解决这个异步竞态，Cindy 在 Main 侧引入了 [`AgentInputCoordinator`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-ipc/agent-input-coordinator.ts)，把“发送消息”变成了一次受控的**输入事务（Input Transaction）**。
 
-```text
-ChatInput 提交输入意图
-  → preload / maker IPC
-  → AgentInputCoordinator 接纳、排队并协调回滚
-  → maker-host 解析任务、执行位置、模型和权限
-  → maker-core Session.send
-  → AgentSessionHandle.send
-  → 底层引擎运行，产生事件
-  → 宿主事件处理、持久化与 Renderer 投影
-```
+把整条发送主链与异常分支放到一起看，`AgentSessionHandle.send` 刚好将一次提交切成了两段语义截然不同的区间：
 
-这里有一个需要精确保留的时序：产品层的 `onAccepted` 和底层已经接受输入，不是同一个瞬间。在 [`session.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/maker-core/src/session.ts) 中，`Session.send` 进入 `dispatchSend`，经过轮次预留、授权和宿主钩子后调用 `handle.send`；其成功返回才构成对应的派发接受边界。失败恢复必须知道错误发生在这道边界之前还是之后，否则可能重复发送。
+![Cindy 两阶段输入事务与派发接受边界](/images/diagrams/app-cindy-input-transaction.svg)
 
-几类操作因此有不同的状态语义：
+*在跨过 `AgentSessionHandle.send` 之前发生异常，协调器直接回滚队首并原样恢复输入框与附件；跨过边界后再遇中断，则转入会话内运行态异常轮次，避免草稿丢失或静默重发（可打开[交互式流向图](/diagrams/app-cindy-input-transaction.html)切换正常提交、边界前回滚与边界后异常三条路径）。*
 
-| 操作 | 宿主需要维持的约束 |
-| --- | --- |
-| 普通发送 | 队首先被 drain；派发前失败可以回滚，不能只凭气泡认定执行成功 |
-| 插话 | 与当前轮次协调；底层拒绝时保留或恢复待发状态 |
-| 停止 | 保留并暂停待发输入，在 abort 边界后释放相应调度 |
-| 重试 | 根据错误阶段恢复，不能无条件复制原文本再次发送 |
-| 编辑或移除待发输入 | 只操作仍未被接受的条目，避免改动已经执行的历史 |
+阅读 [`session.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/maker-core/src/session.ts) 和 `maker-ipc/register.ts` 里的 `sendToSessionInternal` 时，最值得留心的是图中的**派发接受边界**。产品层收到请求（`onAccepted`）与底层引擎真正接手这轮输入，并不是同一个时刻。只有当 `Session.send` 走完 `dispatchSend`、完成轮次预留与授权检查，最终调用底层 `handle.send` 成功返回后，这条消息才算真正跨过了边界。
 
-这些约束会被普通任务、伙伴、定时任务和消息渠道共同使用。新增一个入口时，复用协调器能够保留已有的接受、回滚和恢复语义；直接绕到某个 CLI 的 `send`，就需要重新承担这些一致性成本。
+一旦画清这条线，各种复杂的交互就有了干净的账本规则：
 
-## Maker、Session 和引擎适配分别持有什么
-
-[`Maker`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/maker-core/src/maker.ts) 是 Agent 注册中心和 Session 编排入口。它按 `AgentKind` 查找实现，结合工作目录、执行位置与启动选项创建会话，协调宿主准备、底层启动、元数据保存和失败清理。其依赖包含存储、日志、认证及生命周期钩子；Electron 相关行为由 Desktop 宿主装配。
-
-[`BaseAgent`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/maker-core/src/agents/base-agent.ts) 定义统一适配面，具体引擎提供会话 handle、事件流和能力声明。统一接口不意味着能力完全相同：不支持的操作需要明确拒绝，调用方根据 capabilities 决定是否展示或调用。`packages/maker-core/src/agents/` 下的 Claude Code、Codex、Pi 实现封装各自的原生运行方式，Desktop 的 `main/maker-host/` 再注入二进制路径、环境、认证、工具桥及存储。
-
-`Session` 持有一次运行时会话的 handle、轮次状态、权限状态和事件消费。Maker 创建它之后，宿主订阅事件，将流式文本、错误、结束和会话编号变更接入产品层。不能把 `Maker.createSession` 的成功、第一条模型回复到达，以及整轮任务完成视为同一个成功条件。
-
-这条链还有启动回滚：引擎启动成功之后，存储步骤仍可能失败。Maker 的创建路径会尝试关闭已经启动的 handle，并通知失败钩子；若底层清理没有确认完成，宿主仍需保持相应的运行保护。只看数据库是否插入成功，可能漏掉遗留子进程。
-
-任务 ID 与原生引擎 ID 也应分别看待。产品任务使用 Cindy 自己的 ID，底层 Codex thread 或 Pi session 有自己的恢复标识，后者通过 `sdkSessionId` 等字段建立关联。切换引擎、恢复原生记录和删除产品任务，涉及不同的生命周期，不能只改一个编号便声称完成迁移。
-
-## 模型、协议、凭证和引擎是四个维度
-
-Cindy 的模型选择需要至少回答四个问题：使用哪个连接、哪个上游型号、哪种传输协议，以及由哪个 Agent 引擎执行。一个模型名称不能替代这组信息。Codex 可以经兼容桥调用 Anthropic Messages 接口上的其他模型，Pi 也可以使用自己的原生协议适配；界面显示 Codex，不意味着上游一定是 OpenAI。
-
-模型资料的共享层在 [`packages/model-providers`](https://github.com/makecindy/cindy/tree/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/model-providers)，Desktop 活动目录在 `maker-host/active-catalog.ts`，最终路由集中于 [`provider-route.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/provider-route.ts)。目录把公共型号资料、供应商路由、引擎差异、实报和用户覆盖组合起来；服务端目录与客户端离线副本的关系，见基线的 `docs/dev-rules/model-catalog-maintenance.md`。
-
-目录中的“可显示”、连接的“已认证”、路由的“可执行”和真实请求的“已成功”是不同证据。添加模型条目，只能说明客户端有了描述；接口、鉴权头、模型 wire ID 或协议字段仍可能不匹配。后续实践中出现的“列表完全为空”和“有模型但请求 401”，分别发生在目录初始化和实际鉴权阶段，修复位置也不同。
-
-Codex 的 Desktop 代理生命周期由 [`codex-proxy-host.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/codex-proxy-host.ts) 管理。本地回环（Loopback）代理承担路由、请求适配和宿主策略；`responses-anthropic-bridge` 则提供 Responses 到 Anthropic Messages 的转换。桥接只是协议和策略执行路径，模型推理仍在选中的上游完成。
-
-Pi 的宿主装配位于 [`pi-host.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/pi-host.ts)。需要根据供应商分支理解它：订阅来源可以经宿主代理注入凭证，自定义 API key 来源则有原生供应商配置和环境变量注入路径。文件头对某个阶段或订阅路径的说明，不能代替函数内部对所有来源的实际分支。接入自己的模型时，应该检查 `buildPiNativeProvidersFromConfigs` 怎样生成 API、base URL、模型列表和密钥引用。
-
-## 存储负责恢复事实，界面状态负责展示
-
-Desktop 的 `main/localDb/` 使用 SQLite 和 Drizzle 组织产品数据；[`DesktopSessionStorage`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/session-storage.ts) 把核心会话接口映射到数据库。任务元数据、消息、模型、执行位置和原生会话编号等信息，因而能被宿主与界面共同使用。
-
-这里最容易误读的是 `sessions.status`。存储映射的注释明确把它界定为产品生命周期的 `active / archived / deleted`，而不是当前轮次的“运行中 / 已完成”。因此，运行核验不能因为一行仍是 `active` 就认定 Agent 还在执行。要结合轮次开始与结束标记、存活进程和界面事件判断；同样，留下开始标记但对应进程已死，也可能是中断任务。
-
-原生引擎还维护自己的历史或转录，产品 SQLite 并不是所有运行数据的唯一物理文件。记忆、Skill、附件、凭证和插件持久数据也有不同的作用域与存储合同。分析其中一个 FTS 查询入口，不能据此推断整个客户端只有一种检索方式；查看一个 Pi transcript，也不能认为它包含所有 Cindy 产品状态。
-
-重启恢复由这些事实共同驱动。`sessionActiveTurn.ts` 判断启动时的中断候选，`interruptedResumeCandidates.ts` 补充展示信息，运行期恢复则由 `maker-ipc/interruptedTurnAutoResume.ts` 分类，再回到输入协调器。启动时发现中断和运行中自动续跑是两条不同的路径。保留原版 SQLite 与任务入口，正是本次定制没有重新实现这些状态机的主要收益。
-
-## 外围能力通过宿主接线扩展基础链路
-
-在理解发送和恢复后，再看插件、手机与协同，会更容易判断它们的位置。下面的表是代码导航，不表示所有能力都已在本次环境中联调。
-
-| 能力 | 客户端入口 | 与基础任务链的关系 |
+| 用户动作 | 跨过接受边界前（仍在协调队列） | 跨过接受边界后（底层引擎已接手） |
 | --- | --- | --- |
-| MCP、文件、浏览器和电脑操作 | `main/mcp-integrations/`、`packages/lizi-mcps`、`browser-control-runtime` | 宿主装配工具与权限，Agent 在任务中按需调用 |
-| 插件发现与运行 | `main/plugin-market/`、`packages/cindy-tools` 及 Ghost 相关模块 | 市场发现、已装插件运行与批准记录是不同层，关闭市场不能顺手破坏存量数据 |
-| 伙伴与 Orca 协同 | Desktop 伙伴宿主、`packages/orca-workflow` | 增加身份、调度和多 worker 行为，不能把伙伴输入直接视为用户授权 |
-| 定时任务 | `packages/maker-scheduler` 与 Desktop runner | 调度入口复用执行链，保留来源和恢复语义 |
-| 手机控制桌面 | `apps/mobile`、`packages/device-link`、`main/device-link/` | 手机持有控制和镜像状态，任务在被选中的执行电脑上运行 |
-| SSH 执行 | `maker-remote-ssh`、`maker-cc-manager`、`maker-pi-manager` | 远端进程和工作目录带来独立的断链、恢复与凭证边界 |
-| 语音、外设、菜单栏和灵动岛 | 对应 Main 服务与 native helper | 通常有独立启动、预热、系统事件和清理路径，不能只审查任务工具入口 |
+| **普通发送** | 按序排队；若环境准备或鉴权失败，直接回滚队首，不留脏历史 | 进入正式轮次，等待引擎流式事件驱动状态更新 |
+| **运行中插话** | 暂存为待发条目；若底层引擎拒绝插话，原样退回待发区 | 交由引擎与当前轮次合并处理 |
+| **点击停止** | 暂停队列继续下发，保留用户已敲好的待发草稿 | 向引擎发送中止信号（Abort），等边界收尾后释放调度锁 |
+| **编辑 / 撤回** | 允许直接修改或移除尚未下发的排队条目 | 已进入引擎上下文的历史不再篡改 |
+| **失败重试** | 无需复制消息，恢复排队状态即可 | 需结合失败阶段决定续跑还是开启新轮次，防止重复执行副作用 |
 
-原仓有多类“远程”，也有多类“后台”。手机远控一台桌面、通过 SSH 在服务器运行 CLI、上游模型在网络服务推理，分别跨越不同的边界。本地 profile 可以保留网络模型；关闭设备互联可以保留任务内按需操作本机电脑；关闭插件市场也不必删除用户已批准的插件。这些取舍必须落在具体能力上。
+更妙的是，这套协调器不仅服务于主聊天框，定时任务、自动化伙伴（Partner）和外部消息渠道也共用同一入口。不管输入从哪里来，只要走协调器，排队、回滚和中断语义就是一致的。
 
-## 从架构推导定制的最小改动面
+---
 
-在上述约束下，保留原版基础逻辑的定制可以集中在三个位置。第一，在启动配置与能力判据中选择要注册的 Agent、服务和 UI 入口。第二，在既有模型目录及路由中加入公司供应商，复用协议转换和凭证读取。第三，在设置存储中保留默认值与用户覆盖的区别，让 Main、preload、Renderer 使用一致的启动快照。
+## 三、会话编排：Maker、Session 与双层会话 ID
 
-任务协调器、Session 派发、消息落库和恢复逻辑则继续复用。这会保留原系统的复杂性，也要求审查所有可能唤起服务的旁路：窗口显示、睡眠恢复、启动补传、原生助手预热、模块初始化与 IPC 查询。下一篇记录中的 WorkLouder 和日志补传遗漏，正说明“主初始化函数有判断”不足以覆盖完整生命周期。
+跨过输入协调器往下走，就进入了与 Electron 解耦的编排核心 `packages/maker-core`。这里有三个核心角色各司其职：
 
-要继续深入阅读，可以按下面的顺序复核源码：
+- **[`Maker`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/maker-core/src/maker.ts)（总调度室）**：按引擎类型（`AgentKind`）管理注册表。每当要启动新会话时，它结合工作目录、本地或远端位置以及启动参数创建实例，串联起宿主环境准备、底层进程拉起、元数据落库和异常清理。
+- **[`BaseAgent`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/maker-core/src/agents/base-agent.ts)（引擎适配器）**：为 Claude Code、Codex、Pi 定义统一的会话句柄（Handle）和事件流接口，同时通过能力声明（Capabilities）诚实暴露差异——比如某个引擎不支持某项热切换，上层就据此置灰入口，而不是硬调报错。Desktop 侧的 `main/maker-host/` 则通过依赖注入，把具体的二进制路径、环境变量、鉴权桥和 MCP 工具装配进去。
+- **`Session`（单次运行管家）**：持有当前活跃句柄、轮次状态机和权限上下文，把底层吐出的增量文本、工具调用请求和报错翻译成统一的产品层事件。
 
-1. `main/index.ts → bootstrap-electron.ts`：确认 profile、生效配置与服务接线时机。
-2. `renderer/components/new-chat/ChatInput.tsx → preload/preload.ts → maker-ipc/register.ts`：跟踪一次发送意图。
-3. `agent-input-coordinator.ts → maker-core/src/maker.ts → session.ts → agents/base-agent.ts`：识别事务、派发和运行时边界。
-4. `active-catalog.ts → provider-route.ts → codex-proxy-host.ts / pi-host.ts`：区分目录、协议和真实凭证路径。
-5. `session-storage.ts → localDb/sessionActiveTurn.ts`：用持久化事实理解恢复，而不是只看界面状态。
+这里藏着两处极易踩坑的工程细节。
 
-这套阅读顺序适用于修改本地执行、模型接入或后台服务策略。它不构成对独立服务端、所有插件权限、全部远程组合和完整电脑控制任务的验收；这些路径仍需要按各自的协议、身份与失败条件单独验证。
+第一处是**启动半途失败的孤儿进程清理**。设想 `Maker.createSession` 已经成功拉起了底层的 Codex 子进程，但紧接着写本地数据库时报错了。如果只盯着数据库事务回滚，后台就会留下一个没人管的孤儿进程。因此 `Maker` 在创建链路里专门做了逆向补偿：一旦后续装配失败，立即关闭已启动的句柄并触发失败钩子；如果底层进程未能确认退出，宿主还会维持运行态保护，防止状态失联。
+
+第二处是**双层 ID 映射**。Cindy 侧边栏里的每个任务有自己的产品级 ID，而底层运行的 Codex Thread 或 Pi Session 又有各自原生的会话标识，两者通过 `sdkSessionId` 等字段关联。为什么要分开？因为用户可能在一个产品任务里查看归档、恢复原生上下文，或者删除本地记录；把产品生命周期和底层 CLI 的会话文件解耦后，各自演进才不会互相绑死。
+
+---
+
+## 四、模型选路：把“一个模型名字”拆回四个正交维度
+
+在单模型客户端里，下拉框选中一个名字，直接发请求就完了。但在多引擎客户端里，界面上选一个模型，背后其实要同时对齐四件事：
+
+1. **走哪条连接与凭证**（官方订阅登录、企业网关，还是用户自填的 API Key）？
+2. **上游推理型号叫什么**（例如网关侧真实的 `bailian/deepseek-v4.1-flash`）？
+3. **走什么传输协议**（OpenAI Responses 协议，还是 Anthropic Messages 协议）？
+4. **由哪个 Agent 引擎驱动工具循环**（Codex 还是 Pi）？
+
+举个直观的例子：界面上选了 Codex 引擎，但配置的是公司内部的 Anthropic Messages 兼容网关。这时“界面显示 Codex”只决定了本地由谁来跑读写文件和终端命令的循环，真正的推理请求完全可以发往非 OpenAI 的大模型。
+
+Cindy 把这套组合逻辑放在了三层代码里：跨端共享的模型元数据位于 [`packages/model-providers`](https://github.com/makecindy/cindy/tree/b1d73b1f79ae812d0950c632db4785b1f06d48e7/packages/model-providers)，桌面端汇总可用列表在 `maker-host/active-catalog.ts`，而真正发请求前的路由拍板则集中在 [`provider-route.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/provider-route.ts)。
+
+更关键的是，**Codex 和 Pi 拿到凭证与协议适配的方式截然不同**：
+
+- **Codex 走“本地回环代理桥”**（[`codex-proxy-host.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/codex-proxy-host.ts)）：Codex CLI 启动时拿到的只是一个指向本机 `127.0.0.1` 的代理地址和占位 Key。当它发出 OpenAI Responses 格式的请求后，Main 进程里的本地代理负责拦截请求，通过 `responses-anthropic-bridge` 把协议转换成 Anthropic Messages 格式，再贴上真实的网关密钥发往上游。这样子进程本身根本碰不到真实密钥。
+- **Pi 的自定义模型走“原生配置注入”**（[`pi-host.ts`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/pi-host.ts)）：当使用官方订阅时，Pi 同样可以走宿主代理；但当接入自定义 API Key 供应商（BYOM）时，`buildPiNativeProvidersFromConfigs` 会组装好 Base URL 和模型列表，把真实密钥放进为子进程准备的独立环境变量里，通过 `apiKeyEnvVar` 交给 Pi 原生运行时直接调用。
+
+把这两条路径对比着看，很多诡异的故障就一目了然了：如果“下拉框里压根没出现模型”，病根一定在 `active-catalog` 初始化阶段（比如某个被裁剪引擎的能力探测卡死了整张目录）；如果“能选模型，一发消息报 401”，病根就在 `provider-route` 或本地代理桥的请求头拼装（比如同时带上了冲突的 `Authorization` 和 `x-api-key`）。
+
+---
+
+## 五、持久化与崩溃恢复：别被 `sessions.status` 的名字骗了
+
+桌面应用随时可能遇到系统休眠、强制退出或进程崩溃。Cindy 在 `main/localDb/` 下用 SQLite 配合 Drizzle ORM 持久化本地状态，并通过 [`DesktopSessionStorage`](https://github.com/makecindy/cindy/blob/b1d73b1f79ae812d0950c632db4785b1f06d48e7/apps/desktop/src/main/maker-host/session-storage.ts) 与核心编排层对接。
+
+第一次查这张表时，几乎所有人都会踩一个命名陷阱：看到 `sessions.status` 字段的值是 `active`，就以为“当前有个 Agent 正在后台跑”。其实源码注释写得很清楚，这个字段表达的只是侧边栏卡片的归档状态——**`active`（正常展示）、`archived`（已归档）、`deleted`（已删除）**，跟此刻有没有子进程在干活毫无关系。
+
+那客户端怎么知道哪些任务是被意外腰斩的？答案是看**轮次账本与存活进程的差集**：
+
+- 如果数据库里某条会话留着“轮次已开始、尚未写入结束标记”的记录，而当前内存里又找不到对应的活跃子进程，说明它在上一轮运行中途断掉了。
+- 应用冷启动时，`sessionActiveTurn.ts` 会扫描这类未闭合轮次，`interruptedResumeCandidates.ts` 据此在界面上提示用户是否恢复；而在运行期间如果发生意外中断，则由 `maker-ipc/interruptedTurnAutoResume.ts` 判定错误类型，再送回前面的 `AgentInputCoordinator` 决定自动续跑还是交给用户处理。
+
+与此同时，SQLite 只管 Cindy 自己的产品账本；Codex 的本地目录、Pi 的会话转录文件、MCP 配置以及系统钥匙串里的凭证，都按各自的作用域分开存放。这也是我在做本地定制时决定保留整套 SQLite 和任务主干的原因——自己重写一个聊天界面很容易，但要把这套跨重启的中断检测和双层会话对齐重做一遍，极易引入丢消息的隐蔽 Bug。
+
+---
+
+## 六、外围能力与定制切入点
+
+顺着“前端意图 → 输入协调器 → Maker/Session → 模型路由 → SQLite 账本”这条主干往外看，仓库里其余庞大的模块不过是挂在宿主上的扩展插件：
+
+| 扩展方向 | 核心模块位置 | 架构角色与边界 |
+| --- | --- | --- |
+| **本地工具与电脑控制** | `main/mcp-integrations/`、`packages/lizi-mcps`、`browser-control-runtime` | 由 Main 统一装配权限与审批，供 Agent 在轮次内按需调用文件、终端与浏览器 |
+| **插件体系** | `main/plugin-market/`、`packages/cindy-tools` | 市场浏览、本地已安装插件运行与权限记录分层管理；关掉在线市场不影响存量本地工具 |
+| **多 Agent 协同与定时任务** | `packages/orca-workflow`、`packages/maker-scheduler` | 本质上是主任务链的另一类输入源，复用相同的会话编排与恢复机制 |
+| **跨设备与远端执行** | `apps/mobile`、`packages/device-link`、`maker-remote-ssh` | 手机远控桌面改变的是“谁发指令”；SSH 远端执行改变的是“CLI 跑在哪台机器上” |
+| **系统常驻与外设集成** | 语音、外设监听（如 WorkLouder）、菜单栏与灵动岛相关 Main 服务 | 往往在启动、窗口唤醒或睡眠恢复时独立自启，裁剪时必须逐一排查生命周期入口 |
+
+摸清了这张全景图，我们就能回答文章开头的问题：**想做一个干净、可控、保留原版体验的个人定制版，刀该下在哪里？**
+
+完全不需要去动 `AgentInputCoordinator`、`Session` 或 SQLite 表结构，只要守住三个咽喉要道就够了：
+
+1. **启动快照门禁**：在 Main 初始化阶段固定一份能力开关快照（同步给 preload 与 Renderer），把不需要的引擎（如本次排除的 Claude Code）和后台常驻服务在注册入口直接拦住，同时排查睡眠恢复、日志补传和硬件预热等旁路入口。
+2. **目录与路由注入**：顺着 `active-catalog.ts → provider-route.ts` 注册内部模型供应商，分别接好 Codex 的本地代理桥和 Pi 的原生配置路径。
+3. **独立数据目录（Profile）**：在 `main/index.ts` 为定制版划分独立的用户数据目录，与官方发行版彻底隔离。
+
+如果你想亲自对照源码走读一遍，最省力的路线就是沿着下面五步顺藤摸瓜：
+
+1. `main/index.ts → bootstrap-electron.ts`：看应用启动时如何确定数据目录并拉起后台服务；
+2. `ChatInput.tsx → preload/preload.ts → maker-ipc/register.ts`：看一次敲击回车如何跨过进程隔离墙；
+3. `agent-input-coordinator.ts → maker.ts → session.ts → base-agent.ts`：看输入事务如何切分排队回滚与引擎执行；
+4. `active-catalog.ts → provider-route.ts → codex-proxy-host.ts / pi-host.ts`：看模型名称如何落地成真实的协议转换与鉴权请求；
+5. `session-storage.ts → localDb/sessionActiveTurn.ts`：看客户端如何靠持久化账本找回中断现场。
+
+下一篇[《保留 Cindy 原版逻辑的本地定制：模型接入、可选功能与运行核验》]({{< ref "2026-10-24-cindy-company-local-build-notes.md" >}})，我们就把这套推导变成真实的代码补丁，看看目录空白、鉴权头冲突和后台漏网之鱼是怎么一个个抓出来的。
+
+---
+
+> **源码基线说明**：文中源码路径固定在 `makecindy/cindy` 上游提交 `b1d73b1`（2026-10-24，本地定制验证分支截至 `61db885`）。该仓库为涵盖 Desktop、Mobile 与共享 `packages/` 的客户端单仓，本文聚焦桌面端核心调用链，不涉及独立闭源服务端。

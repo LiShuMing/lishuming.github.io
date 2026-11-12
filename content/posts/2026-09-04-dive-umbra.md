@@ -12,568 +12,291 @@ tags:
   - 查询优化器
   - HTAP
   - 云原生数据库
-description: "沿 19 篇一手论文重建 Umbra 的研究谱系：它如何从 HyPer 的纯内存假设出发，以 SSD Buffer Manager 为系统底座，逐步补齐低延迟编译、事务、复杂 Join、云对象存储、流处理和库内机器学习，并在每次扩张中重新划定关系模型与编译器的边界。"
+description: "从 HyPer 纯内存与全量 LLVM 编译撞上的两堵物理高墙出发，串联慕尼黑工业大学 19 篇核心论文，拆解 Umbra 如何用指针混写、German Strings、Flying Start 单遍编译、解关联大连接优化、菱形硬化连接与冷热变形存储一步步重塑现代数据库内核。"
 draft: false
+toc: true
+math: true
 ---
 
-Umbra 系列研究反复处理的是编译型数据库的适用边界：数据超过内存时如何访问页面，短查询如何避免编译延迟，复杂 Join 如何控制搜索与中间结果，以及数组、流和云存储如何接入已有内核。这些问题共享执行与优化基础，但论文中的独立原型并不等于一套同时具备全部能力的发布版本。
+2010 年代初，慕尼黑工业大学（TUM）的 HyPer 系统曾用一套极度纯粹的组合技震撼了数据库界：**假设全部数据常驻 DRAM，彻底砍掉传统缓冲池（Buffer Pool）与火山模型迭代器，用 LLVM 把整条 SQL 流水线直接编译成紧凑的原生机器码。** 在内存放得下的分析基准测试上，这套架构快得几乎摸到了单机硬件的天花板。
 
-沿着这个问题重读论文，会看到一条很清晰的演化路线：
+可一旦走出实验室、把这套纯粹设计推向真实的生产负载，它迎头就会撞上两堵结结实实的物理高墙：
+
+1. **DRAM 容量与 NVMe 税之墙**：现代企业级 NVMe SSD 阵列已经能跑出每秒数千万次 IOPS 和几十 GB 的吞吐，单字节成本却只有 DRAM 的零头。一旦数据集涨破内存上限，系统就必须重新管起磁盘页；但如果你在编译执行引擎底下原样塞回一个传统数据库缓冲池——每次访问页面都要去全局哈希表里查页号、加锁、增减引用计数（`pin/unpin`），再按死板的 8 KiB 小页切碎大列块——CPU 光是在缓冲池记账上烧掉的指令周期，就足以把 JIT 编译省下来的算力红利吃得干干净净。
+2. **LLVM 编译启动延迟之墙**：LLVM 全量优化后端（`-O3`）在跑十秒钟的大表扫描时威风八面，但它做一遍指令选择、循环展开和寄存器分配本身就要花掉几十毫秒，碰上几百行的复杂 TPC-DS 查询甚至逼近 1 秒。而线上大量点查、元数据查询或短事务真正的执行时间还不到 1 毫秒——“磨刀一秒钟，砍柴半毫秒”，编译本身反倒成了最大的响应延迟瓶颈。
+
+顺着这两堵墙继续往下深挖，还会连带拔出另外三串连锁难题：当 TUM 招牌的通用子查询解关联（Subquery Unnesting）把层层嵌套的相关子查询统统拍平为连接图后，优化器动辄面对几十上百张表、夹杂外连接与半连接的搜索爆炸，以及多对多菱形连接（Diamond Join）引发的中间结果雪崩；当存储底座进一步延伸向云端对象存储（S3），客户端 CPU 往往在喂饱网卡带宽前就先被协议栈榨干；而当用户试图把数组、流处理乃至神经网络训练一并塞进 SQL 引擎时，“万物皆元组”的物理表示又会遭遇严酷的内存拷问。
+
+把 TUM 团队在 2018 至 2024 年间发表的 **19 篇一手论文**拼回同一张工程蓝图，你会发现 **Umbra** 从来不是一堆零散顶会技巧的拼盘，而是围绕上述矛盾一环扣一环长出来的完整演化树：
 
 ```text
-HyPer：内存常驻 + 编译执行
+HyPer 起点：全量常驻 DRAM + 全量 LLVM 编译执行
   │
-  ├─ 数据可能大于内存 ───────→ Umbra Buffer Manager / Swip
-  │                              └─ MVCC：把 OLTP 带回 SSD 架构
+  ├─ 撞上内存容量墙 ────→ Umbra 缓冲池（可变长页 + Swip 指针混写 + German Strings）
+  │                        ├─ Memory-Optimized MVCC：页局部内存版本链补齐磁盘态 OLTP
+  │                        └─ AnyBlob → Colibri：打满对象存储带宽，热 PAX 页与冷列文件随温度变形
   │
-  ├─ 编译可能比执行更慢 ─────→ Adaptive Execution
-  │                              └─ Tidy Tuples / Umbra IR / Flying Start
-  │                                  ├─ Dynamic Blocks：执行期适应
-  │                                  └─ FireARM：迁移到 AArch64
+  ├─ 撞上编译延迟墙 ────→ Adaptive Execution（先解释 LLVM IR 再按需切 JIT）
+  │                        └─ Tidy Tuples + Umbra IR + Flying Start（毫秒级单遍原生码 + 后台 LLVM）
+  │                             ├─ Dynamic Blocks：预埋多路机器码分支实现免重编自适应
+  │                             └─ FireARM：验证分层 IR 向 AArch64 的低成本移植
   │
-  ├─ 优化空间可能失控 ───────→ JOB 诊断 → Adaptive Large Join → LinDP++
-  │                              └─ Indexed Algebra：降低代数优化复杂度
+  ├─ 撞上连接搜索与膨胀 ─→ JOB 归因诊断 → Adaptive Very Large Join → LinDP++ 语义守门
+  │                        ├─ Indexed Algebra：用动态树索引把计划树列分析压回 O(n log n)
+  │                        └─ Unchained 哈希表 + Diamond Hardened Join（拆开 Lookup 与 Expand）
   │
-  ├─ Join 可能在错误位置膨胀 → Unchained Hash Table
-  │                              └─ Lookup / Expand / Diamond Hardened Join
-  │
-  ├─ 数据可能已经在对象存储 ─→ AnyBlob
-  │                              └─ Colibri：热行存 + 冷列存的云端 HTAP
-  │
-  └─ 工作负载不再只是 SQL ───→ ArrayQL / Recursive SQL + GPU / LLVM AD
-                                 ├─ Duck's Brain：反思关系物理表示
-                                 └─ Relation-Based Streaming
+  └─ 试探关系模型外延 ──→ ArrayQL / Recursive SQL + GPU / LLVM 自动微分优化
+                           ├─ Relation-Based Streaming：环形缓冲关系复用编译执行器
+                           └─ The Duck's Brain：用实测内存鸿沟证伪“物理表示大一统”
 ```
 
-这篇文章不是按发表时间逐篇摘录摘要，而是按系统问题组织 19 篇论文。每一节都会回答四件事：论文真正解决了什么、机制是什么、实验证明到哪里、它为什么自然地导向下一步。这样才能把 Umbra 看成一条研究路线，而不是论文标题的集合。
+下面我们就顺着这五条主干脉络，看清每一项核心机制究竟被什么物理约束逼出来、靠什么数据结构落地，又在哪道边界上把接力棒交给了下一篇工作。
 
-## 一、论文谱系与比较范围
+---
 
-### 跨论文比较的范围
+## 一、存储与事务底座：在 NVMe 与云对象存储上保住内存级热路径
 
-以下联系是对文献的综合解释，不是作者公布的统一产品路线。存储、编译、优化与 Join 分别处理不同约束；某项机制在单篇论文中的收益，不能直接推导为这些机制组合后的收益。
+想要支持超出内存的数据规模，同时守住接近纯内存系统的吞吐，核心铁律只有一条：**缓存命中（Cache Hit）这条占 99% 比例的快路径上，绝不允许出现任何全局哈希查表和重量级锁竞争。**
 
-### 先校准论文谱系：原始材料中的几处错位
+### 1.1 可变长页、Swip 指针混写与 German Strings（CIDR 2020）
 
-区分论文真正实现的机制，是比较研究路线的前提。例如 Indexed Algebra 优化的是代数树上的分析与维护，而非物理索引访问路径。
+作为整条路线的奠基之作，[《Umbra: A Disk-Based System with In-Memory Performance》](https://cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf)（CIDR 2020）借鉴并扩展了 `vmcache` 虚拟内存缓冲思想，从三个维度重塑了存储底座。
 
-| 常见写法 | 论文中的真实含义 |
-|---|---|
-| `Making Compiling Query Engines Practical` 就是 Flying Start 论文 | 这是 2018 年 ICDE 工作扩展成的 2019 年 TKDE 论文，核心是 **LLVM IR 解释执行后再自适应编译**；Flying Start 属于 2021 年的 `Tidy Tuples and Flying Start` |
-| `Indexed Algebra` 把物理索引提升为代数节点，并降低 Join 枚举复杂度 | 这里的“Indexed”是给**代数树上的路径查询与更新**建立动态索引，主要加速列集合分析，不是数据库 B-tree/index access path，也不负责 Join 枚举 |
-| Robust Hash Table 是带 16-bit fingerprint 的 open addressing | 论文中的结构叫 **Unchained**，组合分区、adjacency array、流水化 probe、Bloom filter 和 software write-combining buffer |
-| Diamond Hardened Join 靠计数器检测爆炸后在线换计划 | 核心是把二元 Join 分解成 **Lookup（收缩）与 Expand（扩张）**，分别重排，并用 `Expand3` 处理环；不是 in-flight re-optimization |
-| Relation-Based Streaming 是 Differential Dataflow 的关系化实现 | 论文采用有限窗口的 ring-buffered relation，并尽量复用数据库执行器；它没有实现完整的分布式 checkpoint、watermark、exactly-once 和反压协议 |
-| Colibri 以 S3 为唯一持久层，WAL 只在临时 NVMe | 论文明确区分 page server、log server 与 object storage；热页、日志和冷列文件承担不同持久化职责 |
+第一刀砍向了延续几十年的**固定大小磁盘页**。传统 8 KiB 定长页在分析列存和大字符串面前左右为难：页太小，扫大列时 I/O 请求碎成一地且大对象被迫拆成跨页链表；页太大，随机点查改一行却要连坐读写几兆字节。Umbra 直接引入**按指数分档的可变长页（Variable-Size Pages）**，从 `64 KiB` 起步按 `2^k` 倍增，并在操作系统 64 位虚拟地址空间里为每一个尺寸档位（Size Class）预先划出独立的连续地址段——点查走小页免读放大，大列块与大对象直接住进大页保顺序吞吐。
 
-还有一篇名为 `Instead of Rewriting Everything: A Case for Compiler-Driven Database Engines` 的所谓 CIDR 2023 论文，无法在 CIDR 论文集和作者发表列表中核验。本文不把它当作事实来源，而以真实发表的 [Bringing Compiling Databases to RISC Architectures](https://db.in.tum.de/people/sites/gruber/p791-gruber.pdf) 讨论 Umbra 编译架构的可移植性。
+第二刀是用 64 位**混写指针 `Swip`（Swizzled Pointer）**彻底消灭热页访问的全局查表税。由于内存页按字节对齐后最低位天然为 `0`，热页驻留内存时，`Swip` 直接存放 64 位缓冲帧虚拟内存地址（最低位 `tag = 0`）；冷页尚在磁盘时，最低位标为 `tag = 1`，高 57 位编码逻辑页号、中间 6 位记录尺寸档位。
 
-## 二、系统底座：从“数据必须在内存”到“冷热路径都可控”
+CPU 沿着 B+-Tree 往下走时只需一条位测试指令：看到末位是 `0`，直接当原生 C++ 指针解引用冲过去，连缓冲池管家的面都不用见；只有看到末位是 `1`，才慢速陷入 Buffer Manager，将对应尺寸档位的页面从 SSD 读入预先 `mmap` 好的虚拟地址段，并把父节点里的 `Swip` 原地改写成 `tag = 0` 的虚拟内存指针（即 Pointer Swizzling）。等到内存吃紧需要替换冷却页面时，系统再通过原子 `CAS` 把父页 `Swip` 解混写（Unswizzle）回 `tag = 1`，最后调用 `madvise(MADV_DONTNEED)` 归还物理内存帧而保留虚拟地址空间：
 
-数据不常驻内存后，存储访问和事务版本都需要稳定身份。Umbra 的页面访问、MVCC 与云端冷热布局依次处理这一约束，不能只靠提高 SSD 带宽替代。
+![Umbra vmcache 可变长虚拟内存缓冲池与 Swip 指针混写生命周期](/images/diagrams/exec-umbra-vmcache-swip.svg)
 
-### 2.1 Umbra 2020：让 Buffer Manager 的命中路径接近指针访问
+注意这个精巧闭环成立的拓扑前提：**所有持久页必须构成一棵严格的单亲树（每个子页有且仅有一个父页持有它的 Owning Swip）**——否则当冷页被驱逐换出内存时，系统根本不知道该去哪里把散落在外的裸指针安全改回磁盘页号。配合**乐观版本闩锁（Versioned Latch）**（先读版本号、无锁读内容、末尾校验版本未变，遇到并发写干扰走乐观重试，仅在写操作或缺页 I/O 时升级锁）以及持久数据、瞬态状态、查询临时页的三级持久化职责剥离，Umbra 在 64 GiB 内存配 Samsung 960 EVO SSD 的实测中，把热页缓冲管理税压到了 **6% 以内**，冷数据顺序扫描跑出 `1.13 GiB/s`，几乎贴着操作系统裸 `mmap`（`1.15 GiB/s`）的极限飞驰。
 
-缓存命中的固定开销决定磁盘型系统能否保留内存执行优势；Swip 通过在指针中区分驻留与换出状态，避免命中时查询中央页表。
+第三处后来被 DuckDB、Velox、Polars 与 Apache Arrow `StringView` 竞相效仿的经典设计，是叶页列存里的 **16 字节字符串描述符（俗称 German Strings）**：当字符串长度 `≤ 12` 字节时，采用 `4B 字节长度 + 12B 完整内容` 全量内联在槽位里；当长度 `> 12` 字节时，槽位改存 `4B 字节长度 + 4B 首部前缀 + 8B 堆/数据块指针`。试想在做字符串等值探测或 `ORDER BY` 比较时，绝大多数业务编码、国家缩写、状态枚举压根不超过 12 字节，直接在 16 字节定长槽位里就能用寄存器一次比完；哪怕碰上几百字节的 URL 长文本，只要前 4 个字节的前缀（Prefix）对不上，CPU 当场就能判定不相等或比出大小，连一次跨页追逐外部指针的随机访存都不用付！
 
-[Umbra: A Disk-Based System with In-Memory Performance](https://cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf)（CIDR 2020，Thomas Neumann、Michael Freitag）是系统路线的分水岭。HyPer 的很多设计默认数据常驻内存；Umbra 接受数据会超过 DRAM，却不愿退回传统 Buffer Pool 每次访问都查全局页表、加锁、pin/unpin 的路径。
+### 1.2 面向磁盘换出的内存态 MVCC（PVLDB 2022）
 
-论文的第一项关键设计是 **variable-size page**。页面从 64 KiB 起按 size class 指数增长，不同 size class 在进程虚拟地址（Virtual Address）空间中各自保留连续区域。小随机访问不必承担超大页的读放大，大对象和顺序数据也不必被强行切成大量固定小页。
+搞定了分析扫描，要做真正的 HTAP 还得过高频 OLTP 事务这一关。[《Memory-Optimized Multi-Version Concurrency Control for Disk-Based Database Systems》](https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf)（PVLDB 2022）直面了一个经典两难：如果学 PostgreSQL 把旧版本直接追加进持久化数据页，不仅页面迅速膨胀还会引发严重的磁盘写放大；可如果学纯内存 HyPer 用裸内存指针串起 Undo 版本链，一旦数据页被换出到 SSD 再读回来，物理地址全变了，版本链当场断成野指针。
 
-第二项设计是 64-bit `Swip`（swizzled pointer）：
+Umbra 抓住了一个关键的负载事实：**日常在线写事务同一时刻活跃的未提交/历史版本总量其实非常小，现代服务器内存完全装得下。** 于是它定下规矩：持久化数据页上永远只原地存放最新状态，修改前的旧镜像（Before-Image）留在事务私有的内存版本缓冲区里；只要某个常驻内存页上改出了多版本对象，就在该页旁挂一张轻量的**页局部映射表（Page-Local Mapping Table）**，用页内稳定的逻辑槽位号桥接到内存版本链。一旦页面冷却被驱逐落盘，无需把仅服务于并发快照读的历史旧版本写进数据文件（崩溃恢复本就有预写日志 WAL 兜底；遇到超大批量导入版本爆内存时，再退回页上极简标记位保证并发只读隔离）。靠着把持久恢复与并发读隔离拆开记账，其事务吞吐相比传统页内多版本磁盘引擎拉开了最高一个数量级的身位。
+
+### 1.3 从 AnyBlob 到 Colibri：喂饱云端带宽与数据随温度变形（PVLDB 2023–2024）
+
+当战场从本地 NVMe 转向云端对象存储（如 AWS S3），很多人直觉以为瓶颈全在“云存储延迟高”。[《Exploiting Cloud Object Storage for High-Performance Analytics》](https://www.vldb.org/pvldb/vol16/p2769-durner.pdf)（PVLDB 2023，系统名 **AnyBlob**）先把整条云端下载通路拆骨剖肉量了一遍，揪出了真凶：**在开足并发拉取分块后，网卡带宽还没满，数据库节点的客户端 CPU 就先被 TLS 加解密、HTTP 响应解析、内核态拷贝和线程切换吃光了！** AnyBlob 基于 `io_uring` 与低开销异步下载器重构了数据获取层，在无本地磁盘缓存的云主机上直接扫对象存储，跑出了逼近带本地 SSD 缓存云数仓的吞吐。
+
+但 AnyBlob 只管高吞吐冷读，不管在线点查更新与事务日志。紧接着 PVLDB 2024 的 **[Colibri](https://www.vldb.org/pvldb/vol17/p3290-schmidt.pdf)**（*Two Birds With One Stone: Designing a Hybrid Cloud Storage Engine for HTAP*）把最后一块拼图合拢——既然没有任何一种单一物理格式能同时讨好高频原地更新与压缩列扫，那就**让同一张表的数据顺着生命周期温度自动变形**，并与前文的 16 字节 `German Strings` 前缀快筛协同挡掉绝大部分跨层随机解引用：
+
+![German Strings 16B 寄存器快筛与 Colibri 冷热变形 HTAP 存储](/images/diagrams/exec-umbra-colibri-strings.svg)
+
+新写入与热修改落在由 Page Server 托管的未压缩 PAX 页里并挂接内存版本链；数据冷却后后台紧缩打包成不可变的高压缩 Mini-Page 列存块沉入廉价对象存储（在论文测试的 `12 GB/s` 对象存储带宽下靠高压缩率与异步预取弥补与 `25–56 GB/s` 本地盘的差距），并在相关事务提交前确保持久化、将叶页引用变更记入 Log Server；万一某条冷数据突然又被业务更新，系统就把它解压迁回热页区，绝不在压缩列文件上硬做昂贵的原地修补。从 2020 年让页面跨越内存与 SSD，到 2024 年让物理布局跨越行式热页与云端冷列，Umbra 的存储底座走完了一个漂亮的闭环。
+
+---
+
+## 二、查询编译演进：跨过 LLVM 的启动延迟悬崖
+
+按下存储墙之后，回头看开头提到的第二堵墙：一条执行只需 `0.5 ms` 的点查，凭什么要等 LLVM 花 `80 ms` 做重度编译优化？
+
+### 2.1 从字节码自适应切换到 Flying Start 单遍原生后端（TKDE 2019 → VLDBJ 2021）
+
+TUM 团队第一次出手拆这堵墙，是在 [《Making Compiling Query Engines Practical》](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf)（TKDE 2019，扩展自 ICDE 2018 的自适应执行工作；注：Umbra 2020 早期系统论文沿用的也是这套自定义字节码解释过渡方案）。为了避免同时维护“一套火山解释器算子 + 一套编译代码生成器”导致语义双轨分裂，他们让查询先生成统一的 IR，由专门编写的字节码解释器立刻开跑，同时后台盯紧各个代码分支的执行进度；一旦发现某个流水线剩余元组还很多，就在运行途中把该分支无缝热切换到后台刚编好的 LLVM 机器码上。
+
+解释过渡虽然砍掉了启动硬屏障，但字节码解释器本身的指令派发开销依然偏高，而且庞大的 LLVM IR 构造起来也不算轻快。能不能干脆连解释器都省掉，**在几百微秒内直接吐出第一版像样的原生机器码**？
+
+这就是 VLDB Journal 2021 名作 [《Tidy Tuples and Flying Start: Fast Compilation and Fast Execution of Relational Queries in Umbra》](https://link.springer.com/content/pdf/10.1007/s00778-020-00643-4.pdf) 的核心突破。它把原本一锅炖的代码生成切成了 `Tidy Tuples`（约 2.2 万行）、`Umbra IR`（约 3,000 行紧凑图式 SSA 与信息单元 `IU`）以及双层后端（约 4,200 行 `Flying Start` 单遍机器码生成器 + 后台异步 `LLVM -O3`），并在 Morsel 数据块边界上通过替换函数指针完成无锁热切换（可点击查看[交互式双层编译与热切换流程图](/diagrams/exec-umbra-flying-start.html)）：
+
+![Umbra 双层自适应编译与 Morsel 函数指针热切换](/images/diagrams/exec-umbra-flying-start.svg)
+
+这套分层里每一笔工程账都算得极其精细：
+
+- **上层 `Tidy Tuples` 治乱**：早期编译型引擎最让人头疼的是 C++ 代码里到处拼接零碎的 IR 指令，改一个 `NULL` 语义像排雷。`Tidy Tuples` 用强类型接口把 SQL 值语义严密包裹起来，下层 IR 根本不用操心数据库业务逻辑。
+- **底层 `Flying Start` 抢时间**：它模仿 WebAssembly 浏览器基线编译器的思路，只做单遍（Single-Pass）扫描直出 x86-64 机器码。论文消融实验给出了一组极具说服力的数字：加上轻量级寄存器分配能让生成代码的运行耗时立减 **32%**，性价比极高；但如果再往上堆复杂的线性扫描寄存器分配（Linear-Scan Allocation），编译耗时暴涨 **14%**，执行速度却只抠出来区区 **1%**——于是果断舍弃！最终 `Flying Start` 产出的机器码与满血版 LLVM 相比，虽然中位数多执行了约 `2.3` 倍指令、多花 `1.6` 倍时钟周期（因指令级并行度 IPC 高出约 `1.4` 倍而部分抵消，代码体积约 `2.4` 倍），但编译耗时直接压缩到了毫秒乃至亚毫秒级，短查询不等 LLVM 醒来就已经跑完收工了。
+
+### 2.2 编译期预埋自适应分支与跨指令集移植（Dynamic Blocks & FireARM）
+
+首层机器码飞快跑起来之后，紧接着会冒出两个灵魂拷问：
+
+第一，**机器码一旦编死下发，运行中发现过滤率或连接顺序估错了怎么办？** 如果停下来重新调编译器生成一套新代码，刚省下来的编译延迟又全赔进去了。ADMS 2022 的 **[Dynamic Blocks](https://db.in.tum.de/people/sites/schmidt/papers/dynamic-blocks.pdf)** 想出了一招“空间换时间”：在初次生成机器码时，就把几个备选的过滤谓词次序或局部连接分支一并编进程序体里，中间用可动态改写目标地址的间接跳转连接。运行期根据前几批元组的实测选择率，直接拨动跳转指针切向最优代码段——全程零重编译，在论文自适应过滤与重排测试中拿下了超 2 倍加速（代价是只能切换编译期预先枚举埋好的有限分支，无法凭空变出全新拓扑）。
+
+第二，**自己手搓 x86-64 后端这么爽，换到云厂商力推的 ARM（AArch64）服务器上岂不是要推倒重来？** PVLDB 2023 的 **[FireARM](https://db.in.tum.de/people/sites/gruber/p791-gruber.pdf)**（*Bringing Compiling Databases to RISC Architectures*）专门拿 AArch64 检验了这套分层架构的成色：上面的查询优化器、`Tidy Tuples` 和 `Umbra IR` 纹丝不动，只需重写最底下那几千行目标指令选择与调用约定（ABI）适配即可跑通。四层架构各管一摊的边界至此清晰无比：
+
+| 编译栈层级 | 掌控的核心上下文 | 最拿手的优化活儿 |
+| --- | --- | --- |
+| **数据库优化器** | 关系代数等价性、基数统计、有趣物理属性 | 连接重排、谓词下推、子查询解关联、物理算子选型 |
+| **Tidy Tuples / Umbra IR** | `NULL` 语义、内存元组布局、算子流水线边界 | 紧凑物化、指针混写解引用、领域特化控制流降级 |
+| **Flying Start / FireARM** | 目标 CPU 寄存器个数与指令集（x86-64 / AArch64） | 单遍极速指令映射、贪心寄存器分配，压住首行响应延迟 |
+| **LLVM 后端** | 完整控制流图（CFG）、别名信息与微架构流水线模型 | 公共子表达式消除（CSE）、死代码删除、循环向量化与深度调度 |
+
+---
+
+## 三、优化器四部曲：当解关联遇上超大连接图
+
+为什么 TUM 团队一边抠底层机器码，另一边却在查询优化器上连发四篇重磅论文？这要从 HyPer/Umbra 的看家本领——**任意嵌套子查询通用解关联（General Subquery Unnesting）**说起。在很多传统数据库还在把复杂 `EXISTS` 或相关标量子查询退化成逐行循环探测（Nested-Loop）时，Umbra 会先把所有相关子查询彻底改写成显式的关系连接（包含大量外连接、半连接与反连接）。这一招威力无穷，但副作用也立竿见影：**哪怕业务只写了一条中等复杂的分析 SQL，解关联展开后的逻辑计划树动辄就有二三十张甚至上百张表相连！**
+
+一旦进入这种深水区，基数估不准、搜索空间指数爆炸、外连接乱换顺序算错数、乃至遍历计划树本身的 CPU 开销，就会排着队找上门来。
+
+### 3.1 JOB 归因诊断与查询图自适应枚举（VLDBJ 2018 & SIGMOD 2018）
+
+面对选出烂计划的优化器，工程上最忌讳瞎改成本常数。[《Query Optimization Through the Looking Glass, and What We Found Running the Join Order Benchmark》](https://db.in.tum.de/~leis/papers/lookingglass.pdf)（VLDBJ 2018，扩展自 PVLDB 2015 经典 JOB 论文）拿真实世界高度偏斜且列间强相关的 IMDb 电影数据集（113 条多表查询）做了一次极其漂亮的对照控制实验：把**真实的中间结果精确基数**直接注入优化器，去隔离检验基数估计（CE）、成本模型（Cost Model）与计划枚举器（Enumerator）到底谁在背锅。
+
+实验结果给所有迷信精细硬件系数的人泼了一盆冷水：随着连接层数加深，独立性假设导致的基数低估动辄偏离三四个数量级；在内存计算场景下，只要喂进准确的基数，哪怕用一个简陋到只把中间结果行数加起来的玩具成本公式 `C_mm`，选出来的计划照样能跟精雕细琢的 PostgreSQL 成本模型打得有来有回——反过来，如果输入基数错了十万倍，再精密的 CPU/I/O 权重也只是在极其认真地放大错误前提。不过在固定相同估计的前提下，完备的动态规划搜索依然显著优于过早剪枝的贪心启发式。
+
+既然尽量搜完备更好，要是真撞上 BI 工具自动生成的 80 张表甚至 4,000 张表连接怎么办？传统优化器喜欢设一条一刀切红线：“不超过 12 张表跑精确动态规划 `DPHyp`，满 13 张表瞬间切贪心算法”。SIGMOD 2018 的 [《Adaptive Optimization of Very Large Join Queries》](https://db.in.tum.de/~radke/papers/hugejoins.pdf) 一针见血地指出：**决定搜索难度的根本不是表数，而是连接图的拓扑稠密度！** 一条首尾相接的 50 表链状图，连通子图（Connected Subgraphs）数量很少，精确搜索眨眼就完；而一张两两相连的 16 表星团稠密图，状态数早就爆表了。
+
+因此，Umbra 把优化器改造成了紧盯“端到端用户等待时间 = 规划耗时 + 执行耗时”的平滑分档器：先预估连接图的连通子图规模——简单图跑精确 `DPHyp`；中等复杂度图先按启发式排出一条线性表序列，随后只在这条序列的**连续子区间**上跑线性化动态规划（Linearized DP，把任意子集的指数级空间压缩成区间级的二次/三次空间，同时保留局部翻盘纠错能力）；超巨型图再进一步结合贪心与迭代动态规划，稳稳撑起超过 4,000 个关系的极端查询。
+
+### 3.2 LinDP++ 语义守门与 Indexed Algebra 动态树索引（BTW 2019 & PVLDB 2023）
+
+2018 年的线性化 DP 主要对付可以自由交换结合的内连接（Inner Join），但前面说过，子查询解关联吐出来的满地都是 `LEFT OUTER`、`SEMI` 和 `ANTI JOIN`——乱换次序会直接把空值补位和存在性去重语义搞错。
+
+BTW 2019 最佳论文 **[LinDP++](https://btw.informatik.uni-rostock.de/index.php/de/tagungsbaende/send/3-tagungsbaende/tagungsband.pdf)** 把外连接/半连接的保留侧约束严丝合缝地编进了线性化区间枚举里，确保“先等价，再比价”。不仅如此，它还顺手打破了“永远禁止笛卡尔积（Cross Product）”的教条：假设两张极小的维表 `u` 和 `w` 各自连着庞大的事实表 `v`，先算 `u × w` 虽然没有直接连接条件，却能合成复合键一次性过滤 `v`！为了防止放开任意笛卡尔积引爆搜索空间，`LinDP++` 只在连接图上试探长度为 2 的二跳邻居路径 `(u, v, w)`，且仅当满足严格基数不等式：
+
+$$
+|u \times w| < |u \bowtie v| \quad \text{且} \quad |u \times w| < |v \bowtie w|
+$$
+
+且基数具备可靠上界时，才保守补入这条人工笛卡尔边（论文实例中将最优计划代价从 `1.84M` 直接腰斩至 `0.94M`）。
+
+当百表大查询和上百条代数改写规则同时运转时，团队又抓到了一个藏在优化器肚子里的隐形瓶颈（PVLDB 2023 [《Asymptotically Better Query Optimization Using Indexed Algebra》](https://www.vldb.org/pvldb/vol16/p3018-fent.pdf)）：优化规则每挪动一次算子，都要反复追问“某个字段是底下哪个算子产出的？沿途被谁消费了？两个节点的最近公共祖先在哪？”如果按传统做法在每个算子节点上维护整棵子树的自由变量列集合，每次局部改写都向上全链路刷新，在深链计划树上就会退化成 `O(n^2)` 的二次方复杂度！注意，这篇论文里的“Indexed”跟数据库的 B-Tree 物理索引毫无关系——它是用算法竞赛里经典的动态树结构 **Link-Cut Tree（动态森林）** 给优化器内存里的代数计划树本身建了索引，让树链切割、嫁接与路径列属性查询统统降到均摊 `O(log n)`，整棵树优化维护从 `O(n^2)` 压回 `O(n log n)`，连常规 TPC-H / TPC-DS 的总编译优化耗时都跟着缩短了超 `1.8` 倍。
+
+---
+
+## 四、鲁棒连接执行：一手抓哈希表局部性，一手推迟笛卡尔展开
+
+就算优化器用最快的速度挑出了表面最优的连接树，一到真实数据上跑连接，还是有两颗地雷随时可能引爆：一颗埋在**单个 Hash Join 算子内部**（键分布严重偏斜），另一颗埋在**多表二元连接之间**（多对多菱形膨胀）。2024 年的两篇论文刚好一人拆了一颗。
+
+### 4.1 Unchained 哈希表：消除倾斜键的指针追逐税（DaMoN 2024）
+
+在编写内存哈希连接时，内核工程师常陷入两难：开放寻址法（Open Addressing）在无重复的主外键 `1:n` 连接上紧凑飞快，可一旦 Build 侧涌入大量相同键或哈希冲突，探测距离就会急剧拉长；拉链法（Chaining）虽然不怕重复键，但沿着链表逐节点跳指针又会制造满屏随机 Cache Miss。
+
+DaMoN 2024 的 **[Unchained Hash Table](https://db.in.tum.de/~birler/papers/hashtable.pdf)**（*Simple, Efficient and Robust Hash Tables for Join Processing*）干脆把指针链彻底砍掉，换上了一套五合一的紧凑流水线：
+
+1. **并行分区聚拢**：Build 阶段先用软件写合并缓冲区（Software Write-Combining Buffer）把元组按哈希前缀分桶归拢；
+2. **连续邻接数组（Adjacency Array）**：把落入同一槽位的所有匹配元组紧挨着排在连续内存数组里，取代东一榔头西一棒子的链表节点指针；
+3. **内嵌轻量级 Bloom Filter**：在目录槽位上顺手压入标签位过滤器，让绝大多数根本连不上的探测行在触碰数据区前就被当场挡回；
+4. **流水化预取探测**：同时挂起多个未决探测请求，利用现代 CPU 的内存级并行度（MLP）掩盖 DRAM 延迟。
+
+这套结构让主外键快路径与重度倾斜的多对多路径和谐共处，相比常规开放寻址哈希表平均提速约 2 倍，在充斥高重复度节点的图分析连接上更是拉开了最高约 20 倍的差距。
+
+### 4.2 Diamond Hardened Join：拆开 Lookup 与 Expand（PVLDB 2024）
+
+但有些连接灾难，换再快的哈希表也救不回来。设想在社交关系或商品标签上跑一条菱形（Diamond）或三角环路查询：`A` 连 `B`、`A` 连 `C`，最后 `B` 和 `C` 还要在下游汇合过滤。假设某个热点键在 `B` 里有 1,000 条匹配，在 `C` 里也有 1,000 条匹配，但合拢检验后最终存活下来的只有寥寥 2 条。在传统的二元连接（Binary Join）树里，只要第一步先连了高扇出的分支，算子就会老老实实先把 `1,000 × 1,000 = 1,000,000` 行中间笛卡尔组合全物化出来，再推给下一步去砍掉 99.999% 的废品！
+
+PVLDB 2024 的 **[Diamond Hardened Joins](https://www.vldb.org/pvldb/vol17/p3215-birler.pdf)** 点破了病根：**传统二元连接把“验证能不能连上（Lookup，只会收缩行数）”和“把一对多匹配逐条复制吐出（Expand，会成倍放大行数）”死死绑在了同一个算子里！**
 
 ```text
-cached page
-┌───────────────────────────────────────────────────────────────┬─┐
-│                       buffer-frame address                    │0│
-└───────────────────────────────────────────────────────────────┴─┘
+传统二元连接（过早耦合扩张）：
+  Input ──→ BinaryJoin(同时查表 + 展开 100 万行中间元组) ──→ 下游连接过滤剩 2 行
 
-evicted page
-┌─────────────────────────────────────────────┬────────────┬─────┐
-│               57-bit page number            │ size class │  1  │
-└─────────────────────────────────────────────┴────────────┴─────┘
-                                                    6 bits   tag
+Diamond Hardened Join（物理代数显式拆解）：
+  Input ──→ Lookup(B) ──→ Lookup(C) ──→ 尽早做完半连接裁剪与预聚合 ──→ Expand / Expand3 按需展开存活行
 ```
 
-最低位为 `0` 时它就是可直接解引用的内存地址；为 `1` 时携带 page number 与 size class，需要 Buffer Manager 载入并 swizzle。于是命中热页时没有中央哈希表（Hash Table）查询。这个优化成立还有一个重要前提：持久页必须形成树，每个页面只有一个 owning Swip，Buffer Manager 才能安全地在父页中切换逻辑页号与物理指针。
+注意它并不是在运行中途发现行数爆炸后推倒重编计划，而是在物理代数层直接把一次连接拆成 `Lookup` 和 `Expand` 两个独立算子：优化器拼命把所有只起过滤定位作用的 `Lookup`、半连接削减和可提前聚合往前排，把真正引发数据膨胀的 `Expand` 死死摁到流水线最后；遇到三角闭合环路时，还祭出三路协同算子 `Expand3` 同时核验第三条边，无需推翻整个二元编译引擎重写全套最坏情况最优连接（WCOJ），就在基数估计基准测试的恶劣菱形查询上跑出了最高约 **500 倍**的惊人加速，且在常规 TPC-H 与 JOB 上几乎零回退。
 
-并发控制使用 **versioned latch**：乐观读先读版本、访问页面、再检查版本是否变化；冲突或 I/O 路径再转向 shared/exclusive latch。它和 Swip 共同表达了 Umbra 的设计取向：常见热路径只做局部检查，稀有慢路径才支付协调成本。
+---
 
-关系本身组织为 B+-tree，叶页内部采用面向列的布局；短字符串（不超过 12 字节）可内联。系统还区分三类数据：
+## 五、关系模型的边界实验：数组、库内机器学习与流处理
 
-- persistent data 必须可恢复；
-- transient data 属于数据库状态但不要求持久化；
-- temporary data 仅服务某次查询。
+当存储、编译、优化与连接内核全部成型后，TUM 团队顺理成章地把触角伸向了传统 SQL 之外的领地：科学计算数组、库内机器学习（In-DB ML）以及实时流处理。把这五篇探索论文连起来读，最有价值的恰恰不是“数据库无所不能”的凯歌，而是团队亲手用实验测出来的**诚实反思**。
 
-这个区分很关键。Hash table、排序 runs、中间物化并不需要与用户表共享同一种恢复义务，统一交给 storage layer 管理也不等于统一持久化策略。
+起初三步走得顺风顺水：
 
-论文的实验边界同样值得保留。测试使用 64 GiB 内存和 Samsung 960 EVO，在 JOB 与 TPC-H 上比较缓存和冷数据路径。绕过 Buffer Manager 的平均收益不足 6%，说明热页管理税被压得很低；顺序冷扫描约 1.13 GiB/s，与 `mmap` 的约 1.15 GiB/s 接近。它证明的是**缓存工作集接近内存系统、缺页时可平滑使用 SSD**，不是“SSD 与 DRAM 等价”。
+- **数组前端降级（EDBT 2022 [ArrayQL](https://db.in.tum.de/~schuele/data/arrayql.pdf)）**：不另起炉灶写数组引擎，而是把 `n` 维数组坐标与 `m` 个数值映射成 `n + m` 列的关系表，在语义分析阶段直接把矩阵乘法等 9 类数组运算降级为标准的 `Join + Projection + GroupBy`，顺手复用现成的优化器、MVCC 与代码生成器（过滤聚合表现轻快，但坐标平移与翻转仍需物化表函数买单）。
+- **递归 SQL + 自动微分 + GPU 内核生成（DAPD 2022 [Recursive SQL and GPU-support](https://link.springer.com/article/10.1007/s10619-022-07417-7)）**：用递归 CTE 表承载模型参数迭代，新增 `derivation` 算子在代码生成期对 SQL Lambda 表达式做反向模式自动微分（Reverse-Mode AD），再由充当流水线断点的梯度下降算子攒批物化，直接编译吐出 NVPTX 代码喂给 GPU 执行，把数据清洗、训练与验证揉进了同一条查询里。
+- **编译器自动消冗余测试（DEEM 2022 [LLVM AD](https://db.in.tum.de/~schuele/data/forward.pdf)）**：对比前向自动微分（Forward AD，生成的导数冗余表达式更多）与反向自动微分时发现，只要在小规模静态计算图上明确标好指针无别名（`noalias`），LLVM 强大的公共子表达式消除（CSE）与死代码删除就能自动把大量冗余计算抹平，让两者的最终 PTX 核函数运行耗时相差无几（差距主要体现在编译耗时与多输入单输出场景上）。
 
-2020 版系统论文中的编译路径仍是自定义 IR 生成 bytecode，先解释、再视执行长度交给 LLVM。后来著名的 Flying Start 尚未出现在这里。把后续论文的实现倒灌回 2020 论文，会掩盖真正的演化。
+沿着这条路再往前迈一步，岂不是连深度神经网络都能直接拆成关系元组来训练了？2023–2024 年的 **[The Duck's Brain](https://arxiv.org/pdf/2312.17355)**（*Training and Inference of Neural Networks in Modern Database Engines*）真的在 Umbra 和 DuckDB 里分别用“纯 SQL-92 坐标元组关系表示”与“原生数组（Array）类型表示”跑了一遍神经网络训练与推理，并拿 NumPy 当标尺对照。结果账单一出来，触目惊心：
 
-### 2.2 Memory-Optimized MVCC：只解决分析还不算通用数据库
+- 在极小的 Iris 数据集上，关系元组路径每轮就要吃掉 `10–20 MiB` 内存，而数组路径只需 `1–1.6 MiB`；
+- 一旦换到稍微大一点的 MNIST 手写数字数据集，把稠密权重矩阵拆成带坐标键的宽元组、挂进连接哈希表与分组聚合状态后，关系路径的内存消耗瞬间爆炸到了约 **`25 GiB`**，而保留连续张量布局的数组路径还不到 **`5 MiB`**——足足差出五千倍！哪怕用上 Umbra 原生数组，推理速度距高度调优的 NumPy 矩阵库仍有约一个数量级的差距。
 
-Buffer Manager 证明了分析负载可以越过内存边界，但 HTAP 还要求写事务、快照读和恢复。[Memory-Optimized Multi-Version Concurrency Control for Disk-Based Database Systems](https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf)（PVLDB 2022）解决的是一个两难：
+几乎在同一时期，CDMS@VLDB 2023 的 **[Relation-Based Streaming](https://ceur-ws.org/Vol-3462/CDMS7.pdf)** 把近期实时事件流封装成固定窗口的**环形缓冲关系（Ring-Buffered Relation）**，让即席流表关联（Stream-Table Join）直接复用 Umbra 飞快的编译执行器，免去了跨系统倒腾历史维表的痛苦；但它统一的是“近期窗口状态的可查询性”，并没有替你变出分布式流引擎（如 Flink）里的全局 Checkpoint、Watermark 乱序水位线、端到端 Exactly-Once 与反压控制面协议。
 
-- 像 PostgreSQL 一样把历史版本放进持久页，会产生空间膨胀和写放大；
-- 像纯内存 MVCC 一样用裸指针连接版本，页面一旦换出，指针就失去稳定锚点。
-
-Umbra 的观察是，日常 OLTP 写事务通常很小，版本量相对现代服务器内存几乎可以忽略。于是数据库页只保留对象的最新状态，before-image 存在事务私有的内存 version buffer；每个出现版本对象的 resident page 配一张局部 mapping table，把稳定对象标识映射到内存版本链。访问热页时仍是局部映射，不引入全局版本索引。
-
-当页面被换出时，版本数据并不随页持久化；恢复依赖原有 WAL，而非把可重建的历史副本写两遍。对于 bulk load 这类版本量可能超过内存的大写事务，论文另设轻量 fallback，在页上保留最少信息，使并发只读分析仍能隔离地进行。
-
-实验报告事务吞吐相对传统磁盘系统最高达到一个数量级提升。准确的结论不是“MVCC 不需要持久化”，而是：**最新数据和 WAL 必须持久，绝大多数仅服务并发读的旧版本可以是可丢弃、可回收的内存状态**。这让 Umbra 的“memory-optimized disk-based”从 OLAP 扩展到了事务路径。
-
-### 2.3 AnyBlob：先问对象存储本身到底慢在哪里
-
-对象存储扫描不只受请求延迟限制，还可能先耗尽客户端 CPU。AnyBlob 通过并发请求和下载路径优化提高带宽利用率，代价是需要足够并发与可并行读取的数据。
-
-走向云端时，研究顺序很克制：先不设计完整云数据库，而是测量对象存储数据通路。[Exploiting Cloud Object Storage for High-Performance Analytics](https://www.vldb.org/pvldb/vol16/p2769-durner.pdf)（PVLDB 2023）把请求提交、TLS/网络栈、内存分配、响应解析和并发下载拆开分析，并实现 AnyBlob。
-
-AnyBlob 使用 `io_uring` 和 CPU-efficient download manager，核心目标不是把单个 GET 变快，而是在足够并发下填满网络带宽，同时避免下载线程、复制和协议处理先吃光 CPU。论文在其云环境中表明：直接从对象存储读取、没有本地缓存的分析执行，可以接近依赖本地 SSD cache 的云数仓基线。
-
-这个结论有明确边界：AnyBlob 是高性能 retrieval blueprint，不处理页面更新、日志、事务和恢复。它回答“冷数据能否直接扫”，没有回答“热写和冷分析怎样共存”。后者正是 Colibri 的问题。
-
-### 2.4 Colibri：不是一份数据兼顾所有温度，而是让数据随温度变形
-
-热更新与冷分析扫描需要不同布局，Colibri 因而用页式热数据和压缩列文件分担职责，而不是让单一表示同时服务两类访问。
-
-[Two Birds With One Stone: Designing a Hybrid Cloud Storage Engine for HTAP](https://www.vldb.org/pvldb/vol17/p3290-schmidt.pdf)（PVLDB 2024，系统名 Colibri）把 Umbra 的 B+-tree、页式更新和对象存储扫描接在一起：
+这两盆清醒的冷水，反而淬炼出了整套研究路线最深刻的一句架构箴言：**逻辑接口的大一统（Logical Unification），绝不等于底层物理代数的大一统（Physical Unification）。**
 
 ```text
-                         B+-tree key space
-                               │
-              ┌────────────────┴────────────────┐
-              │                                 │
-       hot / recently changed             cold / stable
-       uncompressed PAX pages        immutable compressed column files
-       point lookup + update          bandwidth-efficient async scan
-              │                                 │
-         page servers                       object storage
-              └────────── log servers ──────────┘
+           SQL 查询  /  实时流窗口  /  多维数组  /  库内机器学习
+                                 │
+                                 ▼
+                    保留领域语义的统一逻辑中间层
+                                 │
+                                 ▼
+                  共享优化器骨架、存储生命周期与编译框架
+                 ┌───────────────┼───────────────┐
+                 ▼               ▼               ▼
+          关系元组物理代数   稠密张量/算子融合代数  流式窗口生命周期原语
+                 └───────────────┼───────────────┘
+                                 ▼
+                    多核 CPU  /  GPU  /  云对象存储
 ```
 
-新写入和频繁修改的数据留在未压缩 PAX 页中，获得行式点查和更新能力；冷却后的数据转成不可变、压缩、面向列的数据文件。若冷记录再次更新，系统把它解压并迁回热区，而不是在压缩文件上做细粒度原地修改。
-
-提交协议也不是“对象存储是唯一真相”。压缩文件需要在相关事务提交前持久化，叶页中的引用变化进入日志；B+-tree、热页、log server 与 object store 各自承担职责。论文既给出 page/log server 的云部署，也讨论本地单机部署。测试环境中对象存储顺序带宽约 12 GB/s，低于本地 SSD 的 25～56 GB/s，因此它依靠压缩、预取和异步并发节省带宽，而不是假设网络和本地盘等速。
-
-Colibri 是存储路线的阶段性闭环：Umbra 2020 让同一页在内存和 SSD 间切换，Colibri 2024 则让同一逻辑关系在**热行页与冷列文件**之间改变物理形态。前者统一地址空间，后者统一数据生命周期。
-
-## 三、编译路线：从“先解释再编译”到分层 IR 与运行时适应
-
-生成更快机器码并不保证更短查询延迟，因为编译本身也计入响应时间。相关论文分别优化启动、IR 层次、有限运行时选择和目标架构移植。
-
-### 3.1 Making Compiling Query Engines Practical：先解决 JIT 的启动悬崖
-
-短查询可能无法摊销 LLVM 优化成本，因此需要先执行、再判断是否值得编译。该工作依据剩余工作量选择路径，而不是对所有查询固定启用最高优化等级。
-
-[Making Compiling Query Engines Practical](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf)（TKDE 2019，源自 ICDE 2018 的 `Adaptive Execution of Compiled Queries`）讨论的是 HyPer/Umbra 编译路线的前史。问题非常实际：一个元数据查询可能执行不到 1 ms，LLVM 优化却需要几十毫秒；最大 TPC-DS 查询的编译甚至接近 1 秒。长查询靠编译获益，短查询却被 JIT 启动时间吞没。
-
-论文没有维护“解释器算子”和“编译算子”两套语义，而是让同一份 LLVM IR 先由专门 bytecode interpreter 执行，同时跟踪代码路径进度；当预计剩余工作足够大时，再把相应路径切到 LLVM 机器码。切换粒度可以细到同一查询的不同代码路径。
-
-这一步的价值是消除 `compile first, execute later` 的硬屏障，但解释阶段仍有解释开销，LLVM 后端仍然很重。它自然导向下一个问题：能否让第一份原生机器码本身就足够快地产生？
-
-### 3.2 Tidy Tuples 与 Flying Start：把复杂度分层，而不是交给一个巨型后端
-
-快速启动和高质量代码生成需要不同后端策略，分层 IR 使二者可以复用上层关系语义。
-
-[Tidy Tuples and Flying Start: Fast Compilation and Fast Execution of Relational Queries in Umbra](https://link.springer.com/content/pdf/10.1007/s00778-020-00643-4.pdf)（VLDB Journal 2021）给出了 Umbra 编译内核的完整回答：
-
-```text
-physical query plan
-        │
-        ▼
-Tidy Tuples：typed values / nullable values / tuple materialization
-        │
-        ▼
-Umbra IR：SSA-like control flow + database-oriented data structures
-        │
-        ├─ Flying Start ─→ 很快产生 x86-64 机器码 ─→ 立即执行
-        │
-        └─ LLVM backend ─→ 更慢但更充分优化 ─────→ 长查询接管
-```
-
-`Tidy Tuples` 不是一个元组格式，而是一组分层代码生成抽象。上层表达 SQL 类型、NULL 语义、比较、哈希与物化，下层再落到 Umbra IR。它解决的是“编译器代码会不会把数据库语义散落成难以维护的字符串拼接”。
-
-Umbra IR 则是为快速构造和遍历准备的图式中间表示（Intermediate Representation）。它保留 SSA、basic block、phi 等编译器概念，但数据结构和操作集合服务于数据库生成模式。这样，数据库可以在高层做 predicate、pipeline 与数据结构选择，把寄存器分配、指令选择留给后端。
-
-Flying Start 是单遍、低延迟的原生代码生成器。论文的消融实验显示，寄存器分配是最有价值的快速优化之一，可使运行时间降低约 32%；更复杂的 linear-scan allocation 只再改善约 1% 执行时间，却增加约 14% 编译成本，因此没有成为默认选择。与优化 LLVM 相比，Flying Start 生成程序的中位数大约多执行 2.3 倍指令、消耗 1.6 倍 cycles，但 IPC 约高 1.4 倍，代码体积约 2.4 倍。它不是“和 LLVM 一样快”，而是在**编译时间和机器码质量之间选择了明确位置**。
-
-论文还用代码规模反驳“编译执行必然难以工程化”：Tidy Tuples 约 2.2 万行、Umbra IR 约 3000 行、Flying Start 约 4200 行。行数不是复杂度证明，但分层至少让 SQL 语义、IR 与目标机器后端不必互相渗透。
-
-后续 Umbra 把两条后端组合起来：Flying Start 让查询立刻跑，LLVM 在后台生成更优化的长跑代码，完成后切换。这和前一篇“bytecode 解释后再编译”目标相同，演化点是首层已经变成低延迟原生代码。
-
-### 3.3 Dynamic Blocks：编译完成后，计划还可以改变吗
-
-低延迟编译解决启动时间，却没有解决基数估计（Cardinality Estimation）错误。传统 Adaptive Query Processing 可以在执行中换 Join 顺序或选择实现，但编译引擎若每次选择都重新生成和编译整段代码，适应成本可能比收益还大。
-
-[Efficiently Compiling Dynamic Code for Adaptive Query Processing](https://db.in.tum.de/people/sites/schmidt/papers/dynamic-blocks.pdf)（ADMS 2022）提出 **Dynamic Blocks**：在生成机器码时，把有限候选的代码片段全部嵌入程序，并保留可改变的间接控制流。运行时根据真实测量选择片段或调整顺序，无需重新进入编译器。论文用自适应 selection 与 Join reorder 展示这种机制，在部分测试中获得超过 2 倍提升。
-
-它的边界也很重要：Dynamic Blocks 只能在**编译前已经枚举并嵌入**的候选之间选择，不是执行中任意重建物理计划。它把“重新编译”变成“选择预编译路径”，用代码体积换适应延迟。
-
-### 3.4 Bringing Compiling Databases to RISC：自研编译器是否会成为架构债务
-
-专用后端降低编译延迟，却把指令选择和 ABI 适配的维护责任留给数据库团队。FireARM 用 AArch64 移植检验哪些逻辑可以复用、哪些必须重新实现。
-
-自定义 x86 后端越快，一个新的问题越尖锐：换到 ARM 时，是否要重写全部指令选择和 ABI 适配？[Bringing Compiling Databases to RISC Architectures](https://db.in.tum.de/people/sites/gruber/p791-gruber.pdf)（PVLDB 2023）系统比较了标准语言/通用编译基础设施与数据库专用代码生成器，并为 AArch64 实现 FireARM。
-
-论文得到的不是单向结论。通用编译设施降低移植门槛，对长查询能给出高质量代码；专用后端则能更严格地控制编译延迟，并更快支持新架构。FireARM 的意义在于验证 Umbra IR 的分层：上面的数据库语义和大部分优化可以保留，只替换目标后端。
-
-因此 Umbra 的 compiler-driven 并不是“所有工作都交给 LLVM”，也不是“为每种 CPU 重写数据库”。更准确的边界是：
-
-| 层次 | 应掌握的信息 | 适合的优化 |
-|---|---|---|
-| DB optimizer | 关系语义、基数、物理属性 | Join reorder、predicate pushdown、operator selection |
-| Tidy Tuples / Umbra IR | NULL、布局、pipeline、数据结构 | materialization、控制流、domain-specific lowering |
-| Flying Start / FireARM | 启动时延、目标 ISA | 快速指令选择、轻量寄存器分配 |
-| LLVM | 完整 CFG 与机器模型 | CSE、DCE、强度削弱、深度寄存器与指令优化 |
-
-## 四、优化器路线：估得准、搜得够、改得合法、维护得快
-
-统计误差、搜索空间和代数维护成本是独立约束，修复其中一项不能替代另外两项。以下工作分别通过消融实验、受限枚举和动态数据结构处理它们。
-
-### 4.1 Looking Glass / JOB：先把“优化器差”拆成三个可验证问题
-
-基数估计误差可能掩盖成本模型的改进，必须固定其他因素才能归因。JOB 的真实数据与基数注入实验用于区分估计、计价和枚举的影响。
-
-[Query Optimization Through the Looking Glass, and What We Found Running the Join Order Benchmark](https://db.in.tum.de/~leis/papers/lookingglass.pdf)（VLDB Journal 2018；早期版本是 PVLDB 2015 的 `How Good Are Query Optimizers, Really?`）使用 IMDb 的真实相关数据和 113 条多表 SQL，把优化器拆成 Cardinality Estimation、Cost Model 和 Plan Enumeration 分别做消融。
-
-最有价值的实验不是比较数据库总分，而是把真实中间结果基数注入优化器。结果表明，多表和相关谓词下的估计误差会随 Join 层数迅速放大，并且更常见的是低估；在内存型执行中，用所有中间结果基数之和构成的简单 `C_mm`，已经能与复杂 PostgreSQL cost model 竞争。此时如果输入基数错了几个数量级，再精细的 CPU/I/O 系数也只是在精确计算错误前提。
-
-但论文没有说枚举器不重要。给定相同估计，较完整的搜索仍通常优于过早启发式；丰富索引还会放大 access path 与 Join order 的组合空间。JOB 真正留下的方法论是：
-
-```text
-plan regression
-   ├─ estimate error?   → 注入真实 cardinality
-   ├─ cost error?       → 固定 cardinality，替换 cost model
-   └─ search error?     → 固定前两者，扩大 enumerator
-```
-
-它诊断了“为什么会选错”，但 exhaustive search 本身会爆炸。于是下一篇把优化器的运行时间也纳入目标函数。
-
-### 4.2 Adaptive Optimization of Very Large Join Queries：查询图难度比表数更重要
-
-相同表数可以对应不同数量的可连接子图，因此仅按表数切换枚举算法不能准确控制规划预算。
-
-[Adaptive Optimization of Very Large Join Queries](https://db.in.tum.de/~radke/papers/hugejoins.pdf)（SIGMOD 2018）反对一个生硬阈值：少于 N 张表用 exact DP，多于 N 张表突然切 greedy。链状 50 表可能很容易，稠密 15 表却可能产生巨大搜索空间；真正的难度更接近连接图中 connected subgraph 的数量，也就是 DP 状态规模。
-
-论文因此先估算搜索难度，再在不同层级选择策略：
-
-- 小而简单的图运行 exact `DPHyp`；
-- 中等图先得到一个线性顺序，再只对这条顺序上的区间做 DP；
-- 极大图进一步结合 greedy、linearized DP 或 iterative DP，让搜索预算平滑下降。
-
-线性化以后，候选子计划主要是连续区间，搜索从任意子集收缩成受限空间，却仍能通过区间 DP 修复初始顺序。论文展示了超过 4000 个关系的查询仍可优化，而常见查询继续保留 exact search。
-
-优化器可以视为有截止时间的随时算法（Anytime Algorithm）：搜索预算增加时改进候选，预算耗尽时返回已有可行计划。因此需要权衡规划时间与执行时间，而不只是最小化执行代价：
-
-```text
-user-visible latency = optimization time + execution time
-```
-
-它的边界是计划质量仍依赖 CE 和 cost model，线性化也可能丢掉有价值的图拓扑。2018 论文主要处理 inner join；真实 SQL 的 outer/semi/anti join 还引入语义合法性约束。
-
-### 4.3 LinDP++：搜索空间缩小后，不能把不等价的计划放进去
-
-限制枚举空间不能放松语义约束；非内连接（Inner Join）的保留侧和空值扩展决定了哪些交换、结合仍合法。
-
-[LinDP++: Generalizing Linearized DP to Crossproducts and Non-Inner Joins](https://btw.informatik.uni-rostock.de/index.php/de/tagungsbaende/send/3-tagungsbaende/tagungsband.pdf)（BTW 2019，最佳论文）把 linearized DP 推向工业 SQL。
-
-Inner join 可以在满足谓词的连接图上广泛交换、结合；left outer、semi、anti join 的 preserved side、NULL 扩展和 predicate dependency 会限制可重排区域。LinDP++ 在生成线性顺序和区间子问题时保留这些约束，从而先回答“等价吗”，再回答“便宜吗”。
-
-论文还讨论了一个反直觉情况：cross product 不总是坏计划。若两个很小关系的笛卡尔积能够绕过一连串昂贵 Join，它可能降低总中间结果。穷举任意 cross product 会让搜索空间失控，因此 LinDP++ 只检查长度为 2 的相邻边路径，并在估计满足
-
-```text
-|u × w| < |u ⋈ v|  and  |u × w| < |v ⋈ w|
-```
-
-时保守加入人工 cross-product edge。论文示例中，最优代价从 1.84M 降到 0.94M，而不必开放所有笛卡尔积。作者也明确警告：如果基数把 10,000 错估成 1，cross product 会灾难性放大，因此只应在精确基数或可靠上界下采用。
-
-LinDP++ 的贡献不是让任意 Join 都能自由重排，而是把 **search scalability** 与 **semantic legality** 放进同一枚举器。它与 Looking Glass 共同说明：估计不确定时，能做的变换本身也应更保守。
-
-### 4.4 Indexed Algebra：当规则越来越多，分析一棵计划树也会成为瓶颈
-
-计划树的重复属性维护可能产生二次复杂度，即使 Join 枚举已受控也会拖慢优化。Indexed Algebra 针对的是这些路径查询与更新。
-
-[Asymptotically Better Query Optimization Using Indexed Algebra](https://www.vldb.org/pvldb/vol16/p3018-fent.pdf)（PVLDB 2023）解决的是另一类复杂度。许多优化都要反复问：某列在哪里产生、沿路径在哪里被使用、两个算子的最低公共祖先是谁、移动算子后哪些列集合改变。若每个算子都存整棵子树所需列集合，并在每次改写后重新向上传播，链状计划会产生二次工作量。
-
-论文把代数树维护成 dynamic forest，用 link/cut tree 支持 `link`、`cut`、path query 和 path update。列的 producer/consumer 信息不再复制进沿途每个节点，而通过树路径聚合获得。这样，处理整棵 n 节点计划的相关分析从最坏 `O(n²)` 降为 `O(n log n)`。
-
-这与数据库物理索引没有关系。它是在**给优化器自己的代数数据结构建索引**。实验中，即使 TPC-H/TPC-DS 这类并不极端的计划，总优化时间也可改善超过 1.8 倍。
-
-四篇论文连起来，优化器路线就完整了：
-
-| 问题 | 论文 | 回答 |
-|---|---|---|
-| 输入事实是否可信 | Looking Glass / JOB | 真实相关数据让 CE 成为主要误差源 |
-| 候选是否搜得完 | Adaptive Large Join | 根据图难度平滑压缩枚举空间 |
-| 改写是否语义等价 | LinDP++ | 在 non-inner join 约束下枚举，保守考虑 cross product |
-| 大计划上的分析是否可维护 | Indexed Algebra | 用动态树索引降低列传播与路径查询复杂度 |
-
-## 五、Join 路线：把数据结构鲁棒性与代数鲁棒性分开
-
-更好的 Hash Table 无法消除错误 Join 顺序产生的大量中间元组。Unchained 降低单次连接的访问成本，Diamond Hardened Join 则改变何时展开匹配结果。
-
-### 5.1 Unchained：n:m 倾斜不能让 1:n 快路径付出高税
-
-重复键和倾斜改变 Probe 的访问模式，统一数据结构需要同时约束连续扫描、随机访问与构建成本。
-
-[Simple, Efficient and Robust Hash Tables for Join Processing](https://db.in.tum.de/~birler/papers/hashtable.pdf)（DaMoN 2024）从一个生产矛盾出发：open addressing 在主外键 `1:n` Join 上简单而快速，但 build side 有重复键或严重倾斜时，probe chain 和冲突会恶化；chaining 对 `n:m` 更稳，却增加指针追逐和分配成本。
-
-论文提出 **Unchained**，并不是 tagged open addressing。其关键组合是：
-
-1. build side 先分区，使相近哈希值连续落入局部区域；
-2. 用 adjacency array 表示同一 bucket/键的匹配项，避免传统链表随机指针；
-3. probe 侧流水化多个未决查找，利用 memory-level parallelism 隐藏访存延迟；
-4. 用 Bloom filter 提前排除不命中；
-5. 用 software write-combining buffer 合并分区写入。
-
-设计目标不是某一数据分布下的峰值，而是让同一个结构覆盖 `1:n` 与带 skew 的 `n:m`。论文报告相对 relational open addressing 平均约 2 倍提升，在图工作负载上最高约 20 倍。数字不能外推为所有 Hash Join 的固定加速；它说明的是，把重复键表示、内存局部性和 probe 调度一起设计，比只调 load factor 更鲁棒。
-
-### 5.2 Diamond Hardened Join：问题不只在 Hash Table，而在 Expand 出现得太早
-
-提前展开多对多匹配会生成稍后被过滤的大量元组，推迟 Expand 因而可以减少中间结果，而不只是加速同样数量的查表。
-
-[Robust Join Processing with Diamond Hardened Joins](https://www.vldb.org/pvldb/vol17/p3215-birler.pdf)（PVLDB 2024）处理另一种性能悬崖。所谓 diamond，不限于图形长得像菱形，而是多个分支共享键并再次汇聚时，传统二元 Join 顺序可能先产生远大于输入与最终结果的中间结果。
-
-论文把 Join 语义拆成两种作用：
-
-- `Lookup`：只判断或定位是否存在匹配，通常收缩候选；
-- `Expand`：真正枚举一对多/多对多匹配，可能放大数据。
-
-传统 binary Join 把二者绑在一起，优化器一旦过早选中高 fan-out 的分支，就必须把巨大中间结果送给后续过滤。Diamond Hardened Join 先重排 Lookup，尽量完成过滤、semi-join reduction、sideways information passing 和可提前的聚合，再安排 Expand；对于三角/环结构，引入 `Expand3` 同时检查第三条边，避免二元展开后才发现大部分组合无效。
-
-论文在 CE 工作负载上最高达到约 500 倍提升，同时在 TPC-H/JOB 上只有很小回退。这不是一个“运行时发现爆炸后换计划”的故事，而是**在物理代数里把收缩和扩张显式化，让优化器有机会把危险动作推迟**。它也不是完全替代 worst-case optimal join，而是在现有 binary Join 编译执行框架中吸收多路 Join 的关键优势。
-
-这两篇论文构成两个互补层次：Unchained 防止单次 Hash Join 因键分布崩坏；Lookup/Expand 防止整个 Join 拓扑因中间结果顺序崩坏。一个修数据结构，一个修代数表达能力。
-
-## 六、工作负载扩张：Relation 能表达多少，物理层又应该保留什么
-
-共享关系前端可以复用优化与事务能力，但数据布局仍需匹配领域计算。数组、机器学习和流处理分别暴露了表示成本、迭代状态与生命周期约束。
-
-### 6.1 ArrayQL：先证明“数组语义可以进入关系优化器”
-
-数组操作可以通过坐标列降为关系算子，但表达能力成立不代表元组表示具有最佳执行效率。
-
-[ArrayQL Integration into Code-Generating Database Systems](https://db.in.tum.de/~schuele/data/arrayql.pdf)（EDBT 2022）没有给 Umbra 再塞一套独立数组执行器。它给出完整 ArrayQL grammar，并把 n 维坐标与 m 个值表示成 `n + m` 列的关系；维度列组成主键，bounding box 与 validity map 保存数组范围和有效区域。
-
-九类数组操作在 semantic analysis 阶段 lowering 为关系代数（Relational Algebra）。以矩阵乘法为例：对共享维度做 Join，乘积做 Projection，再按输出坐标 GroupBy/SUM。后续 optimizer、MVCC、codegen 都不需要知道前端来自 ArrayQL。接口既可独立暴露，也可嵌入 SQL/UDF。
-
-实验显示过滤和聚合能够很好地复用关系执行器，但 index shift、反转等操作需要物化 table function，成本明显。论文证明的是 **logical reuse 可行**，没有证明 HashJoin + HashAggregate 是 dense GEMM 的最佳 physical implementation。
-
-### 6.2 Recursive SQL + GPU：把训练拆成可编译的数据库阶段
-
-库内训练需要显式管理迭代与梯度状态，不能仅把 GPU 调用包进普通无状态函数。该工作把这些阶段纳入查询编译流程。
-
-[Recursive SQL and GPU-support for In-Database Machine Learning](https://link.springer.com/article/10.1007/s10619-022-07417-7)（Distributed and Parallel Databases 2022）进一步把 preprocessing、training 和 validation 放进一个查询。
-
-recursive table 表达参数迭代：上一轮参数经过 loss 与梯度更新产生下一轮。论文的 derivation operator 接收 SQL lambda，在 code generation 阶段做 reverse-mode automatic differentiation，并缓存公共子表达式。gradient-descent operator 是 pipeline breaker：它物化 batch、管理迭代状态，并把适合的数值计算生成 NVPTX 交给 GPU。
-
-```text
-SQL preprocessing
-       │
-       ▼
-recursive relation ── derivation operator ──→ gradient expression
-       │
-       ▼
-gradient-descent pipeline breaker
-       ├─ CPU relational pipelines
-       └─ batched NVPTX kernels on GPU
-```
-
-论文覆盖多个 learner，并展示端到端性能可与外部框架竞争、GPU 路径最有优势。但 batch size 同时影响硬件吞吐和统计收敛，不能只最大化 GPU 利用率；结论也不能外推到 Transformer、Tensor Core、混合精度或分布式训练。它的研究价值是证明 DB compiler 能跨越“关系预处理—迭代状态—设备代码”三层，而不是宣称 SQL 已替代 PyTorch。
-
-### 6.3 LLVM AD：通用编译器可以消掉多少领域生成代码
-
-自动微分产生的表达式数量不能直接预测最终机器码成本，通用编译器还会消除重复计算；结论必须绑定模型、别名信息和优化配置。
-
-[LLVM Code Optimisation for Automatic Differentiation](https://db.in.tum.de/~schuele/data/forward.pdf)（DEEM 2022）只用 4 页回答一个很窄却重要的问题：理论上对多参数、单输出 loss 更合适的 reverse mode，与生成更多重复表达式的 forward mode，经过 LLVM 后差距还剩多少？
-
-实验表明，在把别名信息明确为 `noalias` 后，LLVM 能识别并消除大量公共计算；测试模型上 forward/reverse 最终 PTX 和运行时间接近，主要差异转移到编译时间，且输入多于输出时 reverse mode 仍更有优势。测试里的 `fast-math` 没有产生额外收益。
-
-这不等于“forward 与 reverse AD 普遍等价”。它只说明：当计算图小、静态且完全暴露给编译器时，算法层生成的冗余不能直接等同于最终机器码成本。数据库应在高层决定导数语义和数据布局，再让 LLVM 做 CSE/DCE；不要在 DB optimizer 中重写通用编译器已经擅长的工作。
-
-### 6.4 The Duck's Brain：能用 Relation 表达，不代表应该用 Relation 存
-
-密集矩阵转成坐标元组会增加键、分组和物化状态，数组布局因而可能显著降低内存。下面的数字只对应论文列出的模型与表示，不能推广为所有库内机器学习任务。
-
-[The Duck's Brain: Training and Inference of Neural Networks in Modern Database Engines](https://arxiv.org/pdf/2312.17355)（arXiv 2023，后发表于 Datenbank-Spektrum 2024）是前述路线难得的自我反思。作者分别用 SQL-92 的 relational coordinate representation，以及 Umbra 的 array datatype，在 Umbra/DuckDB 中实现神经网络训练和推理，并与 NumPy 比较。
-
-关系表示当然能算，但代价很具体：坐标、Join key、GroupBy state 和 recursive CTE 物化会把密集矩阵拆成大量宽元组。论文展示的 Iris 设置中，每轮 relational 路径约使用 10/20 MiB，而 array 路径约 1/1.6 MiB；MNIST 的关系路径在部分设置中增长到约 25 GiB，数组路径低于 5 MiB。Umbra 在部分实验中是唯一完成全部数据库方案的系统，但 NumPy 仍更快；Umbra array inference 也仍约比 NumPy 慢一个数量级。
-
-因此它给出了整条 workload-extension 路线最重要的否定性结论：
-
-> **Logical unification 不等于 physical unification。**
-
-SQL/Relation 可以作为组合和治理接口，但 dense tensor 需要保留 shape、stride、GEMM、fusion 与 device placement 等领域语义。把一切过早 lowering 成普通 tuple，会让后续编译器再也看不见这些机会。
-
-### 6.5 Relation-Based Streaming：统一的是“可查询状态”，不是完整流系统协议
-
-将近期事件保存为可查询关系，可以复用数据库算子，但不能自动获得分布式流处理的故障恢复和时间语义。
-
-[Relation-Based In-Database Stream Processing](https://ceur-ws.org/Vol-3462/CDMS7.pdf)（CDMS @ VLDB 2023）从另一个方向扩张 Relation。传统架构把实时数据送入专用流引擎，把历史数据留在数据库；临时的 stream-table join 需要复制历史状态或跨系统访问。
-
-论文把有限时间窗口实现成 ring-buffered relation：新数据追加，过期分区复用；从 optimizer 看，它仍是一张可扫描、Join、Aggregate 的关系，因此历史表与最近事件可以走同一个编译执行器。变化主要集中在 relation 的生命周期和扫描入口，而不是另建一套 streaming operator graph。论文用分析型流 workload 与 Spark/Flink 做比较，证明复用高性能 DBMS 内核是可行路线。
-
-但它没有实现工业分布式流系统的完整控制面（Control Plane）：checkpoint、exactly-once、watermark、late event、backpressure、弹性扩缩都不在证明范围。它更接近“数据库中一张持续滚动、支持 ad-hoc query 的近期关系”，而不是 Flink 的等价替代。
-
-五篇论文连起来能看到一次观点收缩：
-
-```text
-ArrayQL：      新领域语义可以 lowering 到 Relation
-Recursive ML：Relation + Compiler 可以穿过迭代与 GPU 边界
-LLVM AD：      一部分低层冗余应交给通用编译器
-Duck's Brain： Relation 不应垄断 dense numerical physical representation
-Streaming：    Relation 适合统一可查询状态，但不自动提供分布式流协议
-```
-
-Umbra 的核心因此不是朴素的 “Everything is a Relation”，而更接近：**Everything may enter a common optimizer/compiler/runtime, but not everything should share one physical algebra.**
-
-## 七、把 19 篇论文还原成一条核心演化路径
-
-按问题依赖组织论文，可以解释各项机制为何需要协同，但不能据此断言它们存在直接继承或代码集成关系。下表的后续问题属于本文归纳，年份与实现范围以对应论文为准。
-
-| 年份 | 论文 | 解决的瓶颈 | 留给下一步的问题 |
-|---|---|---|---|
-| 2018 | Looking Glass / JOB | 分离 CE、Cost、Enumeration 的责任 | 搜索本身如何扩展 |
-| 2018 | Adaptive Very Large Join | 依据查询图难度平滑压缩搜索空间 | non-inner join 的合法性 |
-| 2019 | LinDP++ | cross product 与 non-inner join 下的受限枚举 | 复杂计划分析的维护成本 |
-| 2019 | Making Compiling Query Engines Practical | 同一 LLVM IR 先解释后编译，降低短查询延迟 | 能否直接快速产生原生码 |
-| 2020 | Umbra | 用可变页、Swip、latch 跨越 DRAM/SSD | 事务与更低编译延迟 |
-| 2021 | Tidy Tuples and Flying Start | 分层 codegen、Umbra IR、快速原生后端 | 运行时如何适应错误估计；如何移植 ISA |
-| 2022 | Memory-Optimized MVCC | 内存版本链 + 页局部映射覆盖 OLTP | 远端云存储的数据布局 |
-| 2022 | ArrayQL | 数组语义复用关系编译器 | 关系表示是否适合数值计算 |
-| 2022 | Recursive SQL + GPU | 迭代、AD 与 GPU 纳入查询流水线 | 生成代码冗余和张量表示 |
-| 2022 | LLVM AD | 划分 AD 与通用 LLVM 优化职责 | 真实大模型/大数组仍需专门物理算子 |
-| 2022 | Dynamic Blocks | 预编译候选在运行时切换 | 候选范围仍受编译时枚举限制 |
-| 2023 | Indexed Algebra | 动态树索引把代数分析降到 `O(n log n)` | 更丰富规则如何与运行时反馈结合 |
-| 2023 | AnyBlob | 高并发、低 CPU 的对象存储读取 | 热写、日志、冷列扫如何统一 |
-| 2023 | RISC / FireARM | 验证 Umbra IR 与目标后端分层 | 多 ISA 后端的长期维护成本 |
-| 2023 | Relation-Based Streaming | 复用关系执行器查询近期流与历史表 | 完整流语义与增量维护 |
-| 2023/24 | The Duck's Brain | 定量暴露 relational ML 的内存和物化代价 | 需要 heterogeneous physical algebra |
-| 2024 | Unchained Hash Table | 同一 Join 结构覆盖 1:n 与倾斜 n:m | 跨多个 Join 的中间结果爆炸 |
-| 2024 | Diamond Hardened Join | Lookup/Expand 分离，推迟放大 | 与 CE feedback/WCOJ 的更深结合 |
-| 2024 | Colibri | 热 PAX 页与冷压缩列文件组成云 HTAP | 多节点写入、分层缓存与成本治理 |
-
-从这张表可以抽象出三次核心演化。
-
-### 第一次：从“所有数据在内存”到“常见路径在内存”
-
-HyPer 的强假设是常驻；Umbra 的强假设改成**工作集有局部性**。页可以在 SSD，对象可以在远端，历史版本可以只在内存，热数据可以是 PAX、冷数据可以是压缩列文件。系统不再统一介质，而是统一地址、生命周期和访问接口。
-
-### 第二次：从“编译查询”到“编译一个可适应的执行系统”
-
-早期问题是 LLVM 启动慢，于是先解释后编译；Flying Start 把第一阶段也变成机器码；Dynamic Blocks 让机器码内含运行时选择；FireARM 证明同一个中层 IR 可以落到另一种 ISA。编译器不再只是把 plan 翻译成 code，而是承载了**分层优化、启动策略、运行时切换和硬件映射**。
-
-### 第三次：从“Relation 是共同语言”到“共同语言必须保留物理差异”
-
-Array、ML 与 Stream 都能进入关系前端，这是复用 optimizer/runtime 的巨大收益；Duck's Brain 又用实验说明，过早抹平 tensor/array 结构会付出难以挽回的内存和计算代价。后期路线不是退回多套烟囱，而是趋向：
-
-```text
-SQL / Stream / Array / ML
-             │
-             ▼
-domain-aware logical IR
-             │
-             ▼
-shared optimization framework
-      ┌──────┼────────┐
-      ▼      ▼        ▼
-relational  array    streaming
-physical    tensor   state/lifecycle
-algebra     algebra  operators
-      └──────┼────────┘
-             ▼
-       CPU / GPU / remote storage
-```
-
-共同的是编译框架、代价决策和状态管理；不应强行共同的是所有物理算子与数据布局。
-
-## 八、工程取舍与待验证问题
-
-### 从数据库工程视角看 Umbra：真正值得借鉴的不是某个技巧
-
-采用论文机制前应先识别目标负载跨越的边界，例如内存容量、编译延迟或中间结果规模。不同边界对应不同成本，无法用一张性能图替代选型。
-
-#### 先优化失败曲线，再优化峰值
-
-常见路径的平均加速比不能描述边界附近的风险，因此评估应覆盖工作集与输入形态变化。系列论文处理了以下不同退化情形。
-
-Umbra 系列论文反复选择“悬崖”作为研究对象：
-
-- 数据超过 DRAM，纯内存系统停止工作；
-- 查询很短，LLVM 编译比执行更久；
-- Join 图稍大，exact DP 突然超时；
-- build side 倾斜，Hash table probe 突然退化；
-- diamond 过早 expand，中间结果突然爆炸；
-- 数据进入对象存储，线程和 CPU 开销先于带宽成为瓶颈。
-
-这些方案试图缓解特定的性能突降，但不能据此保证所有路径都连续退化。验证时仍需改变工作集、数据倾斜（Data Skew）和查询规模，观察切换点附近的延迟与资源使用，而不是只比较单个最优数据点。
-
-#### “零开销抽象”不是没有抽象，而是把检查放到局部
-
-降低热路径开销的方法并不相同：Swip 用指针标记减少缓存命中时的查表，page-local version map 局部化版本映射，Dynamic Blocks 预先保留执行选择，Indexed Algebra 则维护可增量更新的树索引。不宜把这些机制统一解释成消除全局状态。
-
-局部化并不等于无成本，它把成本变成可预测、可缓存、可在慢路径回收的形式。阅读 Umbra 时应关注的不是“是否有一层抽象”，而是：**这层抽象的判定发生在每个 tuple、每个 page、每个 pipeline，还是只在状态转换时发生？**
-
-#### Optimizer 与 Runtime 不应互相替罪
-
-Looking Glass 说明 CE 错误可能压倒 cost model；LinDP 说明再准的估计也救不了超时的枚举；LinDP++ 说明便宜计划必须先语义合法；Dynamic Blocks 和 Diamond Join 则说明某些不确定性应交给执行层吸收。
-
-一个更健康的职责分工是：
-
-- optimizer 用统计和预算找出高质量候选；
-- algebra 暴露 Lookup/Expand、Array/Tensor 等真正影响代价的语义；
-- runtime 用 measured behavior 在预留边界内适应；
-- storage 保证工作集变化时不会把整个系统拖入不同数量级。
-
-“把 CE 做到完美”与“运行时全部自适应”都是不现实的单点答案。Umbra 路线的价值恰恰在于同时推进四层。
-
-### 仍未闭合的研究问题
-
-单篇原型的实验不能证明跨机制组合已成立；下列问题超出了本文所引论文的验证范围。它们是后续研究问题，不是对 Umbra 当前产品能力的缺陷清单。
-
-1. **反馈如何跨查询持久化？** Dynamic Blocks 解决单次执行内有限候选的切换，尚未形成从 runtime measurement 回流 CE、cost 与 plan cache 的完整闭环。
-2. **异构物理代数如何共享 Memo？** ArrayQL 与 Duck's Brain 已证明需要保留 array/tensor 表示，但 relational、tensor、stream operator 如何在同一搜索空间比较 cost 与 property，仍是开放问题。
-3. **云端写扩展如何演化？** Colibri 重点是冷热布局与读写共存，不等于跨地域 multi-writer、serverless elasticity 和租户隔离已经解决。
-4. **复杂 Join 的鲁棒性如何组合？** Unchained、Lookup/Expand、Dynamic Blocks、运行时 filter 与 WCOJ 各自处理不同风险，真正的 optimizer 需要知道何时组合它们，而不只是多注册几个算子。
-5. **流与表的统一是否应进入增量代数？** ring relation 解决近期数据可查询，完整系统仍需要 changelog、watermark、checkpoint、增量视图维护（Incremental View Maintenance）与历史一致性。
-
-### 结语：按约束选择机制，而不是按论文数量叠加功能
-
-Umbra 文献适合用来拆解系统约束，不宜用来证明某个统一架构已经覆盖全部负载。Swip 依赖页面所有权与缓存局部性，分层编译需要摊销后端维护成本，Dynamic Blocks 只能选择预先生成的候选，关系化数组与流也各有表示和协议边界。
-
-复现实验时，应先固定对应论文的硬件、查询、数据分布和基线版本，再测试目标系统中的边界变化。若只需要降低短查询延迟，就先比较编译与执行时间；若瓶颈是多对多中间结果，则先测结果膨胀，而不是直接替换 Hash Table。本文归纳的跨论文联系用于提出实验假设，不替代组合后的正确性和性能验证。
-
-## 参考论文
-
-### 系统与存储
-
-- [Umbra: A Disk-Based System with In-Memory Performance（CIDR 2020）](https://cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf)
-- [Memory-Optimized Multi-Version Concurrency Control for Disk-Based Database Systems（PVLDB 2022）](https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf)
-- [Exploiting Cloud Object Storage for High-Performance Analytics / AnyBlob（PVLDB 2023）](https://www.vldb.org/pvldb/vol16/p2769-durner.pdf)
-- [Two Birds With One Stone: Designing a Hybrid Cloud Storage Engine for HTAP / Colibri（PVLDB 2024）](https://www.vldb.org/pvldb/vol17/p3290-schmidt.pdf)
-
-### 查询编译
-
-- [Making Compiling Query Engines Practical（TKDE 2019）](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf)
-- [Tidy Tuples and Flying Start: Fast Compilation and Fast Execution of Relational Queries in Umbra（VLDBJ 2021）](https://link.springer.com/content/pdf/10.1007/s00778-020-00643-4.pdf)
-- [Efficiently Compiling Dynamic Code for Adaptive Query Processing（ADMS 2022）](https://db.in.tum.de/people/sites/schmidt/papers/dynamic-blocks.pdf)
-- [Bringing Compiling Databases to RISC Architectures（PVLDB 2023）](https://db.in.tum.de/people/sites/gruber/p791-gruber.pdf)
-
-### 查询优化与 Join
-
-- [Query Optimization Through the Looking Glass, and What We Found Running the Join Order Benchmark（VLDBJ 2018）](https://db.in.tum.de/~leis/papers/lookingglass.pdf)
-- [Adaptive Optimization of Very Large Join Queries（SIGMOD 2018）](https://db.in.tum.de/~radke/papers/hugejoins.pdf)
-- [LinDP++: Generalizing Linearized DP to Crossproducts and Non-Inner Joins（BTW 2019）](https://btw.informatik.uni-rostock.de/index.php/de/tagungsbaende/send/3-tagungsbaende/tagungsband.pdf)
-- [Asymptotically Better Query Optimization Using Indexed Algebra（PVLDB 2023）](https://www.vldb.org/pvldb/vol16/p3018-fent.pdf)
-- [Simple, Efficient and Robust Hash Tables for Join Processing（DaMoN 2024）](https://db.in.tum.de/~birler/papers/hashtable.pdf)
-- [Robust Join Processing with Diamond Hardened Joins（PVLDB 2024）](https://www.vldb.org/pvldb/vol17/p3215-birler.pdf)
-
-### 数组、机器学习与流
-
-- [ArrayQL Integration into Code-Generating Database Systems（EDBT 2022）](https://db.in.tum.de/~schuele/data/arrayql.pdf)
-- [Recursive SQL and GPU-support for In-Database Machine Learning（Distributed and Parallel Databases 2022）](https://link.springer.com/article/10.1007/s10619-022-07417-7)
-- [LLVM Code Optimisation for Automatic Differentiation（DEEM 2022）](https://db.in.tum.de/~schuele/data/forward.pdf)
-- [Relation-Based In-Database Stream Processing（CDMS @ VLDB 2023）](https://ceur-ws.org/Vol-3462/CDMS7.pdf)
-- [The Duck's Brain: Training and Inference of Neural Networks in Modern Database Engines（arXiv 2023 / Datenbank-Spektrum 2024）](https://arxiv.org/pdf/2312.17355)
+SQL 和关系模型是极佳的声明式胶水与数据治理入口，但绝不能在优化器一开头就把稠密矩阵的维度步长（Shape/Stride）过早拍扁成一盘散沙般的 `(row_id, col_id, val)` 元组——共享编译与事务底座，同时尊重不同负载原生的物理内存布局，才是库内多模计算的真正出路。
+
+---
+
+## 六、十九篇论文的全景总账与未竟问题
+
+把这七年间的 19 篇论文按“解决了哪道悬崖 → 暴露出什么新矛盾”串成一张时间表，整条学术谱系的内在张力便一目了然：
+
+| 年份 | 代表论文 | 攻克的核心系统瓶颈 | 自然引出的下一棒问题 |
+| --- | --- | --- | --- |
+| **2018** | Looking Glass / JOB | 用真实基数注入剥离 CE、成本与枚举器的误差责任 | 面对几十上百表连接图，完备搜索本身如何不超时？ |
+| **2018** | Adaptive Very Large Join | 按连通子图复杂度从 `DPHyp` 平滑降级到线性化区间 DP | 外连接、半连接与受控笛卡尔积怎样保证语义合法？ |
+| **2019** | LinDP++ | 在线性化 DP 中严守非内连接约束并安全引入二跳笛卡尔边 | 计划树与改写规则变庞大后，树属性分析本身变慢怎么办？ |
+| **2019** | Making Compiling Engines Practical | 同一份 LLVM IR 先字节码解释再按进度热切 JIT | 解释器仍有开销，能不能亚毫秒级直接吐出原生机器码？ |
+| **2020** | Umbra (CIDR) | 可变长页 + 64 位 `Swip` + 乐观锁 + German Strings 打通 SSD | 磁盘换页下如何跑高频 OLTP 多版本事务？编译能否更快？ |
+| **2021** | Tidy Tuples & Flying Start | 三层代码生成 + 单遍原生后端把编译延迟压进毫秒内 | 机器码编好后撞上基数误判怎么改？换 ARM 芯片怎么移？ |
+| **2022** | Memory-Optimized MVCC | 内存私有 Undo 链 + 页局部映射表兼顾换页与高吞吐事务 | 数据搬上云端对象存储后，冷热混合 HTAP 怎么存？ |
+| **2022** | Dynamic Blocks | 编译期预埋多路机器码片段，运行期零重编拨动跳转指针 | 预埋分支仍受限于编译前能想到的有限候选集 |
+| **2022** | ArrayQL | 数组语法降级为关系代数，验证编译器与事务层逻辑复用 | 关系坐标表示跑密集数值计算到底有多大物理代价？ |
+| **2022** | Recursive SQL + GPU | 递归关系表 + 反向自动微分 + GPU NVPTX 核函数生成 | 自动微分吐出的大量冗余算式该由哪一层负责化简？ |
+| **2022** | LLVM AD | 靠 `noalias` 别名标注借力 LLVM 消除前/反向微分冗余计算 | 真正的大规模张量运算靠标量编译器优化够用吗？ |
+| **2023** | Indexed Algebra | 用 Link-Cut 动态树索引把计划树列传播从 `O(n^2)` 降到 `O(n log n)` | 静态代数维护快了，如何与运行期实测反馈闭环联动？ |
+| **2023** | AnyBlob | `io_uring` 异步下载器解决客户端 CPU 先于云存储带宽饱和 | 只有高吞吐冷读还不够，在线热更新与日志如何协同？ |
+| **2023** | FireARM (RISC) | 实证 `Umbra IR` 上层复用、仅替换薄后端即可迁往 AArch64 | 多指令集自研后端与通用编译器的长期维护边界在哪？ |
+| **2023** | Relation-Based Streaming | 环形缓冲关系表让即席流表关联直接复用编译型执行内核 | 缺少分布式流处理的容错快照、乱序水位线与增量代数 |
+| **2023/24** | The Duck's Brain | 实测揭露纯关系元组跑神经网络导致数千倍内存膨胀 | 多物理代数（关系/张量/流）如何共享同一个优化搜索器？ |
+| **2024** | Unchained Hash Table | 分区邻接数组 + 内嵌 Bloom Filter + 流水探测免疫键值偏斜 | 单算子不退化了，多表菱形连接过早吐出天量中间行咋办？ |
+| **2024** | Diamond Hardened Join | 拆开收缩型 `Lookup` 与膨胀型 `Expand`（含 `Expand3`）推迟展开 | 如何与运行期基数反馈及更多最坏情况最优算法深度融合？ |
+| **2024** | Colibri | 热未压缩 PAX 页 + 冷压缩列文件 + 日志服务构成云端 HTAP | 跨可用区多写节点扩展、多租户隔离与云账单治理如何演进？ |
+
+回看这张演进表，Umbra 给整个数据库系统界留下的最宝贵财富，不是某一个具体的哈希函数或位操作技巧，而是**“永远盯着性能悬崖做局部化拆解”**的工程哲学：无论是 `Swip` 指针里的最低标记位、页局部版本映射表、`German Strings` 里的 4 字节前缀，还是 `Dynamic Blocks` 里的间接跳转，它们都在做同一件事——**让最常见的快路径只看手边几个字节就当场拍板冲过去，把昂贵的全局协调、磁盘 I/O、LLVM 重度优化和笛卡尔展开统统关进稀有慢路径的笼子里。**
+
+当然，作为一系列各自独立验证的学术原型（而非单一商业发行版的功能承诺），这条路线上依然留着五个极具吸引力的开放问题等待后来者接棒：**单次执行内的 `Dynamic Blocks` 测量如何沉淀为跨查询的统计与计划缓存闭环？关系元组、稠密张量与流窗口三套异构物理代数如何在同一个 Cascades Memo 里公平比价？`Colibri` 的云端冷热引擎如何迈向多写节点弹性扩展？`Unchained`、`Lookup/Expand` 与因子化执行如何由优化器自动编排组合？而环形缓冲流关系又该如何补齐增量视图维护（IVM）与精确一次语义？** 这每一个追问，几乎都是下一代数据库内核正在攻关的前沿阵地。
+
+---
+
+## 参考文献与谱系校准说明
+
+> **文献核验与常见误读校准说明**：本文依据慕尼黑工业大学数据库组公开发表的 19 篇一手论文原文与实验章节整理（对照站内 [2026 数据库内核研究进展]({{< relref "2026-09-19-database-research-frontiers.md" >}}) 与 [经典数据库论文精读笔记]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})）。阅读二手综述时需留意几处高频概念错位：其一，`Flying Start` 出自 2021 年 VLDBJ 论文，而 2019 年 TKDE 论文采用的是 LLVM IR 字节码解释过渡；其二，`Indexed Algebra` 是用 Link-Cut Tree 加速优化器内存计划树的路径属性分析，与数据库 B-Tree 物理索引无关；其三，`Unchained` 哈希表并非带标签的开放寻址法，而是分区构建加连续邻接数组；其四，`Diamond Hardened Join` 靠物理代数拆解 `Lookup` 与 `Expand` 在优化期推迟膨胀，并非运行中途推翻重编计划；其五，部分二手资料提及的所谓 CIDR 2023 *"Instead of Rewriting Everything: A Case for Compiler-Driven Database Engines"* 在 CIDR 官方论文集与作者主页均无此文，探讨编译引擎跨架构移植的一手文献实为 PVLDB 2023 的 *Bringing Compiling Databases to RISC Architectures*。
+
+### 一、存储引擎、事务与云端 HTAP
+
+1. Thomas Neumann, Michael J. Freitag, *Umbra: A Disk-Based System with In-Memory Performance*, [CIDR 2020](https://cidrdb.org/cidr2020/papers/p29-neumann-cidr20.pdf).
+2. Michael J. Freitag et al., *Memory-Optimized Multi-Version Concurrency Control for Disk-Based Database Systems*, [PVLDB 15(11), 2022](https://www.vldb.org/pvldb/vol15/p2797-freitag.pdf).
+3. Dominik Durner, Viktor Leis, Thomas Neumann, *Exploiting Cloud Object Storage for High-Performance Analytics (AnyBlob)*, [PVLDB 16(11), 2023](https://www.vldb.org/pvldb/vol16/p2769-durner.pdf).
+4. Tobias Schmidt, Dominik Durner, Viktor Leis, Thomas Neumann, *Two Birds With One Stone: Designing a Hybrid Cloud Storage Engine for HTAP (Colibri)*, [PVLDB 17(11), 2024](https://www.vldb.org/pvldb/vol17/p3290-schmidt.pdf).
+
+### 二、自适应查询编译与跨架构代码生成
+
+5. André Kohn, Viktor Leis, Thomas Neumann, *Making Compiling Query Engines Practical*, [IEEE TKDE 2019](https://db.in.tum.de/~leis/papers/adaptiveexecution.pdf).
+6. Timo Kersten, Viktor Leis, Thomas Neumann, *Tidy Tuples and Flying Start: Fast Compilation and Fast Execution of Relational Queries in Umbra*, [VLDB Journal 2021](https://link.springer.com/content/pdf/10.1007/s00778-020-00643-4.pdf).
+7. Tobias Schmidt et al., *Efficiently Compiling Dynamic Code for Adaptive Query Processing (Dynamic Blocks)*, [ADMS @ VLDB 2022](https://db.in.tum.de/people/sites/schmidt/papers/dynamic-blocks.pdf).
+8. Philipp Gruber et al., *Bringing Compiling Databases to RISC Architectures (FireARM)*, [PVLDB 16(4), 2023](https://db.in.tum.de/people/sites/gruber/p791-gruber.pdf).
+
+### 三、查询优化器与鲁棒连接执行
+
+9. Viktor Leis et al., *Query Optimization Through the Looking Glass, and What We Found Running the Join Order Benchmark*, [VLDB Journal 2018](https://db.in.tum.de/~leis/papers/lookingglass.pdf).
+10. Bernhard Radke, Thomas Neumann, *Adaptive Optimization of Very Large Join Queries*, [SIGMOD 2018](https://db.in.tum.de/~radke/papers/hugejoins.pdf).
+11. Bernhard Radke, Thomas Neumann, *LinDP++: Generalizing Linearized DP to Crossproducts and Non-Inner Joins*, [BTW 2019](https://btw.informatik.uni-rostock.de/index.php/de/tagungsbaende/send/3-tagungsbaende/tagungsband.pdf).
+12. Philipp Fent, Thomas Neumann, *Asymptotically Better Query Optimization Using Indexed Algebra*, [PVLDB 16(11), 2023](https://www.vldb.org/pvldb/vol16/p3018-fent.pdf).
+13. Altan Birler, Thomas Neumann, Viktor Leis, *Simple, Efficient and Robust Hash Tables for Join Processing (Unchained)*, [DaMoN 2024](https://db.in.tum.de/~birler/papers/hashtable.pdf).
+14. Altan Birler, Alfons Kemper, Thomas Neumann, *Robust Join Processing with Diamond Hardened Joins*, [PVLDB 17(11), 2024](https://www.vldb.org/pvldb/vol17/p3215-birler.pdf).
+
+### 四、多维数组、库内机器学习与流处理扩展
+
+15. Maximilian E. Schüle et al., *ArrayQL Integration into Code-Generating Database Systems*, [EDBT 2022](https://db.in.tum.de/~schuele/data/arrayql.pdf).
+16. Maximilian E. Schüle et al., *Recursive SQL and GPU-support for In-Database Machine Learning*, [Distributed and Parallel Databases 2022](https://link.springer.com/article/10.1007/s10619-022-07417-7).
+17. Maximilian E. Schüle et al., *LLVM Code Optimisation for Automatic Differentiation*, [DEEM @ SIGMOD 2022](https://db.in.tum.de/~schuele/data/forward.pdf).
+18. Maximilian E. Schüle et al., *Relation-Based In-Database Stream Processing*, [CDMS @ VLDB 2023](https://ceur-ws.org/Vol-3462/CDMS7.pdf).
+19. Maximilian E. Schüle et al., *The Duck's Brain: Training and Inference of Neural Networks in Modern Database Engines*, [arXiv:2312.17355 / Datenbank-Spektrum 2024](https://arxiv.org/pdf/2312.17355).

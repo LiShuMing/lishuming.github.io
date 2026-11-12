@@ -14,137 +14,91 @@ tags:
   - LLM
 description: "梳理 TPC、JOB、ClickBench、SQLStorm、SQLancer、Velox Fuzzer 等公开工作，讨论如何联合构造数据、查询、执行状态与判定器，发现数据库正确性错误、性能悬崖及 corner case，并用 LLM 扩展引擎能力边界的测试覆盖。"
 draft: false
+toc: true
+math: true
 ---
 
-跑完基准测试（Benchmark）不能证明数据库的功能组合正确，因为固定负载未必触达空值、异常历史或物理路径切换。TPC-H、TPC-DS、JOB 用于衡量特定工作负载；带预期结果的回归用例则验证明确的语义承诺。两者需要共享可重放的输入，但判定目标不同。
+测试一个普通 Web 接口时，工程师面对的是已知答案的命题：喂进去三条订单参数，断言返回的金额等于 `199.00`、状态码等于 `200`，对错一目了然。
 
-对于支持 Array、Map、JSON 与向量检索的引擎，测试对象还应包含类型、算子、编码和运行状态的交互。只有构造能区分合法与非法实现的输入，再用可执行判定器检查，功能覆盖才有正确性含义。
+可一旦把被测对象换成数据库内核，这套朴素直觉立刻撞上一堵高墙：**当一条包含八表外连接、相关子查询、`COALESCE` 空值转换与滑动窗口的复杂 SQL 在千万行数据上跑出 `41,829` 行结果时，谁知道标准答案究竟该是 `41,829` 行还是 `41,830` 行？** 除非你手里已经有一台绝对无 Bug、且在方言隐式转换、排序规则（Collation）、浮点舍入与空值语义上分毫不差的“全知参考引擎”，否则面对一条随机生成的复杂查询，测试者连预期结果都写不出来——这就是数据库测试最核心的**判定器难题（Oracle Problem）**。
 
-这与前面讨论的 [Dynamic Filter 穿越 Outer Join]({{< relref "2026-08-24-dynamic-filter-outer-join.md" >}}) 是同一个问题。一个过滤器在大多数数据上都有效，并不能证明它不会在“原本匹配的右行被过滤，随后补出的 NULL 又通过上层谓词”时改变结果。触发这种错误可能只需要两行数据。
+更棘手的是，即便跑通了全套标准基准测试（Benchmark），依然挡不住静默错数（Silent Wrong Result）。就像我们在 [Dynamic Filter 穿越 Outer Join]({{< relref "2026-08-24-dynamic-filter-outer-join.md" >}}) 里拆解过的那样：一个运行时过滤器在 99.9% 的均匀合成数据上都能合法加速，唯独遇到“右表原本有匹配行、被提前过滤掉后触发左外连接补 `NULL`、补出的 `NULL` 又恰好穿过上层 `COALESCE(b.v, 0) = 0`”的组合时，就会凭空多吐出一行脏数据。触发这个致命缺陷不需要 100 GB 的标准数仓，两张单行小表就够了；反过来，跑上百遍均匀分布的大规模扫描，却可能一次都踩不中这个死角。
 
-本文沿着三个问题组织调研：公开数据集和工具分别提供了什么；如何把它们变成能判错的测试集；LLM 能怎样帮助我们跨过手写生成器的覆盖边界。资料核对截至 **2026-09-18**，采用论文原文、作者页面和项目文档。后文的边界矩阵、测试契约与实施路线是基于这些工作的工程设计，不是某篇论文已经实现的统一框架。
+把**“组合爆炸的输入与执行状态空间”**和**“缺乏现成标准答案的判定器难题”**放在一起，就能看清数据库测试过去十年的演进主线：公开 Benchmark、差分测试与形式化模型、SQLancer 代表的变形测试（Metamorphic Testing）、面向算子物理路径的 Fuzzer，以及近期引入大语言模型（LLM）的语法与特征探索，其实是在从不同侧面围剿同一对矛盾。下面我们就顺着“资产拆解 → 判定器构造 → 语义与物理反例 → 现代引擎多模态边界 → LLM 协同闭环 → 工程沉淀”这条脉络，把整套测试体系拆开看清。
 
-## 测试目标：把负载、判定与覆盖分开
+---
 
-### 判定与覆盖的关系
+## 一、拆解“数据集”幻觉：为什么跑通 Benchmark 抓不住两行数据的 Bug？
 
-一个用例需要同时证明目标路径被执行、结果由有效判定器检查。生成一万条相同物理计划的 SQL，不能替代进入 spill 分支的一个反例；LLM 的作用也应按新增有效覆盖与独立缺陷衡量，而不是生成量。
-
-### 先区分四类经常被混称为“数据集”的资产
-
-可重放测试必须包含影响结果的环境与判定条件，单独保存 SQL 或数据文件不足以复现失败。可将一次测试表示为：
+日常讨论里，大家常把 CSV/Parquet 数据文件、TPC-H 负载脚本和单元测试用例统称为“测试数据集”。但如果一个失败现场想要跨机器稳定复现，光存下 SQL 文本和数据文件远远不够。从第一性原理看，一次完整的数据库测试其实是一个七元组：
 
 ```text
 Test = (Schema, Data, Query, State, Configuration, Environment, Oracle)
 
-Schema        类型、约束、索引、分区、视图
-Data          值域、重复度、相关性、排序、文件和物理编码
-Query         SQL / API 调用 / 事务程序
-State         统计信息、缓存、版本、提交历史、索引或 MV 刷新进度
-Configuration 优化规则、并行度、内存预算、执行模式
-Environment   引擎版本、硬件、依赖、时区、排序规则、故障序列
-Oracle        预期结果、等价关系、状态不变量或性能判定条件
+Schema        列类型、非空/唯一约束、索引、分区键、物化视图定义
+Data          值域边界、重复度、列间相关性、物理排序、文件切分与编码
+Query         单条 SQL、API 调用或并发交错的事务序列
+State         统计信息快照、Buffer/OS 缓存冷暖、MVCC 版本历史、刷新水位
+Configuration 优化器规则开关、并行度（DOP）、内存上限与溢写（Spill）阈值
+Environment   引擎提交版本、CPU 架构、时区、排序规则与注入的故障序列
+Oracle        显式预期结果、代数等价关系、状态不变量或性能回退界限
 ```
 
-据此，公开资产可以分为四类。
+同一份 Parquet 文件，拿去测列式扫描吞吐时看的是解压带宽与 SIMD 过滤速度，拿去测格式兼容性时盯的却是嵌套空值位图（Null Bitmap）、高精度 Decimal 元数据或损坏页能否按契约报错。输入文件一模一样，只要 `State`、`Configuration` 和 `Oracle` 换了，验证的就完全是两码事。
 
-| 资产 | 典型内容 | 能直接回答什么 | 还需要补什么 |
-|---|---|---|---|
-| 数据语料 | CSV、Parquet、文档、向量、图 | 输入是否具有目标分布或编码特征 | 查询、语义契约、判定器 |
-| Benchmark workload | Schema、生成器、查询模板、驱动和指标 | 特定负载下的吞吐、延迟与资源开销 | 定向语义反例、异常状态、覆盖证明 |
-| Regression corpus | 初始化 SQL、查询、预期结果、历史 reproducer | 已知行为是否回退 | 新功能组合、未知缺陷的探索 |
-| Testing framework | 生成器、mutator、oracle、reducer | 能否持续产生并缩减失败实验 | 引擎适配、能力模型、资源预算 |
+沿着每种公开资产最擅长暴露的失效机制去挑选起点，才不会拿着锤子找钉子：
 
-例如，一份 Parquet 数据可以同时用于扫描 benchmark 和格式兼容性测试，但前者通常关心吞吐，后者关心 nested null、decimal metadata 或损坏页是否按契约处理。文件相同，不意味着测试目标相同。
+| 公开资产与入口 | 核心内容与定位 | 最值得复用的结构特征 | 单独使用时的结构性盲区 |
+| --- | --- | --- | --- |
+| [TPC-H / TPC-DS](https://tpc.org/TPC_Documents_Current_Versions/current_specifications5.asp) | 官方决策支持规范、数据与查询生成器 | 规模可伸缩、多表业务模式与复杂分析模板 | 合成数据偏均匀独立，缺极端倾斜与异常提交历史；改动 Schema 或参数后属派生负载，不可混称官方 TPC 成绩 |
+| [Join Order Benchmark（JOB）](https://github.com/gregrahn/join-order-benchmark) | IMDb 真实电影关系快照与 113 条连接查询 | 真实世界的列间强相关性与倾斜分布，专治基数估计偏差 | 聚焦内连接分析，不含更新恢复与复杂嵌套类型；必须锁定同一份 IMDb 快照才具横向可比性 |
+| [ClickBench](https://github.com/ClickHouse/ClickBench) | 真实流量宽表数据、各引擎 DDL 与 43 条查询 | 宽表扫描、高基数字符串处理、过滤与聚合压测 | 无多表关联与事务语义；对比时极易受冷暖缓存与数据加载口径干扰 |
+| [SQLStorm](https://github.com/SQL-Storm/SQLStorm)（[PVLDB 2025](https://db.in.tum.de/~schmidt/papers/sqlstorm.pdf)） | LLM 生成的 18,251 条复杂查询（覆盖 1/12/220 GB 规模） | 跳出几十条手工模板，显著拓宽 SQL 语法与物理计划形态 | 跨引擎方言与非确定性行为未完全对齐，跨系统结果差异需先排查方言契约而非直接记为 Bug |
+| [YCSB](https://github.com/brianfrankcooper/YCSB) / [BenchBase](https://github.com/cmu-db/benchbase) | 键值读写比例压测框架与多数据库 JDBC 事务套件 | 可控键分布（如 Zipfian）、并发争用与标准事务混合负载 | 吞吐数字高不代表隔离级别实现正确，缺少对并发历史异常与崩溃恢复的语义裁决 |
+| [DuckDB sqllogictest](https://duckdb.org/docs/current/dev/sqllogictest/overview) | 声明式 SQL 逻辑测试格式与引擎回归语料 | 精确绑定初始化 SQL、查询结果与预期错误类型 | 依赖人工沉淀已知边界，无法自动探索未知的功能交互死角 |
+| [Apache parquet-testing](https://github.com/apache/parquet-testing) | 包含 `data`、`bad_data` 与 Variant 等边界文件样例 | 跨引擎列存格式互操作、特殊编码与截断/损坏页防御 | 只检验存储读写契约，不触及上层查询优化器改写 |
+| [Velox Fuzzers](https://facebookincubator.github.io/velox/develop/testing/fuzzer.html) | 表达式、聚合与窗口算子的随机输入与计划变体工具 | 在同一批逻辑数据上强行切换编码布局、内存与溢写路径 | 聚焦向量化执行层，不涵盖完整数据库的事务、权限与崩溃恢复 |
+| [LDBC SNB](https://github.com/ldbc/ldbc_snb_interactive_v2_impls) / [ANN-Benchmarks](https://github.com/erikbern/ann-benchmarks) / [BEIR](https://github.com/beir-cellar/beir) | 社交图交互负载、向量近邻数据集与多领域文本检索评测 | 图跳数相关性、向量精确 Ground Truth、文档相关性标注 | 评测近似召回率或图遍历性能，不能替代带标量过滤、并发删除与快照可见性的数据库语义验证 |
 
-还要区分**可公开下载、代码开源、数据可再分发**。TPC 的规范与工具、IMDb 派生数据、Stack Exchange 数据、论文 artifact 各有自己的使用条件；不能因为一个 GitHub 仓库使用 MIT，就把它引用的所有数据一起视为 MIT 数据集。这里将它们统称为“公开可获取资产”，具体复用要记录各自来源与许可。
-
-### 公开 Benchmark 与测试语料：应该怎样选
-
-资产选择应从失效机制出发：优化器估计需要相关数据，事务隔离需要操作历史，格式兼容需要编码样例。没有一种数据集覆盖所有边界。
-
-#### 关系型与事务负载
-
-分析负载与事务负载的结果判定不同，统一驱动并不意味着可以使用同一个 oracle。下表列出可复用内容及需要补充的验证。
-
-| 工作与入口 | 公开资产及主要用途 | 最值得保留的特征 | 测试时需要补齐的边界 |
-|---|---|---|---|
-| [TPC-H / TPC-DS](https://tpc.org/TPC_Documents_Current_Versions/current_specifications5.asp) | 官方规范、数据和查询生成工具；决策支持负载 | 可控规模、固定业务关系、复杂分析查询 | 模板之外的 SQL 组合、特殊值、异常历史；修改后的 workload 应说明是派生实验 |
-| [Join Order Benchmark，JOB](https://github.com/gregrahn/join-order-benchmark) | IMDb 派生关系数据入口、schema、113 条查询 | 多表连接和真实数据相关性 | Outer Join、嵌套类型、DML、恢复；固定 IMDb 快照，不能随意换成今日数据后沿用旧结果 |
-| [ClickBench](https://github.com/ClickHouse/ClickBench) | 数据下载入口、各系统 DDL/查询/运行脚本和结果 | 宽表分析、扫描、过滤、聚合及字符串处理 | 多表关联、事务、复杂状态；统一冷暖缓存和加载成本的口径 |
-| [SQLStorm](https://github.com/SQL-Storm/SQLStorm) | LLM 生成查询、数据准备及 benchmark 工具 | 更丰富的分析 SQL 与计划形态 | 方言差异、非确定性、筛选偏差；不能把所有跨引擎差异直接记为 bug |
-| [YCSB](https://github.com/brianfrankcooper/YCSB) | 可配置 workload、数据生成和数据库 bindings | 读写比例、键访问分布和并发压力 | SQL 代数、事务隔离与复杂查询语义 |
-| [BenchBase](https://github.com/cmu-db/benchbase) | 基于 JDBC 的多数据库 benchmark 框架，包含多种事务负载 | 统一驱动、事务组合和执行统计 | 事务历史判定、故障注入；事务吞吐高不代表隔离级别实现正确 |
-
-这些资产适合作为起点，但不应该只按“能跑哪些 benchmark”选择。要先明确正在测试的失效机制：Join order 适合从 JOB 出发，Scan/表达式适合从 ClickBench 出发，事务调度需要带历史的 workload，优化规则的 NULL 语义往往更适合自己构造小表。
-
-TPC-H 和 TPC-DS 的价值也不只在总耗时。不过，把生成参数改成极端倾斜、把 schema 改成 nullable 或新增自定义查询后，得到的是**从 TPC 派生的测试负载**，不能据此宣称获得符合官方规范的 TPC 成绩。
-
-#### 复杂类型、文件、图与检索
-
-复杂类型和检索引入了编码、质量与近似性条件，传统 SQL 结果对比无法自动覆盖。需要按接口承诺选择判定方式。
-
-| 工作与入口 | 可以复用的资产 | 适合检验 | 不能直接替代 |
-|---|---|---|---|
-| [DuckDB sqllogictest](https://duckdb.org/docs/current/dev/sqllogictest/overview) | SQL 测试格式与引擎测试实践 | 功能回归、结果与预期错误 | 自动发现所有新 bug 的生成器 |
-| [Apache parquet-testing](https://github.com/apache/parquet-testing) | `data`、`bad_data`、Variant 等样例 | 格式互操作、特殊编码、损坏输入处理 | 查询优化器的语义验证 |
-| [Velox Aggregation / Window Fuzzer](https://facebookincubator.github.io/velox/develop/testing/fuzzer.html) | 算子生成、计划变体与验证工具 | 聚合、窗口以及不同执行路径的一致性 | 完整 DBMS 的事务和恢复 |
-| [LDBC SNB](https://github.com/ldbc/ldbc_snb_interactive_v2_impls) | 规范、数据生成器入口、图查询和更新实现 | 图结构、相关性、交互负载 | 关系引擎所有 SQL 语义；不同 workload/version 应分别固定 |
-| [ANN-Benchmarks](https://github.com/erikbern/ann-benchmarks) | 向量数据、ground truth、算法适配及评测代码 | recall 与查询性能的权衡 | 带过滤、更新和权限的完整向量数据库语义 |
-| [BEIR](https://github.com/beir-cellar/beir) | 多领域文档、query 和 relevance judgments | 文本检索质量及跨领域变化 | 存储、索引可见性、事务或 SQL 正确性 |
-
-这里有两个容易忽略的区别。Array、Map、Struct 是有明确类型结构的数据；JSON/Variant 通常是半结构化数据；文本、图像、音频才涉及更开放的内容解释。向量则已经是定长数值表示。它们的输入契约和 oracle 不应混成一个“非结构化类型测试”。
-
-另一个区别是公开程度。[SQLite 的测试说明](https://www.sqlite.org/testing.html) 同时介绍了公开测试和 TH3 等资产，但 TH3 是专有测试套件。不能把 SQLite 的全部测试能力写成一个可以直接下载的开源 corpus。
-
-#### 怎样把现成 workload 变成自己的测试集
-
-原始 workload、定向变体与最小反例应分别保存，以免调整输入后丢失与公开基线的可比性。可以组织为三层资产：
+复用这些公开资产时，还有两道工程红线容易踩错。第一是**开源许可与公开程度的区分**：一个测试仓库代码采用 MIT 协议，不等于它脚本里拉取的 TPC 工具、IMDb 快照或 Stack Exchange 语料也能自由再分发；同样，阅读 [SQLite 的测试说明](https://www.sqlite.org/testing.html) 时要注意区分其公开测试套件与闭源专有的 TH3 高可靠测试集，后者并不是一份能直接下载复用的开源语料。第二是**基准可比性与破坏性探索的隔离**：为了抓 Bug，我们经常需要把表的列改成可空（Nullable）、注入极端热点键或强行压低内存预算，如果直接原地篡改基准目录，就会毁掉与历史版本对比性能趋势的尺子。最稳妥的办法是把资产拆成三层漏斗管理：
 
 ```text
-原始基线：固定快照、工具版本和查询，保留可比性
-    ↓ 定向扰动
-探索集合：改变值域、相关性、物理路径与历史，寻找失败
-    ↓ 缩减与解释
-回归集合：最小数据 + 必要配置 + 可执行判定 + 缺陷说明
+原始基线层：冻结数据快照、生成工具版本与标准查询，专供跨版本趋势对照
+      │  定向注入空值、列相关性、内存压力与并发历史
+      ▼
+开放探索层：大规模变异与模糊测试，允许海量试错，只求撞出异常现场
+      │  自动缩减（Reduce）并定位失效前提
+      ▼
+核心回归层：最小数据集 + 必要配置开关 + 可执行判定器，随每次提交快速运行
 ```
 
-原始基线用于比较趋势，探索集合可以不断扩张，回归集合则要尽量小而稳定。把几百万随机 SQL 永久塞进每次提交的 CI，通常只会增加成本；更好的做法是把它们发现的**不同失效机制**沉淀下来。
+不要把探索层生成的几百万条随机 SQL 原封不动塞进日常 CI——真正值得永久留存进回归集的，是从海量试错里提炼出来的**独立失效机制**。
 
-## 学术测试路线：先解决“谁来判断结果对不对”
+---
 
-生成合法输入只解决可执行性，发现静默错误还需要独立的测试判定器（Test Oracle）。各类方法通过预期结果、等价关系或历史不变量提供判据。
+## 二、破解判定器难题：没有标准答案，靠什么抓出逻辑错数？
 
-### 从 crash oracle 到逻辑 oracle
+把语法生成器和类型绑定器写对，只能保证数据库“不把 SQL 拒之门外”。真正在生产环境惹出大祸的，往往是不报错、不崩溃、平静返回错误行数的逻辑缺陷。在缺乏人工标准答案的前提下，现代数据库测试沿着跨引擎差分、同引擎代数变形（`TLP`、`NoREC`、`PQS`）与黑盒并发依赖环（`Elle`）三条验证主线构造判定器，从不同维度围捕静默错数与隔离级别异常：
 
-检测崩溃不能发现正常返回的错误结果，逻辑 oracle 必须构造可验证的结果关系。SQLancer 将这一职责与生成器分开。
+![数据库测试判定器三条核心验证主线](/images/diagrams/dbres-testing-oracles.svg)
 
-[SQLancer](https://github.com/sqlancer/sqlancer) 将 schema/data/query 生成与 test oracle 分开，集成了 PQS、NoREC、TLP、DQP、CODDTest 等方法，也提供基于查询计划的生成反馈。它是一个测试框架，不是一份固定数据集；不同 provider 的语法和 oracle 覆盖并不相同。
+### 2.1 从崩溃检测到变形测试（Metamorphic Testing）
 
-几条代表性路线的区别如下。年份对应所链接工作或项目说明，不意味着这些技术只能用于当年的版本。
+最早普及的 [SQLsmith](https://github.com/anse1/sqlsmith) 依据数据库元数据随机拼装类型合法的抽象语法树（AST），靠进程崩溃、断言失败或内部错误来抓 Bug（即 Crash Oracle）；随后的 [SQUIRREL（2020）](https://arxiv.org/abs/2006.02398) 和 [SQLRight（2022）](https://github.com/PSU-Security-Universe/sqlright) 引入了结构化变异、语法语义修复与代码覆盖率反馈，把随机触角伸进了更深的内核分支。但只要没有独立的结果判定器，哪怕一条查询少算了一半数据，进程照样返回成功。
 
-| 路线 | 判定依据 | 擅长发现 | 关键限制 |
-|---|---|---|---|
-| [SQLsmith](https://github.com/anse1/sqlsmith) | 随机生成类型和 schema 感知的 SQL，观察异常 | crash、断言和内部错误 | 没有独立结果 oracle 时，无法判断正常返回的错误结果 |
-| [SQUIRREL，2020](https://arxiv.org/abs/2006.02398) / [SQLRight，2022](https://github.com/PSU-Security-Universe/sqlright) | 结构化变异、合法性修复、覆盖反馈；SQLRight 结合逻辑 oracle | 更深的执行路径和逻辑缺陷 | 代码覆盖高不等于语义组合覆盖全 |
-| [PQS，OSDI 2020](https://www.usenix.org/conference/osdi20/presentation/rigger) | 生成必须包含某个 pivot row 的查询 | 漏行等逻辑错误 | 需要在测试器中理解表达式语义；只验证保证的性质 |
-| [NoREC，ESEC/FSE 2020](https://arxiv.org/abs/2007.08292) | 优化查询与较难被优化的参照查询一致 | 过滤相关优化错误 | 不覆盖任意查询；两条路径仍可能共享错误 |
-| [TLP，OOPSLA 2020](https://www.research-collection.ethz.ch/bitstream/20.500.11850/456967/2/3428279.pdf) | TRUE/FALSE/UNKNOWN 分区后重组结果 | 三值逻辑及相应查询变换错误 | 聚合、DISTINCT、窗口需要各自合法的分解方式 |
-| [DQP，SIGMOD 2024](https://nus-test.github.io/publication/2024-sigmod-dqp/) | 同一查询用不同执行计划，结果一致 | 计划和算子实现差异 | 计划必须真的不同；相同公共路径上的 bug 可能漏掉 |
-| [CODDTest，SIGMOD 2025](https://github.com/sqlancer/sqlancer/pull/1054) | 固定状态下，表达式/子查询与其求值结果替换前后一致 | 常量折叠、传播及相关语义错误 | 要保证作用域、类型、相关绑定和求值时机合法 |
-| [EET，OSDI 2024](https://www.usenix.org/conference/osdi24/presentation/jiang) | 等价表达式变换前后结果一致 | 表达式求值和优化错误 | 等价性依赖适用的 SQL 语义与前提 |
+最直观的补救思路是**差分测试（Differential Testing）**：把同一条 SQL 同时发给 PostgreSQL、DuckDB 和被测引擎，谁跟大家不一样谁就有嫌疑。但差分测试很快就会撞上两个痛点：一是各家方言在隐式类型转换、溢出报错、排序稳定性上本来就各执一词，海量“假阳性”噪声会淹没真正的 Bug；二是遇到反直觉的优化规则边界，两个引擎完全可能犯下一模一样的错。[SemConT](https://arxiv.org/abs/2406.09469) 尝试从源头消解“两个实现一起错”的盲区——它把受限 SQL 子集的形式化语义写成可执行的 Prolog 参考模型，用显式规则替代“拿老牌数据库当标准答案”，只是形式化模型覆盖的语法范围与目标产品的兼容契约仍需逐条对齐。
 
-DQP 与 CODDTest 的论文和实现入口见 [SQLancer approaches](https://github.com/sqlancer/sqlancer#approaches-and-papers)。它们共同说明：无需给每条随机 SQL 手写完整答案，也可以通过**应当成立的关系**发现错误。
+有没有办法**不依赖外部参考引擎，只靠被测数据库自己跟自己对账**，就能抓出逻辑错误？[SQLancer](https://github.com/sqlancer/sqlancer) 将 Schema/数据生成与逻辑判定解耦，集成了一整套精妙的变形测试方法（详见 [SQLancer approaches](https://github.com/sqlancer/sqlancer#approaches-and-papers)）。它的第一性原理非常干净：虽然我算不出复杂查询 `Q(D)` 的绝对正确结果，但我可以构造一组语义上必然成立的变换关系——如果引擎自己算出的左右两边对不上，内核里一定有一边撒了谎。
 
-### TLP：把三值逻辑变成可执行判定
+看看其中最具代表性的两条构造思路，就能体会这种四两拨千斤的效果。
 
-给定确定性的谓词 `p`，每一行恰好属于 `p` 为 TRUE、FALSE、UNKNOWN 中的一类。对适合直接分区的查询，可以验证 bag 等价：
+第一条是 **[TLP（Ternary Logic Partitioning，OOPSLA 2020）](https://www.research-collection.ethz.ch/bitstream/20.500.11850/456967/2/3428279.pdf)**。在 SQL 的三值逻辑（Three-Valued Logic）下，给定任意确定性谓词 `p`，表里的每一行数据在求值 `p` 时，必然且只能落入 `TRUE`、`FALSE`、`UNKNOWN`（即 `IS NULL`）三个互斥分区之一。于是，不带过滤的原查询结果，在多重集（Bag，保留重复行次数）意义下必然等于三个分支的 `UNION ALL`：
 
 ```sql
--- 原始结果
+-- 原始查询：直接扫描全表
 SELECT x FROM t;
 
--- 分区重组；必须保留重复值
+-- TLP 分区重组查询：强迫优化器走三条不同的谓词过滤路径，再用 UNION ALL 拼回
 SELECT x FROM t WHERE x > 0
 UNION ALL
 SELECT x FROM t WHERE NOT (x > 0)
@@ -152,70 +106,48 @@ UNION ALL
 SELECT x FROM t WHERE (x > 0) IS NULL;
 ```
 
-令 `t.x = [NULL, -1, 0, 1, 1]`，两侧都应返回这五个值。去掉 UNKNOWN 分区会丢失 NULL；把 `UNION ALL` 改成 `UNION` 会丢失重复的 `1`。因此，这个小表同时检验了三值逻辑（Three-Valued Logic）和 bag semantics。
+拿一张只有 5 行的小表 `t.x = [NULL, -1, 0, 1, 1]` 试一下：第一分支吐出 `[1, 1]`，第二分支吐出 `[-1, 0]`，第三分支吐出 `[NULL]`，合起来恰好还原完整的 5 个值。倘若某个索引裁剪或条件下推规则漏掉了 `UNKNOWN` 分支，`NULL` 就会人间蒸发；倘若测试器误把 `UNION ALL` 写成去重的 `UNION`，重复的 `1` 就会少掉一个。当然，要把 TLP 推广到更复杂的 SQL，测试生成器自身必须懂代数分解——遇到 `AVG(x)` 不能直接把三个分区的均值再求平均，必须拆成各分区的 `SUM` 之和除以 `COUNT` 之和；遇到 `COUNT(DISTINCT)`、`LIMIT`、窗口函数或非确定性函数（如 `RANDOM()`），也必须遵守各自的等价拆解前提。
 
-不能把这个公式机械地套在 `LIMIT`、窗口、volatile function 或所有聚合外面。`AVG` 的分区合并需要 sum/count，而不是平均各分区的平均值；`COUNT(DISTINCT)` 也不能简单相加。测试器本身必须携带变换的前提。
-
-### NoREC：把过滤从 WHERE 移到表达式求值
-
-在确定性与类型语义一致的条件下，将过滤改成显式计数可以避开部分优化路径，并对照同一谓词的结果。下面的 NoREC 风格查询用于说明这一关系，并非某个 provider 的原样实现：
+第二条是 **[NoREC（Non-optimizing Reference Engine Construction，ESEC/FSE 2020）](https://arxiv.org/abs/2007.08292)**。优化器最喜欢对 `WHERE` 子句大刀阔斧地做索引选择、分区裁剪和谓词下推，却很少去改动 `SELECT` 投影列表里的复杂条件求和。于是我们可以把同一条过滤条件平移到投影表达式里，人为造出一个“难以被激进优化”的参照查询：
 
 ```sql
+-- 待测路径：触发 WHERE 过滤下推、索引扫描或动态裁剪
 SELECT COUNT(*) FROM t WHERE x > 0;
 
-SELECT COALESCE(SUM(CASE WHEN x > 0 THEN 1 ELSE 0 END), 0)
-FROM t;
+-- 参照路径：全表扫描逐行求值，绕开大部分过滤优化规则
+SELECT COALESCE(SUM(CASE WHEN x > 0 THEN 1 ELSE 0 END), 0) FROM t;
 ```
 
-第一条可走过滤优化，第二条逐行计算谓词并累计真值。上述输入下二者都为 `2`。这里的 `COALESCE` 很重要：空表上的 `COUNT(*)` 为 `0`，而 `SUM` 为 NULL。
+在刚才的 5 行输入上，两条 SQL 都应该返回 `2`。注意参照查询外层包着的那层 `COALESCE(..., 0)` 绝不是多余装饰：一旦表 `t` 是空表，`COUNT(*)` 按标准返回 `0`，而空集上的 `SUM(...)` 会返回 `NULL`！这也点破了变形测试的铁律——测试框架构造的等价式本身必须严丝合缝，同时最好检查执行计划，确认两条 SQL 确实走了不同的内核路径，避免两条查询被同一个前端重写器改成了完全相同的计划而漏掉公共路径上的缺陷。
 
-这只是针对一个受限过滤问题构造参照。不能因为两条 SQL 相同就证明整个引擎正确，也不能假设关闭一个 optimizer 开关就得到“完全未优化的参考引擎”。还要观察计划，确认待测规则或执行路径确实形成差异。
+顺着这个思路往下看，近年顶会涌现的新 Oracle 其实都在变换不同的“不动点”：
 
-### 形式语义参照：减少“两个实现一起错”的盲区
+| 代表工作 | 核心等价或锚定关系 | 最擅长猎杀哪类内核缺陷 | 适用前提与固有盲区 |
+| --- | --- | --- | --- |
+| **[PQS](https://www.usenix.org/conference/osdi20/presentation/rigger)**（OSDI 2020） | 先从表中挑定一行数据（Pivot Row），再反向合成保证使该行为 `TRUE` 的复杂谓词 | 复杂连接与表达式求值中的漏行错误 | 测试器内部需自带一套精确的表达式求值器来挑选谓词 |
+| **[TLP](https://www.research-collection.ethz.ch/bitstream/20.500.11850/456967/2/3428279.pdf)**（OOPSLA 2020） | `TRUE / FALSE / UNKNOWN` 三值分区合并且保留多重集重数 | 三值逻辑处理、外连接空值与分区裁剪错误 | 含窗口、`LIMIT` 或不可加聚合时需专门设计合并算式 |
+| **[NoREC](https://arxiv.org/abs/2007.08292)**（ESEC/FSE 2020） | `WHERE` 过滤计数与全表扫描 `CASE WHEN` 累加结果一致 | 索引扫描、谓词下推与过滤路径优化错误 | 主要针对过滤计数形态，不直接覆盖任意复杂输出结构 |
+| **[DQP](https://nus-test.github.io/publication/2024-sigmod-dqp/)**（SIGMOD 2024） | 同一条 SQL 通过 Hint 或优化开关强行走不同物理计划，结果必一致 | Join 算法切换、并行算子与特定物理实现 Bug | 若错误藏在所有计划共享的前置解析或重写阶段，则双方同错 |
+| **[EET](https://www.usenix.org/conference/osdi24/presentation/jiang)**（OSDI 2024） | 对查询内子表达式做恒等变换（如布尔/算术等价改写），结果不变 | 表达式折叠、短路求值与优化器规则交互 Bug | 改写必须严格避开整数溢出、除零异常改变与空值传播陷阱 |
+| **[CODDTest](https://github.com/sqlancer/sqlancer/pull/1054)**（SIGMOD 2025） | 固定数据库快照下，将子查询或表达式替换为其预先求出的常量值，结果一致 | 常量折叠、常量传播与相关子查询绑定错误 | 必须精确控制变量作用域、类型精度与求值时机 |
 
-跨引擎一致不能排除共同缺陷，形式语义参照提供另一种独立依据；代价是必须明确模型覆盖的 SQL 子集。
+### 2.2 跳出单次查询结果：性能退化与并发事务的判定器
 
-[Semantic Conformance Testing of Relational DBMS / SemConT](https://arxiv.org/abs/2406.09469) 将 SQL 语义形式化并用 Prolog 实现参照，按语义覆盖生成测试。它与“拿 PostgreSQL 当正确答案”的区别在于，判定依据来自显式的语义模型。
+除了“单条 `SELECT` 算没算对”，数据库还有两类致命问题无法靠核对静态结果集抓住。
 
-这种方式对一个受限 SQL 子集很有吸引力，但仍然需要明确模型覆盖的构造及目标方言。SQL 标准、产品文档和历史兼容行为之间可能存在差异；一个 mismatch 首先说明“不一致”，还需要依据目标引擎的契约判断是不是缺陷。
+一类是**性能与基数估计退化**。查询结果完全正确，但新版本耗时暴涨了 50 倍。针对这类问题，[APOLLO](https://github.com/sslab-gatech/apollo) 自动生成、缩减并定位跨版本性能回退用例；而 [CERT](https://arxiv.org/abs/2306.00355) 则把变形测试的思想搬进了优化器的基数估计器（Cardinality Estimator）——给一条查询追加更严格的过滤条件（例如把 `a > 10` 收紧成 `a > 100`），优化器估算出的输出行数理应单调不增。一旦发现“条件越严、估行越多”的反常跳跃，往往就揪出了统计直方图或相关性推导里的隐患，随后再结合真实执行计划核验它是否诱发了烂计划。
 
-工程上可以组合三种证据：同引擎等价变换、跨实现差分、受限语义模型。它们减少彼此盲区，却都不构成对无限输入空间的证明。
+另一类是**并发事务与故障恢复异常**。压测工具汇报“每秒跑完十万笔事务且零报错”，丝毫不能证明系统兑现了可串行化（Serializable）或快照隔离（Snapshot Isolation）承诺。到了这一层，测试输入不再是一条 SQL，而是多客户端并发交错的读写序列与网络分区、进程强杀故障；判定器也随之升级为历史依赖图检查器——例如 [Jepsen](https://github.com/jepsen-io/jepsen) 注入分布式故障、[Elle](https://github.com/jepsen-io/elle) 从可观测的读写历史反推事务依赖环来捕获脏读、丢失更新与写偏序（Write Skew），以及 [OSDI 2023 的 Graph-Based Oracle Construction](https://www.usenix.org/conference/osdi23/presentation/jiang) 面向通用事务隔离级别自动构造图判定器。
 
-### 性能与事务需要另外的 oracle
+---
 
-结果相同不代表性能未回退，也不代表事务历史满足隔离承诺。两类测试分别需要受控测量与历史语义判定。
+## 三、从优化器前提反推反例：两行小数据如何击穿复杂规则？
 
-[APOLLO](https://github.com/sslab-gatech/apollo) 面向数据库性能回退的生成、缩减和定位。[CERT](https://arxiv.org/abs/2306.00355) 则利用“限制更强的查询不应获得更大的估计基数”这样的预期寻找 CE 异常线索。后者不等于证明实际执行变慢：统计估计违反预期后，仍需要检查计划与运行数据。
+盲目扩大随机表的数据量，在很多优化器 Bug 面前效率极低。原因很简单：**每一条查询改写规则背后，都依赖一组往往没有写进类型系统的隐式数学前提**——比如连接键是否唯一、谓词是否拒绝空值（Null-Rejecting）、标量子查询是否至多返回一行、两阶段聚合的中间状态是否满足结合律。只要顺着这些前提去构造“恰好踩破假设”的最小输入，两行数据就能让错误的优化规则当场现形。
 
-事务方面，[Jepsen](https://github.com/jepsen-io/jepsen) 提供带故障注入的分布式测试框架，[Elle](https://github.com/jepsen-io/elle) 根据可观察历史推导依赖关系并检测事务异常；[Graph-Based Oracle Construction，OSDI 2023](https://www.usenix.org/conference/osdi23/presentation/jiang) 也研究如何为事务缺陷构造判定依据。此时输入已经不是一个 SELECT，而是事务程序、交错、提交结果和故障历史。
+### 3.1 两个经典的最小语义反例
 
-因此，“这一批查询的结果相同”不能覆盖丢失更新、错误可见性或恢复后丢数据；“并发 benchmark 跑完”也不能代替 isolation checking。
-
-## 构造反例：数据、引擎状态与性能悬崖
-
-### 怎样构造真正有区分力的测试数据
-
-能触发规则前提失效的小输入，往往比大量不相关数据更容易定位错误。构造时应先指定待检验假设，再控制空值、重复和相关性。
-
-#### 从优化前提反推反例
-
-优化规则的前提决定反例构造方向：先列出空值、重复次数、输出顺序和状态条件，再寻找能区分变换前后结果的最小输入。随机生成只有命中这些条件，才有机会暴露对应错误。
-
-| 优化或功能 | 容易被隐含的前提 | 应主动构造的输入 |
-|---|---|---|
-| Join elimination | 被消除表的唯一性、匹配存在性 | 无匹配、重复匹配、nullable key；若已有约束禁止，改用不声明该约束的 schema |
-| Predicate pushdown | 谓词对 NULL、异常和求值位置的行为 | NULL 补齐、`COALESCE`、转换失败、过滤顺序变化 |
-| Subquery decorrelation | 标量子查询最多一行、绑定范围正确 | 零行、一行、多行、重复外层键、内层 NULL |
-| Aggregation split | 中间状态可合并、类型和空输入一致 | 空分区、全 NULL、溢出边缘、不同 merge 顺序 |
-| Partition pruning | 元数据、比较语义和边界一致 | 恰落边界的值、NULL 分区、时区转换、过期统计 |
-| Top-K / late materialization | 排序键与行标识对应、tie 语义合法 | 相同排序键、稀疏选择、删除后重排、跨 batch tie |
-| Incremental view maintenance | delta 与快照、重复度及删除处理一致 | 最后一个匹配被删除、重复插入、迟到更新、刷新重试 |
-
-这里的重点不是绕过 schema。一个声明 `PRIMARY KEY` 的表拒绝重复键，可能正是正确行为。生成器要区分“合法状态下的规则测试”和“非法输入下的拒绝测试”，不能靠破坏前提后仍要求系统优化正确来制造假 bug。
-
-#### 一个 Outer Join 反例：过滤之后新产生的 NULL
-
-外连接（Outer Join）过滤可能改变是否需要补 NULL，因此即使各表只有一行也能区分错误改写。构造如下：
+先看**外连接谓词下推**。设左表 `a` 只有一行 `(1)`，右表 `b(k, v)` 也只有一行 `(1, 7)`：
 
 ```sql
 CREATE TABLE a(k INTEGER);
@@ -223,16 +155,12 @@ CREATE TABLE b(k INTEGER, v INTEGER);
 INSERT INTO a VALUES (1);
 INSERT INTO b VALUES (1, 7);
 
+-- 原始查询：先做左外连接得到 (1, 7)，再过滤 COALESCE(7, 0) = 0，正确结果为空集
 SELECT a.k, b.v
 FROM a LEFT JOIN b ON a.k = b.k
 WHERE COALESCE(b.v, 0) = 0;
-```
 
-正确结果为空：匹配行的 `v=7`，不满足谓词。
-
-假设错误地把谓词复制进右侧输入，同时保留上层过滤：
-
-```sql
+-- 错误改写示例：若优化器把过滤条件提前压进右表输入
 SELECT a.k, b2.v
 FROM a
 LEFT JOIN (
@@ -241,15 +169,9 @@ LEFT JOIN (
 WHERE COALESCE(b2.v, 0) = 0;
 ```
 
-第二条返回 `(1, NULL)`。提前过滤删除了原匹配行，LEFT JOIN 生成的 NULL 又被 `COALESCE` 变为 `0`，通过上层过滤。
+对比一下发生了什么：原查询里 `a` 和 `b` 成功连上，产出 `(1, 7)`，接着被 `WHERE` 干净利落地滤掉，最终返回空集。可一旦某条不够严谨的优化规则把 `COALESCE(v, 0) = 0` 提前压进了 `LEFT JOIN` 右侧，`b` 表里的 `(1, 7)` 在连接前就被提前杀死了！随后 `LEFT JOIN` 看到左表 `1` 找不到右表伙伴，按语义贴心地补出一行 `(1, NULL)`；这行新造出来的 `NULL` 撞上外层的 `COALESCE(b2.v, 0) = 0`，摇身一变成了 `0 = 0`，堂而皇之地混进了最终结果！这个两行反例直观地说明了：任何不拒绝 `NULL` 的上层谓词，绝不能越过外连接的补空侧提前下推。
 
-**这两条 SQL 故意不等价**。它们用于证明这种 rewrite 不合法，不表示某个实际引擎当前会做这个错误改写。一个有意义的优化器测试还需要确认目标引擎走到了相关规则，并检查其保留了必要保护。
-
-由此扩展 case family：右侧空表、真实 NULL、重复匹配、左右键均为 NULL、普通等值与 null-safe equality、过滤器提前/延迟完成。每个变体都对应一条不同的语义前提。
-
-#### `NOT IN` 与 `NOT EXISTS`：一个 NULL 足以推翻直觉
-
-`NOT IN` 与 `NOT EXISTS` 在可空输入上不普遍等价，因为 UNKNOWN 会影响前者的过滤结果。以下用例将这个差异隔离出来。
+再看大模型和初级开发者最常混淆的 **`NOT IN` 与 `NOT EXISTS` 互换**：
 
 ```sql
 CREATE TABLE outer_t(k INTEGER);
@@ -257,298 +179,140 @@ CREATE TABLE inner_t(k INTEGER);
 INSERT INTO outer_t VALUES (1);
 INSERT INTO inner_t VALUES (NULL);
 
+-- 查询 A：计算 1 <> NULL 得到 UNKNOWN，NOT IN 结果为空集
 SELECT k FROM outer_t WHERE k NOT IN (SELECT k FROM inner_t);
 
+-- 查询 B：相关子查询无匹配行返回，NOT EXISTS 结果返回 1
 SELECT k FROM outer_t
 WHERE NOT EXISTS (
   SELECT 1 FROM inner_t WHERE inner_t.k = outer_t.k
 );
 ```
 
-第一条结果为空，第二条返回 `1`。这里不是引擎差异，而是三值逻辑下两条 SQL 本来就不同。对 Anti Join 的测试，应该把 outer key 是否 NULL、inner 是否空、inner 是否含 NULL、是否匹配分别列出来。
+只要内表里混进哪怕一个 `NULL`，`x NOT IN (SELECT y ...)` 展开成的合取式 `x <> y1 AND x <> NULL` 永远不可能为 `TRUE`，整条查询瞬间颗粒无收；而按等值条件关联的 `NOT EXISTS` 只关心“存不存在让 `inner_t.k = outer_t.k` 为真的行”，遇到 `NULL` 判定无匹配，照常把外表的 `1` 吐出来。因此，任何反半连接（Anti Join）去相关改写都必须把“外表键可空、内表为空集、内表含 `NULL`”四象限逐一测透；同时这也提醒我们，绝不能轻信大模型随口声称的“这两条 SQL 等价”，否则测试器会把完全合法的三值逻辑差异误报成引擎 Bug。
 
-LLM 很容易把这两条 SQL 当作通用等价改写。因此，让模型生成“等价查询”之后，仍要检查其前提；模型说等价并不能授权 oracle 把差异报成 bug。
+沿着同样的第一性原理，内核里常见高危优化的反例靶心可以一目了然地列出来：
 
-#### 改变联合分布，而不只改变数据量
+| 内核优化机制 | 隐含的成立前提 | 定向构造的最小破防输入 |
+| --- | --- | --- |
+| **连接消除（Join Elimination）** | 被消除侧连接键唯一，且外键匹配存在 | 无匹配行、一对多重复匹配、可空连接键（在未声明主键约束的表上验证） |
+| **标量子查询去相关** | 子查询对每个外层行至多返回一行，空集补 `NULL` | 子查询返回 0 行、多行报错边界、外层存在重复键与 `NULL` 键 |
+| **两阶段聚合拆分（Partial/Final Agg）** | 局部状态可无损合并，空输入与溢出行为一致 | 空分组、全 `NULL` 输入、高精度 Decimal 累加溢出临界点、乱序合并 |
+| **分区裁剪（Partition Pruning）** | 分区元数据、时区/排序规则与查询比较算子完全同构 | 恰好卡在分区右开/闭边界的值、`NULL` 分区、夏令时跨越与过期统计元数据 |
+| **Top-K 与延迟物化** | 排序键与物理行号（Row ID）映射在重排/过滤后不漂移 | 大量并列排序值（Ties）跨向量批次切分、带删除标记行的稀疏延迟回表 |
 
-相同单列分布不能确定联合选择率，相关性测试需要控制列间关系而不只控制 NDV。假设两列各有 100 个值，且各值出现次数相同：
+### 3.2 联合分布倾斜与物理阈值的“骑墙测试”
 
-```text
-数据 A：x 与 y 近似独立
-数据 B：y = x
-数据 C：大部分行 y = x，少量行打破相关性
+抓逻辑错数靠两行精巧反例，抓优化器选错计划和执行器崩溃则要瞄准**列间联合分布**与**物理状态切换阈值**。
 
-查询：WHERE x = 7 AND y = 7
-```
+许多基准生成器只管单列的不同值个数（NDV）和最大最小值，但优化器最容易栽跟头的地方恰恰是单列统计看不见的列间耦合。设想表里有 `x` 和 `y` 两列，取值都是 `1..100` 且每个数字各出现一万次——单看每一列的直方图，下面三份数据一模一样：
 
-即使单列 NDV、min/max 和边际分布相同，A 与 B 的联合选择率也可能相差两个数量级。把数据量从一千万扩大到一亿，未必比构造这两种联合分布更容易发现 CE 问题。
+1. **数据集 A**：`x` 与 `y` 完全独立随机配对，`WHERE x = 7 AND y = 7` 命中约 `1` 行；
+2. **数据集 B**：严格满足 `y = x`，同样的过滤条件瞬间命中 `10,000` 行，与独立假设估算出的基数整整差了四个数量级；
+3. **数据集 C**：99% 的行满足 `y = x`，唯独 1% 的异常行打破规律，专治那些采样过浅就盲目推导函数依赖的激进策略。
 
-建议将生成参数显式化：row count、NDV、null ratio、top-key frequency、列间相关性、Join overlap、fanout、字符串长度分布、排序程度、文件数和 row-group 大小。还要区分“生成器期望的分布”与“生成后实际测出的分布”，避免约束修复和采样改变原本设计。
+把均匀表从一千万行灌到一亿行，远不如造出 A、B、C 这三组对照更能逼出基数估计与 Join 顺序的死角。
 
-#### 测试阈值两侧，并证明路径确实切换
+而在执行引擎内部，真正的暗礁几乎全埋在物理状态切换的临界点 `B` 附近——构造输入时应当专门围绕 `B - 1`、`B`、`B + 1` 做“骑墙扫描”：
 
-对已知阈值 `B`，重点测 `B-1 / B / B+1`。但这里的 B 要来自目标版本的实现或观测：
+- **向量批次（Batch Size，如 1024 或 2048 行）**：空批次、恰好装满一整批、最后一批只剩孤零零 1 行；
+- **字符串内联边界（如 12 字节前缀内联）**：按 UTF-8 字节长度（而非字符个数）卡在 11、12、13 字节的多语言字符串比较与哈希；
+- **编码与哈希表切换**：字典编码（Dictionary Encoding）退化为平坦向量的临界 NDV、哈希表触发扩容重哈希（Rehash）且伴随长冲突链的瞬间；
+- **内存溢写（Spill）边界**：算子内存刚好够用、第一次触发落盘、极端热点分组迫使溢写分区发生**递归二次落盘（Recursive Spill）**。
 
-- batch size 边界：空 batch、恰好满 batch、最后一个 batch 只有一行；
-- hash table 扩容边界：rehash 前后键值及重复链仍一致；
-- 内存预算边界：首次 spill、递归 spill、多个分区同时回读；
-- 字符串 inline/out-of-line 边界：字节长度而非仅字符数量；
-- dictionary 与普通编码切换：NDV、空值和索引宽度变化；
-- optimizer 预算边界：枚举上限、超时退出、fallback plan；
-- 文件/page 边界：变长值跨页、空 row group、统计缺失。
+这里必须立下一条硬规矩：**声称测试某个内部物理分支，就必须拿到运行时计数器或计划签名作为铁证。** 由于不同类型宽度、内存分配器碎片和并发线程数都会移动真实的溢写触发线，单凭“我灌了十万行数据”根本不作数；如果跑完用例一看 `spill_bytes == 0`，这条测试只能归类为 `not_covered`（未触达目标路径），绝不能算作溢写分支测试通过。
 
-对于内存相关阈值，行数只是近似代理，值宽、allocator、并发都会改变触发点。应先通过 profile 找到转换区间，再围绕区间扫描，记录 `spill_bytes`、实际 batch/编码、rule hit 或 plan signature。
+---
 
-**如果测试宣称覆盖 spill，却没有发生 spill，就不能将它记为该分支通过**。这条要求比增加更多随机种子更能提高结果可信度。
+## 四、跨出平坦关系表：复杂类型、向量过滤、增量维护与性能悬崖
 
-### 按引擎边界组织测试，而不只按 SQL 功能组织
+现代分析与湖仓引擎早已不局限于平坦的整数和字符串。当嵌套类型、半结构化 JSON、近似向量检索与增量物化视图交织进同一条查询时，输入契约和结果比较器都必须跟着升级。
 
-引擎能力需要表达为条件组合，因为相同 SQL 可能在不同编码、内存预算或状态历史下进入不同实现路径。
+### 4.1 嵌套类型与列式编码：固定逻辑边界值，轮换物理表示
 
-#### 能力模型应该是条件集合
-
-类型支持依赖算子、编码和运行模式，`supports_array=true` 无法描述这些条件。能力描述至少应区分：
-
-```text
-语法可解析 → 类型可绑定 → 能生成计划 → 能执行 → 可持久化/恢复
-                                                ↓
-                         满足结果、错误、资源与生命周期契约
-```
-
-“支持”还应附带条件：类型参数、嵌套深度、算子、编码、执行模式和版本。把观测状态记为 `supported / expected_rejection / unknown / inconsistent`，不要把一次失败自动学习成“不支持”，否则 crash 或回归可能被生成器悄悄绕开。
-
-一个功能的边界至少应有三组测试：边界内成功、边界处成功或按契约拒绝、边界外明确拒绝且状态完整。错误消息字面值可能演化，通常应匹配错误类别及必要语义；如果协议承诺了稳定错误码，再验证错误码。
-
-#### 一张覆盖复杂类型与系统状态的矩阵
-
-覆盖声明需要运行证据支撑，例如计划、计数器或状态变化；仅在 SQL 文本中出现关键字不足以证明目标实现被测试。
-
-| 边界 | 必须区分的输入/状态 | 主要 oracle | 必须观察到的证据 |
-|---|---|---|---|
-| NULL 与空值 | SQL NULL、空字符串、空集合、集合内 NULL | 明确 expected + TLP | 各种值仍可区分 |
-| 数值与转换 | 最小/最大值、decimal scale、溢出、NaN、±0 | 方言契约、参考实现、合法变换 | 输出类型、异常及舍入方式 |
-| 时间与排序规则 | DST 重叠/跳跃、时区转换、Unicode normalization、大小写 | 固定时区/collation 的 expected | session 配置与实际比较路径 |
-| 嵌套类型 | NULL list、`[]`、`[NULL]`、NULL struct、字段为 NULL 的 struct | typed result、round trip、跨表示对照 | 类型与 null bitmap 没有塌缩 |
-| JSON / Variant | missing、JSON null、SQL NULL、重复 key、混合数值类型 | 明确解析/路径访问契约 | 存在性、类型和值分别检查 |
-| 列式执行 | flat、constant、dictionary、lazy，非连续 selection | 不同表示上的相同逻辑输入 | 实际编码/选择向量及结果 |
-| 聚合与窗口 | 空分区、NULL peer、ties、frame 边界、多级合并 | 单阶段/多阶段、参考计算 | frame 定义、merge 次序、类型 |
-| 内存与调度 | spill、并行取消、重试、提前结束的 LIMIT | 路径差分 + 资源不变量 | spill/retry/cancel 确实发生，资源被回收 |
-| 存储与外表 | 截断文件、异常 metadata、schema evolution、分区缺失 | 文件语料、独立 reader、预期拒绝 | 错误后的事务和文件状态 |
-| MV / 索引 | update/delete、刷新延迟、重建、读写交错 | 全量重算/基表扫描 | snapshot 与可见性水位一致 |
-| 分布式与恢复 | worker 失败、消息重复/乱序、提交结果不明 | history checker、恢复不变量 | 故障时点、已确认提交和重试身份 |
-| 权限与隔离 | 租户过滤、行列权限、索引/缓存复用 | 明确的允许集合 | 无越权行、无跨身份结果复用 |
-
-表中的每一格都需要适配目标引擎。例如 map duplicate key 可以被拒绝，也可以按明确定义处理；浮点 NaN 的比较与排序也存在方言差异。测试的目标是核对承诺，而非强迫所有产品采用同一行为。
-
-全矩阵笛卡尔积通常不可承受。可先做 pairwise 覆盖，再为高风险交互保留定向三元组，例如 `NULL × dictionary × selection vector`、`decimal × partial aggregation × spill`、`Outer Join × null-safe predicate × runtime filter`。pairwise 是预算策略，不是充分性证明。
-
-#### 嵌套类型：先保持逻辑值，再改变物理表示
-
-逻辑值不变而物理表示变化时，执行结果应保持一致；这是检查嵌套类型编码路径的依据。list/struct 的最小值域至少包含：
+在引擎里写一句 `supports_array = true` 很容易，但真正的支持意味着从语法解析、类型推导、列式字典编码、向量选择掩码（Selection Vector），一直到分组聚合落盘再读回，全链路都不丢状态。测试 `Array`、`Map`、`Struct` 时，与其随机塞几万个普通整数列表，不如先锁死最容易让空值位图（Null Bitmap）坍缩的 8 个最小逻辑值：
 
 ```text
-NULL
-[]
-[NULL]
-[1, NULL, 1]
-NULL struct
-{a: NULL}
-{a: []}
-{a: [NULL]}
+NULL               （整个列表字段为 SQL NULL）
+[]                 （非空列表，但长度为 0）
+[NULL]             （含 1 个空元素的列表，长度必须为 1）
+[1, NULL, 1]       （混合重复值与空元素，保序且保重数）
+NULL struct        （整个结构体为 SQL NULL）
+{a: NULL}          （结构体本身非空，内部字段 a 为 NULL）
+{a: []}            （结构体内嵌空列表）
+{a: [NULL]}        （结构体内嵌含 NULL 的列表）
 ```
 
-接下来不是继续增加随机值，而是让同一批逻辑值走不同路径：内存构造与文件读入、直接投影与 UNNEST、flat 与 dictionary、单线程与并行、内存聚合与 spill 后合并。
+如果是 `JSON` 或 `Variant` 半结构化列，还要把**字段缺失（Missing）**、**JSON 字面量 `null`** 与外层 **SQL `NULL`** 严格区分开。锁定这组逻辑值之后，借鉴 [Velox Expression Fuzzer](https://facebookincubator.github.io/velox/develop/testing/expression-fuzzer.html) 与 [Aggregation / Window Fuzzer](https://facebookincubator.github.io/velox/develop/testing/fuzzer.html) 的思路，保持逻辑输入不动，强行切换底层物理表示与执行路径——同一批值，从内存常量构造与从 Parquet 读入结果一致吗？套上非连续过滤掩码与字典压缩后做 `UNNEST` 一致吗？内存直接聚合与触发 Spill 落盘合并后一致吗？
 
-[Velox Expression Fuzzer](https://facebookincubator.github.io/velox/develop/testing/expression-fuzzer.html) 对表达式不同求值路径做验证；[Aggregation / Window Fuzzer](https://facebookincubator.github.io/velox/develop/testing/fuzzer.html) 则将随机输入与执行计划变体结合起来。它们提供的工程启发是：**相同逻辑值的不同物理表示，本身就能形成高价值的测试轴。**
+配套的结果比较器也得按数据库类型系统重写：一旦测试脚本偷懒把所有输出 `toString()` 成字符串再转成集合（Set）比对，SQL `NULL`、字符串 `"null"` 和 JSON `null` 就会糊成一团，列表元素顺序和多重集重复次数也会被悄悄抹平。
 
-这里尤其要注意测试比较器。把所有值转成字符串，可能把 NULL、字符串 `"null"`、JSON null 混为一谈；把结果转成 set 会抹掉重复值；对 list 排序会破坏元素次序。比较器应该递归保留类型、nullness 和必要的顺序。
+### 4.2 非结构化链路与“向量 Top-K + 标量过滤”的顺序陷阱
 
-#### 非结构化数据：把输入、索引、检索质量分开
+当数据库接入文本检索与向量索引时，从原始字节到最终返回行中间隔着好几道工序：`原始文档解码 → 分块与元数据绑定 → Embedding 向量化 → 索引构建与可见性控制 → 混合过滤检索`。端到端跑通一句检索只说明管道通了：截断图片或非法 UTF-8 测的是解析器防御；文档删除后还能被搜出来抓的是索引快照可见性 Bug；而要隔离数据库自身逻辑与外部大模型服务的波动，就必须冻结预生成的向量，不能让上游 Embedding 模型的微小漂移背上“存储引擎回退”的黑锅。
 
-非结构化数据测试需要分别验证解析、索引与检索，端到端返回非空结果不能定位哪一层正确。文本或图像的路径可拆为：
+在这条链路上，最容易被单一召回率（Recall）数字掩盖的语义坑，是**带标量过滤条件的近似最近邻检索（Filtered Vector Search）**。只要接口向用户承诺“返回满足过滤条件 `predicate(v)` 的前 `K` 个最近邻”，正确的基准真值（Ground Truth）就必须在过滤后的合法候选子集上计算：
+
+$$\text{Candidates} = \{v \in D \mid \text{predicate}(v)\}, \qquad \text{Truth} = \operatorname{ExactTopK}(\text{Candidates}, q, \text{metric})$$
+
+为什么不能先在全局向量索引里取出最近的 `K` 个点，再套上 `WHERE` 过滤（Post-filtering）？构造一个只有两个点的极简反例就一清二楚：点 `p1` 离查询向量距离为 `1`，但不满足权限或租户过滤条件；点 `p2` 距离为 `2`，满足过滤条件。当查询请求 `K = 1` 时，`Filter(TopK(D, 1))` 先抓出 `p1` 随后滤掉，直接返回**空集**；而符合契约的 `TopK(Filter(D), 1)` 则会正确返回 `p2`！因此，向量检索测试必须拆成三层核对：**硬正确性**（绝不返回越权、已删除或不满足 `WHERE` 谓词的脏数据）、**近似质量契约**（在约定参数下统计相对于过滤后精确真值的 Recall 与结果不足率），以及**退化边界**（合法候选数少于 `K` 甚至为 0 时的分母处理、等距并列点的打破规则，以及索引后台重建期间的并发读写可见性）。
+
+### 4.3 增量计算的时间轴与性能测试的“幸存者偏差”
+
+一旦测到物化视图增量维护（IVM）或流式更新，静态快照数据集就不够用了——测试输入必须拉出一条包含生老病死的**时间轴**。依然拿 `LEFT JOIN` 举例，一次插入跑通说明不了问题，连续推进下面五步状态跃迁才能摸到计数器的底：
 
 ```text
-原始字节 → 解码/解析 → 分块/元数据 → embedding → 索引 → 检索 → SQL 组合
+S0：左表插入 (1)，右表为空             → 视图应输出补空行 (1, NULL)
+S1：右表插入第 1 条匹配 (1, 7)         → 之前的补空行必须撤回，输出变为 (1, 7)
+S2：右表再插入重复匹配 (1, 7)          → 多重集计数加一，输出两行 (1, 7)
+S3：右表删除其中一条 (1, 7)            → 仍剩一条匹配，绝不能提前恢复 (1, NULL)
+S4：右表删除最后一条匹配 (1, 7)        → 匹配归零，视图必须重新补回 (1, NULL)
 ```
 
-每一段都有不同的测试问题。损坏编码、截断图片、超长文本是 ingestion 的输入边界；doc-id 与 chunk-id 错配是映射错误；删除之后仍可被索引查到是可见性错误；返回内容相关性差则属于检索质量问题。
+每走完一步，都在相同的已提交快照水位上，把增量刷新后的视图内容与基表全量重算的多重集逐行比对，中间但凡漏掉一次撤回（Retraction）或把引用计数算错，立刻无所遁形。
 
-测试确定性路径时，固定解析器、分块参数、embedding 模型和预生成向量，让同一文档稳定映射到同一测试输入。模型服务另做质量、漂移、超时和部分失败评估。否则 embedding 变化可能被误报成存储或检索引擎回退。
+回到**性能回归测试**，它与正确性测试应当共享同一批可重放用例，但必须遵守一套严苛得多的测量与缩减协议：
 
-BEIR 的 relevance judgments 可以帮助评价文本检索质量，但不是每个未标注文档都已被证明不相关。对数据库层，还应加入一组人工可判定的小 corpus：同内容不同 ID、更新前后文档、空文本、多语言、被删除文档、无权限文档。
+1. **先验对错，再量快慢**：新版本快了 30% 但少吐出一半数据是严重事故；反过来，修复了漏算数据的 Bug 导致耗时增加，也不能糊里糊涂算作性能劣化。
+2. **隔离缓存与系统漂移**：独立预热后，采用基线与候选交替运行的 `ABBA` 配对测量（例如起步至少 10 组配对样本观察方差，同时设定中位耗时比 `> 1.2` 且绝对增量 `> 50 ms` 才进入异常候选）；区分冷暖数据时要格外小心——只重启数据库进程清不掉操作系统的 Page Cache。
+3. **警惕超时删失（Censored Observation）与幸存者偏差**：如果基线跑 1 秒，新版本卡死到 60 秒被超时强杀，只能记录“回退幅度至少超过 60 倍下界”，既不能把 60 秒当成真实完成耗时，更不能在汇总报告时“只挑双方都跑完的查询算几何平均加速比”——把跑崩跑超时的慢查询剔除出分母，是性能报告最常见的自欺欺人。
+4. **缩减用例时守住触发条件**：正确性 Reducer 习惯疯狂删行删列，可性能悬崖往往高度依赖数据规模或倾斜度；一旦把十万行删成十行，溢写（Spill）消失了，性能回退也跟着消失了。因此性能 Reducer 的保留判据（Interestingness Predicate）必须同时锁死“结果一致 + 耗时比值仍超阈值 + 目标物理路径/计数器依然命中”，只二分裁剪无关分支，最终留下能稳定复现该性能悬崖的最小实验。
 
-#### 向量 + Filter + Top-K：最容易被一个 recall 数字掩盖的边界
+把复杂类型、存储状态与系统边界浓缩在一张检查表里，日常设计测试矩阵时就可以按对角线做成对组合（Pairwise Coverage），再对高危三元组（如 `NULL × 字典编码 × 过滤掩码`、`Decimal × 两阶段聚合 × Spill`、`Outer Join × 空值敏感谓词 × Runtime Filter`）做重点爆破：
 
-若接口承诺返回满足过滤条件的最近邻，ground truth 应该在过滤后的集合中计算：
+| 引擎边界维度 | 必须区分的最小输入或状态 | 核心判定依据（Oracle） | 证明路径触达的运行证据 |
+| --- | --- | --- | --- |
+| **空值、数值与时区** | SQL `NULL`、空串、Decimal 极值/缩放、`NaN`/`±0`、夏令时跳变 | 方言契约 + TLP / 参考实现 | 实际输出类型、异常码与会话时区/排序规则记录 |
+| **嵌套与半结构化类型** | `NULL`、`[]`、`[NULL]`、Missing 键、JSON `null` | 递归类型化比对 + 跨物理表示差分 | Null Bitmap 未坍缩，Flat/Dictionary 编码均命中 |
+| **列式算子、内存与调度** | 非连续 Selection Vector、空窗口帧、Spill、提前取消的 `LIMIT` | 单/多阶段计划差分 + 资源回收不变量 | `spill_bytes > 0`、取消/重试计数器与内存回落 |
+| **外表、索引与分布式恢复** | 截断 Parquet、Schema 演进、MV 并发刷新、Worker 崩溃重放 | 独立 Reader / 基表重算 / 事务历史检查器 | 快照水位一致，故障恢复后无脏文件或重复提交副作用 |
 
-```text
-Candidates = {v ∈ D | predicate(v)}
-Truth      = ExactTopK(Candidates, query_vector, metric)
-```
+---
 
-`Filter(TopK(D))` 与 `TopK(Filter(D))` 一般不同。最小反例只需两个点：最近的点不满足过滤，次近的点满足过滤；`k=1` 时，先取 top-1 再过滤会得到空集，而过滤后精确搜索应该返回第二个点。
+## 五、LLM 时代的模糊测试：让模型补齐语法盲区，把裁决权留给确定性工具
 
-对 ANN，不能要求每个输入都与精确 top-k 完全相同。需要分别判定：
+手工给每个数据库方言写一套覆盖几百个内置函数、窗口帧语法与专有扩展的随机生成器，工程维护成本极高。这两年大模型进入数据库测试领域，几项代表性工作恰好切中了不同的痛点：
 
-1. **硬正确性**：维度和距离契约正确，结果符合过滤与权限条件，不返回已不可见的数据。
-2. **质量契约**：针对约定 workload 与参数，测量 recall、结果不足率、延迟和索引成本。
-3. **边界行为**：过滤后集合少于 k、零个候选、重复向量、等距离 tie、更新与重建期间的可见性。
+- **拓宽分析负载形态（[SQLStorm，PVLDB 2025](https://db.in.tum.de/~schmidt/papers/sqlstorm.pdf)）**：用大模型在真实数据集上合成了 18,251 条复杂分析查询，显著突破了传统基准几十个固定模板的计划同质化，用来压测解析、优化与执行多样性非常顺手。
+- **自动适配多引擎方言（[SQLancer++](https://arxiv.org/abs/2503.21424v2)）**：通过与目标数据库交互探测哪些语法特性受支持，大幅降低为新引擎逐条手写生成器的门槛。
+- **往成熟测试器里注入缺失特征（[ShQveL](https://arxiv.org/abs/2505.02012v2)）**：不让大模型漫无目的地瞎编整条查询，而是用带占位槽位的 SQL 草图（SQL Sketch）把模型合成的新函数/语法片段嵌入现有的变形测试循环（作者论文报告在 5 个主流 DBMS 中找出了 55 个未知 Bug，其中 50 个获官方修复）。
+- **探索长期被冷落的运维与状态特性（[FuzzySQL](https://arxiv.org/abs/2602.19490)）**：瞄准 GTID 复制、存储过程、`KILL` 并发中断等传统 SQL 生成器极少触及的专有状态序列，结合变异修复与崩溃重放验证挖掘深层故障。
 
-ground truth 必须与被测查询使用相同快照、距离定义及归一化方式。若候选数不足 k，recall 分母按实际 truth 大小定义；若没有候选，则单独检查应为空，避免除零。ties 需要固定 tie-breaker，或采用允许等距离替代的判定方式。
+把这些前沿探索放回工程流水线里审视，最核心的架构原则只有一条：**让大模型干它最擅长的“读文档提假设、填补语法盲区”，把“绑定约束、执行度量与对错裁决”死死留在确定性程序手里**——绝不能既让模型出题，又让模型凭语感批改试卷。一旦沙箱执行触发判定器违例或崩溃，再交由 AST 感知的缩减器（如 `C-Reduce` 或 Delta Debugging）在锁死失效判据的前提下剥离无关语法分支，沉淀出最小可复现用例：
 
-#### 增量计算：数据集应包含时间轴
+![LLM 引导的模糊测试与确定性缩减闭环](/images/diagrams/dbres-llm-fuzz-reduce-loop.svg)
 
-一次 insert 后查询正确，并不能覆盖 IVM。更有用的是逐步执行：
+比如团队刚刚重构了 `HashAggregate` 中间状态的序列化代码，与其笼统地让模型“生成一万条复杂 SQL”，不如把状态结构定义、合并约束和溢写触发条件喂给它，定向要求生成覆盖“全 `NULL` 分组、空分区、超长变长键、高精度 Decimal 溢写合并”的 SQL Sketch。
 
-```text
-S0：左表一行，右表空
-S1：右表插入一个匹配
-S2：右表再插入一个重复匹配
-S3：删除其中一个匹配
-S4：删除最后一个匹配
-```
+在落地这套协同循环时，有一个极隐蔽的反模式必须防范：**“为了修通语法而把测试目标修没了”**。设想我们本来要测 `JSON 路径提取 + 窗口函数 + LEFT JOIN` 的组合边界，结果初版 SQL 报了个绑定错误；如果自动修复循环只以“查询跑成功（Exit Code 0）”为奖励目标，模型最省事的改法就是删掉报错的 JSON 和窗口子句，把它退化成一句人畜无害的 `SELECT k FROM t`——表面上看“有效执行率”飙升到了 99%，实际上高危交互分支一次都没测到！
 
-对 LEFT JOIN，输出经历 NULL 补齐、一条匹配、两条匹配、一条匹配、重新 NULL 补齐。每一步都应在**相同已提交快照/刷新水位**下，比较增量结果与基表完整重算的 bag。
+因此，每条下发给生成与修复环节的任务都必须锁死不可妥协的**覆盖不变量**（例如强制检查计划与运行证据必须同时命中 `nested_projection`、`left_outer_join` 与 `spill_bytes > 0`），修不通就诚实记为 `not_covered`，绝不允许靠删减测试条件来刷绿灯。同理，评估“引入 LLM 到底值不值”也必须在同等 CPU 墙钟预算（外加单独核算的 Token 推理账单）下，与纯手写生成器做严格的消融对照（Ablation），按时间切分隔离历史公开 Issue 以防模型背题，只认**新增有效物理分支**与**去重后的独立根因缺陷数**，最后把抓出 Bug 的最小复现包固化为静态文件——日常 CI 回归只跑确定性构件，无需每次提交都去调大模型。
 
-重放重复消息时是否去重，取决于入口协议；不能无条件要求所有更新幂等（Idempotency）。测试必须携带 operation identity、commit order、watermark/checkpoint 以及产品承诺的 delivery semantics。
+---
 
-### 性能测试：寻找悬崖，而不是只比较平均分
+## 六、把探索沉淀为工程资产：契约清单、比较器与分池演进
 
-性能回归需要在结果正确的前提下判定，并观察内存与数据倾斜（Data Skew）阈值附近的变化；平均耗时可能掩盖个别输入上的不可完成路径。
-
-#### 正确性回归与性能回归要共享 case，分开判定
-
-同一个测试可以先核对结果，再记录 latency、CPU、峰值内存、扫描字节、网络、spill 和编译时间。一个版本快了 20%，但少输出一半行，不是优化；一个版本修复了错误结果而变慢，也不应只被汇总成性能回退。
-
-对性能问题，至少需要三类比较：
-
-| 比较 | 回答的问题 | 需要控制的条件 |
-|---|---|---|
-| 同 case，旧版本 vs 新版本 | 是否发生版本回退 | 硬件、数据、配置、并发、缓存、结果语义 |
-| 同逻辑，同版本，不同计划/开关 | 是否存在明显更好的可行路径 | 确认计划不同且结果一致，记录强制计划方式 |
-| 参数连续变化 | 是否存在不合理悬崖或规模增长趋势 | 每一步的数据统计、路径切换和资源限制 |
-
-不要规定“更少行就必须更快”或“加一个过滤条件就必须更快”。计划、压缩率、缓存命中和并行度（Degree of Parallelism）变化都可能使耗时不单调。类似关系可以用于提名异常，再通过 profile 判断。
-
-#### 一个可执行的性能判定协议
-
-性能判定需要隔离噪声并保留原始样本，否则一次抖动可能被误报为回归。以下是建议协议，不是某篇论文的固定阈值：
-
-- 先做独立预热，再随机交错或采用 ABBA 顺序运行基线与候选，减少温度和系统漂移影响。
-- 冷缓存与暖缓存分组；仅重启数据库未必清掉 OS page cache，也不等于冷数据测试。
-- 起步可做至少 10 组配对（Paired）测量，再根据方差增加次数；不能用这么少的样本声称得到稳定 p99。
-- 同时使用相对和绝对门槛，例如中位耗时比超过 `1.2` 且增加超过 `50 ms`，作为初始候选，而非普适标准。
-- 保存原始样本，检查配对差异或置信区间，补采稳定后再归类；记录查询是否超时、OOM 或出错。
-- timeout 是删失观测：若基线 1 秒完成、候选超过 60 秒上限，只能说回退至少超过该界，不能把 60 秒当真实耗时。
-
-总体报告应同时保留覆盖率、正确结果比例、失败类别、逐查询变化和最坏回退。只在双方都完成的查询上算几何平均会产生幸存者偏差；可以报告这个统计，但必须同时报告被排除的查询。
-
-#### 缩减性能 case 时不要把触发条件一起缩没
-
-正确性 reducer 通常尽量删行、删列、删表达式。但性能 case 可能恰好依赖某个规模、倾斜度或编译复杂度：缩到十行之后，spill 消失，问题也消失。
-
-性能 reducer 的 interestingness predicate 应同时要求：结果仍一致、退化可重复、目标计划/资源路径仍出现。可以先保持数据分布和阈值，只缩 query；也可以固定 query，二分查找最小触发规模。
-
-最终保留的未必是“字节数最小的 SQL”，而是**能够稳定表达该性能失效机制的最小实验**。
-
-## LLM 时代：从生成 SQL 走向覆盖反馈
-
-LLM 可以扩展候选输入和约束假设，但不能凭描述裁定数据库结果。覆盖反馈与可执行 oracle 决定生成内容是否有测试价值。
-
-### 三项近期工作应放在不同位置理解
-
-工作负载生成、方言适配和功能探索解决不同覆盖缺口，应分别评价，不能只按 SQL 总量比较。
-
-**SQLStorm：用 LLM 扩充分析 workload。**[PVLDB 2025 论文](https://db.in.tum.de/~schmidt/papers/sqlstorm.pdf) 发布了含 18,251 条查询的初始集合，并在 1 GB、12 GB、220 GB 数据规模上研究覆盖与执行表现。论文不仅统计 SQL 数量，也观察计划和执行 trace 的多样性；[代码与查询](https://github.com/SQL-Storm/SQLStorm) 公开。它支持“LLM 可以产生传统少量模板之外的负载”这一判断，但没有证明这些查询代表所有生产负载。
-
-**SQLancer++：让生成器适应不同引擎。**[Scaling Automated Database System Testing](https://arxiv.org/abs/2503.21424v2) 的重点是通过与 DBMS 交互，学习哪些 SQL 特征能够被接受，降低逐方言手写生成器的成本。它不是“用 LLM 判断结果”的同义词；自适应生成与逻辑 oracle 是不同职责。
-
-**ShQveL：让 LLM 补充生成器缺失的特征。**[2026-08 更新的 v2](https://arxiv.org/abs/2505.02012v2) 标题为 *Automated Database Testing via LLM-Synthesized SQL Features*；2025 年 v1 标题是 *Testing Database Systems with Large Language Model Synthesized Fragments*。其核心是用 SQL sketch 留出待填片段，把 LLM 产生的功能纳入现有生成过程。v2 摘要报告在五个 DBMS 上发现 55 个此前未知 bug、其中 50 个已修复；这是作者实验结果，不是本文复现。
-
-另外，[FuzzySQL，2026 年预印本](https://arxiv.org/abs/2602.19490) 将注意力放在 GTID、存储过程、KILL 等通常较少被探索的专有功能，结合生成、变异、错误修复和 replay-guided crash validation。它拓展的是功能和状态序列覆盖，不能据此推断已解决任意 SQL 的结果正确性问题。
-
-SQLancer++、ShQveL 和 FuzzySQL 在这里按论文路线讨论；本文未安装这些研究原型，也未验证其 artifact 在当前环境可重跑，不把论文公开等同于完整工具链已经验收。
-
-### LLM 应进入哪些环节
-
-模型适合提出与整理候选假设，接受标准必须留在 parser、路径检查、重放和 oracle 中，以防生成与判定共享同一错误。
-
-```text
-文档 / 类型签名 / 优化规则 / 历史 bug
-                  │
-                  ▼
-        LLM 提取契约和候选失效假设
-                  │
-                  ▼
-  功能描述 + 前提 + 数据草图 + SQL sketch
-                  │
-                  ▼
-  确定性生成器：绑定 schema、补值、检查约束
-                  │
-                  ▼
-  沙箱执行：结果 / 错误 / 计划 / profile / history
-                  │
-          ┌───────┴────────┐
-          ▼                ▼
-  已验证 oracle 判定     覆盖反馈选择下一轮
-          │                │
-          ▼                └──→ LLM 补充新假设/片段
-  replay → reduce → triage → 固定回归 case
-```
-
-这里最值得交给 LLM 的不是重复生成十万条 SELECT，而是以下几类成本高、知识分散的工作。
-
-| 环节 | 给模型的上下文 | 期望产物 | 接受产物的依据 |
-|---|---|---|---|
-| 契约提取 | 固定版本文档、函数签名、错误定义 | 参数范围、NULL/溢出/状态前提及来源位置 | 人工或规则核对契约，不直接采信描述 |
-| Patch 定向测试 | diff、相邻代码、相关回归 | 哪个旧假设变了，哪些输入可区分前后 | 触达变更路径，旧缺陷/注入 mutant 被检出 |
-| 方言适配 | schema、类型和功能探测结果 | 可绑定的 SQL sketch | parser/binder 和目标功能检查 |
-| 边界扩展 | 已覆盖组合与未覆盖条件 | 高风险的新交互，而非措辞变化 | 新语义标签、计划或运行分支 |
-| 失败分析 | 最小重放、日志、plan diff | 可能的公共机制和进一步实验 | replay 验证，不能仅凭描述合并 bug |
-| 报告整理 | 原始证据与缩减产物 | 可审阅的复现步骤、预期/实际差异 | 附件完整、结论不超出证据 |
-
-例如修改了 HashAgg 的中间状态序列化，prompt 应提供状态类型、merge 约束和 spill 触发方式，要求覆盖全 NULL、空分区、大 decimal、不同 merge tree。只有“帮我生成复杂 SQL”通常无法把预算集中到这次改动。
-
-### 生成得更合法，也可能测得更少
-
-仅以执行成功为目标的修复会允许删除测试条件，因而可能提高成功率却降低覆盖。例如，若 JSON + window + outer join 被修复为普通 SELECT，原定组合已不再接受测试；这是需要防止的失败模式，不是对所有模型行为的统计结论。
-
-因此，每个 case 要保留不可随意删除的目标条件，例如：
-
-```text
-必须包含 nested field projection
-必须使用 nullable key 的 LEFT JOIN
-必须命中指定规则或替代计划
-必须发生至少一次 spill
-```
-
-修复只允许改变非目标部分；如果无法满足，记录为未覆盖或待诊断。不能把结果 mismatch 交给模型改 expected，让测试“恢复通过”。对于模型新提出的 metamorphic relation，也要先用受限语义模型、小域枚举或审阅确认其前提，再成为正式 oracle。
-
-### LLM 赋能是否有效，需要消融实验
-
-LLM 的收益需要在相同预算下与既有生成器对照，否则更多算力本身就可能解释缺陷数量增长。至少比较四组：手写生成器、LLM 直接生成、LLM sketch + 既有 oracle、加入覆盖反馈的混合方案。给它们相同 CPU/墙钟预算，另外报告 token 和推理费用，使用多个独立种子。
-
-最值得观察的指标是：
-
-- 有效执行率，同时分开 syntax error、binding error、预期运行时拒绝；
-- 目标路径触达率，而非只有 SQL 条数；
-- 新增语义组合、计划结构与运行分支；
-- 首次发现时间、每小时/每单位成本的独立缺陷数；
-- 可重现率、缩减成功率、误报率及修复后回归保留率。
-
-不要把同一个根因的几千个 SQL 变体算成几千个 bug。历史 bug 可以作为可控评估集，但应按时间或根因家族隔离训练/提示材料与评测集，减少模型记住公开 issue 后产生的虚高收益。保存模型版本、prompt、生成产物；即使设置随机种子，也不能假定远端模型调用永久逐字可复现。
-
-最终进入日常回归的应该是固定 artifact。日常验证不需要每次重新询问模型，探索阶段才持续调用 LLM。
-
-## 沉淀测试资产：契约、重放与增量建设
-
-### 一个可落地的测试集架构
-
-测试资产需要把复现、判定和覆盖要求一起保存，才能在引擎升级后继续使用。以下是工程设计建议，不是已经交付的平台。
-
-#### 每个 case 都有 manifest
-
-manifest 将输入身份、语义前提和目标覆盖绑定到同一用例，便于区分测试通过与未触达路径。下面是建议格式，值为设计示例，不代表已有 runner 的真实输出：
+当测试从一次性找茬变成长期演进的基础设施时，每一个沉淀下来的回归用例都应当自带一份自包含的契约清单（Manifest），把输入哈希、语义前提、判定方式和必须命中的运行证据绑在一起：
 
 ```yaml
 id: outer-join-null-extension-001
@@ -562,92 +326,42 @@ inputs:
 semantics:
   result: typed-bag
   deterministic: true
-  preconditions:
-    - fixed-snapshot
-    - no-volatile-functions
+  preconditions: [fixed-snapshot, no-volatile-functions]
 oracle:
   kind: explicit-expected
   expected: expected.json
 coverage:
-  required:
-    - left-outer-join
-    - nullable-right-output
-    - null-accepting-predicate
+  required: [left-outer-join, nullable-right-output, null-accepting-predicate]
 execution:
   seed: 17
   timeout_seconds: 30
-artifacts:
-  - logical-plan.json
-  - physical-plan.json
-  - profile.json
-  - engine.log
+artifacts: [logical-plan.json, physical-plan.json, profile.json, engine.log]
 ```
 
-性能 case 追加硬件、缓存状态、重复次数、baseline、阈值及原始样本；事务 case 追加 session、barrier、operation ID、history 和故障时间轴。数据生成器版本与参数也必须保留：只有随机种子，不足以跨生成器版本复现。
+围绕这份契约，整套测试底座的日常运转靠三块基石撑住：
 
-结果分类应至少有 `pass / result_mismatch / unexpected_error / crash / timeout / resource_exhausted / expected_rejection / not_covered / inconclusive`。这比一个 exit code 更能防止“没有跑到目标分支却算通过”。
+1. **细粒度结论分类与类型化比较器**：告别非黑即白的 `0 / 1` 退出码，明确区分 `pass / result_mismatch / unexpected_error / crash / timeout / expected_rejection / not_covered / inconclusive`。无序查询默认按保留重数的**类型化多重集（Typed Multiset）**精确比对；带 `ORDER BY` 但存在并列值（Ties）时，验证等价组内的合法排列或补齐确定性决胜键；浮点数严格区分精确位级契约与允许重排误差的聚合计算，绝不给所有数值一刀切套个粗糙的 `epsilon` 掩盖精度事故。
+2. **按预算切分四个测试池**：
+   - **语义核心池（每次提交必跑）**：几行小表、毫秒级执行、明确预期答案与历史修复 Bug，追求零噪点秒级定位；
+   - **功能组合池（PR 或每晚定时）**：运行 TLP/NoREC 变形验证、列式编码与计划变体差分，强制核验覆盖证据；
+   - **性能鲁棒性池（独占隔离硬件）**：运行冻结的 Benchmark 代表子集、列间相关性与内存阈值骑墙扫描，保留原始配对样本与资源画像；
+   - **开放探索池（受预算约束的后台长任务）**：持续运转覆盖率引导的 Fuzzer、LLM Sketch 合成与故障注入序列，专职猎杀未知缺陷。
+3. **用变异测试（Mutation Testing）反测判定器自身**：测试跑得全绿，究竟是因为内核真没 Bug，还是因为判定器坏了？定期在测试环境里故意注释掉一条 `null-safe` 保护、故意漏掉 TLP 的 `IS NULL` 分区、或者把多重集比较器偷偷改成集合去重——如果对应的测试池没有立刻报警变红，说明要么数据没激活分支，要么 Oracle 存在漏网之鱼。
 
-#### 比较器也是数据库组件，需要语义设计
+如果团队打算从零起步搭建这套能力，最务实的推进节奏不是一上来铺大摊子接大模型，而是选定一个高风险语义切面（例如 **Outer Join + NULL + Runtime Filter**，或者 **嵌套类型 + 两阶段聚合 + Spill**）走好三步：先手写十几个两三行的小表反例并打通 `typed-bag` 比较器；再接入一个公开 Benchmark 子集与 TLP/算子差分判定器，把相关性参数和路径命中证据跑顺；等确定性底座立稳了，最后再引入 LLM 定向填补未覆盖的函数与语法组合，用实打实的独立新缺陷数检验投入产出。
 
-默认无序 SQL 结果按 **typed multiset** 比较，保留重复次数。明确要求顺序时比较序列；如果 ORDER BY 不能完全打破 ties，就比较合法的等价组，或给测试补充稳定排序键。
+---
 
-整数、decimal 与字符串通常精确比较；浮点先区分 exact contract 和允许重排的数值误差，再约定绝对/相对误差以及 NaN、infinity 的策略。不能给所有数值套一个宽松 epsilon，否则很容易掩盖真实错误。
+## 参考资料与推荐阅读顺序
 
-对大结果可以先做类型化 hash 预筛，但 hash 不能成为唯一证据；发现差异后应能够定位到具体行和值。跨引擎的错误、隐式 cast、collation 与时间语义需要先对齐，不一致时归为“待契约判定”，不能让多数投票自动裁决。
+想把上述机制的来龙去脉一次读透，可以沿着下面五步顺藤摸瓜：
 
-#### 四个测试池，四种预算
+1. **变形判定入门**：先读 [NoREC（ESEC/FSE 2020）](https://arxiv.org/abs/2007.08292) 与 [TLP（OOPSLA 2020）](https://www.research-collection.ethz.ch/bitstream/20.500.11850/456967/2/3428279.pdf)，看清没有标准答案时如何靠三值逻辑与代数重写抓出逻辑错数；
+2. **SQL 层与算子层双轮驱动**：对照 [SQLancer](https://github.com/sqlancer/sqlancer)（含 [PQS](https://www.usenix.org/conference/osdi20/presentation/rigger)、[DQP](https://nus-test.github.io/publication/2024-sigmod-dqp/)、[CODDTest](https://github.com/sqlancer/sqlancer/pull/1054)）与 [Velox Expression](https://facebookincubator.github.io/velox/develop/testing/expression-fuzzer.html) / [Aggregation & Window Fuzzer](https://facebookincubator.github.io/velox/develop/testing/fuzzer.html)，体会高层 SQL 等价变换与底层向量物理表示差分的分工；
+3. **多元判定扩展**：继续读 [SemConT](https://arxiv.org/abs/2406.09469)、[EET（OSDI 2024）](https://www.usenix.org/conference/osdi24/presentation/jiang) 与 [Jepsen](https://github.com/jepsen-io/jepsen) / [Elle](https://github.com/jepsen-io/elle) / [OSDI 2023 事务图判定器](https://www.usenix.org/conference/osdi23/presentation/jiang)，补齐形式化语义模型、子表达式变换与并发事务历史验证；
+4. **性能悬崖与负载多样性**：结合 [APOLLO](https://github.com/sslab-gatech/apollo)、[CERT](https://arxiv.org/abs/2306.00355) 与 [SQLStorm（PVLDB 2025）](https://db.in.tum.de/~schmidt/papers/sqlstorm.pdf)，连接基数单调性检查、性能回退缩减与大规模负载构造；
+5. **LLM 协同探索前沿**：对比 [SQLancer++ v2](https://arxiv.org/abs/2503.21424v2)、[ShQveL v2](https://arxiv.org/abs/2505.02012v2) 与 [FuzzySQL](https://arxiv.org/abs/2602.19490)，看清方言自适应探测、SQL Sketch 特征合成与运维状态序列探索各自的能力边界。
 
-确定性回归与开放探索有不同预算和失败处理方式，分池运行可避免昂贵探索阻塞每次提交。
+---
 
-| 测试池 | 内容 | 运行位置 | 验收重点 |
-|---|---|---|---|
-| 语义核心池 | 小数据、明确 expected、已修复 bug | 每次提交 | 快、确定、可定位 |
-| 功能组合池 | TLP/NoREC、plan/encoding 差分、边界矩阵 | PR 或 nightly | 触达目标组合，失败可重放 |
-| 性能鲁棒性池 | 固定 benchmark 子集、相关性与阈值扫描 | 隔离性能环境 | 原始样本、资源画像、回退界限 |
-| 探索池 | 覆盖引导、LLM sketch、历史状态和故障序列 | 受预算约束的长时间任务 | 独立新缺陷、有效覆盖增长 |
-
-选择 benchmark 子集时，不宜只保留最慢的查询。可按“查询覆盖了哪些算子、表达式、计划边、数据分布和运行状态”做预算化集合覆盖，同时为历史故障和风险高的 case 保留硬约束。
-
-#### 验证测试集自身是否能抓错
-
-测试集的检错能力需要通过已知缺陷或变异测试（Mutation Testing）验证，因为全绿也可能来自未激活错误或失效的 oracle。例如故意遗漏 TLP 的 UNKNOWN 分区、把 bag 比较改成 set、去掉 null-safe 保护。
-
-被注入的错误应该被对应测试检出。未检出时，检查是数据没有激活错误、目标路径未执行，还是比较器抹掉了差异。mutation score 仍不是完整正确性的证明，但比单看通过率更能暴露测试设计漏洞。
-
-### 先做哪几步：从一个语义切面开始
-
-先覆盖一个能定义明确 oracle 的语义切面，更容易验证测试基础设施是否有效。例如 **Outer Join + NULL + runtime filter** 可以使用小表手算结果，**nested type + aggregation + spill** 可以对照不溢写（Spill）路径。
-
-第一步，固定引擎版本与语义契约，写出十几个可手算的最小 case，并建立 typed-bag 比较。验收标准是每个 case 都有明确预期，且能检出至少一种对应的错误变换。
-
-第二步，接入一个已有 benchmark 子集和一种自动 oracle。为目标规则增加开关或计划证据，把数据量、重复度、NULL、相关性和内存阈值参数化。验收标准是失败可完整重放，并能区分 mismatch、预期拒绝和未覆盖。
-
-第三步，再引入 LLM。只让模型补充当前未覆盖的函数、类型或组合，比较引入前后的目标覆盖与独立缺陷产出。若只有 SQL 数量上升，没有新增计划、运行路径或有效反例，就没有证据表明测试能力提高了。
-
-最后才扩展到事务历史、文件格式、向量过滤和故障恢复。每扩展一条边界，都要补齐相应的 oracle，而不是复用一个“查询成功且结果非空”的通用断言。
-
-扩展测试规模前，应先证明现有用例能检出已知错误并稳定重放。LLM 产物只有经过绑定、执行和 oracle 验证后才进入回归；跨引擎语义尚未对齐、非确定性无法控制或目标路径未触达时，应记录为未决或未覆盖，而不是通过。
-
-## 附：几个语义例子的验证范围
-
-小域语义验证可以检查文中的反例，但不能代替目标引擎或测试框架的完整复现。2026-10-07 使用 Python 标准库的内存 SQLite（3.51.3）重新检查了以下五组关系；结果比较保留重复行，TLP 额外执行了遗漏 UNKNOWN 分区和错误去重的负向检查。
-
-| 验证对象 | 最小输入与操作 | 检查结果 |
-|---|---|---|
-| TLP / NoREC | `x = NULL, -1, 0, 1, 1`，谓词 `x > 0`；另检查空输入 | 三分区 UNION ALL 与原始多重集相同；遗漏 UNKNOWN 或改用 UNION 均不等价。计数与 CASE 求和一致，空输入需 COALESCE 为 0 |
-| Outer Join 谓词下推 | 左表键 1，右表 `(1, 7)`；连接后过滤 `COALESCE(v, 0) = 0` | 原查询返回空集；错误地先过滤右表再左连接，会产生 `(1, NULL)` |
-| NOT IN 与 NOT EXISTS | 外表键 1，子查询只含 NULL | NOT IN 不返回行；按等值条件关联的 NOT EXISTS 返回键 1，不能直接互换 |
-| Outer Join 更新序列 | 右表从空表开始，插入两个 `(1, 7)`，再逐个删除 | 输出依次为空值补齐行、一个匹配行、两个重复匹配行、一个匹配行、空值补齐行 |
-| Filter 与 Top-K 顺序 | 距离为 1、2 的两个点，仅第二个满足过滤条件，K = 1 | 先 Top-K 再过滤为空；先过滤再 Top-K 返回第二个点 |
-
-这些检查验证的是小输入下的结果关系。Outer Join 更新序列每一步都重新执行查询，没有实现或验证增量视图维护器；Top-K 例子使用精确排序，没有模拟近似索引。本文也没有据此验证 SQLancer 等研究工具、目标数据库的优化规则或性能。
-
-## 参考资料与阅读顺序
-
-以上表格已给出可复用项目入口。若希望先把机制读透，可以按下面的顺序继续：
-
-1. [NoREC](https://arxiv.org/abs/2007.08292) 与 [TLP](https://www.research-collection.ethz.ch/bitstream/20.500.11850/456967/2/3428279.pdf)：先理解没有完整标准答案时，怎样构造可验证的关系。
-2. [SQLancer](https://github.com/sqlancer/sqlancer) 与 [Velox Fuzzer](https://facebookincubator.github.io/velox/develop/testing/fuzzer.html)：分别观察 SQL 层生成/判定和执行层计划/表示变体的职责。
-3. [SemConT](https://arxiv.org/abs/2406.09469)、[EET](https://www.usenix.org/conference/osdi24/presentation/jiang)、[Elle](https://github.com/jepsen-io/elle)：理解语义模型、表达式关系和事务历史三种不同 oracle。
-4. [APOLLO](https://github.com/sslab-gatech/apollo) 与 [SQLStorm](https://db.in.tum.de/~schmidt/papers/sqlstorm.pdf)：把正确性探索连接到性能回退与 workload 多样性。
-5. [SQLancer++ v2](https://arxiv.org/abs/2503.21424v2)、[ShQveL v2](https://arxiv.org/abs/2505.02012v2) 与 [FuzzySQL](https://arxiv.org/abs/2602.19490)：比较适应方言、LLM 片段扩展和专有功能探索的不同边界。
+> **调研基线与小域验证说明**：本文公开文献与开源项目资料检索截至 **2026-09-18**。文中引用的五组最小语义反例（TLP/NoREC 三值分区与空表 `COALESCE`、Outer Join 提前下推补 `NULL`、`NOT IN` 与 `NOT EXISTS` 遇 `NULL` 差异、Outer Join 五步增删状态跃迁、`Filter` 与 `Top-K` 先后顺序反例）已于 **2026-10-07** 使用 Python 标准库内存 SQLite（`3.51.3`）完成多重集语义核验与遗漏 `UNKNOWN` 分支/去重的负向回归检查；`SQLancer++`、`ShQveL`、`FuzzySQL` 依据论文描述讨论其架构机制，未在本地复现实验原型，第六节中的测试清单与分池方案为基于上述工作的工程落地设计。
