@@ -17,206 +17,29 @@ toc: true
 math: false
 ---
 
-最近我重新从源码学习操作系统，选择的入口是 MIT 的 `xv6-riscv`。这次没有先从概念章节开始，而是先在自己的 WSL 环境中把它编译、运行起来，并整理出可复现的调试路径，然后围绕运行中真正遇到的问题阅读源码：x86 CPU 为什么能运行 RISC-V 内核？QEMU 把内核放到了哪里？`entry.S`、`start.c` 和 `main.c` 分别完成什么？一个 `proc` 到底怎样获得 CPU？timer interrupt 如何迫使当前进程让出 CPU？虚拟地址（Virtual Address）最终又如何找到物理页（Physical Page）？
+按下电源复位键的那一瞬间，CPU 里既没有“进程”，也没有“虚拟内存”，甚至连调用一个最普通 C 函数的资格都没有——程序计数器（PC）孤零零地指着物理内存里的某个起始地址，全套寄存器处于最高权限的机器态（Machine Mode），栈指针 `sp` 里的数值毫无意义。
 
-阅读时，我把进程、调度器、页表（Page Table）和中断处理连到同一条控制流上，检查寄存器、栈和状态由谁保存、何时恢复。这样比逐个记模块功能更容易发现理解中的断点。
+如果把操作系统教材里的抽象名词先统统忘掉，直面裸机硬件，任何内核源码其实都必须先回答三个最根本的物理问题：
 
-本文基于我本机的 `xv6-riscv` 仓库，当前分支为 `riscv`，源码基线提交为 `5474d4b`。这个版本已经包含 lazy `sbrk`/page fault 相关实现，部分细节可能与旧版 xv6 教材代码不同。工作树中还有我为阅读源码增加的环境检查、编辑器配置和文档，以及一处尚未整理完成的 Makefile 修改；后文会把“已经验证的实验”和“准备继续做的实验”明确区分。
+1. **第一行 C 代码是怎么跑起来的？** 只有物理地址和机器态寄存器时，谁来给 C 编译器生成的栈帧腾地方，又怎样从至高无上的机器态降权到受保护的用户态？
+2. **用户态写下 `while(1);` 死循环时，内核凭什么强行夺回控制权？** 当 CPU 正在全速执行用户指令时，内核代码明明不在运行，它是靠什么硬件机关打断当前执行流、换上另一套栈和页表的？
+3. **同一个虚拟地址为什么在不同进程眼里指向不同物理内存，而在切换页表的刹那又不会让 CPU 取指踩空崩溃？**
+
+带着这三个问题重读 MIT 的 `xv6-riscv` 源码，不再按文件目录逐个背模块，而是顺着一条真实的硬件控制流——从 QEMU 复位地址 `0x80000000` 出发，一路追踪寄存器、栈指针、控制状态寄存器（CSR）与三级页表的每一次易手——整座内核的骨架顿时变得无比通透。
 
 ---
 
-## 本机学习环境
+## 一、从 `0x80000000` 到首个 Shell：两次“伪造返回”驱动的冷启动
 
-交叉编译与全系统模拟让 x86_64 主机能够运行 RISC-V 内核，但模拟环境不能用来推断真实硬件性能。下表保留原稿的 WSL2 实验配置：
+执行 `make qemu` 拉起 xv6 时，QEMU 模拟出一块带 3 个硬件线程（`hart`，`-smp 3`）和 128 MiB 物理内存的 RISC-V `virt` 开发板，加上 `-bios none` 参数跳过外部固件，直接按链接脚本 `kernel/kernel.ld` 的约定把内核镜像装入物理地址 `0x80000000`，并让所有 `hart` 同时从这里开始取指。
 
-| 项目 | 本机环境 |
-| --- | --- |
-| 操作系统 | WSL2，Linux `6.6.87.2-microsoft-standard-WSL2` |
-| 宿主架构 | x86_64 |
-| CPU | AMD Ryzen AI 9 HX 370，12 核 24 线程 |
-| RISC-V 编译器 | `riscv64-linux-gnu-gcc 13.3.0` |
-| QEMU | `qemu-system-riscv64 8.2.2` |
-| GDB | `gdb-multiarch 15.1` |
+从裸机复位到屏幕上打出第一个 `$ ` 提示符，控制流跨越了机器态（M-mode）、监管态（S-mode）和用户态（U-mode）三道特权级边界：
 
-这里最先要澄清的是：`risc64` 通常是对 `RISC-V 64` 或 `riscv64` 的口头简写，并不是另一套架构。我的 CPU 只能原生执行 x86_64 指令，不能直接执行 xv6 内核中的 RV64 指令。整个运行过程实际分成两步：
+![xv6-riscv 冷启动特权级跃迁：从 0x80000000 裸机复位到用户态 /init](/images/diagrams/aug-sys-xv6-boot-modes.svg)
 
-```text
-xv6 C/Assembly source
-        │
-        │ riscv64-linux-gnu-gcc
-        ▼
-RISC-V 64 ELF kernel
-        │
-        │ qemu-system-riscv64 translates/emulates instructions and devices
-        ▼
-x86_64 host CPU executes QEMU
-```
+### 1. `entry.S`：给每个物理核划出第一块 4 KiB 栈
 
-交叉编译器解决“生成哪种机器码”，QEMU system emulator 解决“由谁执行这种机器码”。这也是 x86_64 主机能够学习 xv6-riscv 的根本原因。它不是把 RISC-V 程序当成 x86 程序运行，而是在 x86 上模拟出一台完整的 RISC-V 计算机。
-
-我在仓库中增加了一个环境检查脚本：
-
-```bash
-./scripts/check-env.sh
-```
-
-本机检查结果是 `make`、`perl`、`bc`、RISC-V GCC、QEMU 和 GDB 均可用。WSL Ubuntu 上所需依赖可以这样安装：
-
-```bash
-sudo apt update
-sudo apt install build-essential make perl bc qemu-system-misc gdb-multiarch \
-  gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu
-```
-
-### 编译、运行和退出
-
-构建并启动：
-
-```bash
-make qemu
-```
-
-本次实际启动输出为：
-
-```text
-xv6 kernel is booting
-
-hart 1 starting
-hart 2 starting
-init: starting sh
-$
-```
-
-进入 shell 后实际执行：
-
-```text
-$ echo xv6-learning
-xv6-learning
-$ ls
-README         2 2 2425
-cat            2 3 35384
-echo           2 4 34288
-...
-console        3 22 0
-```
-
-Makefile 默认传递 `-smp 3`，所以 QEMU 创建了 3 个 RISC-V hart。hart 是 RISC-V 对 hardware thread 的称呼，在 xv6 这套配置里可以近似理解为 3 个 CPU 执行上下文。
-
-因为 QEMU 使用 `-nographic`，终端同时承担串口输入和 QEMU monitor escape。退出不是在 xv6 shell 中输入 `exit`，而是依次按：
-
-```text
-Ctrl-a
-x
-```
-
-这里是先按 `Ctrl-a`，松开后再按 `x`，最终会看到 `QEMU: Terminated`。
-
-我还遇到过一次很有代表性的启动失败：QEMU 报 `Could not open 'fs.img': Read-only file system`。这不是内核编译问题，而是 virtio block device 默认以可写方式打开 `fs.img`，当仓库或镜像位于只读挂载中时，内核甚至还没有开始执行。它提醒我在判断“系统为什么没启动”时，先分清失败发生在 host 工具、虚拟硬件、boot，还是 xv6 内核内部。
-
-### GDB 调试路径，以及一次本地 Makefile 回归
-
-上游 `5474d4b` 的 Makefile 原本保留了 DWARF 调试信息，并提供 `qemu-gdb`、`.gdbinit` 和 `print-gdbport`。正常路径是终端 1 执行：
-
-```bash
-make qemu-gdb
-```
-
-该目标在正常 QEMU 参数后增加了两个关键选项：
-
-- `-S`：虚拟 CPU 启动后立即暂停；
-- `-gdb tcp::26000`：在本机 26000 端口等待 GDB remote connection。
-
-终端 2：
-
-```bash
-gdb-multiarch -x .gdbinit
-```
-
-生成的 `.gdbinit` 会加载 `kernel/kernel` 的符号，并连接本机动态计算的 GDB 端口。适合第一次源码跟踪的断点是：
-
-```gdb
-set pagination off
-b _entry
-b start
-b main
-b scheduler
-b usertrap
-b clockintr
-c
-```
-
-几个常用观察命令：
-
-```gdb
-bt
-info registers
-info registers sp ra sepc scause stval satp
-x/16gx $sp
-disassemble /m swtch
-p ticks
-```
-
-端口不应硬编码到通用文档中，应使用下面的命令确认：
-
-```bash
-make print-gdbport
-```
-
-按当前用户 ID 计算，本机通常会得到 `26000`。
-
-不过，在写这篇笔记时，我重新执行 `make print-gdbport`，实际得到的是：
-
-```text
-make: *** No rule to make target 'print-gdbport'.  Stop.
-```
-
-对比 `git diff` 后发现，本地尚未提交的 Makefile 修改不仅删除了 `qemu-gdb`、`.gdbinit` 和 `print-gdbport`，还从 `CFLAGS` 中移除了 `-ggdb -gdwarf-2`。也就是说，上面的 GDB 流程描述的是上游基线能力，不是当前脏工作树已经验证通过的能力。
-
-这个问题很有价值：开发辅助配置也属于代码的一部分，文档、VS Code task 和 Makefile 必须保持一致。当前 `.vscode` 里甚至只有 build/run/clean task，没有文档中声称存在的 `xv6: run qemu-gdb`。后续整理这组修改时，我需要恢复或重新实现 GDB 目标，再用真实断点记录完成下面的调试实验，而不是把“计划执行”写成“已经执行”。
-
-## 内核如何启动：从 QEMU 到 scheduler
-
-启动路径必须先建立栈与特权级环境，才能进入 C 初始化和调度循环；QEMU 的机器模型与加载参数决定这一过程的起点。`make qemu` 的核心命令如下：
-
-```text
-qemu-system-riscv64 \
-  -machine virt \
-  -bios none \
-  -kernel kernel/kernel \
-  -m 128M \
-  -smp 3 \
-  -nographic \
-  -drive file=fs.img,... \
-  -device virtio-blk-device,...
-```
-
-这些参数建立了学习源码时需要记住的硬件边界：
-
-- `virt` 是 QEMU 提供的 RISC-V 虚拟板卡；
-- `-bios none` 表示没有 OpenSBI 等固件替内核完成早期初始化；
-- `-kernel kernel/kernel` 把 ELF 内核装入内存；
-- `-m 128M` 对应 xv6 使用的 128 MiB RAM；
-- `-smp 3` 创建 3 个 hart；
-- `fs.img` 通过 virtio block device 提供根文件系统。
-
-整体启动控制流可以压缩成：
-
-```text
-QEMU reset
-  └─> _entry                  kernel/entry.S, M-mode
-       └─> start()            kernel/start.c, M-mode
-            └─> mret
-                 └─> main()   kernel/main.c, S-mode
-                      ├─> global/per-hart initialization
-                      └─> scheduler()
-                           └─> forkret()
-                                └─> /init
-                                     └─> sh
-```
-
-### `entry.S`：先让 C 代码拥有可靠的栈
-
-链接脚本 `kernel/kernel.ld` 把 `_entry` 放在 `0x80000000`，QEMU 加载内核后让每个 hart 从这里开始执行。`kernel/entry.S` 的核心只有几行：
+为什么内核的第一行代码必须是汇编而不是 C？因为 C 语言编译器一进函数体就会生成向栈上保存返回地址和局部变量的指令，没有合法的 `sp`，第一条访存就会踩坏未知物理内存。`kernel/entry.S` 全文核心只有寥寥数行：
 
 ```asm
 la   sp, stack0
@@ -228,120 +51,50 @@ add  sp, sp, a0
 call start
 ```
 
-此时分页尚未开启，使用的地址就是物理地址（Physical Address）。`mhartid` 是硬件提供的 hart 编号，xv6 据此为每个 hart 选择一段独立的 4096 字节启动栈：
+此时分页尚未开启，所有地址都是实打实的物理地址。由于 3 个 `hart` 同时执行这段代码，如果共用同一个栈就会互相覆盖栈帧。代码通过 `csrr` 读取硬件只读寄存器 `mhartid`（编号 `0, 1, 2`），在全局字节数组 `stack0` 里为每个核切出一段互不重叠的 4096 字节空间；又因为栈向低地址生长，`sp` 必须指向各自区间的顶部 `stack0 + (mhartid + 1) * 4096`。一旦 `sp` 站稳脚跟，一条 `call start` 把返回地址写入 `ra`，C 语言世界的大门才算正式打开。
 
-```text
-hart 0: stack0 + 1 * 4096
-hart 1: stack0 + 2 * 4096
-hart 2: stack0 + 3 * 4096
-```
+### 2. `start.c`：借 `mret` 实施第一次“伪造返回”降权
 
-栈向低地址增长，因此 `sp` 初始化为各段栈的高地址。直到 `sp` 可用之后，CPU 才能安全地执行遵循 C ABI 的 `start()`。`call start` 同时把返回地址写入 `ra`，这也是后面理解上下文切换（Context Switch）的第一个线索。
+QEMU 复位后处于无所不能的 M-mode，但现代内核为了利用硬件分页保护与中断委托机制，主体逻辑都运行在次一级的 S-mode。有趣的是，RISC-V 并没有一条叫作“向下跳转进监管态”的普通跳转指令；要想体面地降权，标准做法是**伪造一次从异常返回的现场，再执行机器态异常返回指令 `mret`**。
 
-### `start.c`：从 Machine mode 降到 Supervisor mode
+在 `kernel/start.c` 的 `start()` 函数里，每个 `hart` 依次完成这组硬件握手：
 
-QEMU 让内核从 Machine mode（M-mode）开始执行，但 xv6 的主体运行在 Supervisor mode（S-mode）。`start()` 的任务是设置 RISC-V 控制状态寄存器，然后通过 `mret` 完成特权级切换。
+- 修改 `mstatus` 寄存器的 `MPP`（Machine Previous Privilege）字段为 `S-mode`，欺骗硬件“刚才我是从监管态陷入进来的”；
+- 把 C 函数 `main` 的入口地址写进机器态异常程序计数器 `mepc`，指定“返回后跳去哪里继续取指”；
+- 将页表根寄存器 `satp` 清零暂时关闭分页，配置物理内存保护（PMP）允许 S-mode 访问全部物理空间，并通过 `medeleg` 和 `mideleg` 把绝大多数同步异常与中断直接委托给 S-mode 处理；
+- 在 `timerinit()` 中写 `stimecmp = r_time() + 1000000` 并打开 `MIE_STIE`，为日后的时间片抢占埋下第一颗定时种子，随后把 `mhartid` 存入 `tp` 寄存器供内核随时调用 `cpuid()` 识别身份。
 
-关键步骤如下：
+最后执行一句内联汇编 `asm volatile("mret")`，硬件便原子地把特权级降为 S-mode，同时将 PC 拨向 `main()`。
 
-1. 修改 `mstatus.MPP`，指定 `mret` 后进入 S-mode；
-2. 把 `mepc` 设置为 `main`，指定 `mret` 后的 PC；
-3. 将 `satp` 清零，早期启动阶段先关闭分页；
-4. 通过 `medeleg`、`mideleg` 把异常和中断委托给 S-mode；
-5. 配置 PMP，使 S-mode 能访问 xv6 使用的物理内存；
-6. 初始化每个 hart 的 timer interrupt；
-7. 把 `mhartid` 保存到 `tp`，供 `cpuid()` 使用；
-8. 执行 `mret`，硬件根据 `mstatus` 和 `mepc` 进入 `main()`。
+### 3. `main.c` 到 `/init`：多核屏障与第二次“伪造返回”
 
-因此，`mret` 并不是普通函数返回。它让硬件原子地完成“恢复目标 PC + 切换特权级 + 更新中断状态”。可以把 `start()` 理解为 xv6 与 RISC-V 特权架构之间最集中的握手过程。
-
-### `main.c`：全局初始化与每 hart 初始化
-
-所有 hart 都会进入 `main()`，但共享对象只能由 hart 0 初始化一次：
+所有核一脚踏进 `kernel/main.c` 后，全局共享的数据结构（物理页空闲链表 `kinit`、内核页表 `kvminit`、进程数组 `procinit`、磁盘与块缓存）绝不能初始化三次，因此只由 `hart 0` 一人包揽：
 
 ```c
 if(cpuid() == 0){
   consoleinit();
   printfinit();
-  kinit();
-  kvminit();
-  kvminithart();
+  kinit();            // 回收内核末尾 end 到 PHYSTOP 的空闲物理页
+  kvminit();          // 构建内核直接映射页表
+  kvminithart();      // 写 satp 并执行 sfence.vma，正式开启 Sv39 分页！
   procinit();
   trapinit();
-  trapinithart();
+  trapinithart();     // 将 stvec 指向 kernelvec
   plicinit();
   plicinithart();
   binit();
   iinit();
   fileinit();
   virtio_disk_init();
-  userinit();
+  userinit();         // 捏造出系统中第一个 RUNNABLE 进程
   __sync_synchronize();
   started = 1;
 }
 ```
 
-其他 hart 等待 `started`，看到 hart 0 发布的初始化结果后，只执行页表、trap vector、PLIC 等 per-hart 初始化。`__sync_synchronize()` 是内存屏障，防止另一个 hart 看见 `started == 1` 时，前面的共享状态仍未对它可见。
+注意倒数第二行的内存屏障 `__sync_synchronize()`：在弱内存序架构下，如果没有这道屏障，`hart 1` 和 `hart 2` 可能先在缓存里看到 `started == 1` 而冲出等待循环，此时 `hart 0` 对内核页表或 `proc[]` 数组的写入却还没对它们可见。穿过屏障后，其余核只需调用 `kvminithart()`、`trapinithart()` 和 `plicinithart()` 装载各自的硬件寄存器，随后三颗核殊途同归，一头扎进永不返回的 `scheduler()`。
 
-最后，每个 hart 都调用自己的 `scheduler()`，并且不再从这个函数返回。
-
-这里也解释了一个常见误会：系统中没有一个独立的“调度 CPU”。每个 CPU 都有自己的 scheduler context；一个 CPU 当前要么运行 scheduler，要么运行某个进程的用户/内核控制流。
-
-## CPU 控制权如何交接与收回
-
-### `proc` 究竟如何在 CPU 上执行
-
-CPU 按 PC 取指，使用寄存器和内存继续执行，并不直接识别 `struct proc`。内核用 `proc` 组织暂停点、地址空间与管理状态；调度器恢复寄存器和栈后，控制权才回到进程。下面从 `RUNNABLE` 追踪到 `swtch()`。
-
-#### scheduler 保存的不是程序，而是暂停点
-
-`scheduler()` 扫描全局 `proc[]`：
-
-```c
-if(p->state == RUNNABLE) {
-  p->state = RUNNING;
-  c->proc = p;
-  swtch(&c->context, &p->context);
-  c->proc = 0;
-}
-```
-
-`swtch.S` 保存旧 context，加载新 context：
-
-```asm
-sd ra, 0(a0)
-sd sp, 8(a0)
-sd s0, 16(a0)
-...
-sd s11, 104(a0)
-
-ld ra, 0(a1)
-ld sp, 8(a1)
-ld s0, 16(a1)
-...
-ld s11, 104(a1)
-ret
-```
-
-通常会把它概括成“调度的本质是切换 `sp` 和 `ra`”，这句话抓住了核心，但还需要两个补充：
-
-1. `s0-s11` 也必须恢复，因为根据 RISC-V ABI，它们是 callee-saved registers；
-2. 用户态（User Space）的全部通用寄存器不保存在 `context`，而保存在 `trapframe`。
-
-为什么恢复 `sp` 和 `ra` 后，CPU 就“自然进入”另一个进程？根本原因来自编译器、ABI 和指令语义共同建立的契约：
-
-- `sp` 指向当前执行流的栈，栈中保存函数调用帧、局部变量和调用链；
-- `ra` 保存函数返回后继续执行的地址；
-- RISC-V 的 `ret` 本质上跳转到 `ra` 指向的地址；
-- `s0-s11` 按 ABI 在函数调用前后应保持不变。
-
-当 `swtch` 加载进程的 `sp` 时，CPU 后续的栈访问已经落到该进程自己的内核栈；加载它的 `ra` 后，最后一条 `ret` 又把 PC 设置为该执行流上次暂停的位置。CPU 没有执行“启动进程”这种特殊指令，它只是恢复了一组足够描述 C 函数执行现场的寄存器。
-
-这与恢复一台虚拟机 snapshot 有相似之处：对象名称不是关键，关键是恢复后下一条指令、寄存器和内存是否彼此一致。
-
-#### 第一次运行为什么也能 `ret`
-
-已经运行过的进程有真实的暂停位置，新进程却没有。xv6 在 `allocproc()` 中人为构造第一次 context：
+那么 `userinit()` 造出来的第一个进程，从来没有在 CPU 上跑过，它是怎么启动的？答案依然是**伪造返回现场**。`allocproc()` 在分配进程槽位时故意写下两行关键赋值：
 
 ```c
 memset(&p->context, 0, sizeof(p->context));
@@ -349,431 +102,156 @@ p->context.ra = (uint64)forkret;
 p->context.sp = p->kstack + PGSIZE;
 ```
 
-所以 scheduler 第一次切换到该进程时，`swtch` 的 `ret` 会进入 `forkret()`。第一次 `forkret()` 初始化文件系统并 `kexec("/init", ...)`，随后通过 `prepare_return()` 和 trampoline 的 `userret` 恢复用户寄存器，最终由 `sret` 进入用户态 `/init`。
+当某颗核上的 `scheduler()` 扫到这个处于 `RUNNABLE` 状态的初始进程、调用 `swtch` 换上它的 `context` 并执行末尾的 `ret` 指令时，CPU 顺着预设的 `ra` 第一次跳进内核函数 `forkret()`（完成依赖进程睡眠机制的文件系统初始化与根程序加载），紧接着走 `prepare_return() -> userret` 恢复预先填在 `trapframe` 里的 ELF 入口地址与用户栈，最后伴随一条监管态返回指令 `sret` 降权进入 U-mode，跑起 `/init` 并拉起交互式 `sh`。
 
-这里有两类不同的“返回”：
+---
 
-| 指令 | 恢复什么 | 用途 |
-| --- | --- | --- |
-| `ret` | 普通函数返回地址 `ra` | 在 scheduler context 与进程 kernel context 之间切换 |
-| `sret` | `sepc`、`sstatus` 所描述的 trap 前状态 | 从 S-mode 返回 U-mode 或恢复被中断的 S-mode 代码 |
+## 二、强行夺回 CPU：跳板页、双现场与 `swtch` 对称切栈
 
-#### scheduler 不是在后台同时运行
+现在 `/init` 派生的用户进程已经在 U-mode 下跑起来了。假设某个用户程序写了一个纯粹的算术死循环 `while(1);`，既不调系统调用，也不主动睡眠，早已把执行权交出去的内核靠什么把它拉下马？
 
-当一个 CPU 正在执行用户进程时，它在该 CPU 上的 scheduler 已经暂停在：
+答案藏在硬件定时器与两套完全独立的寄存器保存区（`trapframe` 与 `context`）的精密接力之中。下面这张全链路控制流图完整串起了从用户态陷入、内核分发到跨栈切换的每一步（推荐点开[交互式陷阱与上下文切换路径视图](/diagrams/aug-sys-xv6-trap-swtch.html)，在右上角切换“时钟抢占切换路径”与“系统调用/缺页直返路径”对照观察）：
 
-```c
-swtch(&c->context, &p->context);
-```
+![xv6-riscv 跨态陷阱、时钟抢占与双栈上下文切换全链路](/images/diagrams/aug-sys-xv6-trap-swtch.svg)
 
-scheduler 的 `sp`、`ra`、`s0-s11` 保存在 `c->context` 中，当前硬件寄存器属于进程的执行流。直到该进程执行 `sleep()`、`yield()`、`exit()`，或者被 timer interrupt 抢占（Preemption）并进入 `yield()`，才会调用：
+### 1. 硬件只做最小动作，剩下全靠 `trampoline.S` 走钢丝
+
+在 RISC-V 硬件里，单调递增的 `time` 计数器一旦追平 `start.c` 设下的 `stimecmp` 阈值，无论当前用户进程愿不愿意，CPU 都会在两条指令之间强制触发一次监管态时钟中断（Supervisor Timer Interrupt）。
+
+但 RISC-V 硬件在陷入瞬间做得非常克制——它**不会**替你把 32 个通用寄存器压栈，也不会自动切换页表 `satp` 或栈指针 `sp`（因为在硬件看来，强行在每次陷阱里写内存既慢又缺乏灵活性）。硬件只原子地干四件事：
+
+1. 把被打断的那条用户指令地址存进 `sepc`；
+2. 把中断原因写入 `scause`（时钟中断对应 `0x8000000000000005L`）；
+3. 在 `sstatus` 里记下陷入前的特权级（U-mode）并关闭 S-mode 中断；
+4. 将当前特权级切到 S-mode，然后把 `pc` 直接设为 `stvec` 指向的 `trampoline.S:uservec`。
+
+请仔细体会 `uservec` 第一条指令面临的惊险处境：**此时特权级虽然已经是 S-mode，但 `sp` 里装的还是不可信的用户栈地址，31 个通用寄存器里全是用户态现场（连一个空闲临时寄存器都没有！），更要命的是 `satp` 寄存器里装的依然是用户页表！**
+
+xv6 是怎么在钢丝上完成切换的？
+
+- 首先，进用户态前 `prepare_return()` 早就把该进程 `trapframe` 的虚拟地址预先藏在了专用交换寄存器 `sscratch` 里。`uservec` 第一条指令执行 `csrrw a0, sscratch, a0`，毫发无损地把用户的 `a0` 暂存进 `sscratch`，同时让 `a0` 拿到 `trapframe` 基址，一口气把全部 32 个用户寄存器妥妥当当地存进 `p->trapframe`；
+- 接着，从 `trapframe` 预设槽位里读出该进程专属的内核栈顶赋给 `sp`、读出当前物理核编号赋给 `tp`，再读出内核根页表值写入 `satp` 并执行 `sfence.vma` 刷新快表；
+- **最精妙的一步**：为什么 `csrw satp` 改掉页表的下一纳秒，CPU 去取下一条指令不会触发页错误崩溃？因为 xv6 在构建每一个用户页表和全局内核页表时，都把同一页物理 `trampoline` 代码映射到了**完全相同的最高虚拟地址 `TRAMPOLINE`**（且不置 `PTE_U`，严防用户态偷跑或篡改）。页表在脚下瞬间抽换，但新旧两张地图上 `PC + 4` 这个虚拟坐标指向同一块物理机器码，控制流得以丝滑跨入 C 函数 `usertrap()`。
+
+### 2. 为什么需要 `trapframe` 和 `context` 两套现场？
+
+初读 `kernel/proc.h` 时，最容易犯迷糊的就是“既然 `p->trapframe` 已经保存了整整 32 个寄存器，为什么 `struct proc` 里还要再塞一个 14 寄存器的 `p->context`？”
+
+把一次时钟抢占的后半程走完就彻底明白了：
+
+`usertrap()` 认出 `devintr() == 2`（来自 `clockintr()` 时钟中断，且已在里面将下一次闹钟拨到了 `r_time() + 1000000`），便调用 `yield()`。`yield()` 锁住进程状态将其改为 `RUNNABLE`，接着调用 `sched()`，最终落到汇编函数 [`kernel/swtch.S`](https://github.com/mit-pdos/xv6-riscv/blob/riscv/kernel/swtch.S)：
 
 ```c
 swtch(&p->context, &mycpu()->context);
 ```
 
-此时 scheduler 从原来那次 `swtch()` 调用中“返回”，继续执行 `c->proc = 0` 和下一轮扫描。它看起来像两条互相调用的执行流，实际上同一时刻一个 CPU 只有一套真实寄存器，只能运行其中一条。
+看清 `swtch.S` 里的 29 行汇编：
 
-### Timer interrupt 如何产生抢占
+```asm
+swtch:
+        sd ra, 0(a0)
+        sd sp, 8(a0)
+        sd s0, 16(a0)
+        ...
+        sd s11, 104(a0)
 
-如果进程从不主动调用 `yield()`，内核仍然需要收回 CPU。xv6 使用 RISC-V supervisor timer interrupt 实现时间片抢占。
-
-#### 第一次定时器由 `start.c` 设置
-
-每个 hart 在 `timerinit()` 中：
-
-```c
-w_mie(r_mie() | MIE_STIE);
-w_menvcfg(r_menvcfg() | (1L << 63));
-w_mcounteren(r_mcounteren() | 2);
-w_stimecmp(r_time() + 1000000);
+        ld ra, 0(a1)
+        ld sp, 8(a1)
+        ld s0, 16(a1)
+        ...
+        ld s11, 104(a1)
+        ret
 ```
 
-硬件维护单调递增的 `time` 计数器。当 `time >= stimecmp` 且相关中断使能位允许时，硬件置起 supervisor timer interrupt。
+原来，进程在内核态执行 `usertrap -> yield -> sched -> swtch` 时，自己也是一段标准的 C 函数调用流，跑在属于它自己的内核栈 `p->kstack` 上。按照 RISC-V 函数调用约定（ABI），调用者保存寄存器（Caller-Saved，如 `t0-t6`、`a0-a7`）早就由编译器按需压在了 `p->kstack` 的调用帧里；`swtch` 作为一个被正常 `call` 进来的函数，只需要替当前内核执行流存下返回地址 `ra`、栈顶 `sp` 以及被调用者保存寄存器 `s0-s11`（共计 14 个 64 位寄存器），就足以完整冻结住这个内核暂停点！
 
-这段代码中的 `r_time()`、`w_stimecmp()` 最终都是 CSR 访问指令。它们不是访问普通 C 变量，而是在直接配置 CPU 的计时和中断机制。
+这也顺手打破了另一个常见错觉：**内核里根本不存在一个“在后台和用户进程并行运转”的独立调度线程**。每颗物理核（`struct cpu`）都有一套专属的调度栈和 `cpu->context`：
 
-#### 用户态发生 timer interrupt 后的完整路径
+- 当核 0 正在跑进程 A 时，核 0 的 `scheduler()` 其实正静静地冻结在上一次 `swtch(&c->context, &pA->context)` 的那行代码里；
+- 当进程 A 被时钟中断打进内核、调用 `swtch(&pA->context, &c->context)` 时，硬件寄存器切回核 0 的调度栈，`scheduler()` 就像刚从普通函数调用里返回一样醒过来，执行下一行 `c->proc = 0`，继续扫描 `proc[]` 数组寻找下一个 `RUNNABLE` 的进程 B；
+- 一旦选中进程 B 并执行 `swtch(&c->context, &pB->context)`，CPU 就跳回进程 B 上次在内核里睡着的地方，顺着 `sched -> yield -> usertrap -> usertrapret` 一路倒退回 `trampoline:userret`，换上进程 B 的用户页表，把进程 B 的 `trapframe` 装回 32 个通用寄存器，最终执行 `sret` 回到进程 B 被打断的那条用户指令。
 
-定时器中断先进入 trap 保存用户现场，再由内核决定是否让出 CPU；硬件通知本身不会把进程状态改成 RUNNABLE。
+一句话分清二者：**`trapframe` 守在用户态与内核态的城门口，保存跨特权级边界时的完整用户现场；`context` 守在内核态进程栈与调度器栈的交接处，保存两次 `swtch` 协程切换之间的内核函数暂停点。** 把整条链路里反复出现的三种“返回指令”放在一起对照，xv6 的硬件控制流边界就彻底串通了：
 
-```text
-user instruction
-  │
-  │ time >= stimecmp
-  ▼
-RISC-V hardware trap entry
-  ├─ sepc   <- interrupted user PC
-  ├─ scause <- supervisor timer interrupt
-  ├─ sstatus records previous privilege/interrupt state
-  ├─ privilege U -> S
-  └─ pc <- stvec
-       │
-       ▼
-trampoline.S:uservec
-  ├─ save user registers to p->trapframe
-  ├─ sp <- process kernel stack
-  ├─ satp <- kernel page table
-  └─ call usertrap()
-       │
-       ▼
-devintr() -> clockintr() -> return 2
-       │
-       ▼
-yield()
-  ├─ p->state = RUNNABLE
-  └─ sched() -> swtch(&p->context, &cpu->context)
-       │
-       ▼
-scheduler resumes and chooses a RUNNABLE process
-```
+| 指令 | 特权级变化 | 状态恢复来源 | 在 xv6 中的核心使命 |
+| --- | --- | --- | --- |
+| `mret` | M-mode → S-mode | `mepc`（目标 PC）+ `mstatus.MPP` | 冷启动阶段从 `start()` 首次降权跳入内核 `main()` |
+| `ret` | S-mode 内部平级跳转 | 通用寄存器 `ra`（配合新 `sp` 与 `s0-s11`） | 在 `swtch.S` 中完成进程内核栈与每核 `scheduler()` 栈的对称切换 |
+| `sret` | S-mode → U-mode（或回 S-mode） | `sepc`（目标 PC）+ `sstatus.SPP` | 在 `trampoline:userret` 末尾完成跨态返回，恢复用户指令执行 |
 
-硬件只负责进入 trap：保存少量控制状态、切特权级、跳到 `stvec`。保存全部用户通用寄存器、切换内核栈和页表，是 `trampoline.S:uservec` 的软件职责。
+---
 
-`devintr()` 通过 `scause` 区分中断来源：
+## 三、物理页与虚拟地址解耦：Sv39 三级页表与按需缺页
 
-```c
-if(scause == 0x8000000000000009L) {
-  // supervisor external interrupt: UART/virtio via PLIC
-} else if(scause == 0x8000000000000005L) {
-  clockintr();
-  return 2;
-}
-```
+搞懂了控制流切换，再看 `kalloc.c` 与 `vm.c` 里的内存管理，核心线索就是把**“批一块 4 KiB 物理内存”**和**“在地址空间里画一条虚拟映射”**拆成两件正交的事。
 
-`clockintr()` 只让 hart 0 更新全局 `ticks` 并唤醒等待 `ticks` 的进程，但每个 hart 都会重新设置自己的下一次 timer：
+### 1. 借用空闲页自身做节点的物理分配器
 
-```c
-if(cpuid() == 0){
-  acquire(&tickslock);
-  ticks++;
-  wakeup(&ticks);
-  release(&tickslock);
-}
-w_stimecmp(r_time() + 1000000);
-```
-
-当前注释把 `1000000` 描述为约 0.1 秒。准确的墙钟时间取决于 QEMU `virt` 平台的 timebase，但调度机制并不依赖我们在源码中把它换算成某个固定毫秒数。
-
-`usertrap()` 看到 `devintr()` 返回 2 后调用 `yield()`。如果 timer interrupt 发生在内核态（Kernel Space），则入口是 `kernelvec.S -> kerneltrap()`；只要当前 CPU 关联了进程，`kerneltrap()` 同样调用 `yield()`。因此不是 scheduler 自己周期性 `yield`，而是正在运行的进程控制流在中断处理过程中被改成 `RUNNABLE`，再切回已暂停的 scheduler context。
-
-#### 哪些代码在直接操作 CPU 和设备
-
-阅读 xv6 时，我把“普通内核逻辑”和“硬件边界”分开标记，源码会清晰很多：
-
-| 交互方式 | 典型对象/指令 | 作用 |
-| --- | --- | --- |
-| RISC-V CSR | `mhartid`、`mstatus`、`mepc`、`satp` | hart 标识、特权级、返回 PC、页表根 |
-| Trap CSR | `stvec`、`sepc`、`scause`、`stval`、`sstatus` | trap 入口、现场、原因和故障地址 |
-| Timer CSR | `time`、`stimecmp`、`mie`、`menvcfg` | 产生和控制 timer interrupt |
-| 特权指令 | `mret`、`sret`、`wfi`、`sfence.vma` | 特权返回、等待中断、刷新 TLB |
-| MMIO | UART、virtio、PLIC 地址区间 | 控制串口、磁盘和外部中断控制器 |
-
-`kernel/riscv.h` 把 CSR 指令包装成 `r_*`/`w_*` 内联函数；`uart.c`、`virtio_disk.c`、`plic.c` 则通过固定物理地址读写模拟设备寄存器。这些位置就是 xv6 与 QEMU 虚拟硬件真正接触的地方。
-
-## 内存管理：物理页、虚拟地址与页表
-
-内存管理容易混淆，是因为“分配物理内存”和“建立虚拟地址映射”是两件不同的事。xv6 用两个相对独立的层次把它们连接起来：
-
-```text
-kalloc.c                       vm.c / hardware MMU
-physical page allocator       virtual address translation
-
-kalloc() -> physical page     walk()/mappages() -> PTE
-             │                              │
-             └──────── page table maps ─────┘
-```
-
-### 物理页分配器：一个以空闲页自身为节点的链表
-
-QEMU 把 RAM 放在 `0x80000000` 开始的位置。Makefile 使用 `-m 128M`，源码中 `PHYSTOP` 也定义为 `KERNBASE + 128 MiB`。内核镜像末尾由链接符号 `end` 标记，所以可分配物理内存是：
-
-```text
-[PGROUNDUP(end), PHYSTOP)
-```
-
-`kinit()` 把这个区间按 4096 字节切成物理页，并逐页放入 freelist：
+xv6 管理的物理 RAM 区间从内核镜像末尾符号 `end`（向上页对齐）一直延伸到 `PHYSTOP`（`0x80000000 + 128 MiB`）。既然空闲的物理页里还没有装任何用户有效数据，`kernel/kalloc.c` 干脆连额外的元数据数组都不分配，直接把每个空闲 4 KiB 物理页开头的 8 个字节强转成单向链表指针 `struct run *next`：
 
 ```c
 struct run {
   struct run *next;
 };
-
-struct {
-  struct spinlock lock;
-  struct run *freelist;
-} kmem;
 ```
 
-空闲页不需要保存用户数据，因此 xv6 直接借用页首几个字节存放 `next` 指针。`kalloc()` 从链表头弹出一页，`kfree()` 把一页压回链表头，spinlock 负责多 hart 并发安全。
+`kalloc()` 加自旋锁从表头摘下一页（并在调试语义下填满垃圾字节 `0x05` 以便尽早暴露未初始化读取），`kfree()` 填满 `0x01` 后压回表头。用户代码段、进程内核栈、管道缓冲区乃至构成页表本身的中间目录页，全都是从这个最朴素的页池里一页页领出来的。
 
-这套分配器不处理任意字节大小，也不做 slab、buddy 或 NUMA 优化。它只回答一个问题：给我一个空闲的 4 KiB 物理页。用户内存、内核栈、页表页和 pipe buffer 都建立在这个原语之上。
+### 2. Sv39 硬件查表流水线与 Lazy `sbrk` 缺页闭环
 
-### Sv39：三层索引找到一个 PTE
+在 64 位 RISC-V 上，xv6 启用的是 **Sv39 分页方案**：64 位虚拟地址只使用低 39 位（xv6 进一步将最高虚拟地址 `MAXVA` 限制在 `1L << 38` 即 256 GiB，省去高位符号扩展的麻烦）。为什么页表偏偏设计成三级、每级索引偏偏是 9 比特？算一笔整除账就一目了然：一页物理内存 4096 字节，每条页表项（PTE）占 8 字节，一页恰好放下 `4096 / 8 = 512`（即 `2^9`）个条目。低 12 位留作 4 KiB 页内偏移（Offset），剩下的 27 位虚拟页号自然均分成 `VPN[2]`、`VPN[1]`、`VPN[0]` 三段 9 比特索引：
 
-RV64 的 xv6 使用 Sv39 分页。一个有效虚拟地址拆分为：
+![xv6-riscv Sv39 三级页表地址翻译与高地址特殊页布局](/images/diagrams/aug-sys-xv6-sv39-pagetable.svg)
+
+内核里的 `walk(pagetable, va, alloc)` 函数几乎就是 CPU 硬件内存管理单元（MMU）查表电路的 C 语言镜像：从 `satp` 指向的 L2 根页表出发，依次用 `PX(2, va)`、`PX(1, va)` 取出 PTE；若有效位 `PTE_V` 为 1，就通过 `PTE2PA(*pte)` 提取 44 位物理页号拼成下一级页表的物理基址（因为内核页表对物理 RAM 做了 `VA == PA` 恒等直接映射，内核可以直接解引用这个物理地址！）；若途中发现目录页尚未建立且 `alloc == 1`，便当场调 `kalloc()` 补齐并清零，最终返回 L0 叶子 PTE 的指针供 `mappages()` 填入物理页地址与 `PTE_R/W/X/U` 权限位。
+
+把这套页表机制与第二章的陷阱机制合龙，就能看懂仓库基线（`5474d4b`）中自带的 **Lazy `sbrk`（按需内存分配）** 与 **`exec` 栈保护页**：
+
+- **用缺页异常推迟物理分配**：当用户程序调用默认模式的 `sbrk(n)` 申请大块堆内存时，`sys_sbrk()` 并不急着调 `growproc(n)` 去搜刮物理页，而是只把进程逻辑大小 `myproc()->sz += n` 往上涨了事。等到用户指令真正第一次去读写那片新扩展的地址时，MMU 查表撞上 `PTE_V == 0`，当场触发同步页错误异常（Load/Store Page Fault，`scause` 为 13 或 15，故障虚拟地址记在 `stval` 中）。`usertrap()` 捕获该异常后转交 `vmfault()`，核实 `stval` 落在合法堆区间内，这才调用 `kalloc()` 拿出一页物理内存、清零并挂入用户页表，最后经 `sret` 回到刚才报错的那条用户指令重试——在用户程序毫无察觉的情况下完成了按需兑现。
+- **用清除 `PTE_U` 打造栈溢出护栏**：`kexec()` 在加载 ELF 镜像并分配两页空间时，只把高地址页设为合法的用户栈，紧贴其下的低地址页故意调 `uvmclear()` 抹掉 `PTE_U` 权限位充当 Guard Page。一旦用户递归过深把栈指针踩进护栏页，硬件立刻触发页异常拦截，绝不会让它静默踩坏下方的堆数据。
+
+---
+
+## 四、跨架构实验与排障实录：QEMU 边界、GDB 断点与演进路线
+
+在 x86_64 宿主机（WSL2）上折腾 `xv6-riscv` 时，最容易掉进的坑就是分不清问题出在宿主机文件系统、交叉工具链、QEMU 虚拟板卡还是 xv6 内核代码里。首先在概念上要钉死一件事：宿主机的 AMD x86_64 处理器根本不认识半条 RISC-V 64 指令；我们是用 `riscv64-linux-gnu-gcc` 交叉编译出纯粹的 RV64 ELF 内核镜像，再由全系统模拟器 `qemu-system-riscv64` 在软件层把整块 `virt` 主板（3 颗 RV64 核、UART 串口、PLIC 中断控制器、VirtIO 磁盘）连同指令集一起模拟出来。
+
+### 1. 已跑通的构建启动闭环与一次只读镜像排障
+
+安装齐交叉工具链与 QEMU 依赖后，执行 `make qemu` 即可看到 3 颗 `hart` 启动并拉起 Shell（由于启用了 `-nographic` 将串口复用在当前终端，退出虚拟机不能在 xv6 的 `sh` 里敲 `exit`，而要依次按下 `Ctrl-a` 松开后再按 `x`）：
 
 ```text
- 38        30 29        21 20        12 11         0
-+------------+------------+------------+-------------+
-| VPN[2] 9b  | VPN[1] 9b  | VPN[0] 9b  | offset 12b |
-+------------+------------+------------+-------------+
+xv6 kernel is booting
+
+hart 1 starting
+hart 2 starting
+init: starting sh
+$ echo xv6-learning
+xv6-learning
 ```
 
-每个页表页为 4096 字节，一个 PTE 为 8 字节，所以每层正好有 512 个 PTE，对应 9 位索引。`walk()` 从 level 2 走到 level 0：
+在验证过程中我曾撞见过一次很典型的启动报错：`Could not open 'fs.img': Read-only file system`。当时第一反应以为是文件系统构建脚本 `mkfs` 出了问题，细查 QEMU 启动参数才意识到：VirtIO 块设备驱动默认要求以读写模式打开根磁盘镜像 `fs.img`，而当时工作目录恰好挂在只读路径下——**连第一条 `_entry` 汇编都还没开始跑，QEMU 在挂载虚拟外设阶段就直接退出了**。这类现象提醒我们排障时先划清宿主/模拟器层与客户机内核层的故障边界。
 
-```c
-for(int level = 2; level > 0; level--) {
-  pte_t *pte = &pagetable[PX(level, va)];
-  if(*pte & PTE_V) {
-    pagetable = (pagetable_t)PTE2PA(*pte);
-  } else {
-    pagetable = (pagetable_t)kalloc();
-    memset(pagetable, 0, PGSIZE);
-    *pte = PA2PTE(pagetable) | PTE_V;
-  }
-}
-return &pagetable[PX(0, va)];
-```
+### 2. 本地 Makefile 的 GDB 回归与三组待执行单步实验
 
-`walk()` 找到最低层 PTE 的地址，`mappages()` 再写入物理页号和 `PTE_V/R/W/X/U` 权限。真正执行用户指令时，完成这三级查找的是 CPU 的 MMU；软件 `walk()` 用于创建、修改或检查相同的数据结构。TLB 缓存近期翻译结果，修改或切换页表后用 `sfence.vma` 清理陈旧项。
+上游基线原本提供了开箱即用的双终端远程调试链路——终端一跑 `make qemu-gdb`（附带 `-S` 让虚拟 CPU 在复位点暂停，并监听动态计算的 TCP 端口），终端二跑 `gdb-multiarch -x .gdbinit` 即可挂载符号表。但我在复核本地工作树时执行 `make print-gdbport`，却收到了 `No rule to make target 'print-gdbport'`。检查 `git diff` 才发现，此前整理本地辅助脚本（如环境自检 `scripts/check-env.sh`、`clangd` 交叉头文件路径 `compile_flags.txt` 与 `.vscode/tasks.json`）时，一份未收尾的本地 `Makefile` 改动误删了 `qemu-gdb` 目标以及 `CFLAGS` 里的 `-ggdb -gdwarf-2`。
 
-### 内核页表与用户页表
+工程配置同样是源码真相的一部分，绝不能把“文档里写的命令”当成“当前工作树已验证的状态”。修复恢复 `Makefile` 的 DWARF 调试符号与 `qemu-gdb` 目标后，接下来最值得亲手单步验证的三组跨边界实验已经列好清单：
 
-`kvmmake()` 创建所有 hart 共享的 kernel page table：
+1. **单步跨过 `mret` 验证特权级降级**：在 `_entry`、`start`、`main` 下断点，观察各核 `mhartid` 与初始 `sp` 落点，在 `mret` 指令前后用 `info registers mstatus mepc satp` 搭配 `si` 单步跨界，亲眼确认硬件自动完成 PC 跳转与监管态切换。
+2. **捕获一次完整的时钟抢占切栈**：依次断在 `clockintr -> yield -> sched -> swtch`，在进入 `swtch` 前打印当前栈顶 `sp` 与 `ra`，单步穿过 14 个寄存器的保存与恢复后再次执行 `bt`，观察调用栈如何瞬间从进程内核栈变成 `scheduler()`（验证完需及时 `disable` 高频的 `swtch` 断点，否则虚拟机寸步难行）。
+3. **抓拍 Lazy `sbrk` 缺页兑现现场**：写一个 10 行的小用户程序调用延迟版 `sbrk` 扩充地址空间但不读写，随后向新区间首字节写入数据，在 `vmfault` 处断下核对 `$scause`（应为 `0xf` Store Page Fault）与 `$stval` 故障地址，确认逻辑扩容与物理 `kalloc` 发生在两个完全分离的时刻。
 
-- UART、virtio、PLIC 以 RW 权限直接映射 MMIO；
-- kernel text 映射为 RX；
-- kernel data 和物理 RAM 映射为 RW；
-- trampoline 映射到最高虚拟页；
-- 每个进程的 kernel stack 被映射，并在相邻位置保留 guard page。
+### 3. 从读懂源码到动手改内核的演进阶梯
 
-大部分 kernel mapping 使用 `VA == PA` 的 direct map。`kvminithart()` 把根页表写入 `satp` 并执行 `sfence.vma`，此后 MMU 开始按 Sv39 翻译地址。
+顺着依赖拓扑往深处走，阅读与动手改造 `xv6-riscv` 最顺畅的顺序是先打通跨态边界，再挑战多核锁竞争与崩溃一致性：
 
-每个进程则有独立的 user page table。`proc_pagetable()` 除普通用户内存外，还建立两个特殊映射：
+- **第一阶（打通跨态链路与统计）**：新增一个只读观测型系统调用（如打印当前进程三级页表有效 PTE 或累计运行 tick 数），完整串起 `usys.pl` 用户态桩代码、`ecall`、`syscall.c` 分发表与 `copyout`；
+- **第二阶（整合陷阱、页表与引用计数）**：实现写时复制（Copy-on-Write `fork`），让父子进程共享只读物理页并利用自定义软件保留位标记 COW，在写保护触发 `vmfault` 时按需拷贝新页并刷 `sfence.vma`；
+- **第三阶（多核并发与持久化事务）**：将 `kalloc.c` 那把所有核争抢的全局自旋锁拆成 Per-CPU 空闲链表加跨核窃取，随后深入 `bio.c -> log.c -> fs.c -> virtio_disk.c`，追踪一行 `echo hello > file` 如何穿过预写日志（WAL）事务落入磁盘中断。
 
-```text
-MAXVA
-  ┌────────────────────────┐
-  │ TRAMPOLINE: RX, no U   │  同一段 trampoline 代码
-  ├────────────────────────┤
-  │ TRAPFRAME: RW, no U    │  每个进程各自的寄存器保存页
-  ├────────────────────────┤
-  │                        │
-  │ user stack + guard     │
-  │ heap                   │
-  │ data                   │
-  │ text                   │
-  └────────────────────────┘
-0
-```
+每翻开一组新文件，只要死死盯住四个不变量——**谁交出控制权又由谁接手、进出时 `pc/sp/privilege/satp` 各自是谁、状态归属物理核还是归属进程、哪几行在读写普通内存而哪几行在拨动 CSR/MMIO 硬件开关**——哪怕面对体量百倍于 xv6 的生产级内核，也不会在代码森林里迷失方向。
 
-trampoline 在 user page table 和 kernel page table 中映射到相同虚拟地址。原因是 trap 刚发生时 CPU 仍在使用 user page table，而 `uservec` 执行过程中要切换 `satp`；相同 VA 映射保证切换页表前后的这几条指令能够连续执行。`TRAMPOLINE` 和 `TRAPFRAME` 都没有 `PTE_U`，用户态代码不能直接访问它们。
+---
 
-### `exec` 如何建立一个可运行的地址空间
-
-`kexec()` 的逻辑可以看成一次带回滚能力的地址空间事务：
-
-1. 打开并校验 ELF；
-2. 创建新的 user page table；
-3. 遍历 program header，用 `uvmalloc()` 分配物理页并映射；
-4. 用 `loadseg()` 把 ELF segment 从 inode 读入物理页；
-5. 分配用户栈，并用 `uvmclear()` 建立不可访问的 guard page；
-6. 把 `argv` 字符串和指针数组压入新用户栈；
-7. 设置 `trapframe->epc = elf.entry` 和 `trapframe->sp = sp`；
-8. 最后才替换 `p->pagetable`，释放旧地址空间。
-
-设置 `trapframe->epc` 和 `sp` 后，后面的 `userret -> sret` 就会让 CPU 从 ELF entry 和新用户栈开始执行。这与 scheduler 恢复 kernel context 是同一种思路：先构造硬件可理解的执行状态，再通过一条返回指令让控制流成立。
-
-### 当前版本的 lazy `sbrk`
-
-当前源码的 `sys_sbrk(int n, int t)` 同时支持 eager 和 lazy 两条路径。eager 模式立即调用 `growproc()` 分配和映射物理页；lazy 模式只增加 `p->sz`：
-
-```c
-if(t == SBRK_EAGER || n < 0) {
-  growproc(n);
-} else {
-  myproc()->sz += n;
-}
-```
-
-进程第一次读写尚未映射的地址时，硬件产生 load/store page fault，`scause` 为 13 或 15，`stval` 给出故障虚拟地址。`usertrap()` 调用 `vmfault()`：分配一页、清零、建立 `PTE_W | PTE_U | PTE_R` 映射，然后返回原用户指令重试。
-
-这条路径把内存与中断章节真正连接起来了：page fault 不是“程序崩溃”的同义词，而是一种同步 exception；内核可以检查地址是否合法，并利用它按需完成虚拟内存策略。
-
-## 用不变量组织实验与源码阅读
-
-### 我目前形成的几个核心认识
-
-控制权切换需要同时检查寄存器、栈和共享状态；只看 C 函数调用关系会遗漏 trap、特权级切换和汇编恢复路径。
-
-#### 进程是状态，不是 CPU 中的实体
-
-一个可运行进程至少由三部分组成：
-
-- 执行状态：kernel `context`、user `trapframe`；
-- 地址空间：user page table 和它映射的物理页；
-- 内核管理状态：PID、state、open files、cwd、parent、sleep channel 等。
-
-CPU 只是暂时装载某个进程的寄存器并使用它的页表。所谓“进程在 CPU 上执行”，就是这套状态成为当前硬件状态。
-
-#### 调度器本身也是一段可暂停的控制流
-
-scheduler 不是内核之外的裁判，也不是与用户程序并行运行的后台线程。它拥有自己的 kernel stack/context，在切到进程时暂停，在进程 `sched()` 回来后恢复。`swtch()` 的两个参数是对称的，这种对称性比“调度器调用进程”更接近真实机制。
-
-#### 中断把硬件时间变成软件状态机转换
-
-timer 只通知 CPU“时间到了”。从 `RUNNING` 变成 `RUNNABLE`、保存 context、选择下一个进程，全是内核软件完成的：
-
-```text
-time comparator
-  -> hardware trap
-  -> trap handler
-  -> yield
-  -> proc state transition
-  -> swtch
-  -> scheduler policy
-```
-
-因此，中断机制与调度策略可以分开理解：前者提供抢占点，后者决定接下来运行谁。
-
-#### 页表也是硬件与软件共享的数据结构
-
-`walk()` 和 `mappages()` 由内核维护页表，MMU 通常先查 TLB，未命中时才按页表执行地址翻译；`satp` 指向根页表。页表不是抽象意义上的“地址字典”，而是必须严格符合 RISC-V 位布局和权限语义的硬件协议数据。
-
-### 已完成的实验与下一步 develop
-
-只读源码很容易产生“每个函数都看懂了，但系统仍然没有动起来”的感觉。对我更有效的方法是每次只追一条跨模块控制流，并用断点或小改动验证。
-
-#### 已完成：环境、构建与启动闭环
-
-这次已经实际完成并复核了以下闭环：
-
-1. 用 `scripts/check-env.sh` 检查 host 工具链；
-2. 确认 `kernel/kernel` 和 `fs.img` 可以构建；
-3. 用 QEMU 启动 3-hart 的 RISC-V `virt` 机器；
-4. 看到 `/init` 拉起 `sh`，执行 `echo` 与 `ls`；
-5. 用 `Ctrl-a x` 正常退出 QEMU；
-6. 复现并识别只读 `fs.img` 属于 host/QEMU 层失败，而不是 xv6 kernel panic。
-
-这个闭环看似基础，但它建立了后续所有源码实验的可信起点：每次改内核前先证明基线可运行，改动后再用同一条路径比较行为。
-
-#### 待完成实验一：逐指令观察启动和特权级切换
-
-断点实验需要区分 Machine mode 初始化与 Supervisor mode 主循环；以下命令是待执行步骤，不是已取得的调试输出。
-
-```gdb
-b _entry
-b start
-b main
-c
-```
-
-当前这项实验被本地 Makefile 的 GDB 回归阻断。恢复调试符号和 `qemu-gdb` 目标后，我会在 `_entry` 观察 `mhartid`、`sp`，在 `start` 前后观察 `mstatus`、`mepc`、`satp`，再用 `si` 单步跨过 `mret`。目标不是记住每个 CSR 位，而是亲眼确认：PC 从 `_entry` 到 `start`，再由 `mret` 到 `main`，同时 privilege mode 发生变化。
-
-#### 待完成实验二：捕获一次完整的时间片切换
-
-验证抢占必须同时看到中断入口、进程状态更新和上下文切换；仅命中 `yield()` 无法证明完整路径。
-
-```gdb
-b clockintr
-b yield
-b sched
-b swtch
-c
-```
-
-命中断点后执行：
-
-```gdb
-bt
-info registers sp ra sepc scause satp
-x/16gx $sp
-```
-
-在第一次进入 `swtch` 前记录 `sp/ra`，单步执行保存和加载，再观察 `ret` 后的 backtrace。`swtch` 是高频路径，理解后应禁用断点，否则系统会几乎无法前进：
-
-```gdb
-disable
-c
-```
-
-#### 待完成实验三：观察 lazy allocation page fault
-
-可以新增一个很小的用户程序：调用 lazy `sbrk` 扩大地址空间，先不访问，再写扩展区的第一个字节。GDB 在 `vmfault` 断下后观察：
-
-```gdb
-p/x $scause
-p/x $stval
-bt
-```
-
-然后跟踪 `kalloc -> mappages`，验证“增加逻辑地址空间”与“分配物理页”确实发生在两个不同时间点。
-
-#### 已完成：把阅读环境本身当成 develop
-
-为了降低每次进入仓库的成本，我已经在本地增加了几项辅助设施：
-
-- `scripts/check-env.sh`：检查 make、Perl、bc、QEMU、GDB 和 RISC-V GCC；
-- `scripts/gentags`：为 `kernel/`、`user/`、`mkfs/` 生成 C/Assembly tags；
-- `compile_flags.txt`：让 clangd 理解 RV64、freestanding 和 xv6 include path；
-- `.vscode/tasks.json`：封装环境检查、构建、运行和清理；
-- `.vscode/settings.json`：指定交叉编译器和 C/Assembly 文件关联；
-- `docs/learning-env.md`：记录 WSL 安装、QEMU 运行和建议阅读顺序。
-
-这些改动没有改变 xv6 内核语义，却直接改善了源码跳转、编译反馈和实验复现。与此同时，这次 Makefile/GDB 不一致也暴露出工程化的另一面：工具配置必须能被命令验证，文档不能只凭印象维护。下一步应该先把 GDB task、Makefile target 和文档修到同一状态，再开始更深的内核修改。
-
-#### 下一步：把源码理解变成内核 develop
-
-我计划按下面的顺序修改 xv6，每一步只引入一个新机制：
-
-1. 增加只读调试型 syscall，例如输出进程的页表或运行 tick，熟悉 user stub 到 syscall table 的完整链路；
-2. 给 scheduler 增加每进程运行 tick 统计，验证 timer、锁和 proc 生命周期；
-3. 实现可切换的调度策略，例如在现有 round-robin 之外增加 priority，并用 CPU-bound 程序比较结果；
-4. 实现 copy-on-write fork，把 trap、PTE flag、引用计数和 TLB 刷新串起来；
-5. 把全局物理页 freelist 改成 per-CPU freelist，分析多核锁竞争和跨 CPU 回收；
-6. 继续进入 buffer cache、inode、logging 和 virtio 路径，追踪一次 `echo hello > file` 从 syscall 到磁盘中断的完整生命周期。
-
-其中第 1、2 步适合作为起点，因为行为容易观察，出错范围有限；第 4、5 步才开始真正考验并发不变量和内存一致性。
-
-### 一条更适合源码阅读的路线
-
-结合这次实践，我会按依赖关系而不是文件大小阅读：
-
-```text
-Boot
-  entry.S -> start.c -> main.c
-
-Execution
-  proc.h -> proc.c -> swtch.S
-
-Boundary
-  trampoline.S -> trap.c -> syscall.c -> kernelvec.S
-
-Memory
-  memlayout.h -> riscv.h -> kalloc.c -> vm.c -> exec.c
-
-Storage
-  bio.c -> log.c -> fs.c -> file.c -> sysfile.c -> virtio_disk.c
-
-User space
-  init.c -> sh.c -> ulib.c -> usys.pl
-```
-
-每读一组文件，我会固定回答四个问题：
-
-1. 谁调用它，它最终把控制权交给谁？
-2. 进入和离开时，CPU 的 `pc/sp/privilege/satp` 是什么？
-3. 哪些状态属于 CPU，哪些属于 proc，哪些是全局共享状态？
-4. 哪几行是在操作普通内存，哪几行是在通过 CSR/MMIO 与硬件交互？
-
-每次实验应保存断点位置、寄存器值与对应提交；修改上下文切换或页表时，还需验证失败回滚和多核同步。xv6 的教学实现不代表 Linux 等生产内核的调度、内存回收或设备支持。
-
-## 参考
-
-- 本地源码：MIT `xv6-riscv`，branch `riscv`，commit `5474d4b`
-- 仓库内 `README` 与 `docs/learning-env.md`
-- `kernel/entry.S`、`kernel/start.c`、`kernel/main.c`
-- `kernel/proc.c`、`kernel/swtch.S`
-- `kernel/trampoline.S`、`kernel/kernelvec.S`、`kernel/trap.c`
-- `kernel/kalloc.c`、`kernel/vm.c`、`kernel/exec.c`
+> **学习环境与源码基线**：本文源码基于 MIT `xv6-riscv` 仓库 `riscv` 分支提交 `5474d4b`（已内置 Lazy `sbrk` / `vmfault` 按需分配路径）。本地编译与运行实验在 x86_64 主机（AMD Ryzen AI 9 HX 370，WSL2 Linux `6.6.87.2`）上完成，工具链版本为 `riscv64-linux-gnu-gcc 13.3.0`、`qemu-system-riscv64 8.2.2` 与 `gdb-multiarch 15.1`。

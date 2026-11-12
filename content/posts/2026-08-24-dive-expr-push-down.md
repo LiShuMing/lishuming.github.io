@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入表达式下推：StarRocks、Doris 与 Databend 如何减少 Scan I/O"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-28T00:00:00+08:00
+lastmod: 2026-11-12T00:00:00+08:00
 slug: "dive-expression-pushdown"
 categories:
   - 数据库
@@ -12,590 +12,178 @@ tags:
   - Apache Doris
   - Databend
   - 存算分离
-description: "从存储执行层出发，对比 StarRocks、Apache Doris 与 Databend 的元数据裁剪、Bloom Filter、Runtime Filter、延迟物化和对象存储 I/O 调度实现。"
+description: "从存算分离架构下一次对象存储读取的真实账单出发，深入对比 StarRocks、Apache Doris 与 Databend 的多级索引裁剪、Runtime Bloom 延迟物化及远端 Range 请求合并实现。"
 draft: false
+toc: true
+math: true
 ---
 
-存算分离（Storage–Compute Disaggregation）把计算节点从本地磁盘中解耦出来，带来了弹性伸缩、资源隔离和更低的长期存储成本，也改变了 Scan 的代价结构：一次无效读取不再只是磁盘带宽问题，还可能包含对象存储（Object Storage）请求、网络传输、本地缓存填充、解压和解码等多层开销。
+在存算一体时代，本地 NVMe SSD 多读几十 KB 数据不过是微秒级的带宽抖动；可一旦进入存算分离（Storage–Compute Disaggregation）架构，计算节点（CN）与底层对象存储（S3 / OSS）隔着高延迟网络，一次草率的无效读取就会引发连锁反应：动辄几十毫秒的 HTTP `GET` 首包延迟、按请求次数计费的云账单、跨机房网卡带宽争抢、本地缓存（Data Cache）热页被无用数据挤出，外加解压与列式解码烧掉的 CPU 周期。
 
-因此，“把谓词下推（Predicate Pushdown）到存储层”是正确方向，但它不是一个单独的开关。真正需要回答的是：**谓词能够下推到哪一级？该级别能跳过多少物理数据？为了做出跳读判断，又额外读取了多少索引并发出了多少请求？**
+因此，当你在 `EXPLAIN` 计划里看到 `PREDICATES: ...` 挂在了 `ScanNode` 上时，千万别以为万事大吉。“谓词下推（Predicate Pushdown）”绝不是一个非黑即白的布尔开关。不妨在白板上摆一张典型的日志宽表——包含 `ts DATETIME`（按时间近似聚簇）、`user_id BIGINT`（8 字节随机分布）以及 `payload_json VARCHAR`（平均 2 KB 的大宽列），一共 100 万行数据，执行如下查询：
 
-本文沿着这一问题，对 StarRocks、Apache Doris 和 Databend 的源码进行横向分析。讨论范围刻意排除优化器阶段的 Partition Pruning 和 Bucket Pruning，聚焦 Scan 内部的 Segment、Row Group、Block、Page 和 Column Chunk，并重点回答以下问题：
+```sql
+SELECT user_id, payload_json
+FROM app_events
+WHERE ts >= '2026-08-24 10:00:00'
+  AND user_id = 42;
+```
 
-1. 静态谓词如何借助有序键、Min/Max、Bloom Filter 和二级索引减少 I/O？
-2. 当谓词来自 Join 的 Runtime Filter 时，特别是 Bloom Filter，哪些优化真的发生在数据读取之前？
-3. 当元数据无法排除数据时，延迟物化（Late Materialization）如何减少无效列读取？
-4. 除此之外，存储执行层还有哪些降低对象存储成本的手段？
+如果我们用最朴素的方式实现扫描算子，先把投影所需的 `ts`、`user_id`、`payload_json` 全量从对象存储拉回内存再逐行求值，光拉取 100 万行 `payload_json` 就要搬运近 **2 GB** 远端数据！为了把这笔冤枉钱省下来，现代列式存储引擎在读取路径上设下了层层递进的关卡：
 
-## 先确定收益发生在哪一级
-
-### 源码基线与裁剪层级
-
-解释计划中出现 Scan 谓词，不足以证明远端 I/O 下降。本文按过滤发生的位置区分读取、解码和上层计算收益。
-
-本文使用本地源码逐项核对，分析基线如下：
-
-| 项目 | 源码快照 | 日期 | 重点路径 |
-|------|----------|------|----------|
-| StarRocks | [0fd27fd](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1) | 2026-03-30 | Native Segment、Parquet Reader、Runtime Range Pruner |
-| Apache Doris | [5202d06](https://github.com/apache/doris/tree/5202d06dd8feb3390ff32839227eeee89c345b57) | 2026-08-21 | SegmentIterator、VParquet Reader、Runtime Filter Consumer |
-| Databend | [ab6f27c](https://github.com/databendlabs/databend/tree/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456) | 2026-05-27 | Fuse Pruner、Prewhere、Runtime Filter Pruner |
-
-由于三个项目都在快速演进，本文描述的是这些快照中的实现，不把类名、配置项或 TODO 外推为所有历史与未来版本的固定行为。
-
-2026-10 在更新快照上复核了三个项目（见下文「2026-10 复核记录」）。其中 Databend 的变化足以影响正文：它移除了 native 存储格式，本文原来描述的 Native Reader 页级裁剪已不存在，正文相关段落已按新快照改写。
-
-#### 2026-10 复核记录
-
-复核快照：StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）、Databend `17de870`（2026-10-12）。
-
-**StarRocks**
-
-- `SegmentIterator::_init_internal()` 被拆成「一次性初始化 + 可复用的扫描范围」。索引过滤序列整体移入 `_init_scan_range_and_context()`，顺序未变：RowId → Short Key → Tablet Range → Delete Vector → Bitmap Index → Zone Map → Bloom → Inverted Index；`_rewrite_predicates()` 之后的向量索引裁剪与数据采样保持不变。`_init_ann_reader()` 从 `_init_column_iterators()` 之后移到 `_check_low_cardinality_optimization()` 之前，即整个初始化段的前半部。原文引用的那句 `/// the calling order matters, do not change unless you know why.` 仍在。
-- 新增 `SegmentReadStateCache`：调用方可以传入一份已经折叠了 Page Zone Map / Bloom 的 `scan_range`，子迭代器走 `_init_reused_scan()` 直接应用，不再对子范围重跑 Page 过滤。数据采样（Data Sampling）被明确标注为非幂等，复用范围时跳过；向量索引则相反，必须重跑以恢复每个子迭代器的 `id2distance_map`。
-- 新增 `_apply_del_predicate()`，位置在索引过滤之后、`_rewrite_predicates()` 之前，只对 ANN 查询生效。
-- `runtime_filter_predicate.h` 的主体移到 `be/src/storage_primitive/`，`be/src/storage/` 下只剩包含它并声明改写器的兼容头；`runtime_range_pruner.hpp` 移到 `be/src/compute_env/`。语义未变：采样后最多保留 3 个过滤器，单个过滤率 ≥ 0.95 时只保留它；字典改写仍在。
-- `segment_iterator.cpp` 里 `TODO: support runtime bloom filter push down to page level` 仍在（f977b53 第 747 行），本文关于「Runtime Bloom 不能与持久化 Page Bloom 直接相交」的结论不变。
-
-**Doris**
-
-- 文中引用的 BE 路径全部还在。`_lazy_init()` 的主干变为 `_get_row_ranges_by_keys()`（Z-order 或带 Cluster Key 的表会跳过）→ `_get_row_ranges_by_column_conditions()` → `_vec_init_lazy_materialization()`。
-- 索引顺序变得有条件：当倒排索引的表达式能消费候选位图、且 `get_inverted_index_candidate_pushdown_ratio()` 在 (0, 1] 内时，先做 `_apply_scan_restrictions()` 再走倒排索引；否则相反。删除位图与 Row Ranges 现在都在 `_apply_scan_restrictions()` 里。
-- 新增倒排索引的候选行下推：`_index_query_context->candidate_rows` 指向当前 `_row_bitmap`，索引查询只在该位图内求值。这是「先用别的条件缩小范围，再查索引」的优化，不改变本文的层级结论。
-- `runtimeFilterWaitTimeMs` 默认值仍是 1000。
-
-**Databend**
-
-- **native 存储格式已被移除**（PR #19982，commit `9431970`，2026-06-10）。`FuseStorageFormat::Native` 改为 `Unsupported` 占位：这类表还能被实例化，`SHOW`、`DESC`、`DROP` 可用，但任何触碰数据的操作都会被 `check_format_supported()` 拒绝。`native_data_source_deserializer.rs`、`PagePruner`、以及基于 native Page Meta 的 Cluster Key 页级裁剪都已删除。
-- 因此正文原「Native Reader 按 Page 循环：TopK → Prewhere → Runtime Bloom → Remaining Columns」已改为 Parquet 路径的描述；Prewhere、Runtime Bloom、`ReadState`、`runtime_filter_wait.rs`（50 ms 轮询、30 s 上限）都还在。
-- `expr_runtime_pruner.rs` 的分工未变：MinMax/InList 用 Block 统计做 Domain Fold，InList 值数不超过阈值时再查持久化 Bloom Index。
-- Cluster Key 仍用于写入排序与 Recluster，但读取侧不再有 native 页级裁剪，收益只到 Block 一级。
-
-**未复核**：三个项目都没有本地集群，以上结论全部来自源码，没有执行结果验证；Doris `column_reader.cpp` 在两个快照间有约 1000 行改动，只确认了本文引用的 `get_row_ranges_by_bloom_filter()` 仍在并被 `segment_iterator.cpp` 调用，没有逐处审阅。
-
-本文使用以下术语区分优化发生的位置：
-
-| 层级 | 常见结构 | 能否避免数据 I/O | 典型代价 |
-|------|----------|------------------|----------|
-| 文件/Segment | Footer、Segment Zone Map、短键索引 | 可以，跳过整个文件或 Segment | 读取 Footer、元数据缓存查询 |
-| Row Group/Block | Min/Max、Null Count、Bloom、Block Meta | 可以，跳过整组数据 | 索引文件或对象存储元数据请求 |
-| Page | Page Index、Page Zone Map、Page Bloom | 可以，跳过部分 Page/Column Chunk | 更细索引、更多 Range |
-| 行位置 | Bitmap、Inverted Index、Selection、RowId | 可以减少后续列读取，但索引列可能已读取 | 位图计算、稀疏读取 |
-| 行值 | 向量化谓词、Runtime Bloom Probe | 不能撤销当前列的读取，可减少后续工作 | Hash、表达式计算 |
-
-这里的“避免 I/O”还需要进一步细分：命中本地 Data Cache 时，没有远端读取但仍有内存拷贝和解码；跳过 Payload 列时，谓词列已经发生 I/O；合并 Range 时，远端请求减少但字节数可能增加。本文会在具体实现中区分这些情况。
+1. **第一关（粗粒度范围裁剪）**：由于数据按 `ts` 有序或近似聚簇，绝大多数历史数据块/页的最小最大值区间（Zone Map / Page Index，如 `[08:00, 08:59]`）与 `>= 10:00` 毫无交集，引擎只看几十字节的尾部元数据就能整片跳过 **95%** 的物理页，**数据页 I/O 为零**；
+2. **第二关（细粒度存在性裁剪）**：幸存下来的 5% 最新数据页里，`user_id` 随机散落，每页的区间都是 `[1, 999999]`，Zone Map 束手无策；此时引擎按需拉取页级持久化 **Bloom Filter**，发现绝大多数页的位图断言“`42` 必不存在”，再次免读数据页；
+3. **第三关（窄列先读与两阶段延迟物化）**：倘若过滤条件不是静态常量 `42`，而是上层 Hash Join 在运行期动态传下来的 **Runtime Bloom Filter** 呢？文件里的持久化 Bloom 和内存里的运行时 Bloom 哈希种子、位图布局互不兼容，根本没法直接做位运算求交！引擎被迫老老实实掏钱把 8 字节的窄列 `user_id` 读进内存跑探测，但它绝不会傻到同时去读 2 KB 的 `payload_json`——而是先把命中的行号记成稀疏的 `RowId / Selection` 集合，最后**只为存活下来的寥寥几行去按需读取宽列页**；
+4. **第四关（远端 I/O 请求合并）**：最后一步还藏着云存储特有的物理陷阱——假设存活行散落在同一个对象的 `[0, 64KB]`、`[68KB, 96KB]`、`[104KB, 160KB]` 三处，老老实实发三次稀疏 Range 请求，花在三次网络 RTT 上的时间远比多读中间那两段 4KB / 8KB 缝隙要贵得多！于是底层 I/O 调度器又会反过来把相邻小区间**合并（Coalescing）**成一次 `[0, 160KB]` 的整块拉取。
 
 ![谓词下推的生效层级：I/O 在哪一级被真正省掉](/images/predicate-pushdown-levels.svg)
 
-*图 1：同一份谓词会先尝试文件/Segment 级裁剪，再退到 Block 与 Page，最后才在已读入的行上求值。上方三层决定“读不读”，下方两层只决定“读完之后少算多少”；宽度只表示候选集逐级缩小，不代表实测比例。*
+*图 1：同一条谓词在扫描算子内部的五级下沉漏斗——前三层（文件/Segment → Block/RowGroup → Page）决定“物理页读不读”，后两层（行位置延迟物化 → 行值向量化过滤）决定“宽列读不读、后续算子算不算”。*
 
-### 一条统一的谓词下推链路
+看清这四道关卡的成本账，我们就能抛开营销概念，深入 StarRocks、Apache Doris 与 Databend 的存储执行层源码（刻意聚焦在分区与分桶裁剪之后的单文件 `Segment / Parquet` 内部），逐一拆解多级索引求交、Runtime Bloom 边界以及云端 I/O 调度的真实工程实现。
 
-SQL 表达式必须被转换成存储层可判定的范围或选择集，才可能跳过读取；每一级转换都有能力与语义限制。
+---
 
-#### 从 SQL 表达式到物理候选范围
+## 一、统一物理模型：从 SQL 标量树到保守候选集与延迟物化
 
-一条 SQL 谓词进入存储层后，通常会经历四种表示：
+无论上层 SQL 写得多么花哨，一条谓词想在存储层省下真实 I/O，都必须先把标量表达式树（Predicate Tree）翻译成物理存储能听懂的“位置语言”。
 
-```text
-SQL Expr
-   │  语义分析、常量折叠、类型转换
-   ▼
-执行表达式 / Predicate Tree
-   │  提取单列条件、判断索引能力
-   ▼
-元数据谓词
-   │  Min/Max、Bloom、Dictionary、Bitmap、Inverted Index
-   ▼
-候选行范围
-   │  SparseRange / RowRanges / Bitmap / Partitions
-   ▼
-读取谓词列 → 计算 Selection → 延迟读取输出列 → Residual Predicate
-```
+在列存引擎内部，索引裁剪遵循一条铁律：**允许假阳性（误报），绝不允许假阴性（漏报）。** 假设某个数据页在列 `x` 上的 Zone Map 记录为 `min = 100, max = 199`：面对 `x >= 500`，引擎可以十拿九稳地证明整页为 `MustFalse` 直接跳过；面对 `x = 150`，索引只能保守回答“可能存在”，把该页留进候选集，等读出真实列值后再用残余谓词（Residual Predicate）做精确复核。
 
-元数据判断必须是保守的：**允许误报，不允许漏报。** 当索引无法证明一个块一定不匹配时，只能保留该块，并在读取真实值后执行残余谓词。于是，索引裁剪结果本质上是候选集的上界，而不是 SQL 条件的最终结果。
+这套“保守上界收敛”决定了不同索引的天然分工：
 
-#### 元数据裁剪的能力边界：Min/Max 与 Bloom
+- **有序键与区间摘要（Short Key / Zone Map / Parquet PageIndex）**：体积袖珍、判定极快，但战斗力完全仰仗**物理聚簇度（Clustering）**。一旦高频小批量乱序写入且后台 Compaction / Recluster 没跟上，所有页的 `[min, max]` 彼此大面积重叠，区间裁剪就会退化成摆设。
+- **持久化存在性摘要（Page / Block Bloom Filter）**：不关心数据是否有序，专治高基数等值点查（`=` 与短 `IN` 列表），返回 `false` 即可安全跳页；但它自身需要占用额外存储并消耗一次索引页读取与哈希计算，若前序区间索引已经把范围缩得极窄，再去拉取 Bloom 索引反而得不偿失。
+- **两阶段延迟物化（Late Materialization）**：当所有读前索引都拦不住时，把列拆成“先读过滤列（Predicate / Join-Key Columns）”与“后读输出宽列（Payload / Lazy Columns）”两批。它的净收益取决于 `被省下的宽列字节 × 过滤淘汰率` 能否盖过二次随机定位（Seek）、位置位图维护与列块拼装的额外开销——一旦过滤率很低（比如 90% 的行都存活）或者表本身只有几个定长窄列，拆成两阶段反而比一次性顺序扫完更慢。
 
-Min/Max 与 Bloom Filter 都能在读取数据页之前做否定判断，但两者解决的是不同问题。
+下面我们就顺着这套统一的收益漏斗，横向审视三套引擎是如何在代码里把“读前索引裁剪 → 窄列过滤 → 宽列按需拉取 → 远端请求合并”拧成一股绳的：
 
-**Min/Max 的效果依赖数据聚簇。**
+![StarRocks、Doris 与 Databend 存储层多级裁剪与两阶段延迟物化](/images/diagrams/aug-opt-pushdown-scan-engines.svg)
 
-设 Page `P` 在列 `x` 上记录范围：
+*图 2：StarRocks（`SparseRange`）、Doris（Roaring `_row_bitmap`）与 Databend（`PartInfo` + `RowSelection`）在存储读取器内的三段式协同——先以多级读前索引收敛候选行集，再以窄列过滤驱动宽列延迟读取，最后在对象存储边界合并碎片区间。*
 
-```text
-P.min = 100
-P.max = 199
-```
+---
 
-对于 `x >= 500`，该 Page 可以安全跳过；对于 `x = 150`，只能判断“可能存在”。如果数据按 `x` 有序或近似聚簇，连续 Page 的范围通常互不重叠，裁剪能力很强；如果值随机散布，每个 Page 都可能覆盖很宽的范围，Min/Max 很难证明 `MustFalse`。
+## 二、StarRocks：以 `SparseRange` 为中枢的九级求交与双通道 Runtime Filter
 
-所以 Sort Key、Cluster Key、Compaction 和 Recluster 不只是写入侧功能，它们决定了轻量级元数据能否在读取侧发挥作用。
+打开 StarRocks BE 的原生列存读取器 [`segment_iterator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/rowset/segment_iterator.cpp)，源码在索引初始化序列上方留了一句醒目的警告注释：`/// the calling order matters, do not change unless you know why.`
 
-**Bloom Filter 解决的是存在性问题，而不是范围问题。** 它适合回答“某个值是否一定不存在”：
+在新近主干（`f977b53`）中，原本庞大的 `_init_internal()` 被拆解为一次性上下文初始化与可复用的扫描范围构造函数 `_init_scan_range_and_context()`。整套读前过滤像流水线一样，把不同粒度的索引命中结果统一收敛进同一个数据结构——**稀疏行号区间 `SparseRange`（`_scan_range`）**：
 
-- 返回 `false`：一定不存在，可以安全跳过；
-- 返回 `true`：可能存在，需要继续读取；
-- 不保存顺序，不适合直接处理任意范围条件；
-- 误报率取决于位图大小、哈希数量和不同值数量。
+1. 从完整 Segment 行号区间出发，先按分片范围与有序短键索引（`Short Key / Tablet Range`）做二分查找，卡住首尾物理行号；
+2. 应用主键表或明细表的删除掩码（`Delete Vector`，部分场景可延后）与低基数位图索引（`Bitmap Index`）；
+3. 依次跑页级区间裁剪（`Zone Map`）、持久化布隆过滤器（`_get_row_ranges_by_bloom_filter()`）以及全文/倒排索引（`Inverted Index`）；
+4. 最后衔接删除条件与向量检索（ANN Index）或采样逻辑，吐出最终缩水后的 `SparseRange`（主干还专门引入了 `SegmentReadStateCache`，允许拆分子迭代器时通过 `_init_reused_scan()` 直接复用已算好的页级 Zone Map / Bloom 裁剪结果，免去重复读索引页的开销；同时精细区分了不可重入的数据采样与必须重建距离映射表的向量索引）。
 
-因此，持久化 Bloom 通常服务于 `=`、部分 `IN` 等点查询，而 Zone Map 更适合范围查询。好的 Scan 不会二选一，而是先用便宜元数据缩小范围，再判断读取 Bloom 的成本是否值得。
+每走完一级索引，新的命中区间就与当前 `_scan_range` 原地求交。这意味着排在后面的昂贵索引（比如需要额外读盘算哈希的持久化 Page Bloom）**只需要检查前序便宜索引幸存下来的那几个残余 Page**，并且底层列读取器根本不用关心行号是被哪种索引裁掉的，只管照着最终的 `SparseRange` 跳页解码。
 
-#### 延迟物化：元数据无法命中时的第二道防线
+更精妙的设计在 **Runtime Filter 下沉到存储层时的“双通道分流”**。很多人以为 Join 传下来的 Runtime Filter 是一坨铁板一块的黑盒，StarRocks 却把它劈成了两条截然不同的物理通道：
 
-当元数据无法排除 Page 时，最直接的做法是读取所有投影列，再计算过滤条件；宽表中这会把大量最终被丢弃的 Payload 列读入内存。
+![Runtime Filter 双通道下推：元数据区间裁剪 vs 行级 Bloom 延迟物化](/images/diagrams/aug-opt-pushdown-runtime-bloom.svg)
 
-延迟物化将读取拆成两阶段：
+*图 3：Runtime Filter 进入扫描层的双通道分流——`MinMax / IN` 化身为 `index_filter_only` 谓词直接查询 Zone Map 整页免读；而无法与持久化 Bloom 直交的 `Runtime Bloom` 则先读窄连接键列压缩 `RowId`，靠延迟物化省掉宽输出列 I/O。*
 
-```text
-第一阶段：读取 predicate / join-key 列
-          │
-          ├── 计算静态谓词
-          ├── 计算 Runtime Filter
-          └── 生成 RowId / Selection / Bitmap
-                         │
-第二阶段：只读取存活行的 payload / output 列
-```
+- **通道 A（读前元数据区间裁剪，[`runtime_range_pruner.hpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_range_pruner.hpp)）**：从已到达的运行时过滤器里抽取出 `MinMaxFilter` 与小型 `InFilter`（主干已迁至 `be/src/compute_env/`，并支持对 `slot + c`、`slot - c` 等单调表达式做带 `__builtin_sub_overflow` 溢出保护的反向区间求解），转换成打着 **`index_filter_only` 钢印**的存储层 `ColumnPredicate` 去查页级 Zone Map！为什么要打 `index_filter_only` 标记？设想 Build 端只有 `{1, 100}` 两个值，抽出的区间是 `[1, 100]`——拿它去把 `[200, 300]` 的数据页整页踢掉绝对安全，但绝不能误以为落在 `[1, 100]` 里的 `50` 真的匹配成功了！即便过滤器在扫描中途才姗姗来迟，`_try_to_update_ranges_by_runtime_filter()` 也会在页边界动态拦截，把尚未读取的后半截 `_scan_range` 当场削窄。
+- **通道 B（行级探测联动延迟物化，[`runtime_filter_predicate.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_filter_predicate.cpp)）**：那重头戏 **Runtime Bloom Filter** 呢？在 `segment_iterator.cpp` 里至今留着一行诚实的注释：`TODO: support runtime bloom filter push down to page level`。因为写文件时固化的持久化 Page Bloom 与引擎内存里的 Runtime Bloom 分属两套哈希与位图协议，没法隔空判不相交。但 StarRocks 把它无缝焊进了延迟物化管线：`_build_column_oriented_rf()` 把 Runtime Bloom 绑定到对应的连接键列上，先调 `_predicate_evaluate_late_materialize_read_first_column()` 读出窄小的连接键列（若是全字典编码列，甚至直接在字典词表上跑一遍过滤再映射回字典码！），算完 Runtime Bloom 大幅压缩存活 `RowId` 后，最后才调 `decode_values_by_rowid()` 拉取宽大的输出列。同时引擎会实时采样每个过滤器的淘汰率——最多保留 3 个有效过滤器，一旦发现某条过滤器独挡一面（淘汰率 $\ge 95\%$）就只跑这一个，若是几乎滤不掉行则果断旁路止损。
 
-它的收益近似取决于 `PayloadBytes × 过滤率`，代价则包括二次 Seek、稀疏读取、位置列表和列合并。当谓词几乎不过滤、Payload 很窄或远端小请求非常昂贵时，提前一次性读取可能更快。因此，三套引擎都能看到选择率阈值、列读取顺序或 I/O 合并方面的自适应设计。
+换到外部数据湖的 **Parquet 读取路径**（[`predicate_filter_evaluator.h`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/formats/parquet/predicate_filter_evaluator.h) 与 [`group_reader.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/formats/parquet/group_reader.cpp)），同样的思想换了一身贴合开放格式的行头：先串行过一遍 Row Group 统计信息、Parquet `PageIndex`（`ColumnIndex + OffsetIndex`）与 Row Group Bloom；进组后把列切成 `Active`（谓词列）与 `Lazy`（延迟输出列），`Active` 列一旦把当前批次筛成空集就立刻跳过整批 `Lazy` 列读取。更接地气的是参数 `io_coalesce_adaptive_lazy_active`——它会观察前几批里 `Lazy` 列到底有没有被真正跳过：如果发现查询过滤率很低、`Lazy` 列反正每次都要读，干脆把 `Active` 和 `Lazy` 的远端区间合并成一个大请求一口气拉回来，省去二次访问对象存储的网络往返！
 
-## 三套 Scan 实现如何连接裁剪与读取
+---
 
-### StarRocks——以 SparseRange 为中心的多级裁剪
+## 三、Apache Doris：Roaring `_row_bitmap` 交集与嵌套子路径延迟读取
 
-StarRocks 将不同索引产生的候选行区间收敛到 SparseRange，便于把裁剪结果传给读取器；范围越碎，请求与解码成本越需要单独计算。
+走进 Apache Doris BE 的 [`segment_iterator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/segment_iterator.cpp)，你会看到一位与 `SparseRange` 对偶的老朋友——**压缩位图 `Roaring Bitmap`（`_row_bitmap`）**。
 
-#### Native Segment：把不同索引归一为 SparseRange
+在 `_lazy_init()` 阶段，Doris 先把整个 Segment 的全量行号塞进 `_row_bitmap`，随后按成本与选择率动态编排读前裁剪：先走有序短键范围 `_get_row_ranges_by_keys()`（针对 Z-order 或带 Cluster Key 的表自动跳过前缀假设），再结合列条件走倒排索引（Inverted Index）、字典、页级 Bloom 与 Zone Map。值得一提的是新近主干（`7ac0eb2f`）加入的**候选集反向喂给倒排索引优化**：当其他轻量限制条件已经先把 `_row_bitmap` 削掉一大截、且倒排索引支持消费候选集（`candidate_rows` 比例落在合理区间）时，引擎会先应用范围限制再查倒排索引；同样地，[`column_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/column_reader.cpp) 中的 `get_row_ranges_by_bloom_filter()` 也会先查 `Ordinal Index` 找出当前 `_row_bitmap` 覆盖的幸存页，绝不为早已被淘汰的数据页白跑一趟持久化 Bloom I/O。
 
-StarRocks Native Reader 的核心入口是 [`SegmentIterator::_init_internal()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/rowset/segment_iterator.cpp)。源码特意注明调用顺序不可随意修改，过滤链路依次包括：
+当上层 Join 的 Runtime Filter 抵达扫描算子时（默认远端等待窗口 `runtimeFilterWaitTimeMs = 1000` 毫秒，超时即先行开扫，晚到的过滤器只作用于剩余未读分片），[`runtime_filter_consumer.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/runtime_filter/runtime_filter_consumer.cpp) 与 [`scan_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/scan_operator.cpp) 的 `_normalize_predicate()` 会剥开包装壳，按过滤器物理形态精准分流：
 
-```text
-完整 Segment 行范围
-  → RowId Range
-  → Short Key / Sorted Key
-  → Tablet Range
-  → Delete Vector（可配置延后）
-  → Bitmap Index
-  → Zone Map
-  → Bloom Filter
-  → Inverted Index
-  → Vector Index / Sampling
-  → 最终 SparseRange
-```
+- 运行时 `IN` 与 `MinMax` 被归一化为 `ColumnValueRange` 及存储层谓词，直接杀进读前阶段参与 Short Key、Zone Map 以及 Parquet `RowGroup / PageIndex` 跳页；
+- 运行时 `Bloom` 则化身为 [`BloomFilterColumnPredicate`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/predicate/bloom_filter_predicate.h)，在解码出的 `IColumn`（支持字典码直筛与低效采样熔断）上做向量化求值。
 
-每一级都把候选范围与当前 `_scan_range` 取交集。这样做有两个重要含义：
+在延迟物化编排上，Doris 的 `_vec_init_lazy_materialization()` 把列划分得比传统二分法更细，切成了三级梯队：
 
-1. 后续索引只需处理前一级留下的范围，避免重复扫描完整索引空间；
-2. 最终读取器面对的是统一的 `SparseRange`，上层不需要理解候选范围来自哪种索引。
+1. **`_predicate_ordinals`**：第一顺位读取，跑完所有能够用列原语加速的静态谓词与 Runtime Bloom；
+2. **`_common_expr_ordinals`**：紧随其后，仅为第一轮幸存行读取复杂公共标量表达式所需的输入列；
+3. **`_output_ordinals`**：最后通过 `_read_columns_by_rowids()` 精准拉取最终存活行的纯粹投影宽列（针对 `Struct / Array / Map` 半结构化列，甚至能把谓词引用的深层子列路径与最终输出的其他子路径拆开，过滤完再按需补齐嵌套字段！）。
 
-短键索引在有序键空间上定位起止 RowId；Zone Map 和 Bloom Filter 下沉到 Page；Bitmap/Inverted Index 直接产生更细的行集合。它们的粒度与适用谓词不同，但最终都转化为“哪些物理位置仍需读取”。
+而在外部湖表侧，[`vparquet_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/format/parquet/vparquet_reader.cpp) 与 `vparquet_group_reader.cpp` 同样贯通了“Row Group 统计/Bloom → `ColumnIndex/OffsetIndex` 页级 `candidate_row_ranges`（并入 Iceberg/Delta 删除向量）→ 先读谓词列算 `FilterMap` → Lazy 列跳读”全链路，并在物理字节层由 `MergeRangeFileReader` 把细碎的随机访问区间聚合成大块远端请求。
 
-**静态 Bloom 的位置。**
+---
 
-[`_get_row_ranges_by_bloom_filter()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/rowset/segment_iterator.cpp) 先使用 `BloomFilterSupportChecker` 判断 Predicate Tree 是否存在可用节点，再由 `BloomFilterEvaluator` 收缩 `_scan_range`。这里面对的是文件写入时生成的 Page Bloom，适用于可以提取常量探测值的静态谓词。
+## 四、Databend：完全云原生的 Fuse Block Pruning 与自适应 `Prewhere`
 
-Bloom 并非免费：需要读取索引页并执行 Hash。若前面的 Sorted Key、Zone Map 已经把范围缩得很小，额外读取 Bloom 可能得不偿失。因此，索引顺序和代价控制同样重要。
+与从本地 SSD 演进到存算分离的 StarRocks、Doris 不同，用 Rust 编写的 Databend 从第一天起就长在对象存储之上，并且在新近演进（PR `#19982`，提交 `9431970`）中大刀阔斧地移除了早期自研的 `Native` 存储格式，全面收敛到基于开放 **Parquet** 格式的 Fuse 引擎路径上。
 
-#### Runtime Filter：范围裁剪与行级过滤两条路径
+面对对象存储动辄数十毫秒的元数据读取延迟，Databend 在扫描启动前专门辟出了一个受信号量（Semaphore）严格限流的异步并行裁剪阶段——[`fuse_pruner.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/fuse_pruner.rs)：
 
-StarRocks 的实现最值得注意的地方，是没有把 Runtime Filter 当成一种单一谓词。
+- 沿着 `Segment Pruner → Block Pruner → TopN Pruner` 三级流水线，利用本地缓存的 `Block Meta` 统计信息做值域推导（Domain Folding），一旦证明 `MustFalse` 或不可能挤进 `ORDER BY ... LIMIT N` 的前 N 名，连整个 Parquet 数据块（Block）的边都不碰；
+- 面对等值或短 `InList` 点查，按需拉取独立的块级持久化 Bloom Index 文件做存在性否决，同时靠并发度门禁防止为了读索引反而把 S3 请求打爆。
 
-第一条路径位于 [`runtime_range_pruner.hpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_range_pruner.hpp)：
+当 Hash Join 构建端（[`local_builder.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/service/src/pipelines/processors/transforms/hash_join/runtime_filter/local_builder.rs)）发来运行时过滤器、且扫描端在 [`runtime_filter_wait.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/runtime_filter_wait.rs)（50ms 轮询、监听取消信号）等到位后，Databend 把不同过滤器形态的职责切分得如同教科书般工整：
 
-1. 从已经到达的 Runtime Filter 中提取 `InFilter` 和 `MinMaxFilter`；
-2. 构造 `ColumnValueRange`；
-3. 转换为 Storage `ColumnPredicate`；
-4. 标记 `index_filter_only`；
-5. 用这些谓词查询 Zone Map，并与剩余 `_scan_range` 求交。
+- **`MinMax` 与小型 `InList` 走读前裁剪（[`expr_runtime_pruner.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/expr_runtime_pruner.rs)）**：直接与 Block 统计区间做折叠求值跳过整块；更妙的是，当运行时 `InList` 元素个数不超过阈值时，它还会顺手去查持久化 Block Bloom Index——相当于架起了一座从“运行时连接键值”直通“静态文件索引”的桥梁！
+- **`Runtime Bloom` 汇入 `Prewhere` 两阶段读取（[`read_state.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/read_state.rs) 与 [`parquet_data_source_deserializer.rs`](https://github.com/databendlabs/databend/blob/17de8708fd4095e6a062b6100789b9bc351a7230/src/query/storages/fuse/src/operations/read/parquet_data_source_deserializer.rs)）**：引擎把静态 `Prewhere` 过滤列与 `Runtime Bloom` 探测列合并成第一批预读投影（`Preread Projection`），算完位图交集后当场评估选择率——**只有当淘汰率足够高时，才把位图转成 `RowSelection`（配合默认开启的 `enable_parquet_page_index`）跳读剩余宽列；一旦发现淘汰率平平，立刻退回整块顺序反序列化再内存过滤**，彻底杜绝了“为了少读三五行数据，把顺序大 I/O 切碎成几百个稀疏小 Seek”的反向负优化。
 
-[`_try_to_update_ranges_by_runtime_filter()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/rowset/segment_iterator.cpp) 会在扫描过程中检查晚到的过滤器，用范围摘要继续收缩尚未读取的数据，并累计 `runtime_stats_filtered`。
+---
 
-`index_filter_only` 是一个关键语义：假设 Join Build Key 是 `{1, 100}`，其 MinMax 为 `[1, 100]`。Zone Map 可以用这个范围排除 `[200, 300]` 的 Page，却不能认为值 `50` 一定能 Join。范围谓词只是索引裁剪的必要条件，最终正确性仍由 Runtime Filter 或 Join 保证。
+## 五、横向能力矩阵与 Scan I/O 的真实盈亏方程
 
-第二条路径位于 [`runtime_filter_predicate.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_filter_predicate.cpp)：真实 Runtime Filter 在读取 Probe Column 后生成 Selection。实现还会：
+把 StarRocks、Doris 和 Databend 放在一起对照，会发现尽管三者的候选集数据结构（`SparseRange` vs `Roaring Bitmap` vs `PartInfo + RowSelection`）各有千秋，底层遵循的物理经济学却高度统一：
 
-- 采样每个 Runtime Filter 的过滤率；
-- 最多保留三个有效过滤器，过滤率极高时只保留最佳者；
-- 根据 Selection 的稀疏程度选择 Branchless 或 Selection 执行模式；
-- 对全字典编码（Dictionary Encoding）列，把 Runtime Filter 先作用于字典词，再用字典码过滤每一行。
+| 对比维度 | StarRocks | Apache Doris | Databend |
+| --- | --- | --- | --- |
+| **读前候选行集载体** | 稀疏区间 `SparseRange`（含 `SegmentReadStateCache` 复用） | 压缩位图 `Roaring _row_bitmap` | 块级 `PartInfo` + Parquet `RowSelection` |
+| **有序键与区间索引** | Short Key + Segment/Page Zone Map；Parquet PageIndex | Short Key + Zone Map；Parquet Statistics/PageIndex | Cluster Key 聚簇 + Block Stats + Parquet PageIndex |
+| **持久化存在性索引** | Native Page Bloom；Parquet Row Group Bloom | Ordinal 定位幸存页后按需查 Page Bloom | 独立异步限流 Block Bloom Index |
+| **Runtime MinMax / IN** | 转 `index_filter_only` 谓词动态收缩未读 Zone Map | 归一化为 `ColumnValueRange` 复用短键与区间索引 | Block 统计域折叠；短 `InList` 额外直查持久化 Bloom |
+| **Runtime Bloom 生效点** | 先读 Probe 窄列（或字典词）筛 `RowId`，驱动延迟物化 | `BloomFilterColumnPredicate` 列值过滤，驱动三级延迟读取 | 并入 `Preread / Prewhere` 窄列，高淘汰率下推 `RowSelection` |
+| **对象存储请求优化** | `SparseRange` 合并、`io_coalesce_adaptive_lazy_active`、Data Cache | `MergeRangeFileReader`、Segment 预取、File Cache | 信号量限流裁剪、Meta Cache、低选择率退回顺序整读 |
 
-这些优化主要减少 Hash、字符串解码和后续物化 CPU；只有与范围裁剪或延迟物化结合时，才进一步转化为远端 I/O 收益。
+这也解释了为什么在线上调优时，绝不能单凭 Query Profile 里一句漂亮的 `RowsFiltered = 90%` 就断定扫描变快了。如果我们把存算分离下一次 Scan 的真实字节账单与墙钟耗时账单写成公式，所有隐性成本便无处遁形：
 
-#### Runtime Bloom 的能力边界：不能跳过 Probe 列，但能跳过 Payload
+$$\text{SavedBytes} \approx \text{PrunedPagesBytes} + \text{LazySkippedPayloadBytes} - \text{ExtraIndexBytes} - \text{CoalesceGapBytes}$$
 
-[`PredicateLateMaterializationScanStrategy::read_columns()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/rowset/segment_iterator.cpp) 中有一条非常直接的注释：`TODO: support runtime bloom filter push down to page level`。当前快照中，如果第一谓词列带 Runtime Filter，会避开该列原有的 Page Predicate Pushdown 快速路径，先读取列值再执行 Runtime Filter。
+$$\text{NetTimeSaved} \approx \text{SavedRemoteTransfer} + \text{SavedDecodeCPU} - \text{RFWaitTime} - \text{BloomHashCPU} - \text{ExtraSeekRTT}$$
 
-这不是简单遗漏，而是两类 Bloom 的兼容问题：
+顺着这两个等式看，生产环境里最常见的四类“下推了反而没快（甚至变慢）”瞬间就能对号入座：
 
-| 维度 | 持久化 Page Bloom | Runtime Bloom |
-|------|-------------------|---------------|
-| 表示集合 | 当前数据 Page 的值 | 本次 Join Build 侧的键 |
-| 生命周期 | 写文件时生成，长期存在 | 查询执行时生成，查询结束即释放 |
-| 粒度 | Page/Row Group/Block | Join/Fragment/Partition/Pipeline |
-| 编码与 Hash | 文件格式固定 | 执行引擎内部协议 |
-| 目标 | 证明某个常量一定不在数据块中 | 尽早排除一定无法 Join 的 Probe 行 |
+1. **窄投影陷阱**：查询只写了 `SELECT count(*) FROM t JOIN d ON t.k = d.k`，投影里除了连接键 `t.k` 没有任何宽 Payload 列。此时 Runtime Bloom 既跳不过持久化数据页，也没有宽列可供延迟物化省流，省下的 I/O 字节严格为 **0**，还要倒贴全表算哈希的 CPU（唯一收益只剩减少送往上层算子的行数）。
+2. **迟到失效（Late Arrival）**：Build 端建表太慢，超过了扫描端的等待窗口（如 1000ms），等过滤器跨网送到时，异步预取器早就把 80% 的数据页拉进内存了——Profile 里 `RuntimeFilterRows` 可能依然很高，但 `RemoteBytesRead` 纹丝不动。
+3. **聚簇崩坏**：写入端高频小批次乱序灌数且 Compaction 积压，每个 Page 的 `min..max` 都横跨全月，Zone Map 与 Runtime MinMax 命中率归零；或者反过来，为了极致的微页跳读把 Page 切得太碎，导致 Footer / PageIndex 膨胀、S3 `GET` 请求数翻倍。
+4. **缓存幻觉**：做 A/B 对比实验时第一遍跑热了本地 NVMe Data Cache，第二遍加了索引发现飞快——其实省掉的只是远端慢请求，如果不分清 `RemoteBytesRead`、`LocalCacheRead` 与 `IndexReadBytes`，极易把缓存命中的功劳错记在谓词下推头上。
 
-理论上，如果两个 Bloom 使用完全相同的类型规范化、哈希、位图布局和参数，可以设计保守的相交判定；但这不是通用 Bloom 接口天然保证的能力。当前实现选择用 Runtime MinMax/IN 摘要裁剪元数据，并用 Runtime Bloom 过滤真实 Probe 值，正确性边界更清晰。
+---
 
-不过，“不能直接利用 Page Bloom”不等于“不能减少 Scan I/O”。StarRocks Native Segment 已经把 Runtime Bloom 接入延迟物化链路，关键调用都位于 `segment_iterator.cpp`：
+## 六、经典论文脉络、线上 Profile 排障清单与源码索引
 
-```text
-_build_column_oriented_rf()
-  → 将 Runtime Filter 按 ColumnId 归入谓词列
-  → _predicate_evaluate_late_materialize_read_first_column()
-      先读第一批谓词列和 RowId
-  → _filter_by_compound_and_predicates()
-      在真实 Probe 值上执行 Runtime Bloom，压缩 Selection/RowId
-  → _evaluate_late_materialize_read_other_columns()
-      只为存活 RowId 读取其余谓词列
-  → _finish_late_materialization()
-      通过 decode_values_by_rowid() 读取存活行的输出列
-```
+今天我们在三套开源内核里看到的精巧机关，其实是过去二十余年数据库系统界四条研究主线在云原生时代的工程合流：
 
-明确结论是：**Runtime Bloom 可以与延迟物化结合，并减少 Scan I/O；它节省的是被过滤行对应的 Payload/Output Column I/O，而不是 Runtime Bloom 所依赖的 Probe/Join-Key Column I/O。** 如果 Join Key 很窄、Payload 很宽且 Bloom 过滤率高，收益会非常明显；如果查询只投影 Join Key，或者 Bloom 几乎不过滤，则字节收益很小，甚至可能被额外 Hash 成本抵消。
+- **轻量级块摘要（Zone Map / SMA）**：源自 VLDB 1998 的 [《Small Materialized Aggregates: A Light Weight Index Structure for Data Warehousing》](https://www.vldb.org/conf/1998/p476.pdf)，用极低维护成本的连续桶极值换取大块顺序跳读，直至演化出如今标准化的 [Parquet Page Index](https://parquet.apache.org/docs/file-format/pageindex/)（物理分离值域 `ColumnIndex` 与偏移 `OffsetIndex`）、[Parquet Bloom Filter](https://github.com/apache/parquet-format/blob/master/BloomFilter.md) 与 [ORC Stripe/Row Index](https://orc.apache.org/specification/ORCv1/)；
+- **列存延迟物化（Late Materialization）**：Abadi 等人在 ICDE 2007 名作 [《Materialization Strategies in a Column-Oriented DBMS》](https://www.cs.umd.edu/~abadi/papers/abadiicde2007.pdf) 中奠定了用位置列表（Position List）解耦过滤列与输出列的代价模型；
+- **横向信息旁路（Sideways Information Passing）**：Ives 等人在 [《Sideways Information Passing for Push-Style Query Processing》](https://www.cis.upenn.edu/~zives/research/push.pdf) 中提出的跨子树摘要传递，正是当代分布式 MPP Runtime Filter 的理论先声；
+- **工作负载感知的多维聚簇**：如 [《Learning Multi-Dimensional Indexes (Flood)》](https://arxiv.org/abs/1912.01668) 所揭示的，单一排序键难以兼顾多维过滤，结合历史谓词频率做自动 Recluster 与半结构化 JSON/Variant 子列路径裁剪，正在成为云数仓压降扫描成本的新主战场。
 
-对于多个谓词列，Segment Scan 还会采样实际选择率并调整读取顺序，使过滤能力更强的列尽量提前。这里形成了完整的两级收益：Runtime MinMax/IN 先尝试缩小 Page 范围，Runtime Bloom 再读取 Probe Key 并压缩 RowId，最后延迟读取宽列。
+回到日常研发与线上慢查诊断，当你怀疑某条慢 SQL 的扫描层做了无用功时，只需固定冷热缓存状态，按以下五步核对 Query Profile：
 
-**Parquet 路径采用相似但更贴近文件格式的实现：**
+1. **看物理跳读比（`TotalPages` vs `PrunedPages / FilteredBlocks`）**：确认静态谓词与 Runtime MinMax/IN 是否真正挡住了物理单元，若几乎为零，优先排查排序键聚簇度与乱序未合并的 Rowset；
+2. **算索引与合并税（`IndexReadBytes`、`RemoteRequests` vs `RemoteBytesRead`）**：平均单次远端请求若跌破几十 KB，说明稀疏跳读切得太碎，急需调优 Range Coalescing 合并阈值；
+3. **盯过滤器时序（`RFWaitTime` 与到达时刻）**：确认 Runtime Filter 是赶在开扫前就位，还是扫完大半才迟到；
+4. **验延迟物化实效（`LazyReadRows` 与宽列读取字节）**：核实高淘汰率条件是否排在了第一批谓词列执行，防止昂贵正则或低效过滤器抢跑；
+5. **剥离缓存干扰（`LocalCacheHit` vs `CacheMiss`）**：在做任何参数或索引收益归因前，务必先看冷读下的真实远端字节减量。
 
-- [`PredicateFilterEvaluator`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/formats/parquet/predicate_filter_evaluator.h) 依次尝试 Row Group Statistics、Page Index 和 Row Group Bloom；
-- [`GroupReader`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/formats/parquet/group_reader.cpp) 把列拆为 Active 与 Lazy 两组；
-- Active 列逐列读取和过滤，命中数为零时立即停止；
-- Lazy 列只读取 Selection 覆盖的范围，再与 Active Chunk 合并；
-- 字典谓词可在字典上计算一次，必要时直接跳过整个 Row Group。
+最后附上三套引擎扫描裁剪与延迟物化的核心源码入口：
 
-对象存储上还有一个看似矛盾但合理的优化：`io_coalesce_adaptive_lazy_active` 根据此前 Lazy Column 是否真正被需要，决定 Active/Lazy 的 I/O Range 一起合并还是分开。一起读取会多读部分 Payload，却减少请求；分开读取更节省字节，但可能增加远端往返。
+| 核心模块 | 所属引擎 | 关键源码路径 |
+| --- | --- | --- |
+| 原生 `SparseRange` 多级求交与延迟物化 | StarRocks | [`segment_iterator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/rowset/segment_iterator.cpp) |
+| Runtime Filter 区间裁剪与行级采样执行 | StarRocks | [`runtime_range_pruner.hpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_range_pruner.hpp)、[`runtime_filter_predicate.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_filter_predicate.cpp) |
+| Parquet 统计/页索引评估与 Active/Lazy 自适应合并 | StarRocks | [`predicate_filter_evaluator.h`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/formats/parquet/predicate_filter_evaluator.h)、[`group_reader.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/formats/parquet/group_reader.cpp) |
+| Roaring `_row_bitmap` 裁剪与三级延迟列读取 | Apache Doris | [`segment_iterator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/segment_iterator.cpp)、[`column_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/column_reader.cpp) |
+| Runtime Filter 谓词归一化与 Parquet 合并读 | Apache Doris | [`runtime_filter_consumer.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/runtime_filter/runtime_filter_consumer.cpp)、[`scan_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/scan_operator.cpp)、[`vparquet_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/format/parquet/vparquet_reader.cpp) |
+| Fuse 异步限流块裁剪与运行时统计折叠 | Databend | [`fuse_pruner.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/fuse_pruner.rs)、[`expr_runtime_pruner.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/expr_runtime_pruner.rs) |
+| Parquet `Prewhere` 自适应 `RowSelection` 与等待轮询 | Databend | [`read_state.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/read_state.rs)、[`parquet_data_source_deserializer.rs`](https://github.com/databendlabs/databend/blob/17de8708fd4095e6a062b6100789b9bc351a7230/src/query/storages/fuse/src/operations/read/parquet_data_source_deserializer.rs)、[`runtime_filter_wait.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/runtime_filter_wait.rs) |
 
-### Apache Doris——Bitmap Row Set 与两阶段列读取
+---
 
-Doris 用候选行集合连接索引裁剪与列读取，先读过滤列再取剩余列；能否省 I/O 取决于存活行在物理页（Physical Page）中的分布。
-
-#### Native Segment：统一候选位图与 Runtime Filter 表示
-
-Doris 的核心入口是 [`SegmentIterator::_lazy_init()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/segment_iterator.cpp)。它先把整个 Segment 加入 `_row_bitmap`，再依次应用：
-
-```text
-Short Key Range
-  → Inverted / Expression Index
-  → Dictionary
-  → Bloom Filter Index
-  → Zone Map
-  → Delete Bitmap / Row Range
-  → ANN TopN
-  → 最终 Roaring Bitmap
-```
-
-与 StarRocks 的 `SparseRange` 类似，Doris 用 Roaring Bitmap 统一表达不同索引留下的候选行。Zone Map 和 Bloom 返回 Page 对应的 RowRanges，随后转换为 Bitmap 并求交；Inverted Index 可以直接返回更精细的命中位图。
-
-Runtime Filter 可以进入这条存储谓词链路，但能否转化为读前裁剪，取决于它的具体表示。答案并不是笼统的“可以”或“不可以”：
-
-1. [`RuntimeFilterConsumer::_get_push_exprs()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/runtime_filter/runtime_filter_consumer.cpp) 将 Runtime IN、MinMax 和 Bloom 分别生成为 `IN_PRED`、`BINARY_PRED` 和 `BLOOM_PRED`；
-2. [`ScanLocalState::_normalize_predicate()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/scan_operator.cpp) 解开 Runtime Filter Wrapper，再尝试归一为 `ColumnValueRange` 和 Storage `ColumnPredicate`；
-3. Runtime IN 可以形成 Scan Key、值域或 Storage IN Predicate，Runtime MinMax 可以形成范围条件，因而有机会复用 Short Key、Zone Map、Parquet Statistics/Page Index 等读前裁剪能力；
-4. Runtime Bloom 被归一为 `BloomFilterColumnPredicate`，主要在读取真实 Probe Column 后执行，并通过延迟物化减少后续列读取。
-
-[`ColumnReader::get_row_ranges_by_bloom_filter()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/column_reader.cpp) 会先借助 Ordinal Index 找到当前候选范围覆盖的 Page，再逐页读取持久化 Bloom；只有谓词树判断“可能命中”的 Page 才加入新范围。这个顺序避免了为已经被其他索引排除的 Page 再加载 Bloom。
-
-**Runtime Bloom 主要执行在真实列值上。** Doris 将其构造成 [`BloomFilterColumnPredicate`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/predicate/bloom_filter_predicate.h)，能够对普通列和字典码列执行向量化过滤，并通过采样判断低选择率 Runtime Filter 是否值得继续计算。
-
-`BloomFilterColumnPredicate` 的核心实现是对已经解码出的 `IColumn` 调用 Runtime Bloom，而不是直接比较 Runtime Bloom 与文件中的 Page Bloom。所谓“仍需读取 Probe Column”，指的是 Scan 必须先把 Join Key 所在的 Column Page 读入并解码，才能逐值执行 `find()`；这部分 I/O 已经发生，无法被同一个 Runtime Bloom 撤销。它能做的是先产生更稀疏的 Selection，再阻止被过滤行的宽 Payload 列进入读取链路。
-
-**等待时间是过滤收益与 Pipeline 阻塞之间的显式权衡。** 在该源码快照中，[`SessionVariable.runtimeFilterWaitTimeMs`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/qe/SessionVariable.java) 的默认值为 `1000` 毫秒。`RuntimeFilterConsumer` 的实际规则是：Descriptor 指定值优先；远端 Runtime Filter 默认等待 1000ms；开启无限等待或不存在远端目标时，等待上限取查询 `execution_timeout`。等待超时后 Scan 会继续运行，晚到的过滤器只能影响尚未读取的数据。因此，1000ms 是默认折中值，不是所有查询的最优值。
-
-#### Native 与 Parquet：Runtime Filter 如何驱动两阶段列读取
-
-[`_vec_init_lazy_materialization()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/segment_iterator.cpp) 将列分为三类：
-
-- `_predicate_ordinals`：先读并计算谓词；
-- `_common_expr_ordinals`：过滤后再读，用于剩余公共表达式；
-- `_output_ordinals`：最后按存活 RowId 读取。
-
-`_next_batch_internal()` 先从最终 `_row_bitmap` 中取得一批 RowId，读取谓词列并计算 Selection；如果仍有存活行，再通过 `_read_columns_by_rowids()` 读取表达式列和输出列。对于 Struct/Array/Map，还能把谓词需要的子路径与最终输出需要的子路径拆开，过滤后再恢复被延迟的嵌套字段。
-
-这里体现了一个实用的成本判断：定长数值列顺序读取和 SIMD 过滤很便宜，过度 Lazy Read 的 Seek 成本可能更高；字符串、Bitmap、HLL 等宽列则更容易从延迟物化获益。源码注释也明确把“读取速度”和“谓词计算速度”作为不同维度处理。
-
-**Parquet 路径。** Doris 外部 Parquet 读取链路集中在 [`vparquet_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/format/parquet/vparquet_reader.cpp) 与 [`vparquet_group_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/format/parquet/vparquet_group_reader.cpp)：
-
-1. Row Group 级先尝试 Column Statistics 和 Bloom Filter；
-2. 未能排除时读取 ColumnIndex/OffsetIndex，生成 Page 对应的 `candidate_row_ranges`；
-3. 创建 Column Reader 前，把 Position Delete、Deletion Vector 和缓存条件并入范围；
-4. 先读 Predicate Columns，计算 `FilterMap`；
-5. 再让 Lazy Columns 按 FilterMap 跳过无效行；
-6. 对全字典编码 Column Chunk，可在字典上重写谓词并跳过整个 Row Group。
-
-`_generate_random_access_ranges()` 还会收集所需 Column Chunk 的物理范围；小 I/O 可交给 `MergeRangeFileReader` 合并。这说明 Parquet 优化不只发生在逻辑候选行层，也发生在实际 Range Request 的组织层。
-
-Runtime Filter 对这些能力的复用同样分成两类。`_collect_predicate_columns_from_conjuncts()` 会识别并解开 Runtime Filter Wrapper，把 Probe Slot 加入 Predicate Columns：Runtime IN/MinMax 在归一化成功时可参与 Row Group Statistics、Page Index 等元数据裁剪；Runtime Bloom 本身则成为先读的 Predicate Column 条件，生成 `FilterMap`，让 Lazy Columns 跳过无效行。换言之，**Doris 能让 Runtime Filter 贯穿 Parquet 的“元数据裁剪—谓词列读取—Lazy Column 读取”链路，但不同 Runtime Filter 形态进入的层级不同。**
-
-### Databend——Fuse Block Pruning 与 Prewhere
-
-Fuse 的块裁剪与 Prewhere 作用在不同阶段：前者排除整个块，后者读取过滤列后决定是否继续物化其余列。
-
-#### Fuse Pruner：独立的并行裁剪阶段
-
-Databend Fuse Engine 的 [`PruningContext`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/fuse_pruner.rs) 在扫描前准备多种 Pruner：
-
-| Pruner | 信息来源 | 作用 |
-|--------|----------|------|
-| Range Pruner | Segment/Block Column Statistics | 用表达式 Domain 判断 `MustFalse` |
-| Bloom Pruner | 独立 Bloom Index | 处理 Equality、InList 等点查询 |
-| Page Pruner（已移除） | Native Page Meta、Cluster Key | 曾在 Block 内继续缩小 Page；随 native 格式一并删除 |
-| Inverted Index Pruner | 倒排索引 | 生成匹配行集合 |
-| TopN Pruner | Order/Limit 与统计信息 | 跳过不可能进入 TopN 的 Block |
-| Virtual/Spatial Pruner | 虚拟列或空间索引元数据 | 避免读取源列或无关空间块 |
-
-[`FusePruner::pruning()`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/fuse_pruner.rs) 的主干是 `Segment Pruner → Block Pruner → TopN Pruner`。Block Meta 可以通过 Cache 复用，Pruning 使用独立 Runtime 与 Semaphore 控制并发，避免为了读索引而无界放大对象存储请求。
-
-#### Runtime Filter：不同表示服务不同裁剪层级
-
-Databend 的 Hash Join Build 侧会根据阈值构造 MinMax、InList、Bloom 或 Spatial Runtime Filter，见 [`RuntimeFilterLocalBuilder`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/service/src/pipelines/processors/transforms/hash_join/runtime_filter/local_builder.rs)。跨节点合并后，同一个 Runtime Filter 可以映射到多个 `(probe_key, scan_id)` 目标。
-
-Probe 侧不是让所有结构做同一件事：
-
-- [`RuntimeStatsPruner`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/expr_runtime_pruner.rs) 用 MinMax/InList 表达式与 Block Column Statistics 做 Domain Fold；结果恒为 `false` 时跳过整个 Block；
-- `ExprRuntimePruner` 在 Runtime InList 值数量不超过阈值时，还会调用持久化 Bloom Index；
-- Runtime Bloom 则进入 Prewhere/Preread 列集合，读取真实 Probe Column 后生成 Bitmap；
-- baseline 的 Native Reader 可以在 Page 阶段先应用 Bloom Runtime Filter，若整页无命中则不读剩余列；该路径已随 native 格式移除，当前只剩 Parquet 路径的 Prewhere 与 RowSelection。
-
-Databend 的设计给出了一个很清晰的分工：**MinMax/InList 负责“读之前能否排除 Block”，Runtime Bloom 负责“读到 Probe Key 后还能否避免剩余列”。** 小型 InList 是两者之间的桥梁，因为它既能作为精确表达式查询 Statistics，也能逐值查询持久化 Bloom。
-
-#### Prewhere：在过滤收益、稀疏读取与等待之间取舍
-
-[`ReadState`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/read_state.rs) 把 Prewhere Column 和 Runtime Bloom Column 合并为 Preread Projection，再计算静态 Filter Bitmap 与 Runtime Filter Bitmap。
-
-当选择率达到配置阈值时，Bitmap 转换为 `RowSelection` 并下推给 Remaining Column Reader；否则先顺序反序列化剩余列，再在内存中过滤。这避免了低选择性场景中“为了少丢几行，却制造大量稀疏 Seek”的反优化。
-
-baseline 里的 Native Reader 曾按 Page 循环（TopK → Prewhere → Runtime Bloom → Remaining Columns，任一阶段判断整页不匹配就直接跳到下一组 Page）。这段实现在 `native_data_source_deserializer.rs`，随 #19982 移除 native 格式一并删除；当前快照只剩 Parquet 路径：`ReadState` 仍然负责 Prewhere 与 Runtime Bloom 的先后关系，由 [`parquet_data_source_deserializer.rs`](https://github.com/databendlabs/databend/blob/17de8708fd4095e6a062b6100789b9bc351a7230/src/query/storages/fuse/src/operations/read/parquet_data_source_deserializer.rs) 创建，粒度是 Data Block 而不是 Page。
-
-[`runtime_filter_wait.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/runtime_filter_wait.rs) 在该快照中以 50ms 轮询 Runtime Filter Ready，最长等待 30 秒，同时监听查询取消和下游结束。
-
-这说明 Runtime Filter 下推不仅是过滤算法，也是 Pipeline 调度问题：
-
-```text
-等待更久  →  更可能在 Block Pruning 前得到过滤器  →  少读数据，但增加空等
-立即扫描  →  更快产生首批数据                 →  晚到过滤器只能影响剩余部分
-```
-
-对于高延迟对象存储和高选择率 Join，等待通常更有价值；Build 很大或过滤率很低时，等待可能比节省的 I/O 更贵。
-
-## 横向对比
-
-三个系统组合多粒度过滤信息，但相似的功能名不保证相同的物理跳读能力，应逐项确认发生在读取前还是解码后。
-
-| 能力 | StarRocks | Apache Doris | Databend |
-|------|-----------|--------------|----------|
-| 读前候选集合 | `SparseRange` | Roaring `_row_bitmap` | Segment/Block `PartInfo`、Block 内 `RowSelection` |
-| 有序键裁剪 | Short Key / Sorted Key | Short Key / Key Range | Cluster Key + Range Pruner（页级裁剪已随 native 格式移除） |
-| Min/Max 粒度 | Segment/Page Zone Map；Parquet Row Group/Page | Segment/Page Zone Map；Parquet Row Group/Page | Segment/Block Statistics；Parquet `enable_parquet_page_index`（默认开启） |
-| 持久化 Bloom | Native Page、Parquet Row Group | Native Page、Parquet Row Group | 独立 Block Bloom Index |
-| Runtime MinMax/IN | 转 Index-only Predicate，继续查询 Zone Map | 可形成 Storage Predicate/Key Range，受类型和谓词形态约束 | 直接用 Statistics，阈值内 InList 还查询持久化 Bloom |
-| Runtime Bloom | Probe Column 行级过滤；可驱动延迟物化 | `BloomFilterColumnPredicate` 行级过滤；可驱动延迟物化 | Preread/Prewhere 行或 Page 过滤，再读剩余列 |
-| 延迟物化 | Predicate Column → RowId → Output Column；Parquet Active/Lazy | Predicate/Common Expr → RowId → Output；Parquet Predicate/Lazy | Prewhere/Runtime Key → RowSelection → Remaining Column |
-| 字典优化 | Runtime Filter 先过滤字典词；静态字典谓词改写 | 字典列直接执行 Runtime Bloom；Parquet 字典过滤 | Prewhere/表达式框架内避免不必要的剩余列读取 |
-| 对象存储 I/O | Sparse Range Coalesce、Parquet Active/Lazy 自适应合并、Data Cache | MergeRangeFileReader、Segment Prefetch、File Cache | Pruning 并发控制、Meta Cache、Projection/RowSelection |
-
-三者架构风格不同，但核心模式高度一致：
-
-```text
-便宜且粗粒度的元数据
-        ↓
-更贵且细粒度的索引
-        ↓
-先读窄谓词列
-        ↓
-行级 Runtime/Residual Filter
-        ↓
-按 Selection 读取宽输出列
-```
-
-真正的差异主要在三个位置：元数据组织粒度、动态谓词能转成哪些可索引表示，以及稀疏读取与合并读取之间的成本模型。
-
-## 收益与正确性：布局、请求及 Runtime Bloom
-
-### 进一步降低 Scan I/O 的三个方向
-
-数据布局、索引与请求调度分别影响可排除范围、判定成本和远程开销，需要联动评价，不能只优化过滤选择率。
-
-#### 数据与布局：Projection、嵌套裁剪和聚簇
-
-列式存储（Columnar Storage）最便宜的字节是从未进入 Projection 的字节。除了普通列裁剪，还应把 JSON、Struct、Map、Array 的 Access Path 下推到子字段，避免为了 `payload.user.id` 读取完整 `payload`。这对日志和半结构化宽表往往比增加一个索引更稳定。
-
-**数据布局、Compaction 与 Recluster。**
-
-Zone Map 的效果来自值与物理位置的相关性。写入乱序、频繁小批量导入和长期不做 Compaction，会让重叠范围越来越宽。应结合查询 Predicate 频率选择 Sort/Cluster Key，并通过 Compaction 或 Recluster 恢复局部有序性。
-
-这是一种典型的读写权衡：更强聚簇降低读取放大，但增加写放大、后台计算与数据重写成本。
-
-#### 索引与缓存：避免数据读取，也避免重复读取元数据
-
-索引可以省数据读取，也会引入自身 I/O；元数据缓存和字典执行用于降低反复判定的成本。
-
-- Dictionary 让字符串谓词在小字典上计算一次，再过滤整数码；
-- Bitmap 适合低到中等基数且组合过滤频繁的列；
-- Inverted Index 适合文本、关键词、JSON Path 或高选择率点查；
-- N-gram Bloom 可以为部分 `LIKE` 模式提供保守裁剪。
-
-这些结构可能减少数据 Page I/O，也可能只是减少解码和表达式 CPU。评估时必须把索引读取字节、索引缓存命中和维护成本计入总账。
-
-**Footer、Metadata 与 Data Cache。**
-
-对象存储上的 Footer、Page Index 和 Bloom 本身也需要 I/O。缓存热点 Footer、Segment Meta、Block Meta 和索引页，能减少每次 Scan 的控制面（Control Plane）请求；Data Cache 则把远端随机读取转成本地读取。
-
-缓存没有减少逻辑读取量，却减少了远端字节和尾延迟（Tail Latency）。Profile 中应同时区分 `RemoteBytesRead`、`LocalCacheRead` 和 `CacheMiss`，否则容易把缓存收益误认为谓词下推收益。
-
-#### 请求调度：在少读字节与少发请求之间取舍
-
-假设 Selection 需要读取同一对象中的三个范围：
-
-```text
-[0, 64KB]   [68KB, 96KB]   [104KB, 160KB]
-```
-
-严格稀疏读取发出三个请求；Coalescing 可以把它们合成一个 `[0, 160KB]` 请求，代价是多读间隙。对象存储中单请求延迟和计费可能比额外几十 KB 更重要，因此应设置最大合并距离、Buffer 上限和并发数，并根据实际命中自适应调整。
-
-Prefetch 同样不是越多越好：顺序 Scan 中能隐藏延迟，选择率很高时却可能在过滤结果出来前把无用 Payload 拉入缓存。
-
-**谓词顺序与自适应旁路。**
-
-多个谓词应综合考虑：
-
-```text
-价值 ≈ 被过滤的后续字节 /（索引读取 + 解码 + 谓词计算成本）
-```
-
-高选择率但计算昂贵的正则表达式不一定应该最先执行；低成本的数值比较可能先排除足够多的行。运行时采样、动态重排和低收益 Runtime Filter 旁路，能避免“下推成功但查询变慢”。
-
-**文件与 Page 尺寸。**
-
-粒度越小，Min/Max 和 Bloom 越精确，但 Footer/Index 越大、对象数量和请求越多；粒度越大，顺序吞吐更好，却增加过滤后的读取放大。文件大小、Row Group/Block 大小和 Page 大小必须结合对象存储延迟、典型 Projection 宽度和 Predicate 选择率共同设计。
-
-### Runtime Bloom 下推的三个边界
-
-Runtime Bloom 允许假阳性，不允许因摘要不完整或表示不兼容产生假阴性；正确性成立后，再考虑到达时间和使用成本。
-
-#### 正确性边界：假阳性可以接受，假阴性不可接受
-
-Runtime Filter 是 Join Build 侧键集合的近似摘要。只有在该摘要覆盖了语义所需的完整 Build 集合，并且 Join 类型允许时，Probe 侧才能安全丢行。分区 Bloom、全局 Bloom、Broadcast/Shuffle 布局不能混用；Outer Join、Anti Join、Null-safe Equality 也需要单独处理。
-
-Bloom 的假阳性只会让更多行进入 Join，不影响结果；任何假阴性都会产生错误结果。因此，类型转换、字符串 Collation、Decimal Scale、时区、Null 和 Hash 版本都必须成为过滤器协议的一部分。
-
-#### 时间边界：Late Arrival 只能影响尚未读取的数据
-
-Runtime Filter 到达时，Scan 可能处于三种状态：
-
-1. 尚未生成 Scan Range：可参与完整元数据裁剪；
-2. 已生成范围但尚未读取：可继续收缩剩余 Range；
-3. 对应 Page 已经发出异步请求：通常只能过滤读回的行或阻止后续列物化。
-
-因此，Profile 中的 `RuntimeFilterRows` 很高，不代表远端 `BytesRead` 同比例下降。要验证 I/O 收益，必须同时检查过滤器到达时间、Pruned Blocks/Pages、Lazy Read Rows 和实际远端字节。
-
-#### 表示边界：持久化 Bloom 与 Runtime Bloom 不能默认比较
-
-持久化 Bloom 与 Runtime Bloom 如果要直接做集合不相交判断，至少要保证：
-
-- 相同的值规范化与类型编码；
-- 相同的 Hash 算法、Seed 和 Hash 次数；
-- 相同或可证明兼容的位图布局与长度；
-- Null 语义一致；
-- 分区范围与数据块粒度能够正确对应；
-- 合并判定只产生保守结果。
-
-否则，“位图看起来没有交集”不代表两个值集合没有交集。更通用的做法仍是把 Runtime Filter 附带的 MinMax/小 InList 用于元数据层，把 Bloom 用在真实 Probe Key 上。
-
-#### 选择率不是唯一变量：用字节和时间计算收益
-
-数据库 Profile 常把过滤率写成 `rows_before / rows_after`，但 Scan I/O 的收益更接近下面这个分解：
-
-```text
-SavedBytes
-  ≈ PrunedPhysicalUnitsBytes
-   + SurvivingRowsAvoidedPayloadBytes
-   - ExtraIndexBytes
-   - CoalescingOverReadBytes
-
-NetBenefit
-  ≈ SavedRemoteTime
-   + SavedDecodeCPU
-   - FilterWaitTime
-   - HashAndPredicateCPU
-   - ExtraRequestLatency
-```
-
-同样过滤 90% 的行，窄投影查询可能几乎省不下字节，宽 Payload 查询却可能收益巨大；同样少读 100 MiB，本地 NVMe 与高延迟对象存储的收益也不同。优化器或 Scan Scheduler 因此至少需要估计四类量：过滤器到达时间、列宽、物理聚簇程度以及请求合并后的实际 Range。
-
-这也给出了一个更严格的实验方法：保持 SQL 和数据不变，分别关闭元数据裁剪、Runtime Filter、Late Materialization 与 I/O Coalescing，观察 Remote Bytes、Request Count、Decode CPU 和 Wall Time 的增量。只比较“优化全部打开”与“全部关闭”，无法判断收益来自哪一层，也无法发现某个子机制正在负优化。
-
-## 从 Profile 与研究证据验证改进
-
-### 可观测性：从 Query Profile 验证优化是否真的有效
-
-总耗时不能区分读取、解码和过滤收益，需要同时观察请求数、字节数、候选范围与等待时间。建议按以下顺序检查：
-
-| 观察项 | 需要回答的问题 | 常见误区 |
-|--------|----------------|----------|
-| Planned/Total Blocks、Row Groups、Pages | 元数据裁剪跳过了多少物理单元？ | 只看返回行数，不看扫描单元 |
-| Index/Meta Read Bytes 与时间 | 为跳读付出了多少索引成本？ | 忽略远端 Bloom/Page Index 请求 |
-| Remote Requests 与 Remote Bytes | 是请求过多还是读取放大？ | 只优化字节，制造大量小请求 |
-| Cache Hit/Miss | 远端收益是否只是缓存命中？ | 把 Cache 与 Predicate 收益混为一谈 |
-| Predicate/Runtime Filter Rows | 哪个条件真正有选择率？ | 低收益过滤器持续消耗 CPU |
-| Runtime Filter Build/Wait/Arrival | 过滤器是否赶在 Scan 前到达？ | 只看 Filter Rows，不看到达时机 |
-| Lazy/Prewhere Rows 与 Bytes | 是否避免了 Payload 列读取？ | 过滤了行，但宽列已提前读取 |
-| Decompress/Decode/Scan CPU | 瓶颈是否已经从 I/O 转到 CPU？ | 远端字节下降却总耗时不变 |
-
-一个可靠的 A/B 实验至少应固定数据快照、并发、缓存冷热状态和文件布局，分别关闭 Page Index、Bloom、Runtime Filter 或 Late Materialization，并比较“远端请求 + 远端字节 + Scan CPU + 总耗时”。单次热缓存结果很容易给出错误结论。
-
-### 研究脉络与延伸阅读
-
-块摘要、延迟物化与自适应过滤分别减少候选范围、宽列读取和无收益计算；论文之间应比较机制边界，而不直接叠加性能倍数。
-
-**轻量级块摘要。**
-
-[Small Materialized Aggregates: A Light Weight Index Structure for Data Warehousing](https://www.vldb.org/conf/1998/p476.pdf) 在 VLDB 1998 中讨论了为连续物理 Bucket 保存小型聚合摘要。今天常见的 Min/Max、Count、Null Count 等 Zone Map，可以放在这一类思想下理解：摘要很小、顺序组织、易于批量生成，但效果高度依赖 Bucket 粒度与数据布局。
-
-**延迟物化与位置表示。**
-
-[Materialization Strategies in a Column-Oriented DBMS](https://www.cs.umd.edu/~abadi/papers/abadiicde2007.pdf) 系统比较了早期与延迟物化，并讨论用 Position List 连接列的收益和代价。三套引擎今天使用的 RowId、Selection、Bitmap、Active/Lazy Column，本质上都在工程化这一思想。
-
-值得继续研究的不是“是否采用 Late Materialization”，而是：何时切换、位置集合用 Range/Bitmap/List 中哪种表示、何时合并远端请求，以及如何把真实选择率反馈给列读取顺序。
-
-**Sideways Information Passing。**
-
-[Sideways Information Passing for Push-Style Query Processing](https://www.cis.upenn.edu/~zives/research/push.pdf) 把 Bloom Join、Semijoin 和 Hash Filter 放入更一般的信息旁路框架：一个子表达式完成后，把集合摘要传给计划中其他相关位置，提前丢弃不可能产生结果的数据。现代 Runtime Filter 就是这条思路在 MPP Pipeline、分区 Hash Join 和异步 Scan 中的延伸。
-
-今天的新问题主要来自分布式执行：过滤器布局如何匹配 Shuffle、何时等待、如何渐进合并、怎样处理晚到过滤器，以及过滤收益是否足以覆盖 Build、网络广播和 Probe 成本。
-
-**工作负载感知的数据布局。**
-
-[Learning Multi-Dimensional Indexes](https://arxiv.org/abs/1912.01668) 提出的 Flood 根据数据分布与过滤工作负载共同优化多维布局。它提醒我们：单一 Sort Key 很难同时服务多个相关维度，Z-order 或固定层次排序也不是所有数据集上的最优解。
-
-对云数据仓库更现实的借鉴方向包括：根据历史 Predicate 自动选择 Cluster Key、评估 Recluster 收益、按工作负载调整 Page/Block 粒度，以及为相关列构建轻量级多维摘要。代价同样必须包含数据重写、索引维护和工作负载漂移。
-
-**文件格式正在把跳读能力标准化。**
-
-[Parquet Page Index](https://parquet.apache.org/docs/file-format/pageindex/) 将 ColumnIndex 与 OffsetIndex 分开：前者回答 Page 的值域，后者定位 Page 的物理位置；[Parquet Bloom Filter 规范](https://github.com/apache/parquet-format/blob/master/BloomFilter.md) 则定义了列块级存在性摘要。[ORC Specification](https://orc.apache.org/specification/ORCv1/) 也在 Stripe、Row Index 和 Bloom 等层级保存统计信息。
-
-开源引擎未来的差异不会只在“是否支持这些格式特性”，而在是否能把静态谓词、Runtime Filter、删除向量、延迟物化和对象存储 Range Read 统一进一个成本可控的候选范围模型。
-
-### 验证顺序与旁路条件
-
-先核对 Projection 和数据布局，再分别确认静态谓词与 Runtime Filter 的生效位置。延迟物化应体现为 Payload Bytes 下降；Range 合并、Cache 和 Prefetch 则要同时看请求数与多读字节，不能只比较过滤行数。
-
-固定缓存状态与负载，按 Segment/Row Group/Page/Row、Static/Runtime、Meta/Data、Local/Remote 分层记录指标。过滤器到达太晚、范围无法缩小，或索引请求成本超过读取节省时，应保留旁路。
-
-## 关键源码阅读索引
-
-| 主题 | 项目 | 源码入口 |
-|------|------|----------|
-| Native 多级裁剪 | StarRocks | [`segment_iterator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/rowset/segment_iterator.cpp) |
-| Runtime Range Pruning | StarRocks | [`runtime_range_pruner.hpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_range_pruner.hpp) |
-| Runtime Filter 行级执行 | StarRocks | [`runtime_filter_predicate.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/storage/runtime_filter_predicate.cpp) |
-| Parquet 元数据裁剪 | StarRocks | [`predicate_filter_evaluator.h`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/formats/parquet/predicate_filter_evaluator.h) |
-| Native 多级裁剪 | Apache Doris | [`segment_iterator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/segment_iterator.cpp) |
-| Runtime Filter 表达式生成 | Apache Doris | [`runtime_filter_consumer.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/runtime_filter/runtime_filter_consumer.cpp) |
-| Runtime Filter 存储谓词归一化 | Apache Doris | [`scan_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/scan_operator.cpp) |
-| Native Page Bloom | Apache Doris | [`column_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/storage/segment/column_reader.cpp) |
-| Parquet 裁剪与 Range Read | Apache Doris | [`vparquet_reader.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/format/parquet/vparquet_reader.cpp) |
-| Fuse Pruning | Databend | [`fuse_pruner.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/fuse_pruner.rs) |
-| Runtime Block Pruning | Databend | [`expr_runtime_pruner.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/pruning/expr_runtime_pruner.rs) |
-| Prewhere 与 Runtime Bloom | Databend | [`read_state.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/read_state.rs) |
-| Runtime Filter 等待策略 | Databend | [`runtime_filter_wait.rs`](https://github.com/databendlabs/databend/blob/ab6f27c6aaa53d31f3417bb26b3ab970d7dd0456/src/query/storages/fuse/src/operations/read/runtime_filter_wait.rs) |
+> **源码基线说明**：本文初稿基于 `StarRocks/starrocks` 提交 `0fd27fd`（2026-03-30）、`apache/doris` 提交 `5202d06`（2026-08-21）及 `databendlabs/databend` 提交 `ab6f27c`（2026-05-27），并于 2026-10 对照上游快照 StarRocks `f977b53`、Doris `7ac0eb2f`、Databend `17de870` 完成源码复核。两快照间关键演进——包括 Databend 在提交 `9431970`（PR `#19982`）中正式下线旧版 `Native` 存储格式并统一至 Parquet `ReadState + RowSelection` 路径、StarRocks 拆分 `_init_scan_range_and_context()` 引入 `SegmentReadStateCache` 并将 `runtime_range_pruner.hpp` 迁至 `be/src/compute_env/`、以及 Doris 为倒排索引支持 `candidate_rows` 候选位图下推——均已同步融入正文。

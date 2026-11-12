@@ -20,110 +20,50 @@ toc: true
 math: true
 ---
 
-前一段时间，受朋友讨论社交与 AI 的影响，加上在播客里频繁听到“端侧模型”，我开始重新看待电脑里沉睡的个人数据：照片、视频、语音和零散文档过去只是等待被翻阅的文件；当多模态模型具备理解画面、文字和上下文的能力后，它们有机会成为一套可以检索、关联和重新认识自己的长期记忆。
+硬盘里常年躺着成千上万张生活照、白板截图、票据和零散 PDF 文档。过去它们只是按年月堆在文件夹里的冷字节；看到端侧多模态模型逐渐成熟后，一个很自然的念头冒了出来：能不能在自己那台插着 16GB RTX 5070 Ti 的电脑上搭一套**纯本地的个人多模态知识实验室（`personal-knowledge-lab`）**？不仅能搜“去年在杭州拍的白板架构图”或“乔乔在地铁里的照片”，还能像数据库执行计划一样清楚告诉我**究竟是哪条视觉、文字或时空证据命中的**。
 
-这也是我尝试做 `personal-knowledge-lab` 的起点：用 Vibe Coding 搭建一个面向自己照片和文档的本地知识实验室。原始文件留在 Windows 目录并保持只读，索引、缩略图、任务状态和日志存放在 WSL；搜索能够组合中文描述、物体、OCR、时间、地点和人物，结果还要解释“为什么找到这张照片”。
+动手之前如果只画一张概念草图，最容易写出一条看似顺理成章的“大一统同步流水线”：在同一个 Python Web 进程里一口气塞进视觉大模型（VLM）看图写描述、OCR 识字、CLIP 图像向量、文本嵌入（Embedding）和人脸识别，用户一搜就现场过一遍模型。可只要真把代码放到单机 16GB 显存上跑起来，这套朴素方案立刻就会撞碎在三堵墙上：
 
-项目没有达到我对搜索质量的预期，因此暂时搁置。下面从索引与检索路径说明实现，再结合模型身份漂移和索引快照分析失败原因；重点是分清模型能力、数据覆盖和评测缺口。
+1. **延迟与显存瞬间互掐**：在线查询时让 VLM 逐张重看相册，耗时随图片量线性爆炸；即便改到后台入库时处理，若放任 `Qwen2.5-VL`、`CLIP`、文本编码器与 `InsightFace` 在同一个进程里多 Worker 并发抢显存，轻则频繁触发显存换页（Swap）把吞吐拖入泥潭，重则一个 CUDA 依赖升级就把整个 FastAPI 后端搞崩。
+2. **大模型“合理脑补”污染事实源**：让视觉大模型自由生成一段长描述（Dense Caption）再转成向量，模型看到暖光木桌就会顺口猜“某地网红咖啡馆”，看到两人同框就敢臆测人物关系——一旦把未证实的推断当成客观事实写进主索引，后续检索就会充满莫名其妙的幻觉召回。
+3. **测试全绿却搜不准的“盲人调参”**：单元测试全部通过、几百张图顺利入库生成向量，输入一句日常中文查询，排在前面的结果却依然答非所问。
 
-本文基于 `personal-knowledge-lab`、独立的 `pkl-vllm-service`、本地 SQLite 索引快照和运行日志完成。文中会明确区分已经落地的实现与仍处于设计阶段的能力，不把 roadmap 写成结果。
+这个实验项目在跑通第一版多模态入库与检索闭环后，正是因为搜索相关性尚未达到我对日常主力工具的要求而主动按下暂停键。把这次从架构隔离、数据契约设计到“为什么流水线全通还是搜不好”的完整排查链条摊开复盘，比晒一个精挑细选的成功 Demo 更有工程价值。
 
-## 一、背景：个人资料需要怎样的本地索引 {#从本地优先开始而不是从模型开始}
+---
 
-“本地优先”并不等于把云端 API 地址改成 `localhost`。它更接近 [Ink & Switch 对 local-first software 的定义](https://www.inkandswitch.com/essay/local-first/)：用户拥有数据，应用在离线状态仍然可工作，网络或供应商不应成为访问个人资料的前置条件。
+## 一、本地优先的数据契约：把派生索引与原始事实彻底剥离
 
-在这个项目里，我把它落实成四条约束：
+真正意义上的“本地优先（Local-First）”（参见 [Ink & Switch 的经典定义](https://www.inkandswitch.com/essay/local-first/)）绝不只是把云端接口地址改成 `localhost`，而是从数据所有权与容错边界上立下四条硬规矩：
 
-1. Windows 中的照片和文档是只读事实源，扫描和索引不能改名、移动或删除原文件。
-2. SQLite、向量、缩略图和日志都是可重建的派生数据；模型升级不能污染原始资料。
-3. 视觉理解、embedding、人脸检测和检索在本机完成。环境里即使残留 `LLM_*` 配置，应用也不读取或转发其值。
-4. 人脸模型只发现“相似的人脸”，真实姓名必须由用户确认，不能让 VLM 根据面孔猜身份。
+1. **原始资产严格只读**：存放在 Windows 目录下的照片与文档是唯一事实源（Source of Truth），WSL 内的扫描与索引进程不拥有改名、移动或删除原文件的任何权限。
+2. **一切模型产物皆为可丢弃的派生视图**：SQLite 记录、缩略图、结构化描述与向量全部属于随时可以清空重算的二级索引；升级模型或修改 Prompt 绝不触碰原始文件。
+3. **零外部网络泄漏**：视觉采集、向量编码、人脸检测与混合检索全部闭环在本机完成，即便宿主机环境变量里残留了外部 `LLM_*` 密钥，应用也一律忽略不读。
+4. **人脸只做相似分簇，身份必须人工拍板**：算法只负责把长得像的面孔聚成簇（Cluster），绝不允许大模型凭长相猜测真实姓名。
 
-从数据库的角度看，这套结构并不陌生：
+用数据库系统的视角来映射，整套实验室的职责层次非常干净：
 
-| 数据库概念 | Personal Knowledge Lab 中的对应物 |
+| 数据库经典概念 | Personal Knowledge Lab 中的物理对应物 |
 | --- | --- |
-| Base table / source of truth | Windows 上的原始照片与文档 |
-| Catalog | SQLite 中的 source、file、asset、模型与任务版本 |
-| Materialized view | caption、OCR、缩略图、文档 chunk |
-| Secondary index | CLIP、文本和人脸向量 |
-| Index maintenance | 后台扫描、补索引、失败重试与版本失效 |
-| Query planner | 意图识别、filter 下推和检索路由 |
-| EXPLAIN | `match_reason`、namespace 分数和命中证据 |
+| **基表（Base Table）** | Windows 磁盘上只读挂载的原始照片与 PDF / Markdown 文档 |
+| **系统目录（Catalog）** | SQLite 中记录的文件 SHA-256 指纹、资产元数据、模型版本与任务队列 |
+| **物化视图（Materialized View）** | `photo_context_v2` 结构化描述、OCR 文本块、缩略图与文档分块（Chunk） |
+| **二级索引（Secondary Index）** | `clip:image` 视觉向量、多命名空间文本向量与人脸特征向量 |
+| **查询优化与 `EXPLAIN`** | 规则意图路由、元数据过滤下推、加权 RRF 融合及逐条返回的 `match_reason` |
 
-这个类比也带来一个重要结论：caption 和 embedding 不是“内容本身”，只是可以被丢弃、重算和迁移的索引。更换模型、prompt、pooling 或向量维度，本质上都相当于一次索引格式升级。
+当然，如果唯一诉求是找一个现成好用的家庭相册备份与管理工具，开源社区成熟的 [Immich](https://docs.immich.app/developer/architecture/) 早已把移动端同步、PostgreSQL 存储、人物聚类和语义搜索打磨得相当完善，完全没必要重造轮子；同理，快速搭标准文档问答直接用 LlamaIndex 或 Haystack 编排也省事得多。我之所以选择“**薄业务编排层 + 独立可替换模型服务**”自建实验台，核心诉求在于跨照片与文档做联合检索，并把每一个召回通道的原始排名、模型版本指纹与失败现场透明地暴露出来做对照实验。
 
-## 二、竞品与路线：使用相册产品，还是搭建检索实验台
+---
 
-是否自建取决于需要观察和控制哪些环节，而不是能接入多少模型。下面把原稿中的产品对照放到实现之前，解释这一项目的范围；这不是补写一次当时并未发生的正式选型实验。
+## 二、三平面解耦架构：离线采集、在线融合与独立模型服务
 
-### 与已有开源项目的关系
+为了把昂贵的视觉推理彻底移出在线查询路径，同时守住单张 16GB RTX 5070 Ti 的显存红线，系统在物理上切分成了**离线多模态索引面**、**独立模型服务面（`pkl-vllm-service`）**与**在线混合检索面**三个互不越界的平面：
 
-如果目标只是获得本地照片管理产品，[Immich](https://docs.immich.app/developer/architecture/) 已经提供移动端备份、PostgreSQL、机器学习服务、人物、OCR、地点和语义搜索。重新实现一套相册产品并没有明显价值。
+![Personal Knowledge Lab 离线索引、在线检索与独立模型服务三平面架构：只读扫描 Windows 原文件，由显存感知 Worker 调独立进程 Qwen2.5-VL 服务写入可重建 SQLite 派生库，在线查询经 Weighted RRF 融合输出可解释证据](/images/diagrams/aug-ai-pkl-three-plane-arch.svg)
 
-Personal Knowledge Lab 的价值在另一个方向：
+### 1. 离线索引面：`photo_context_v2` 三层防幻觉建模与人脸确认流
 
-- 同时研究照片与文档，而不是只做照片备份；
-- 保留每条结果的召回通道和证据，观察检索为何成功或失败；
-- 把 prompt、模型、向量和任务都当成有版本的数据产品；
-- 在单机 WSL 与有限 GPU 上研究调度、降级和可恢复性；
-- 允许替换每个组件并做对照实验。
-
-LlamaIndex、Haystack 等框架适合快速搭建 RAG orchestration；Immich 适合直接使用；Qdrant 适合向量规模增长之后的基础设施。这个项目更像一个个人 AI/数据库实验台。它不应该以“代码都是自己写的”为目标，而应该借鉴成熟项目的边界，再把精力放到可解释性、评测与跨资产检索上。
-
-### 三条路线的收益与代价
-
-| 路线 | 优先解决的问题 | 需要承担的代价 | 不适用边界 |
-| --- | --- | --- | --- |
-| 直接使用相册产品 | 备份、管理、人物整理与日常查找，复用成熟工作流 | 接受产品的数据模型和扩展边界；仍需核对部署与模型配置 | 需要逐通道消融、跨文档实验或自定义索引身份时，要先确认扩展接口 |
-| 用检索框架组装应用 | 复用解析、索引和检索编排，减少重复接线 | 仍需实现资产身份、模型指纹、任务恢复和人工修正 | 没有相关性标注时，框架连通不能证明检索质量 |
-| 自建薄业务层 + 可替换模型服务 | 直接观察各通道证据，在本机资源约束下做对照 | 自行维护队列、数据迁移、诊断和评测，开发成本最高 | 只想管理相册、不准备维护实验数据与系统时不值得采用 |
-
-当前实现更接近第三条，但原稿的失败记录并不支持“自建比现成产品好”。它只说明这条路径让模型回退、索引覆盖和资源争用变得可检查。后续应保留必要的资产与证据合同，优先复用通用组件；若这些可观察性不再是目标，就应退回产品方案，不继续扩展实验台。
-
-## 三、实现：离线索引、在线检索与模型服务分开
-
-当前实现把模型观察存为可重建索引，查询只读取已生成的数据。这样将逐图推理移出在线路径，但代价是索引新鲜度、模型版本和失败重建都成为应用责任。以下保留原有实现与运行参数，不将后文的改进建议写成已完成能力。
-
-### 索引写入：从只读文件到可追溯观察 {#索引路径从只读文件到可追溯的模型观察}
-
-#### 当前架构：让 Qwen 负责采集，而不是在线搜索
-
-早期最自然的想法，是每次查询都让视觉大模型逐张看图并回答“是否相关”。它的问题也很直接：延迟随照片数量线性增长，GPU 成本高，结果不可重复，并且难以说明究竟是哪条证据命中。
-
-因此现在的 Qwen2.5-VL 被放在离线索引阶段，角色是 `context collector`：
-
-```text
-只读原始文件
-  ├── 确定性解析
-  │     ├── SHA-256 / 文件属性
-  │     ├── EXIF / GPS / 拍摄时间
-  │     └── 文档正文 / 页码 / chunk
-  │
-  ├── 原始视觉索引
-  │     └── CLIP image embedding
-  │
-  └── 语义采集
-        ├── Qwen2.5-VL -> 结构化 photo context
-        ├── 文本 embedding -> 多个语义 namespace
-        └── InsightFace -> face embedding / person cluster
-
-查询
-  -> 意图解析与过滤条件
-  -> 多路召回
-  -> Weighted RRF
-  -> 结果、证据与 match_reason
-```
-
-[Qwen2.5-VL](https://arxiv.org/abs/2502.13923) 负责把像素转成可检索的结构化描述；[CLIP](https://arxiv.org/abs/2103.00020) 保留原始画面的跨模态召回能力；[InsightFace](https://github.com/deepinsight/insightface) 提供人脸检测和 embedding。在线查询只访问已经生成的索引，不再把整套相册交给 VLM 重看一遍。
-
-这与经典 RAG 的 ingestion、indexing、retrieval、synthesis 分层类似，可以参考 [LlamaIndex 对 RAG 阶段的划分](https://github.com/run-llama/llama_index/blob/main/docs/src/content/docs/framework/understanding/rag/index.mdx)。但框架只能帮助编排组件，并不会自动解决数据归属、模型版本、幂等（Idempotency）任务和评测问题，这些仍然是应用自己的系统责任。
-
-#### Context 不是一段更长的 caption
-
-照片索引最危险的问题，不是模型漏掉一个物体，而是把“看起来合理的推断”写成事实。例如室内装饰可能像杭州某家餐厅，但画面本身不能证明地点；两个人站在一起也不能证明关系。
-
-当前 `photo_context_v2` 把内容拆成三层：
+在离线入库链路上，[Qwen2.5-VL](https://arxiv.org/abs/2502.13923)、[CLIP](https://arxiv.org/abs/2103.00020) 与 [InsightFace](https://github.com/deepinsight/insightface) 各司其职。为了让视觉大模型当好客观的“证据采集员（Context Collector）”而非天马行空的小说家，我们将输出协议升级为严格的 JSON Schema `photo_context_v2`，强制把画面信息拆进三个隔离字段：
 
 ```json
 {
@@ -148,248 +88,81 @@ LlamaIndex、Haystack 等框架适合快速搭建 RAG orchestration；Immich 适
 }
 ```
 
-- `observations` 只放画面中可以直接观察的对象、动作、场景、颜色和文字。
-- `inferences` 保存地点、事件、时间或关系等推断，每项必须携带置信度。
-- `metadata` 保存 EXIF、GPS、文件属性和用户确认的人物等确定性信息。
+- **`observations`（直接观测）**：只允许记录像素里肉眼可见的物体、动作、场景与画面文字，作为主语义向量的核心输入。
+- **`inferences`（受控推断）**：对事件性质或场景氛围的推测必须显式附带置信度，低于阈值的猜测一律拦在向量构造器门外。
+- **`metadata`（确定性元数据）**：拍摄时间、GPS 经纬度与文件属性直接由确定性解析器提取，后续走精确过滤而非塞进文本里赌余弦相似度。
 
-向量构造器只接收超过阈值的推断。姓名、时间和 GPS 更适合成为 filter 或结构化条件，而不是拼进 caption 后让 cosine similarity 碰运气。人脸 prompt 也明确禁止由面孔猜真实身份。
+在Schema 演进上，系统还区分了控制重建批次的任务标识（`photo_context`）与控制字段语义的数据版本（`photo_context_v2`），支持后台渐进式重算而不必在升级结构的一瞬间令全库索引雪崩失效。
 
-这里还保留了一个渐进迁移设计：索引失效版本仍叫 `photo_context`，payload schema 已升级为 `photo_context_v2`。前者控制重建批次，后者控制字段语义。这样不必在改 schema 的一刻让所有照片同时失效，但旧记录是否已经重建必须变得可观测。
+人物链路同样严守事实边界（与 [Immich 人脸模块](https://immich.app/docs/features/facial-recognition)“先聚类、后人工命名修正”的理念一致）：`InsightFace` 提取人脸特征并与现有簇中心做增量均值比对；未确认前它们只是匿名编号，只有当用户在界面上把某个簇确认为“乔乔”后，后台才会触发 `refresh_person_vectors` 将姓名与别名写入关联照片的检索上下文。
 
-#### 人脸能力：聚类不是身份事实
+### 2. 显存感知队列与拆出应用仓库的 `pkl-vllm-service`
 
-人脸聚类只能给出相似性分组，不能自动成为身份事实；需要用户确认、保留修改来源，并支持错误合并后的拆分。人物链路如下：
+后台 `QueueController` 周期性巡检 SQLite 任务表，Worker 通过条件更新原子认领（Claim）待处理资产，并将每次执行的模型配置、耗时与报错完整记入 `ProcessingRun`。虽然配置文件允许最多 4 个并发 Worker，但调度器会实时探查 GPU 剩余空闲显存动态踩刹车：空闲达 24GB 才放行 2 路视觉并发，8GB–16GB 区间严格锁死为 **1 路视觉 Worker**，显存更吃紧时自动挂起视觉任务仅跑轻量解析。在 16GB 的 RTX 5070 Ti 上，老老实实串行跑 1 个视觉 Worker 看似保守，实则彻底根除了四个模型争抢显存引发的 OOM 与反复重加载抖动（后续若任务并发进一步抬升，SQLite 连接还需显式开启 [WAL 模式](https://www.sqlite.org/wal.html) 并配合短事务批次压测写锁吞吐）。
 
-```text
-照片
-  -> InsightFace 检测与 face embedding
-  -> 与 cluster centroid 比较
-  -> person cluster
-  -> 用户命名 / alias / ignore
-  -> 重建受影响照片的 people context
-```
+更关键的一步隔离是将视觉大模型单独拆进 `pkl-vllm-service` 仓库（运行 `Qwen2.5-VL-3B-Instruct`，基于 [PagedAttention](https://arxiv.org/abs/2309.06180) 机制的 [vLLM](https://vllm.ai/) `0.25.0` + `Torch 2.11.0+cu130`）。主应用把默认缩放至 `768 × 768` 以内的图片编码为 Data URL，以 `temperature=0`、最大输出 `512` Tokens 调用本机 OpenAI 兼容接口 `/v1/chat/completions`；**模型服务进程没有任何应用数据库写权限**。
 
-cluster centroid 使用增量均值更新。用户把一个 cluster 命名为“乔乔”后，`refresh_person_vectors` 任务才会把名字和别名写入相关照片的检索 context。因此“找乔乔在地铁里的照片”由用户确认的 cluster、视觉场景和其他证据联合完成，不依赖模型凭脸猜人。
+这次物理拆分顺手帮我揪出了一个极具迷惑性的 WSL 网络怪癖：最初服务绑定在 `127.0.0.1:8100`，进程明明正常监听，客户端却死活报 `Connection refused`。正是因为模型服务已经跟业务代码彻底解耦，我只用几行标准库起了一个最简 HTTP Server 做对照隔离实验，几分钟就锁定真凶——这台机器的 WSL 策略路由把发往 `127.0.0.1` 的包导进了异常回环设备！将监听地址平切到同属本地回环网段的 `127.0.0.2:8100` 后故障当场消失。倘若当时把 vLLM 嵌在业务进程里一锅炖，多半又要白白重装半天驱动和 Torch。
 
-本地快照有 1,227 次人脸检测和 464 个 cluster，其中仍有 96 张图片等待人脸处理。这个数字首先暴露的是评测问题：阈值可能把同一个人拆得过细，也可能错误合并相似面孔。成熟的开源照片系统 [Immich 的人脸识别](https://immich.app/docs/features/facial-recognition) 同样把检测、embedding、聚类和用户命名分开，并提供合并、隐藏等人工修正路径。这里真正值得借鉴的不是“也有一个 People 页面”，而是允许用户持续纠正聚类结果。
+### 3. 在线混合检索面：为什么不能把 CLIP 分数和文本余弦分数直接相加？
 
-### 查询与维护：排序、队列及模型服务 {#检索与后台维护排序队列及模型服务}
+在线查询完全不触碰视觉大模型。一张入库照片同时挂着一条 `clip:image` 原始画面向量以及 `caption / object / activity / OCR / location` 等多个命名空间的文本向量。这里最容易犯的数学错误就是把 `CLIP` 算出来的图文余弦分（往往集中在 `0.25–0.35`）和文本编码器算出来的余弦分（动辄 `0.70–0.85`）直接加权求和——两个异构嵌入空间的数值尺度和分布方差完全不可通约，直接相加只会让高分值空间的噪声彻底淹没另一路信号。
 
-#### 多路检索：不要直接相加两个不同空间的分数
-
-每张图片目前有一条 `clip:image` 向量，也有 caption、dense caption、object、activity、OCR、location、time、event、metadata 等文本向量。不同向量空间的 cosine score 不具备天然可比性：CLIP 的 0.31 与文本模型的 0.78，不能因为都是小数就直接相加。
-
-当前实现让每个检索器先独立排序，再使用 [Reciprocal Rank Fusion（RRF）](https://cormack.uwaterloo.ca/cormack/cormacksigir09-rrf.pdf) 合并：
+为此，在线检索器先根据可解释规则解析查询意图（如识别“去年”下推时间过滤、遇到“报错/白板/写着”拉高 OCR 权重、命中已确认人名映射至人脸簇），让各路召回通道各自独立排序，再通过 **[倒数排名融合（Reciprocal Rank Fusion，RRF）](https://cormack.uwaterloo.ca/cormack/cormacksigir09-rrf.pdf)** 汇总最终次序：
 
 $$
-\operatorname{RRF}(d)=\sum_{r\in R}\frac{w_r}{k+\operatorname{rank}_r(d)}
+\operatorname{RRF}(d) = \sum_{r \in R} \frac{w_r}{k + \operatorname{rank}_r(d)}
 $$
 
-其中 \(R\) 是召回通道，\(w_r\) 是通道权重，\(k\) 用于降低头部名次过强带来的抖动。RRF 使用排名而非原始分数，适合先解决多个模型分值尺度不一致的问题。
+只看名次不看绝对分值，干净绕开了跨模型分数未校准的难题；API 响应同时原样带回每个命名空间的命中排名与 `match_reason`，让前端能清楚展示每张图究竟靠什么证据上榜。
 
-查询规划目前仍是可解释的规则系统：
+---
 
-- “去年”“2025 年”进入时间条件；
-- 城市词与 GPS/地点字段建立候选；
-- “写着”“报错”“函数”“白板”提高 OCR 通道权重；
-- 已命名的人物别名先解析为 face cluster；
-- 物体和场景描述同时进入 CLIP 与文本召回。
+## 三、失败复盘：为什么 529 张照片全部入库、单测全绿，搜索依然不达预期？
 
-响应保留各 namespace 的分数、命中词和 `match_reason`。这类似数据库的 `EXPLAIN`：用户看到的不能只是“相关度 0.83”，而应该知道它来自画面相似、文字命中、人物聚类，还是时间与地点条件。
+系统搭好后，我在本地跑通了包含 `2` 个数据源目录、共 `631` 个文件（`529` 张照片产出 `6,715` 条向量、`1,227` 次人脸检测聚为 `464` 个簇，另有 `102` 份文档切为 `2,293` 个分块）的完整快照，后端 `pytest` 10 项测试全部绿灯通过。然而真拿日常中文问题去搜照片时，相关性却屡屡掉链子。顺着日志、缓存目录与 SQLite 向量表一层层往下扒，三个平时被流水线成功率掩盖的真凶浮出了水面：
 
-当前的 `confidence` 只是融合特征推导出的启发式值，并不是经过校准的概率。把它显示成“83% 正确”会制造并不存在的精确感。
+![本地多模态检索失准根因复盘与评测先行修复闭环：从单测通过但中文搜图失准的表象切入，定位显存限流长尾、BGE-M3 静默回退 512 维模型漂移及英文 CLIP/残缺 OCR 错位，确立锁指纹与标注评测集先行的演进门禁](/images/diagrams/aug-ai-pkl-failure-diagnosis.svg)
 
-#### 后台队列：索引是一项长期的数据维护工作
+### 1. 微基准数字漂亮不代表端到端入库轻快
 
-FastAPI 启动后，`QueueController` 周期性扫描 SQLite 任务表，补入未索引照片、待处理人脸和到期的文档扫描任务。worker 通过条件更新 claim 任务，`ProcessingRun` 记录开始/结束时间、worker、模型 profile、输出统计和错误。
+在服务端压测阶段，我固定 `max_model_len=4096, gpu_memory_utilization=0.82, dtype=bfloat16`，用 `1024px` 合成图片做并发微基准测试：将 `max_num_seqs` 从 `4` 提到 `8` 时，vLLM 连续批处理吞吐从 `13.01 req/s`（`18,501 tokens/s`，P95 `0.69s`）一路跃升至 **`21.95 req/s`（`31,220 tokens/s`，P95 `0.38s`）** 且零抢占（Preemption）。
 
-配置允许最大并发 4，但它只是上限。自动调度会读取 GPU 空闲显存：
+但翻开真实相册入库的 Worker 端到端日志，处理一张生活照实际耗时普遍在 **`4.7–7.2` 秒**，个别大图甚至超过 `10` 秒！原因很现实：高分辨率原图越清晰，切成视觉 Patch Token 后 Prefill 计算量越重（服务端专门限制单请求最多 1 张图且像素上限约 `2,007,040`），再加上磁盘读取缩放、HTTP 往返、JSON 校验、CLIP 编码、多路文本向量生成、人脸检测以及 SQLite 事务落盘全部串在一条单并发链路上。孤立拿 vLLM 引擎的 `0.38s` 推理延迟去估算整库构建时间，会严重低估真实工程成本。
 
-- 空闲显存达到 24GB，视觉任务最多并发 2；
-- 达到 8GB，最多并发 1；
-- 更紧张时只保留轻量任务，或暂停视觉 worker。
+### 2. 最危险的隐形事故：`BAAI/bge-m3` 静默回退成了 512 维小模型！
 
-目标机器是一张 16GB RTX 5070 Ti，实际策略通常只启动一个视觉 worker。这个结果没有“并发 4”好看，却更符合真实资源边界。让 Qwen、CLIP、文本 embedding 和 InsightFace 一起争抢显存，最终 OOM、模型反复加载或进入 swap，并不会提高吞吐。
+排查检索不准时，最让我出冷汗的发现来自数据库向量维度的核验。项目配置文件里白纸黑字请求的多语言文本模型是 `BAAI/bge-m3`（1024 维，兼顾稠密、稀疏与多向量表征，详见 [BGE-M3 论文](https://arxiv.org/abs/2402.03216)）；可当我直接查 SQLite 里的 `photo_vectors` 表时，发现**全部 6,715 条向量清一色都是 512 维**！
 
-SQLite 适合承担当前规模下的 catalog 和任务状态，但必须正视它的并发边界：[SQLite WAL](https://www.sqlite.org/wal.html) 可以让 reader 与 writer 并行，仍然同时只有一个 writer。当前连接配置没有显式启用 WAL，任务增加后应该将 journal mode、busy timeout、短事务和写入批次一起纳入压测，而不是只调 worker 数量。
+顺藤摸瓜查模型加载器才真相大白：由于当时本机 Hugging Face 缓存目录里并没有预先拉取 `bge-m3` 权重，离线模式下模型解析器（Resolver）触发了兜底分支，**不报错地静默回退到了本地已有的 `BAAI/bge-small-zh-v1.5`（512 维）**！这意味着“系统正在使用 BGE-M3”从头到尾都只是配置文件上的一厢情愿。
 
-#### 为什么把 vLLM 从应用仓库拆出去
+这次踩坑敲响了一记警钟：在向量检索系统里，**`(resolved_model, revision, dimension, pooling, normalized, prompt_version)` 共同构成了索引的物理 Schema**。任何静默降级或版本漂移都会让查询向量与库内历史向量在表面兼容的假象下彻底错位。必须在数据库里同时持久化 `requested_model` 与实际生效的 `resolved_model` 指纹，Worker 与查询服务启动时一旦核对指纹不匹配立即硬报错拦截，显式触发全量重建（Reindex）。
 
-`personal-knowledge-lab` 负责业务状态，`pkl-vllm-service` 只负责模型运行时：
+### 3. 跨模态语言错位与一等公民 OCR 的缺席
 
-```text
-React / FastAPI / SQLite worker
-       |
-       | OpenAI-compatible localhost request
-       v
-VisionServiceClient
-       |
-       | 127.0.0.2:8100/v1/chat/completions
-       v
-pkl-vllm-service
-       |
-       | Qwen2.5-VL-3B-Instruct + vLLM + CUDA
-       v
-结构化 JSON（没有应用数据库写权限）
-```
+即便排除了文本模型回退，视觉与文字两条召回腿本身也存在明显短板：
 
-应用把压缩后的图片编码为 data URL，与严格 JSON prompt 一起调用 `/v1/chat/completions`；温度为 0，输出上限 512 tokens。模型服务没有数据库权限，失败时由 worker 决定重试、降级或记录错误。
+- **英文 CLIP 接不住中文细粒度查询**：当前搭载的 `openai/clip-vit-base-patch32` 训练语料以英文为主，直接输入中文短语搜画面细节形同鸡同鸭讲（[Immich 搜索文档](https://docs.immich.app/features/searching/)同样专门提示非英语检索需切换多语言模型），且 `ViT-B/32` 粗粒度 Patch 对小物体与密集文字天生迟钝。
+- **VLM 描述是有损压缩，替代不了专用 OCR + 倒排索引**：一张图片一旦没被 Qwen2.5-VL 在 512 个输出 Token 里写进 `observations`，后续文本向量就永远找不回来；全库 529 张图里仅有 63 张产出了 `OCR` 命名空间记录。搜代码截图里的精确报错名、函数标识符或发票金额时，靠稠密向量做模糊语义匹配远不如专用 OCR 引擎配合 BM25 词法倒排索引精准。
+- **换向量数据库救不了相关性**：目前 529 张图的向量以 JSON 存在 SQLite 里由 Python 读入内存算余弦，延迟完全可控；未来扩到数万张图时确实该迁入支持多命名空间向量（Named Vectors）与无停机别名切换的 [Qdrant](https://qdrant.tech/documentation/manage-data/collections/)，但 ANN 近似最近邻索引只能加速“更快地算出当前的余弦距离”，绝不会自动修好失配的编码器和缺失的 OCR 通道。
 
-拆分之后有三个收益：
+---
 
-1. Web 应用环境不再被 Torch、CUDA 和 vLLM 的兼容矩阵绑死；
-2. 模型的加载、显存、升级和 warmup 成为独立故障域；
-3. 应用只依赖稳定的 endpoint 和模型别名，不把 Hugging Face snapshot 路径写进业务逻辑。
+## 四、重启开发前的准入门禁：让离线评测集成为系统规格
 
-当前服务环境记录为 Python 3.12、vLLM 0.25.0、Torch 2.11.0+cu130、CUDA runtime 13.0；模型是 Qwen2.5-VL-3B-Instruct，服务名为 `qwen-vl-photo-context`。vLLM 通过连续批处理和 KV cache 管理提高吞吐，其核心思想可以追溯到 [PagedAttention 论文](https://arxiv.org/abs/2309.06180)，最新运行时能力则以 [vLLM 官方文档](https://vllm.ai/) 为准。
+复盘整轮实验，最大的收获不是攒出了多少行代码，而是想明白了一件事：**没有带相关性标注的离线评测集，继续往系统里堆再多新模型、换再快的向量库，都只是对着两三个印象深刻的失败案例盲目凑参数。**
 
-WSL 里还有一个很具体的工程教训：这台机器的 `127.0.0.1` TCP policy route 会导向异常 loopback 设备，进程虽然显示监听，客户端却收到连接拒绝。使用普通 HTTP server 复现后，服务改为绑定 `127.0.0.2:8100`，仍只暴露在本机 loopback。很多“模型服务故障”最终是网络、环境或进程边界问题，不能仅靠重装模型解决。
+这与数据库查询优化器的演进逻辑如出一辙——先固定标准负载（Workload）与基线剖析，再动手改索引与代价模型。下次重启 `personal-knowledge-lab` 迭代前，先按以下顺序补齐标尺与安全门禁：
 
-## 四、失败复盘：链路跑通为何仍然搜不好 {#失败复盘资源预算模型身份与样本覆盖}
+1. **锁死模型与索引版本指纹**：在 Catalog 层强制校验实际加载权重指纹、向量维度与归一化标志，杜绝任何形式的静默回退混写；验证人物簇误合并拆分后相关上下文能够幂等重建。
+2. **构建 80–150 条真实个人标注查询集**：覆盖人物、时间、地点、细粒度物体、白板/报错截图、PDF 文档及多条件组合查询，并刻意放入一批“库内确实没有对应照片”的负样本（检验系统能否诚实返回空结果而非硬凑低置信度噪声）。
+3. **固定指标做逐通道消融（Ablation）**：在统一的 `Recall@5/10`、`MRR`、`nDCG` 与端到端延迟标尺下，依次单独开关 `CLIP only`、`Context only`、`专用 OCR + BM25`、`元数据过滤前推` 与 `Weighted RRF`，用真实涨跌点数决定该换哪款多语言视觉编码器（如 Multilingual CLIP / SigLIP），最后再按规模瓶颈引入 Qdrant 与小候选集重排（Rerank）。
 
-原有日志和索引快照能够证明流水线运行过，却不能证明相关性达到预期；配置模型与实际向量不一致，更说明需要先核对数据身份，再调检索权重。下面的数量、耗时和测试结果均来自原稿记录，本轮未重新执行。
+---
 
-### 视觉 token、像素预算和基准数字
+## 五、实验环境与快照基线说明
 
-Qwen2.5-VL 不会直接把 JPEG 字节送入语言模型。图片先被处理成视觉 token，与 prompt 一起完成 prefill，随后才生成 JSON。像素越多，视觉 token 越多，prefill 计算与 KV cache 压力也随之增加。
+本文复盘基于本机 Windows + WSL2 双层存储环境（硬件为单卡 NVIDIA RTX 5070 Ti 16GB），核心服务与数据快照状态如下：
 
-服务端限制每个 prompt 一张图片，最大约 2,007,040 pixels；应用端还有更保守的 `768 × 768` 默认缩放。客户端上限控制常规照片的索引成本，服务端上限保护所有调用者。需要读取小字的图片，未来应该进入专门的 OCR 路由，而不是统一把每张生活照都放大。
-
-当前 vLLM 配置为：
-
-```text
-max_model_len=4096
-max_num_seqs=8
-max_num_batched_tokens=4096
-gpu_memory_utilization=0.82
-dtype=bfloat16
-limit_mm_per_prompt.image=1
-```
-
-在 1024px 合成图、客户端并发 8 的微基准里，`max_num_seqs=8` 达到约 21.95 req/s、P95 0.38s、31,220 tokens/s，且没有 preemption；`max_num_seqs=4` 的基线约为 13.01 req/s、P95 0.69s、18,501 tokens/s。
-
-这个数字证明 continuous batching 有效，但不能翻译成“真实相册每张只需 0.38 秒”。真实 worker 日志中，每张照片通常需要 4.7～7.2 秒，少数超过 10 秒；其中还包括图片读取与缩放、请求传输、JSON 解析、CLIP/文本向量、人脸处理和数据库写入。微基准回答运行时容量，端到端日志回答用户实际等待时间，两者不能混用。
-
-### 一次很关键的模型身份漂移
-
-项目配置中请求的文本模型是 `BAAI/bge-m3`。[BGE-M3](https://arxiv.org/abs/2402.03216) 的价值在于多语言，以及 dense、lexical、multi-vector 等多种检索表示。但检查运行代码、模型缓存和数据库后，实际情况是：
-
-1. 本机没有 BGE-M3 cache；
-2. resolver 静默回退到 `BAAI/bge-small-zh-v1.5`；
-3. SQLite 中所有文本向量都是 512 维，与这个回退模型一致。
-
-也就是说，原来的“使用 BGE-M3”只是配置意图，不是运行事实。这比某次搜索结果不好更值得警惕：模型名、revision、维度、pooling、normalize 和 prompt 模板共同定义一个向量空间，任一项改变都意味着索引版本改变。静默 fallback 会让旧向量和新查询看似兼容，实际语义却已经漂移。
-
-后续必须把两类配置分开记录：
-
-```text
-requested_model = BAAI/bge-m3
-resolved_model  = BAAI/bge-small-zh-v1.5
-revision        = ...
-dimension       = 512
-pooling         = mean
-normalized      = true
-index_version   = ...
-```
-
-worker 启动时应验证数据库中向量的模型指纹；不一致就拒绝混写并触发显式 reindex。这本质上不是 ML 细节，而是 schema compatibility。
-
-### 为什么图片搜索没有达到预期
-
-检索质量的判断需要带上样本覆盖范围：当前快照规模较小，OCR 与文档通道也不完整，不能把少量成功案例外推到完整个人知识库。快照包含：
-
-| 项目 | 数量 |
-| --- | ---: |
-| source roots / files | 2 / 631 |
-| documents / chunks | 102 / 2,293 |
-| indexed images | 529 |
-| photo vectors | 6,715 |
-| processing tasks / runs | 4,627 / 4,646 |
-| face detections / clusters | 1,227 / 464 |
-
-所有 529 张照片已经生成 context 和 `clip:image`；数据库中可见的向量都是 512 维。代码测试也可以通过：
-
-```bash
-PYTHONDONTWRITEBYTECODE=1 \
-python3 -m pytest -p no:cacheprovider backend/tests -q
-# 10 passed
-```
-
-但“pipeline 全部成功”并不代表“搜索足够好”。结合代码与数据，我认为主要瓶颈来自以下几个层面。
-
-#### 中文查询与英文 CLIP 的能力错位
-
-当前视觉模型是 `openai/clip-vit-base-patch32`。它适合验证 text-to-image 的基本链路，但原始训练数据与中文查询并不匹配，ViT-B/32 对细粒度物体和小文字也有限。Immich 的 [搜索文档](https://docs.immich.app/features/searching/) 同样明确提醒：非英语查询应选择合适的多语言模型。
-
-下一步不是随意换一个“更大 CLIP”，而是用真实中文 query 对比 multilingual CLIP/SigLIP 类模型，观察 Recall@10、显存、索引时间和向量维度的整体变化。
-
-#### VLM context 是有损表示
-
-caption 将高维画面压缩成有限文本。没被模型写出来的细节，后续文本 embedding 无法恢复；被模型猜错的内容则会变成新的噪声。observation/inference 分层可以降低污染，但不能消除信息损失。
-
-因此原始视觉向量、OCR、结构化元数据和 VLM context 应当互补，不能让一段 dense caption 成为照片的唯一真相。
-
-#### OCR 还不是独立的一等检索器
-
-当前 visible text 主要来自 VLM 输出，数据库中只有 63 张照片拥有 OCR namespace。截图、白板、票据和报错信息需要专门 OCR、文本规范化和 lexical/BM25 检索。精确错误码或函数名交给 dense embedding，往往不如倒排索引可靠。
-
-#### 检索仍是 Python 中的线性扫描
-
-`photo_vectors` 以 JSON 存在 SQLite，查询时读入 Python 计算 cosine。在 529 张图上可以工作，也便于观察每条向量；继续扩展到几万张图后，内存、延迟和过滤顺序都会成为问题。
-
-[Qdrant](https://qdrant.tech/documentation/manage-data/) 可以提供 ANN、payload filter 和更成熟的索引维护；其 [collection、named vectors 与 alias](https://qdrant.tech/documentation/manage-data/collections/) 也适合当前的多 namespace 与无停机迁移。但迁移向量数据库只解决规模和工程效率，不会自动修好中文 CLIP、坏 caption 或错误权重。
-
-#### 权重和置信度还没有数据依据
-
-当前意图规则、RRF 权重和 confidence 都来自工程经验。没有标注 query 集时，很容易对几条印象深刻的失败样例反复调参，最后得到只对这些样例有效的系统。
-
-#### 文档检索仍是 baseline
-
-照片已经有实验性的多路语义检索，但文档目前主要是本地 parser、chunk 与 TF-IDF，不是完整的 BGE-M3、sparse+dense、rerank pipeline。照片和文档也不是同一种资产：PDF 需要页码、版面、表格、代码和公式，照片需要人物、时空、OCR 与视觉场景。所谓统一检索，不应等同于把所有内容塞进一个 embedding。
-
-## 五、可行性与下一步：用评测决定是否继续 {#下一轮实验先建立评测再决定扩展}
-
-继续开发的前提是能够分辨模型、索引覆盖和排序策略各自造成的误差。现有快照尚不能完成这一判断，因此下一轮先建立标注与恢复检查，再决定是否扩大模型和存储规模。
-
-### 下一步：让评测成为 Vibe Coding 的规格
-
-流水线成功率不能替代检索质量，因为索引任务完成时并不知道用户期待哪些结果。下一轮应先建立带相关性标注的查询集，再比较模型与检索策略。
-
-下一阶段如果继续，我会先暂停堆组件，建立一个小而真实的离线评测集：
-
-1. 从自己的使用方式收集 80～150 条 query，覆盖人物、时间、地点、物体、场景、OCR、文档和跨条件组合；
-2. 为每条 query 标注相关资产与必要证据，并保留“没有正确结果”的样例；
-3. 固定 train/dev/test 或至少固定回归集，避免每次只挑有利案例；
-4. 记录 Recall@5/10、MRR、nDCG、zero-result rate、P50/P95 延迟和索引成本；
-5. 分通道做 ablation：CLIP only、context only、OCR、metadata、RRF、rerank；
-6. 把用户的“相关/不相关、人物合并、名称修正”变成下一轮标注，而不是只改当前页面。
-
-在这个基线之上，优化顺序才清晰：
-
-```text
-模型与索引指纹可观测
-  -> 中文/多语言视觉 encoder 对比
-  -> 专用 OCR + BM25/sparse
-  -> 人物、时间、地点的 filter 前推
-  -> Qdrant named vectors 与可回滚 alias
-  -> 只对小候选集做 cross-encoder/VLM rerank
-  -> 用户反馈进入持续评测
-```
-
-这也可以借鉴数据库优化器的思路：先有 workload 和 profile，再调整索引、执行计划与代价模型（Cost Model）。没有 workload 的“性能优化”容易沦为跑分，没有标注集的“RAG 优化”也容易沦为 Demo 调参。
-
-### 继续前必须通过的检查
-
-恢复开发应先验证原始资料不受影响、索引可重建，再比较检索质量。下表是下一轮验证计划，不是新增的实验结果。
-
-| 检查 | 必须满足的条件 | 不满足时的处理 |
-| --- | --- | --- |
-| 模型别名回退或 revision 改变 | 写入实际模型指纹；不兼容向量不混写 | 暂停对应 worker，显式重建受影响索引 |
-| 任务中断、重复领取与失败重试 | 不改原文件，不重复发布不同身份的派生结果 | 先修任务合同，不提高并发 |
-| 已确认人物被错误合并 | 保留修正来源，能重建相关 people context | 不把聚类结果输出为身份事实 |
-| 无相关资产或组合条件冲突 | 允许无结果，区分元数据条件与模型推断 | 不以低置信候选冒充确定命中 |
-| 放大图库和并发查询 | 同时测延迟、内存、索引耗时与相关性 | 确认瓶颈后再引入 ANN 或独立队列 |
-
-### 阶段结论
-
-再次继续前，先冻结模型与索引指纹，标注文中建议的查询集，逐通道比较 Recall、排序与延迟，再决定是否更换模型。当前实现不适合无人审核的身份判断或地点归因，小规模快照也不能证明扩大图库后仍满足延迟预算。
+- **业务编排与存储层（`personal-knowledge-lab`）**：FastAPI + React + SQLite 任务队列与向量快照（快照规模：`2` 个只读源目录、`529` 张已索引照片、`102` 份文档 / `2,293` 个分块、`6,715` 条 512 维向量、`4,646` 次处理运行记录）。
+- **独立视觉推理服务（`pkl-vllm-service`）**：Python `3.12`、`vLLM 0.25.0`、`PyTorch 2.11.0+cu130`（CUDA Runtime `13.0`），挂载 `Qwen2.5-VL-3B-Instruct`，绑定本机回环地址 `127.0.0.2:8100`。

@@ -1,7 +1,7 @@
 ---
 title: "【源码】Dynamic Filter 穿越 Outer Join：StarRocks、Doris 与 Trino 的正确性边界"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-28T00:00:00+08:00
+lastmod: 2026-11-12T00:00:00+08:00
 slug: "dynamic-filter-through-outer-join"
 categories:
   - 数据库
@@ -12,220 +12,91 @@ tags:
   - StarRocks
   - Apache Doris
   - Trino
-description: "Outer Join 下 RF/DF 穿越的正确性边界：统一判据 + StarRocks/Doris/Trino 对照；工程判断前置，压缩路径复述。"
+description: "从一条仅含三行数据的 coalesce 反例出发，推导 Runtime Filter / Dynamic Filter 穿越 Outer Join 的数学安全边界，并深入对比 StarRocks、Apache Doris 与 Trino 的内核实现。"
 draft: false
+toc: true
+math: true
 ---
 
 > 本系列第 3/3 篇 · Join 执行 · [上一篇]({{< relref "2026-09-10-dive-hash-sort-strategy.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
 
-> **读完带走**
->
-> - RF/DF 只能**无假阴性**地缩小 Probe；Outer Join 下真正的风险是**改变匹配状态后新产生的补 NULL 行**仍能通过上层谓词（典型反例：`coalesce`）。
-> - **生成**与**穿越**必须分开判定：Left/Full 通常不当自己的保留侧 Producer，不代表父层 RF 不能穿过它。
-> - 三系统对照：StarRocks 偏双边等值复制；Doris 分血缘直穿与 Inner/Semi 等值扩展，并显式拦 Null-Safe；Trino 要求先落到保留侧再有向派生。
-> - 工程上优先用文末统一判据表做回归，而不是比“谁下推得更深”。
+在内连接（`INNER JOIN`）里，运行时过滤（Runtime Filter / Dynamic Filter，下文按语境简称 RF 或 DF）的原理直观得几乎不会出错：Hash Join 在构建（Build）端扫完小表后，顺手把连接键的值域压成紧凑摘要（`IN` 列表、`Min/Max` 区间或 `Bloom Filter`），逆流投递给探测（Probe）端的底层扫描算子。只要摘要集合 $D_{\text{filter}}$ 完整覆盖真实构建键集合 $D_{\text{build}}$（满足 $D_{\text{build}} \subseteq D_{\text{filter}}$，允许假阳性、绝无假阴性），被提前丢弃的探测行反正进不了最终连接结果，早扔晚扔在语义上完全等价。
 
-Runtime Filter（RF）/ Dynamic Filter（DF）用 Build 侧键摘要提前过滤 Probe。Inner Join 较直观；一旦计划含 Outer Join，关键问题变为：
+顺着这个直觉往下走，最容易写出一条看似天经地义的推论：**既然连接条件代表等值传递，只要上下两层连接共享连接键，为什么不把上层连接构建的过滤器顺着等值链一路推到底层所有表上？**
 
-> 父 Join 的 RF/DF 能否穿过下层 Outer Join？落在保留侧、NULL 生成侧，还是两侧？在什么条件下不会改语义？
-
-“键相等即可沿等值类传播”不充分：提前删掉本可匹配的 NULL 生成侧行，会合成补 NULL 行；若上层表达式把 NULL 映射成可匹配值，结果就会变。
-
-## 我的工程判断（先读）
-
-**主张：** 下推安全 ⟺ 对被丢弃的每一行，未下推计划中它可能产生的全部输出，在原过滤位置仍会被拒绝；且因匹配状态变化新产生的补 NULL 行也不能通过原条件。  
-**机制：** 分层检查 Producer 完整性、目标侧保留语义、父谓词是否拒 NULL、Probe 表达式是否 Propagate NULL、等值传播方向、Producer–Consumer 闭环。  
-**适用：** 内核正确性审计、跨引擎对照、结果级回归设计。  
-**不适用：** 不能用 Explain 里出现 RF、或下推层数，代替结果正确性。
-
-一眼可用的边界：
-
-| 场景 | 通常结论 |
-|------|----------|
-| Left/Full 对自己的保留侧当 Producer | 否（会删必须输出的未匹配行） |
-| Right Join 用 Build Domain 滤非保留侧 | 可以（仍要完整 Build + Fail-Open） |
-| 父 RF 经 Child Outer：先落保留侧 | 通常可提前删除最终也会被拒的行 |
-| 父 RF 进入 NULL 生成侧 | 仅当 Probe 表达式 Null-Propagating，且父比较拒 NULL（或显式保留 nullAllowed 语义） |
-| `coalesce` / `ifnull` 作 Probe | 不得进 NULL 生成侧 |
-| 父条件为 `<=>` / `IS NOT DISTINCT FROM` | 不得按普通 `=` 做无向双边复制 |
-
-`coalesce` 最小反例：
+一旦查询计划里混入外连接（`OUTER JOIN`），这条朴素推论第一步就会撞出致命的正确性事故。不妨在白板上推演一个只有三行数据的最小反例——表 `A` 有一行 `k = 1`，表 `B` 有一行 `k = 1`，表 `C` 有一行 `k = 0`：
 
 ```sql
 SELECT *
 FROM A
 LEFT JOIN B ON A.k = B.k
 INNER JOIN C ON coalesce(B.k, 0) = C.k;
--- A.k=1, B.k=1, C.k=0 → 正确结果为空；
--- 若错误地把上层 DF 推到 B 并删掉 B.k=1，会合成 B=NULL，
--- coalesce(NULL,0)=0 通过上层，结果多一行。
 ```
+
+我们先算不加任何运行时过滤器的标准答案：下层 `A LEFT JOIN B` 中，`A(1)` 与 `B(1)` 成功配对，吐出一行 `(A.k = 1, B.k = 1)`；送到上层与 `C(0)` 做内连接时，`coalesce(1, 0) = 1`，与 `C.k = 0` 不相等，整条 SQL 的正确输出是**空集（0 行）**。
+
+现在，假设优化器看到上层内连接的右侧值域只有 `{0}`，大笔一挥把这个动态过滤器穿越 `LEFT JOIN` 推到了右表 `B` 的扫描端。灾难在瞬间发生：`B` 表原本那行 `B.k = 1` 不在 `{0}` 里，在进 `LEFT JOIN` 之前就被当场枪毙了！然而 `LEFT JOIN` 的左表 `A` 是保留侧（Preserved Side）——当右表配对行消失后，`A(1)` 并不会跟着消失，而是摇身一变，由外连接算子**凭空合成出一条右侧补空的新行 `(A.k = 1, B.k = NULL)`**。等到这行新合成的数据流到上层连接时，`coalesce(NULL, 0)` 把 `NULL` 映射成了 `0`，恰好撞上 `C.k = 0`，最终查询竟然吐出了 **1 行幽灵数据**！
 
 ![coalesce 反例：DF 进入 NULL 生成侧会改变匹配结果](/images/dynamic-filter-coalesce-counterexample.svg)
 
-*图 1：左侧是不下推时的正确执行，右侧是把 C 侧 `{0}` 推到 B 后的结果。差别不在少读多少行，而在 `B.k=1` 被删后 LEFT JOIN 合成了一条 `B=NULL` 的行，`coalesce` 把它映射成可匹配值，使它穿过了原本拒绝 NULL 的上层谓词。*
+*图 1：左侧是不下推时的标准执行，右侧是将上层 `{0}` 过滤器推入补空侧 `B` 后的错行现场——提前删掉 `B.k = 1` 改变了外连接的匹配状态，迫使 `LEFT JOIN` 合成出原本不存在的 `B = NULL` 行，又被 `coalesce` 救活放行。*
 
-下文钉问题边界与源码版本，再按 StarRocks / Doris / Trino 对照实现；**统一判据表与三系统对比表**仍是本文核心资产。
+看懂这三行数据，就能抓住动态过滤器穿越外连接的根本矛盾：**在内连接里，提前删掉一行输入只会“减少”中间结果；而在外连接的补空侧（Null-Supplying Side），提前删掉一行原本能配对的输入，会把“匹配态”篡改为“未匹配态”，从而“无中生有”地制造出补 `NULL` 的新行。**
 
-## 问题边界：生成过滤器与穿越 Outer Join
+要守住这条语义红线，查询引擎究竟需要证明哪些条件？StarRocks、Apache Doris 与 Trino 各自在源码里筑起了怎样的防线？下面我们从第一性原理出发逐一拆解。
 
-### 源码版本与结论范围
+---
 
-| 项目 | 源码快照 | 日期 | 重点入口 |
-|------|----------|------|----------|
-| StarRocks | [0fd27fd](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1) | 2026-03-30 | `JoinNode`、`RuntimeFilterDescription` |
-| Apache Doris | [5202d06](https://github.com/apache/doris/tree/5202d06dd8feb3390ff32839227eeee89c345b57) | 2026-08-21 | `RuntimeFilterGenerator`、`RuntimeFilterPushDownVisitor` |
-| Trino | [68dae09](https://github.com/trinodb/trino/tree/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c) | 2026-08-22 | `PredicatePushDown`、`DynamicFiltersChecker` |
+## 一、拆解两个正交命题：谁能生成过滤器，谁能被过滤器穿越？
 
-本文结论以以上本地源码快照为准。RF/DF 相关代码变化较快，尤其是 Outer Join 和 Null-Safe Equality 的支持范围，阅读其他版本时应重新核对 Rule、Session Variable 与回归测试。
+排查外连接与 Runtime Filter 的交互时，首要任务是把两个经常被混为一谈的问题彻底分开：
 
-2026-10 在更新快照上复核了三套实现（见下文「2026-10 复核记录」）。总体结论：本文描述的三种传播模型没有变，但 StarRocks 修掉了一个 TopN RF 的排序方向错误，Doris 新增了 RF 驱动的分区/分桶裁剪元数据。
+1. **生成准入（Producer Legality）**：当前这层 `OUTER JOIN` 自己能不能拿 Build 侧去过滤自己的 Probe 侧？
+2. **穿越合法性（Passthrough Legality）**：**上层**某个连接产出的合法过滤器，能不能穿过**下层**这层 `OUTER JOIN` 落到底表扫描上？
 
-#### 2026-10 复核记录
+先看第一个问题。假设单层查询就是 `SELECT * FROM A LEFT JOIN B ON A.k = B.k`，在主流引擎中通常以左表 `A` 为 Probe、右表 `B` 为 Build。此时左表 `A` 是保留侧，哪怕某行 `A.k` 在 `B.k` 的哈希表里完全找不到，这行 `A` 也必须填上 `B.* = NULL` 如数输出。如果拿 `B` 构建的过滤器去删 `A`，未匹配的保留行就会人间蒸发。因此，**`LEFT OUTER JOIN` 和 `FULL OUTER JOIN` 绝不能充当过滤自身保留侧的 Producer**；反过来，`RIGHT OUTER JOIN` 的右侧（Build）才是保留侧，左侧（Probe）是补空侧——未匹配的左表行本来就要被丢弃，只要完整收集完右表键值并在超时或内存超限时保持放行（Fail-Open），`RIGHT OUTER JOIN` 完全可以合法生成过滤左表的动态过滤器。
 
-复核快照：StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）、Trino `6369330`（2026-10-06）。
+再看第二个、也是真正棘手的问题：当上层 `Parent Join` 产出了一个代表“最终结果必满足契约”的过滤器，往下遇到了子算子 `Child Left Join (A ⟕ B)`，它该往哪一侧走？我们按外连接两侧的角色分别推导：
 
-**已核实未变**
+| 外连接类型 | 保留侧（Preserved Side） | 补空侧（Null-Supplying Side） |
+| --- | --- | --- |
+| `LEFT OUTER JOIN` | 左子树 `A` | 右子树 `B` |
+| `RIGHT OUTER JOIN` | 右子树 `B` | 左子树 `A` |
+| `FULL OUTER JOIN` | 左右两侧皆保留 | 左右两侧皆可能补 `NULL` |
 
-- StarRocks `JoinNode.pushDownRuntimeFilters()` 的三级策略未变：仍是先 `pushDownRuntimeFilterBilaterally()`、失败后 `pushDownRuntimeFilterUnilaterally()`、最后在当前 Join 注册 Probe；`buildRuntimeFilters()` 的 Producer 限制、`checkRuntimeFilterOnNullValue()` 的 `equalForNull` 记录也仍在原位置。
-- 本文标记的待验证边界仍然成立：`pushDownRuntimeFilterBilaterally()` 依旧只要求 Probe Slot 参与某个 `BinaryType.EQ`，没有检查父 RF 的 `equalForNull`。文中给出的 `IS NOT DISTINCT FROM` 形态仍需用结果级回归确认是否真的生成错误计划。
-- Doris 的 `RuntimeFilterGenerator` 与 `RuntimeFilterPushDownVisitor` 主流程未变，`runtimeFilterPushDown` 的 Visitor 结构、生产者/消费者登记方式一致。
-- Trino `createDynamicFilters()` 的准入条件仍是 `INNER || RIGHT` 加 session 开关；`nullAllowed` 仍随 `DynamicFilterExpression` 保留。两个快照之间 `PredicatePushDown.java` 的 192 行改动（+65/−127）是 `DynamicFiltersResult` 等内部类改为 record、getter 改为访问器，不改变传播语义。
+如果父层过滤器的探测表达式只引用**保留侧 `A`** 的列，把它推入 `A` 是天然安全的——因为无论某行 `A` 能不能在 `B` 里找到伴侣，它输出的 `A` 列值都原封不动；既然这行 `A` 到了父层连接注定被拒之门外，在进 `LEFT JOIN` 前提前剔除，只会省下无谓的哈希探测，绝不会多造或少造任何输出。
 
-**变化**
+但如果父层过滤器想要踏入**补空侧 `B`**（无论是原本就引用 `B` 列，还是想顺着 `A.k = B.k` 把 `A` 上的过滤器复制给 `B`），就必须同时过完**双重 `NULL` 安全核验**：
 
-- StarRocks `RuntimeFilterDescription.isTopNSortAsc()` / `isTopNullsFirst()` 改为固定读取排序键下标 0。旧实现用 `exprOrder` 索引 `sortInfo`，而 `exprOrder` 表示 group-by 位置、不是排序列位置；多列 TopN 且分组位置与排序列不一致时，可能把降序当成升序构造 TopN RF。这是 RF 正确性问题，不影响 Outer Join 传播模型。
-- StarRocks `canPushDownRuntimeFilterCrossExchange()` 增加 `DescriptorTable` 参数（跨 Exchange 下推时需要它做类型/表达式校验），调用点与语义不变。
-- Doris 新增 `RuntimeFilterPruneClassifier`：`RuntimeFilterPushDownVisitor` 在 DF 落到 Scan 后调用 `RuntimeFilterContext.generateRuntimeFilterPruneMetadata()`，尝试为这条 RF 生成目标侧的分区裁剪与分桶裁剪元数据。分桶裁剪要求 RF 类型为 IN / IN_OR_BLOOM、目标是 `PhysicalOlapScan` 上的直接列、且该列是单列 HASH 分布键；分区裁剪要求 RANGE/LIST 分区、目标表达式落在单个分区列上、RANGE 分区不接受 BLOOM，表达式还要能判定单调。`enable_runtime_filter_bucket_prune` 与 `enable_runtime_filter_partition_prune` 两个开关默认开启。这属于“DF 到 Scan 之后还能做什么”的新能力，不改变本文的穿越判据。
-- Trino 除上述重构外，未见 DF 方向推导逻辑变化；`processLimitedOuterJoin()` 仍要求父谓词先落到保留侧 Scope，再派生 NULL 生成侧副本。
+- **第一重核验（父层比较算子本身拒绝 `NULL`，即 Null-Rejecting）**：普通等值 `=` 在一侧为 `NULL` 时求值为 `UNKNOWN`，天然拒绝空值；但如果是空值安全等值（`<=>` 或 `IS NOT DISTINCT FROM`），当父层 Build 端恰好含有 `NULL` 时，下层新合成的补空行就能合法配对！此时绝不能随意删减补空侧候选。
+- **第二重核验（探测端标量表达式保持空值传递，即 Null-Propagating）**：探测表达式 $e(x)$ 必须满足 $e(\text{NULL}) = \text{NULL}$。裸列引用 `b.k`、保空类型转换 `CAST(b.k AS BIGINT)` 满足这一性质——一旦删掉 `B` 行触发补空，$e(\text{NULL})$ 吐出 `NULL`，撞上第一重核验中拒绝 `NULL` 的父层 `=`，新合成的补空行照样死路一条，语义严丝合缝；而 `coalesce(b.k, 0)`、`ifnull(b.k, 0)` 或行为未知的黑盒 UDF 会把 `NULL` 洗白成非空常数，必须严禁踏入补空侧！
 
-### 建立正确的心智模型
+把生产者完整性、目标侧角色、双重 `NULL` 证明与防死锁闭环串起来，就得到了动态过滤器穿越外连接的完整安全决策流：
 
-RF/DF 只能提前排除不影响结果的输入，原 Join 条件仍需执行；过滤器生成与跨算子传播必须分别判断。
+![Dynamic Filter 穿越 Outer Join 的六步安全判据决策流](/images/diagrams/aug-opt-df-outer-join-boundary.svg)
 
-#### RF/DF 是运行时旁路，不是新的 Join 条件
+*图 2：动态过滤器穿越外连接的六步安全判据——落向保留侧可直接放行；一旦试图进入补空侧，必须同时证明“父比较算子拒绝 `NULL`”且“探测表达式满足 $e(\text{NULL}) = \text{NULL}$”，否则必须截停在连接算子上方。*
 
-以 Hash Join 为例：
+下面这张速查表把最容易踩坑的六种工程场景定死在了明处：
 
-```text
-                 Build Side
-                     │
-                     ▼
-              Hash Table Build
-                     │
-              Build Key Domain
-                     │
-         Bloom / IN / MinMax / Bitset
-                     │
-             Merge / Broadcast
-                     │
-                     ▼
-Probe Scan ── Runtime Filter ── Hash Join ── Original Join Predicate
-```
+| 典型计划形态 | 安全裁决与底层机理 |
+| --- | --- |
+| `LEFT / FULL JOIN` 拿右表 Build 过滤自身左表 | **禁止**：直接误删必须补 `NULL` 输出的保留侧未匹配行 |
+| `RIGHT JOIN` 拿右表 Build 过滤自身左表 | **允许**：左侧本就是非保留侧，确保完整 Build 与异常 Fail-Open 即可 |
+| 父层过滤器穿过子 `LEFT JOIN` 落向保留侧 `A` | **允许**：提前剔除最终在父层必死无疑的行，不改变任何存活行的配对状态 |
+| 父层过滤器（普通 `=`）以裸列 `B.k` 落向补空侧 `B` | **允许**：即便删行诱发补 `NULL`，裸列传递 `NULL` 后仍被父层 `=` 拦截 |
+| 父层以 `coalesce(B.k, 0) = C.k` 落向补空侧 `B` | **禁止**：破坏 $e(\text{NULL}) = \text{NULL}$，合成的补空行会被转成 `0` 假阳性放行 |
+| 父层条件为 `B.k <=> C.k`（或 `IS NOT DISTINCT FROM`） | **禁止无向复制**：父层允许 `NULL` 配对，不可当作普通拒空等值穿透外连接 |
 
-设 Build 侧真实键集合为 `D_build`，过滤器接受的集合为 `D_filter`。安全过滤器必须满足：
+手握这把标尺，我们走进 StarRocks、Doris 和 Trino 的代码库，看看工业界三套主流引擎分别用怎样的架构表达这条边界。
 
-```text
-D_build ⊆ D_filter
-```
+---
 
-也就是说，过滤器允许假阳性，却不能有假阴性：
+## 二、StarRocks：双边等值优先的三级下推与 `equalForNull` 审视
 
-- Bloom Filter 可以误放一行，原 Join 条件会再次校验；
-- MinMax 可以放过区间中的无效值；
-- IN Filter 必须包含完整 Build Key；
-- 分布式 Build 未合并完成时不能把局部值域当成全局值域；
-- 构建失败、超时或取消应 Fail-Open。
+StarRocks 的运行时过滤器在物理 `PlanNode` 构建阶段生成并自顶向下推送，核心逻辑集中在 [`JoinNode.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/JoinNode.java) 与 [`RuntimeFilterDescription.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/RuntimeFilterDescription.java)。
 
-因此 RF/DF 的正确性基础不是“足够精确”，而是“绝不错误拒绝潜在匹配行”。
-
-#### 生成与传播是两个不同问题
-
-考虑：
-
-```sql
-SELECT *
-FROM A
-LEFT JOIN B ON A.k = B.k;
-```
-
-Left Join 的左侧是保留侧。即使 `A.k` 不在 `B.k` 的 Build Domain 中，A 行也必须以 `B.* = NULL` 的形式输出。因此，该 Join 不能用 B 构建的过滤器删除自己的 A 行。
-
-但对下面的计划：
-
-```text
-        Parent Inner Join：P.x = C.k
-                   │
-        Child Left Join：A.k = B.k
-```
-
-Parent Join 生成的过滤器可能已经代表“最终结果必须满足”的条件。这个过滤器是否能继续穿过 Child Left Join，需要分析它引用哪一侧、表达式如何处理 NULL，以及能否沿 Child Join 的等值条件安全改写。
-
-所以必须分别回答：
-
-```text
-问题一：当前 Outer Join 能否成为 RF/DF Producer？
-问题二：其他 Join 生成的 RF/DF 能否穿过当前 Outer Join？
-```
-
-把两者混在一起，会得到“Left Join 不生成 RF，所以 RF 不能穿过 Left Join”这样的错误结论。
-
-### Outer Join 的真正风险：改变匹配状态
-
-删除一个原本匹配的右侧行，可能使 Left Join 新增补 NULL 行；上层谓词若接受这个 NULL，结果就会改变。
-
-#### Preserved Side 与 Null-Generating Side
-
-保留侧定义未匹配行是否仍需输出，NULL 生成侧定义哪些字段会被补齐，两者共同约束过滤方向。
-
-| Join 类型 | 保留侧 | NULL 生成侧 |
-|-----------|--------|-------------|
-| Left Outer Join | 左侧 | 右侧 |
-| Right Outer Join | 右侧 | 左侧 |
-| Full Outer Join | 左右两侧 | 左右两侧 |
-| Inner Join | 无补 NULL 语义 | 无 |
-
-向保留侧下推一个本来就必须在 Join 上方成立的谓词，通常只是提前删除最终也会被拒绝的行。
-
-向 NULL 生成侧下推则更危险。假设一条 B 行原本能与 A 匹配，过滤器提前删除 B 后，Left Join 不会简单地“少输出一行”，而会把对应 A 重新输出为：
-
-```text
-A columns + B columns = NULL
-```
-
-如果上层表达式能把这个 NULL 转换为可匹配值，新生成的行就可能通过上层 Join。
-
-#### 为什么 `coalesce` 是关键反例
-
-文首工程判断已给出最小反例。要点：问题不是“NULL 会不会被滤掉”，而是**下推是否改变匹配状态，以及新补 NULL 行能否通过原谓词**。`slot` / 保 NULL 的 `cast` 通常可证；`coalesce` / `ifnull` / 未知 UDF 默认不可进 NULL 生成侧。
-
-#### Null-Rejecting 与 Null-Propagating
-
-下文将两个相关属性分开检查；具体传播规则需要结合父 Join、表达式与目标侧推导，不能将术语当作不带条件的充分证明：
-
-- **Null-Rejecting**：输入为 NULL 时，父层比较不可能为 TRUE；
-- **Null-Propagating**：表达式保持 NULL，满足 `e(NULL)=NULL`。
-
-| Probe 表达式 | 是否通常 Null-Propagating | 进入 NULL 生成侧 |
-|--------------|---------------------------|------------------|
-| `b.k` | 是 | 普通拒绝 NULL 的父等值条件下可证明 |
-| `cast(b.k AS BIGINT)` | 是 | Cast 保持 NULL 时可证明 |
-| `b.k + 1` | 通常是 | 仍需引擎能证明函数 NULL 传播 |
-| `coalesce(b.k, 0)` | 否 | 不安全 |
-| `ifnull(b.k, 0)` | 否 | 不安全 |
-| 自定义函数 | 未知 | 默认不应下推 |
-
-只有白名单还不够。正确实现应把函数的 Nullability/Null-Propagation 语义纳入表达式属性，并结合父层比较是否允许 NULL 共同判断。
-
-## 源码路径：双边传播、血缘直穿与有向推导
-
-### StarRocks：双边优先的激进传播
-
-StarRocks 对符合条件的普通等值键尝试双边传播，再按 Join 类型降为单边或就地消费；路径优先级不等于无条件允许穿透。
-
-#### 哪些 Join 自己生成 RF
-
-StarRocks 的入口是 [`JoinNode.buildRuntimeFilters()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/JoinNode.java)。源码先按 Join Type 限制 Producer：
+在生成端，`JoinNode.buildRuntimeFilters()` 先卡住 Producer 准入门槛：
 
 ```java
 if (!joinOp.isAnyInnerJoin()
@@ -236,30 +107,14 @@ if (!joinOp.isAnyInnerJoin()
 }
 ```
 
-`child(1)` 是 Build 侧，生成的 RF 被推向 `child(0)` Probe 侧。Left/Full Outer Join 不走普通 RF 生成流程，因为其左侧包含必须保留的未匹配行；Right Outer Join 的左侧是非保留侧，可以使用右侧 Build Domain 预过滤。
-
-每个 RF 还记录 Producer 等值条件是否允许 NULL：
+这里 `child(1)` 固定为 Build 端，`child(0)` 为 Probe 端：`LEFT OUTER`、`FULL OUTER` 与 `LEFT ANTI` 被直接挡在门外，而 `RIGHT JOIN` 合法入场过滤左侧非保留行。同时，每个生成的过滤器都会原原本本记下构建它的等值谓词是否属于空值安全比较（`<=>`）：
 
 ```java
 rf.setEqualForNull(
         BinaryPredicate.IS_EQ_NULL_PREDICATE.apply(joinConjunct));
 ```
 
-[`RuntimeFilterDescription.equalForNull`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/RuntimeFilterDescription.java) 不是执行细节，而是 RF 穿越其他 Outer Join 时不可丢失的语义。
-
-#### 双边、单边、就地接受
-
-[`JoinNode.pushDownRuntimeFilters()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/JoinNode.java) 使用三级策略：
-
-```text
-先尝试 Bilateral：沿 Join 等值列向两个 Child 传播
-      ↓ 不适用
-再尝试 Unilateral：按 Join Type 选择合法的一侧
-      ↓ 未成功
-最后在当前 Join 就地注册 Probe
-```
-
-主流程可以概括为：
+当上层生成的过滤器顺着计划树往下寻找消费落点、撞上下层另一个 `JoinNode` 时，`JoinNode.pushDownRuntimeFilters()` 摆出了极具进攻性的**“双边优先 → 单边回退 → 就地拦截”三级推进策略**：
 
 ```java
 Optional<Boolean> result =
@@ -271,140 +126,32 @@ if (result.isEmpty()) {
 if (result.isPresent() && result.get()) {
     return true;
 }
-// 无法继续下推时，尝试在当前节点消费
+// 若既无法双边也无法单边下穿，则注册在当前 JoinNode 输出端就地过滤
 ```
 
-这个设计体现了明确的性能倾向：只要能够证明安全，就尽量让同一个 RF 覆盖更多 Scan。
+这套三级火箭的性能意图非常鲜明——只要安全条件凑齐，尽量让同一份 Filter ID 裂变覆盖到底层尽可能多的扫描表上：
 
-#### Bilateral：沿普通等值列复制到两侧
+1. **第一级 `pushDownRuntimeFilterBilaterally()`（双边等值复制）**：为什么 `coalesce` 反例没能打穿 StarRocks？秘密就在它的准入锁里——双边复制严苛要求当前连接不是 `Cross Join` 或 `Null-Aware Left Anti Join`，**传入的 `probeExpr` 必须是纯粹的裸列引用 `SlotRef`**（任何套了 `coalesce`、`ifnull` 甚至普通算术函数的表达式当场出局！），且该 `SlotRef` 直接参与了当前连接的普通等值条件 `BinaryType.EQ`。一旦放行，代码会以非短路方式同时向左右两个孩子下推同一份过滤器。
+2. **第二级 `pushDownRuntimeFilterUnilaterally()`（单边保留方向回退）**：一旦 `probeExpr` 带了复合函数（如 `coalesce(A.k, 0)`）进不了双边通道，单边策略就会严格退守保留侧边界——遇到 `Left Outer` / `Left Anti` 只准往左孩子 `child(0)` 推，遇到 `Right Outer` / `Right Anti` 只准往右孩子 `child(1)` 推，从方向上彻底封死了复合表达式溜进补空侧的可能（跨 `Exchange` 节点时还会由 `canPushDownRuntimeFilterCrossExchange()` 结合 `DescriptorTable` 校验类型与分区映射一致性）。
+3. **第三级就地消费与 `checkRuntimeFilterOnNullValue()`**：对于停留在连接附近或涉及合成空值的场景，代码会检查 `!description.getEqualForNull()`，把外连接合成后注定被拒空的列登记进 `filter_null_value_columns` 加速剔除。
 
-双边路径的前置条件包括：
-
-- 当前不是 Cross Join；
-- 当前不是 Null-Aware Left Anti Join；
-- 当前存在等值 Join Conjunct；
-- `probeExpr` 必须是直接 `SlotRef`；
-- Probe Slot 必须参与当前 Join 的普通 `BinaryType.EQ`。
-
-满足条件后两侧都会尝试（非短路）：同一 Filter ID 可落到 `Scan(A).k` 与 `Scan(B).k`。普通 `=` 拒 NULL 且无假阴性时能扩大过滤面；若父 RF 带 `equalForNull`，不能仅凭下层普通 EQ 无条件反向复制（见下节边界）。
-
-
-#### Unilateral：按 Join 类型限制方向
-
-无法使用双边路径时，StarRocks 按当前 Join Type 选择单侧：
-
-```text
-Left Anti / Left Outer    → child(0)，只推左侧
-Right Anti / Right Outer  → child(1)，只推右侧
-Inner / Semi / Cross      → 依次尝试 child(0)、child(1)
-```
-
-单边路径在第一个成功的 Child 后停止。它与双边路径的语义不同：前者遵循保留方向，后者依靠普通等值列建立跨侧等价类。
-
-#### NULL 补齐处理与一个需要回归验证的边界
-
-[`JoinNode.checkRuntimeFilterOnNullValue()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/JoinNode.java) 会记录 Outer Join 合成的哪些 NULL 列可被 RF 拒绝：
-
-```java
-if (joinOp.isOuterJoin()
-        && !description.getEqualForNull()
-        && slotRefWithNullValue) {
-    filter_null_value_columns.add(slotId.asInt());
-}
-```
-
-这段逻辑处理“RF 已经落在当前 Join 后，怎样对待合成 NULL”，但不能单独证明“RF 能否沿等值关系复制到另一侧”。
-
-当前快照中的 `pushDownRuntimeFilterBilaterally()` 检查了**中间 Join 条件**必须是普通 `EQ`，函数内部却没有显式检查**父 RF** 的 `equalForNull`。因此下面的形态值得加入结果级回归：
+用前面的统一标尺审视 `pushDownRuntimeFilterBilaterally()` 的局部代码，也能敏锐地抓出一个值得放进结果级回归测试重点盯防的组合边界：该函数核验了下层连接谓词必须是普通 `BinaryType.EQ`，但在函数体内并未显式复查**父层过滤器自身携带的 `description.getEqualForNull()`**。设想如下 SQL：
 
 ```sql
-(A LEFT JOIN B ON A.k = B.k)
+SELECT *
+FROM (A LEFT JOIN B ON A.k = B.k)
 INNER JOIN C ON B.k IS NOT DISTINCT FROM C.k;
 ```
 
-当 `C.k` 包含 NULL 时，上层 RF 允许 NULL；未匹配 A 产生的 `B.k = NULL` 可能与 `C.NULL` 匹配。此时不能仅依据下层 `A.k = B.k`，把 `B.k` 上的 Null-Safe RF 无条件反向复制到 `A.k`。
+当 `C.k` 包含 `NULL` 时，上层连接产出的过滤器带有 `equalForNull = true`（允许 `NULL` 通过）；左表 `A` 中未匹配的行原本会在补出 `B.k = NULL` 后与 `C.NULL` 成功牵手。倘若此时仅凭下层 `A.k = B.k` 把 `B.k` 上的过滤器反向复制给左表 `A.k`，而 `A.k` 本身是非空值（比如 `A.k = 99`，不在 `C.k` 非空集合里），提前在 `Scan(A)` 处杀掉 `A.k = 99` 就会误伤那条本该靠补 `B.k = NULL` 命中的结果行！尽管上游改写规则与候选槽位推导可能在其他环节拦住这一形态，在内核单测中把“父层 `IS NOT DISTINCT FROM` + 子层 `LEFT JOIN`”列为必测反例，正是防御跨层语义漏网的最佳实践。
 
-这里应保持审慎表述：从当前函数局部看，`equalForNull` 与传播方向值得重点审计；是否形成实际错误计划，还要结合上游表达式改写、候选 Slot 推导及执行层 NULL 处理做完整回归验证。
+---
 
-### Doris：血缘直穿与等值扩展分离
+## 三、Apache Doris：血缘直穿与等值扩展的显式解耦
 
-原表达式沿血缘下推与跨连接键派生新表达式需要不同证明，Doris 将这两类行为分开检查。
+如果说 StarRocks 是“先试双边等值复制、不成再退单边”，Apache Doris 的 Nereids 优化器则在物理后处理阶段（[`RuntimeFilterGenerator`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterGenerator.java) 与 [`RuntimeFilterPushDownVisitor`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterPushDownVisitor.java)）做了一次极其干净的正交拆解：**把“顺着原表达式的列血缘往下走”和“借用连接等值条件跨侧派生新目标”拆成了两条完全独立的证明路径。**
 
-#### Producer 拒绝列表
-
-Doris Nereids 在物理后处理阶段由 [`RuntimeFilterGenerator`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterGenerator.java) 生成 RF。以下 Join Type 默认不能成为 Producer：
-
-```java
-LEFT_ANTI_JOIN,
-FULL_OUTER_JOIN,
-LEFT_OUTER_JOIN,
-ASOF_LEFT_OUTER_JOIN,
-NULL_AWARE_LEFT_ANTI_JOIN
-```
-
-这同样只回答“当前 Join 是否自己生成 RF”，父层 RF 是否能穿过它由另一套 Visitor 决定。
-
-#### 两种传播行为不能混为一谈
-
-[`RuntimeFilterPushDownVisitor.visitPhysicalHashJoin()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterPushDownVisitor.java) 把传播拆成两类。
-
-第一类是**沿原表达式血缘直穿**：
-
-```text
-Probe Expression 引用哪个 Child 的 Slot
-  → 检查能否穿过该 Child
-  → 保持原表达式继续向下
-```
-
-第二类是**沿当前 Join 等值条件扩展**：
-
-```text
-Probe = leftExpr
-  → 根据 leftExpr = rightExpr 生成 rightExpr
-  → 创建新的 PushDownContext
-  → 向对侧继续下推
-```
-
-这种拆分比“任何 Join 等值类都向两侧复制”更容易表达 Outer Join 的方向性。
-
-#### 进入 NULL 生成侧必须保持 NULL
-
-`canPushThroughJoinChild()` 先判断目标 Child 是否是当前 Join 的 NULL 生成侧：
-
-```java
-if (join.equals(ctx.builderNode)
-        || !isNullGeneratingChild(join.getJoinType(), isLeftChild)) {
-    return true;
-}
-return isNullPropagating(ctx.probeExpr);
-```
-
-当前源码认可：
-
-- 直接 `Slot`；
-- 保持 NULL 的 `Cast`；
-- 子表达式同样满足条件的 `PropagateNullable` 函数。
-
-`coalesce` 不满足这个条件，所以不能穿过 NULL 生成侧。
-
-源码中的 [`RuntimeFilterTest`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/test/java/org/apache/doris/nereids/postprocess/RuntimeFilterTest.java) 直接固定了这条边界：
-
-```java
-select *
-from lineorder
-left outer join customer
-  on lo_custkey = c_custkey
-inner join supplier
-  on coalesce(c_custkey, 0) = s_suppkey
-```
-
-测试期望 RF 数量为 0；将上层条件改成 `c_custkey = s_suppkey` 后，裸 Slot 保持 NULL，测试期望生成两个 RF Target。
-
-结果级回归 [`test_runtime_filter_outer_join_nullable_side.groovy`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/regression-test/suites/correctness_p0/test_runtime_filter_outer_join_nullable_side.groovy) 进一步使用真实数据检查 `coalesce` 反例，而不是只比较 Explain 文本。
-
-#### Null-Safe Equality 单独拦截
-
-如果 Builder Join 的 Hash Conjunct 是 `NullSafeEqual`，Visitor 在遇到 Outer Join 时直接停止：
+首先在 Producer 端，`RuntimeFilterGenerator` 用一份明确的黑名单拒绝为 `LEFT_OUTER_JOIN`、`FULL_OUTER_JOIN`、`LEFT_ANTI_JOIN`、`NULL_AWARE_LEFT_ANTI_JOIN` 及 `ASOF_LEFT_OUTER_JOIN` 生成过滤自身保留侧的 RF；紧接着在 `visitPhysicalHashJoin()` 中，如果发现产生产生该过滤器的父连接使用的是空值安全等值 `NullSafeEqual`（`<=>`），而当前下穿途中撞上了任何 `Outer Join`，当场返回 `false` 刹停，直接从根源上掐灭了上一节讨论的空值安全跨层传染隐患：
 
 ```java
 if (equal instanceof NullSafeEqual
@@ -413,333 +160,97 @@ if (equal instanceof NullSafeEqual
 }
 ```
 
-原因是普通 `=` 会拒绝合成 NULL，而 `<=>` 允许 NULL 参与匹配。把两者看成同一类 Hash Key，会破坏前述 Null-Rejecting 证明。
+排除了 `<=>` 之后，Doris 分两条路推进：
 
-#### 等值扩展仅限 Inner/Semi Join
+- **路径一（沿原表达式血缘直穿，`canPushThroughJoinChild`）**：检查当前 `probeExpr` 引用的列归属哪一侧孩子。如果那个孩子不是当前连接的补空侧（比如 `LEFT JOIN` 的左孩子），直接放行；如果那个孩子**正是补空侧**（比如 `LEFT JOIN` 的右孩子），则调用 `isNullPropagating(ctx.probeExpr)` 验明正身——只有裸 `Slot`、保空的 `Cast` 以及所有子参数递归满足保空性的 `PropagateNullable` 函数才能拿到通行证！像 `coalesce(c_custkey, 0)` 这种吞掉 `NULL` 吐常数的函数当场被拒之门外。Doris 仓库不仅在 [`RuntimeFilterTest.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/test/java/org/apache/doris/nereids/postprocess/RuntimeFilterTest.java) 里锁死了计划形状断言，还在回归套件 [`test_runtime_filter_outer_join_nullable_side.groovy`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/regression-test/suites/correctness_p0/test_runtime_filter_outer_join_nullable_side.groovy) 中用真实表数据验证了 `coalesce` 反例的结果行数。
+- **路径二（跨侧等值派生，Equality Expansion）**：当想借用下层连接的 `leftExpr = rightExpr` 把一侧的过滤器克隆给另一侧时，Doris 立下了铁规——除了要求开启 `expand_runtime_filter_by_inner_join` 且新目标收敛于单一 `Slot` 外，**当前被借道的连接本身只准是 `Inner Join` 或 `Semi Join`！** 换句话说，Doris 允许保空表达式顺着自家血缘走入外连接的补空侧，但绝不允许把外连接的等值条件当成无向跳板去跨侧复制过滤器。
 
-Doris 的跨侧 Expansion 需要同时满足：
+一旦过滤器顺利抵达底表 `visitPhysicalRelation()`，Doris 还会检查目标扫描节点能力、拒绝在非数值列上执行昂贵的函数计算，并在新近主干中通过 `RuntimeFilterPruneClassifier`（`generateRuntimeFilterPruneMetadata()`）进一步挖掘出分区裁剪（`RANGE/LIST` 分区上的单调表达式且非 Bloom）与分桶裁剪（单列 `HASH` 分桶键上的 `IN` 过滤器）元数据，让穿越下来的动态过滤器不仅能少读页，还能直接整片砍掉底层的 Tablet 扫描分片。
 
-- 当前 Join 不是 RF Builder；
-- 打开 `expand_runtime_filter_by_inner_join`；
-- 当前 Join 是 Inner 或 Semi Join；
-- Probe Expression 能与某个 Hash Conjunct 的一侧精确匹配；
-- 新 Target 只引用一个 Slot，且不会回到源表达式。
+---
 
-Outer Join 可以允许一个保持 NULL 的表达式沿自身血缘进入 NULL 生成侧，但不会被当作普通等价类向另一侧扩展。这是 Doris 与当前 StarRocks 路径最明显的设计差异。
+## 四、Trino：保留侧锚定的有向作用域推导与防死锁校验
 
-#### Scan 落点仍有成本与能力约束
+Trino 没有单独为动态过滤器发明一套物理树游走器，而是把 `DynamicFilterExpression` 当作一种携带特殊标签的谓词，无缝融进了经典的谓词下推引擎 [`PredicatePushDown.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/optimizations/PredicatePushDown.java) 中，由此展现出第三种极具代数美感的工程解法。
 
-`visitPhysicalRelation()` 还要求：
+在 `createDynamicFilters()` 入口，Trino 同样只允许 `INNER` 与 `RIGHT` 连接创建动态过滤器，并在遇到 `IS NOT DISTINCT FROM` 时显式给表达式打上 `nullAllowed = true` 印记，确保空值许可契约伴随表达式走完全程。
 
-- Scan 支持 Runtime Filter；
-- Target 最终能够绑定到单个 Slot；
-- 非数值类型避免在 Scan 期执行昂贵函数表达式；
-- 同一 Target 去重；
-- 分别登记 `targetExprIdToFilter`、`joinToTargetExprId` 和 `targetsOnScanNode`。
+当父层传下来的动态过滤器作为 `inheritedPredicate` 撞上下层 `LEFT JOIN` 时，接管大权的是 `processLimitedOuterJoin()`。它的核心哲学可以用一句话概括：**“想进补空侧？先证明你能写成保留侧的谓词！”**
 
-因此“逻辑上允许穿过 Join”不等于“最终一定生成 Scan RF”。表达式可计算性、数据类型、Connector 能力和 Pruner 仍会决定最终落点。
+1. 优化器首先利用等值推理器（`EqualityInference`），尝试把父层传下来的 `inheritedPredicate` 纯粹用**保留侧（Outer Scope，即左表）**的符号表达出来（记作 `outerRewritten`），并稳稳压在保留侧头上；
+2. 只有当这一步改写成功时，才允许顺着连接等值关系，再往**补空侧（Inner Scope，即右表）**派生出一份镜像过滤副本；
+3. 如果父层动态过滤器直接引用的是右表 `B` 的列（比如 `B.k = C.k` 或 `coalesce(B.k, 0) = C.k`），由于单靠左表到右表的外连接无法反向把右表谓词等价改写到左表保留域上，`outerRewritten` 求值失败，整条动态过滤器就会被乖乖留在外连接上方的 `postJoinConjuncts` 里，一步也不准往下迈！
 
-### Trino：把 DF 作为特殊谓词做有方向推导
+细品一下这套“保留侧锚定法”为什么稳如泰山：既然保留侧 `A` 已经死死摁住了原谓词的等价副本，任何不满足父层过滤条件的左表行在扫描 `A` 时就已被干掉；至于幸存下来的左表行，右表 `B` 的镜像副本只会帮它提前踢掉那些“配不上对”的右表行，绝不可能让原本不该存活的左表行蒙混过关！这种设计牺牲了“父层直接查 `B.k = C.k` 时单穿右表 `B`”的激进收益，换来了无需逐个审计复杂函数保空性的极简代数安全性。
 
-Trino 的 Outer Join 推导限制了可改写的作用域，因此 DF 不能仅凭连接键等价就在两侧自由复制。
+不仅如此，Trino 还在规划收尾处部署了两道严密的卫兵：[`RemoveUnsupportedDynamicFilters`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/RemoveUnsupportedDynamicFilters.java) 负责清理没能落到合法 `TableScan` 上的孤儿过滤器；而语法健康检查器 [`DynamicFiltersChecker`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/sanity/DynamicFiltersChecker.java) 则逐条核验每对 Producer–Consumer 闭环，尤其严禁**同一个 Join 的 Build 子树反向消费自己构建的 DF**——否则执行期就会陷入“Build 等 Scan 吐数据才能建哈希表、Scan 又傻等 Build 建完发 DF 才肯读盘”的分布式死锁。
 
-#### Left/Full Join 不自行生成 DF
+---
 
-Trino 的入口位于 [`PredicatePushDown.createDynamicFilters()`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/optimizations/PredicatePushDown.java)：
+## 五、三套引擎横向对照与运行期预算治理
 
-```java
-if ((node.getType() != INNER && node.getType() != RIGHT)
-        || !isEnableDynamicFiltering(session)
-        || !dynamicFiltering) {
-    return empty;
-}
-```
+把 StarRocks、Doris 和 Trino 的外连接穿越路径摆在同一张架构图上，能够清晰看到三种截然不同却殊途同归的工程取舍：
 
-只有 Inner 和 Right Join 进入该路径。Right Join 的左侧是 Probe/非保留侧，所以可以使用右侧 Build Domain；Left/Full Join 不能生成过滤自身保留行的 DF。
+![StarRocks、Doris 与 Trino 穿越 Outer Join 的三套传播机制对照](/images/diagrams/aug-opt-df-three-engines.svg)
 
-对 `IS NOT DISTINCT FROM`，Trino 会显式构造 `nullAllowed=true` 的 Dynamic Filter 描述，确保 NULL 语义不会在后续阶段丢失。
+*图 3：三套引擎穿越外连接的传播机制对照——StarRocks 以裸列 `SlotRef` + 普通 `EQ` 优先铺开双边过滤面，Doris 将沿血缘保空直穿与 `Inner/Semi` 等值扩展严格分家，Trino 则以保留侧作用域改写为前置锚点并辅以防死锁校验。*
 
-#### `processLimitedOuterJoin()` 决定穿越方向
+我们将各维度的设计细节浓缩为下表，方便跨引擎对齐排障：
 
-父 Join 产生的 DF 进入子 Left Join 时，被当作 `inheritedPredicate` 交给 [`processLimitedOuterJoin()`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/optimizations/PredicatePushDown.java)。
+| 对比维度 | StarRocks | Apache Doris (Nereids) | Trino |
+| --- | --- | --- | --- |
+| **规划介入时机** | 物理 `PlanNode` 构建后自顶向下推送 | `PlanPostProcessors` 独立后处理遍历 | 迭代规则 `PredicatePushDown` 统一代数推导 |
+| **Producer 准入** | `Inner` / `Left Semi` / `Right` / `Cross` | 显式拉黑 `Left` / `Full` / `Left Anti` / `ASOF` 等 | 仅限 `INNER` 与 `RIGHT` 连接 |
+| **外连接穿越主策略** | `Bilateral` 双边优先 → `Unilateral` 保守单侧 → 就地注册 | 原血缘直穿与跨侧等值扩展（Expansion）彻底分离 | 先锚定改写至保留侧 Scope，成功后再向补空侧派生 |
+| **跨侧等值复制范围** | 裸 `SlotRef` 参与下层普通 `EQ` 时允许双边尝试 | **仅限 `Inner` / `Semi` 连接**，禁止借外连接跨侧扩展 | 外连接允许从保留侧单向派生至补空侧，禁止反向 |
+| **表达式保空门禁** | 双边路径硬限制为裸列 `SlotRef` | 递归校验 `Slot` / 保空 `Cast` / `PropagateNullable` | 靠保留侧作用域改写天然隔离补空侧复杂函数 |
+| **Null-Safe (`<=>`) 防护** | 携带 `equalForNull` 标记并控制 `filter_null_value_columns` | 父连接为 `NullSafeEqual` 时遇任何外连接立即停止下推 | 携带 `nullAllowed` 属性参与作用域与类型一致性校验 |
+| **收尾与防环保障** | 跨 `Exchange` 校验 + 落点探测 | `RuntimeFilterPruner` 剪除无效项（保留分区/分桶裁剪项） | `RemoveUnsupportedDynamicFilters` + `DynamicFiltersChecker` |
 
-过程要点：先把 inheritedPredicate 改写到保留侧 scope；成功后再沿 Join Equality 派生 NULL 生成侧副本，否则留在 Join 上方（`postJoinConjuncts`）。
+语义正确只是动态过滤器的及格线；上了百节点生产集群，还必须管住**值域膨胀（Domain Bloating）的资源账单**。如果右表 Build 端有上千万个互不相同的键，强行序列化精确的 `IN` 集合会把协调节点内存和网络带宽双双打爆；哪怕退化为 `Bloom Filter`，一旦过滤率接近 0%，全集群广播加上扫描端逐行算哈希也是纯亏本买卖。
 
-```text
-父层 DF → 必须先能写成保留侧谓词 → 保留侧留一份
-        → 再派生 NULL 生成侧副本（只减匹配候选）
-```
+因此成熟的 Producer–Consumer 运行时协议都维护着一套可降级的状态机：从初始收集态 `COLLECTING` 出发，在基数与字节阈值内产出完整的精确集合或 `Bloom`（`COMPLETE`）；一旦唯一值基数超标则主动降级为轻量的 `MinMax` 甚至直接放弃（`TOO_LARGE`，详见 [Trino Dynamic Filtering 阈值机制](https://trino.io/docs/current/admin/dynamic-filtering.html)）；遇到网络拥塞超时或查询取消则无条件触发 `Fail-Open` 放行，绝不让一条优化旁路拖垮主查询的可用性。阅读线上 Query Profile 时，也一定要把 `Build Rows / NDV`、`Serialized Bytes`、`Merge / Wait Time` 与扫描端真正跳过的 `Pages / Splits` 对照起来看，揪出那些“广播跑遍全网、一行没滤掉”的无效过滤器。
 
-安全性依赖：保留侧仍持有原谓词；即便 Inner 侧匹配状态变化，不满足 DF 的保留行仍会被拒，不会凭空增多结果。
+---
 
+## 六、统一核验清单、回归测试矩阵与源码索引
 
-#### 引用 NULL 生成侧时停留在 Join 上方
+如果你正在参与优化器内核研发，或者准备给自己的查询引擎补齐外连接上的动态过滤下推，可以把整套证明浓缩成五个接口职责与六步核验门禁：
 
-如果父 DF 直接引用子 Left Join 的右侧 Symbol，`outerInference` 不包含足以把它反向改写到 Outer Scope 的关系，`outerRewritten` 为 NULL，该谓词进入 `postJoinConjuncts`。
+1. **`canGenerate(joinType, eqPred)`**：核验当前连接是否非保留侧探测（拒绝 `Left/Full/Anti` 滤除保留行），记录构建端完整性契约与空值比较标志（`equalForNull` / `nullAllowed`）；
+2. **`canPassThrough(joinType, targetSide, probeExpr, filterMeta)`**：沿既有列血缘下穿时，若目标是保留侧则放行；若目标是补空侧，必须同时断言“父比较拒绝 `NULL`”且“`probeExpr` 满足空值传递 $e(\text{NULL}) = \text{NULL}$”；
+3. **`rewriteAcrossJoin(joinType, joinEq, srcExpr, dstSide)`**：跨连接键向对侧派生新过滤器时，严禁把外连接的等值条件当作无向等价类双向乱抄（要么像 Doris 那样仅限 `Inner/Semi`，要么像 Trino 那样先锚定保留侧再单向派生补空侧）；
+4. **`canConsume(scanNode, targetExpr, rfType)`**：评估底表连接器支持度、分区分桶裁剪潜力以及函数求值开销；
+5. **`validateGraph(producers, consumers)`**：剪除没有任何消费者落点的孤儿 Producer，并静态断言不存在“Build 子树消费自身产出过滤器”的环形依赖。
 
-因此 Trino 的结论不是“父 DF 可以穿过 Left Join 的两侧”，而是：
-
-> 只有能先表示为保留侧谓词的 DF，才允许沿 Join Equality 再派生到 NULL 生成侧；无法改写到保留侧的谓词停留在 Join 上方。
-
-这比对 Outer Join 等值类做无条件双边复制更保守，也更直接地体现了传播方向。
-
-#### Producer-Consumer 完整性校验
-
-Trino 的 [`DynamicFiltersChecker`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/sanity/DynamicFiltersChecker.java) 会验证：
-
-```text
-当前 Join 生成的 DF 必须被 Probe 子树完整消费
-当前 Join 的 Build 子树不得消费这些 DF
-Join Filter 中不能遗留未下推的 DF 表达式
-所有 Consumer 必须能匹配到某个 Join/SemiJoin Producer
-```
-
-Build 子树不能消费自己的 DF，不只是语义要求，也是在防止循环依赖：
-
-```text
-Build 完成才能产生 DF
-    ↑              ↓
-Build Scan 等待 DF 消费
-```
-
-这种计划永远无法取得进展。
-
-[`RemoveUnsupportedDynamicFilters`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/RemoveUnsupportedDynamicFilters.java) 还会移除无法落到受支持 TableScan、表达式不合法或没有有效 Consumer 的 DF。规划期生成候选 Predicate，不代表它必须保留到最终计划。
-
-## 将实现差异还原为正确性条件
-
-### 三套系统的实现对比
-
-三套系统用不同结构表示相同风险；比较应落到生成条件、传播方向与 NULL 处理，而不是按下推深度判断优劣。
-
-| 维度 | StarRocks | Apache Doris | Trino |
-|------|-----------|--------------|-------|
-| 名称 | Runtime Filter | Runtime Filter | Dynamic Filter |
-| 主要规划阶段 | 物理 PlanNode 构建/下推 | Nereids Plan Post Process | Predicate Pushdown/Iterative Rule |
-| Left Join 自身生成 | 否 | 否 | 否 |
-| Right Join 自身生成 | 支持 | 依 Join 拒绝集合与实现 | 支持 |
-| 穿越策略 | Bilateral → Unilateral → Local | 血缘直穿与 Equality Expansion 分离 | 特殊谓词的 Outer → Inner 有向改写 |
-| Outer Join 跨侧扩展 | 普通 EQ Join Key 可双边尝试 | Expansion 仅 Inner/Semi | 先落保留侧，再向 NULL 生成侧派生 |
-| Null-Propagating 判断 | Bilateral 限制为 SlotRef | Slot/Cast/PropagateNullable | 通过 Predicate Scope 与 EqualityInference 控制 |
-| Null-Safe 语义 | `equalForNull` | Outer Join 显式阻断 `NullSafeEqual` | `nullAllowed` |
-| 最终落点 | PlanNode/Scan Target | PhysicalRelation + Context 索引 | Filter(TableScan) 等受支持 Consumer |
-| 完整性保护 | Probe 注册与执行描述 | Context、Pruner、Translator | Remove Rule + Checker |
-
-三者没有谁可以简单概括为“允许”或“不允许穿过 Outer Join”。差异主要来自正确性证明放在哪一层：
-
-- StarRocks 更依赖 Join Key 与候选 Slot 的双边传播；
-- Doris 把表达式 NULL 行为编码为 Visitor 的显式门槛；
-- Trino 借助 Predicate Scope 和 Equality Inference 保持有向推导。
-
-#### 正确之后还要有预算：Domain 不能无限增长
-
-RF/DF 传播即使语义正确，也可能因为 Build Domain 太大而得不偿失。精确 Value Set 会消耗内存和网络，Bloom 会产生构建与 Probe CPU，MinMax 在离散分布上可能几乎没有过滤能力。Trino 的[官方 Dynamic Filtering 文档](https://trino.io/docs/current/admin/dynamic-filtering.html)明确设置 distinct-values、字节数和 range-row 等阈值；超过阈值后可能退化为 MinMax，而不是无限收集值集合。
-
-这说明 Producer-Consumer 协议还需要一组资源状态：
-
-```text
-COLLECTING → COMPLETE(value-set / bloom / minmax)
-           → TOO_LARGE（退化或禁用）
-           → TIMEOUT（Fail-Open）
-           → FAILED（Fail-Open）
-```
-
-Consumer 不应把“过滤器对象存在”解释成“过滤器有效且完整”。执行 Profile 至少要区分 Build Rows、NDV、Serialized Bytes、Merge Time、等待时间、最终表示、Consumer 数量、实际过滤行数和被跳过的 Split/Page。否则一个传播范围很广、过滤率接近零的 DF 可能只是在整个集群广播额外工作。
-
-### 一套统一的正确性判据
-
-对任意被下层 RF/DF 丢弃的输入行，必须证明：
-
-> 它在未下推计划中可能产生的所有输出，都会在过滤器原来的语义位置被拒绝。
-
-Outer Join 还需要额外证明：
-
-> 提前过滤改变匹配状态后新产生的 NULL 补齐行，也不可能通过原来的过滤条件。
-
-工程上可以拆成六个检查。
-
-#### Producer 是否完整
-
-只有覆盖相关 Build 范围的摘要才能据以丢弃 Probe 行；局部尚未完成的集合不能当作全局完整集合。
-
-```text
-过滤器是否覆盖完整 Build Domain？
-分区过滤器是否已经完成 Merge？
-超时或构建失败是否 Fail-Open？
-```
-
-#### 目标侧是否允许改变匹配候选
-
-目标侧的保留语义决定删除是否安全，必须检查丢行是否产生新的补 NULL 输出。
-
-```text
-Preserved Side
-Null-Generating Side
-Inner/Semi Side
-Anti/Null-Aware Anti Side
-```
-
-Anti Join 与 Null-Aware Anti Join 尤其不能套用普通 Inner Join 规则，因为删除 Probe 或 Build 行可能改变“未匹配”判断。
-
-#### 父谓词是否拒绝 NULL
-
-普通 `=` 通常拒绝 NULL；`<=>` 和 `IS NOT DISTINCT FROM` 允许 NULL 匹配。这个属性必须跟随过滤器传播，不能只看中间 Join Condition。
-
-#### Probe 表达式是否保持 NULL
-
-表达式若将 NULL 映射为可匹配值，过滤输入与过滤 Join 输出就可能不等价。
-
-```text
-e(NULL) = NULL       → 可能安全
-e(NULL) = non-NULL   → 不能进入 NULL 生成侧
-```
-
-表达式是 SlotRef 只是一个保守的充分条件，不是理论上的必要条件。成熟实现可以基于函数元数据扩大到更多 Null-Propagating 表达式。
-
-#### 等值传播是否有方向
-
-Inner Join 的普通等值关系通常可以双向推导；Outer Join 应根据保留侧、NULL 生成侧与谓词原始位置建立有向传播，而不是把所有 Join Key 放进一个无方向等价类。
-
-#### Producer-Consumer 是否闭环
-
-消费者需要合法来源和可满足的执行依赖，否则过滤器可能永不到达、过早生效或形成等待环。
-
-```text
-Producer 存在
-  → Probe Consumer 可达
-  → Build 不消费自身过滤器
-  → Scan 能计算 Target Expression
-  → 无 Consumer 时删除 Producer
-```
-
-## 用反例、接口与执行依赖验证下推
-
-### 推荐的回归测试矩阵
-
-只检查 Explain 中出现 `runtime filter` 不足以验证正确性。至少需要三层测试：
-
-| 层次 | 验证目标 |
-|------|----------|
-| Planner Unit Test | Producer 数量、Target 表达式、下推方向 |
-| Explain/Shape Test | Filter ID、Build/Probe、Fragment 与 Scan 落点 |
-| Result Regression | NULL、重复键、空 Build、匹配状态变化后的结果 |
-
-#### Join Type
-
-Join 类型决定未匹配行是否保留，测试需要覆盖下列类型与 Build/Probe 方向，而不是只测 Inner Join。
-
-```text
-INNER
-LEFT / RIGHT / FULL OUTER
-LEFT / RIGHT SEMI
-LEFT / RIGHT ANTI
-NULL-AWARE LEFT ANTI
-```
-
-#### Predicate
-
-谓词测试必须区分普通等值、NULL 安全等值与可接受 NULL 的表达式，否则难以触达错误传播路径。
+在编写回归测试时，千万不要只用 `EXPLAIN` 文本里出没出现 `runtime_filter` 来判对错——没触发下推时结果本来就是对的，错误下推偏偏在均匀随机测试集上又容易侥幸逃过一劫。一套兜得住底的结果级回归矩阵，必须用包含 **`NULL` 值、空 Build 表、重复键以及“删掉原配对行后会诱发补 `NULL` 行”** 的精准数据，跑通以下高危 SQL 组合：
 
 ```sql
-a.k = b.k
-a.k IS NOT DISTINCT FROM b.k
-cast(a.k AS BIGINT) = b.k
-coalesce(a.k, 0) = b.k
-ifnull(a.k, 0) = b.k
-f(a.k) = b.k
-```
-
-#### 数据分布
-
-空 Build、NULL、重复键和倾斜会激活不同执行分支，需要独立构造，不能只依靠均匀随机数据。
-
-```text
-Probe NULL / Build NULL
-Probe 空 / Build 空
-重复键
-全匹配 / 全不匹配 / 部分匹配
-Local RF / Global RF
-过滤器部分到达、超时、取消
-```
-
-#### 必测反例
-
-回归测试应验证匹配行被删后是否产生额外补 NULL 行，并同时确认目标传播路径实际被触发。
-
-```sql
--- 非 Null-Propagating 表达式
-SELECT *
-FROM A
-LEFT JOIN B ON A.k = B.k
+-- 1. 补空侧套非保空函数（核心红线：防删除原配对行后合成 NULL 被洗白）
+SELECT * FROM A LEFT JOIN B ON A.k = B.k
 INNER JOIN C ON coalesce(B.k, 0) = C.k;
 
--- Null-Safe 父 Join
-SELECT *
-FROM (A LEFT JOIN B ON A.k = B.k)
+-- 2. 父层为空值安全等值（防携带允许 NULL 语义的过滤器无向穿透外连接）
+SELECT * FROM (A LEFT JOIN B ON A.k = B.k)
 INNER JOIN C ON B.k IS NOT DISTINCT FROM C.k;
 
--- Full Outer Join 两侧都可能生成 NULL
-SELECT *
-FROM (A FULL OUTER JOIN B ON A.k = B.k)
+-- 3. 全外连接双侧补空（两侧均兼具保留侧与补空侧双重身份）
+SELECT * FROM (A FULL OUTER JOIN B ON A.k = B.k)
 INNER JOIN C ON A.k = C.k;
+
+-- 4. Left Anti / Null-Aware Anti（NOT EXISTS / NOT IN 下删除候选行直接反转真值）
+SELECT * FROM A WHERE A.k NOT IN (SELECT B.k FROM B);
 ```
 
-结果测试要刻意构造“提前删除原匹配行后产生 NULL 补齐行”的数据，否则很容易只覆盖性能路径，没有覆盖语义风险。
+最后附上三套引擎核心实现源码的阅读路标：
 
-### 实现建议
+| 核心模块 | 所属引擎 | 关键源码路径 |
+| --- | --- | --- |
+| RF 生成与双边/单边三级下推 | StarRocks | [`JoinNode.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/JoinNode.java)、[`RuntimeFilterDescription.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/RuntimeFilterDescription.java) |
+| Nereids RF 生成与血缘/扩展分离下推 | Apache Doris | [`RuntimeFilterGenerator.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterGenerator.java)、[`RuntimeFilterPushDownVisitor.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterPushDownVisitor.java) |
+| 补空侧 `coalesce` 单测与结果级回归 | Apache Doris | [`RuntimeFilterTest.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/test/java/org/apache/doris/nereids/postprocess/RuntimeFilterTest.java)、[`test_runtime_filter_outer_join_nullable_side.groovy`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/regression-test/suites/correctness_p0/test_runtime_filter_outer_join_nullable_side.groovy) |
+| 有向作用域推导与完整性防环校验 | Trino | [`PredicatePushDown.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/optimizations/PredicatePushDown.java)、[`RemoveUnsupportedDynamicFilters.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/RemoveUnsupportedDynamicFilters.java)、[`DynamicFiltersChecker.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/sanity/DynamicFiltersChecker.java) |
 
-生成、语义传播与 Scan 能力分层，可以避免把成本检查误当成正确性检查。以下接口是设计建议，不是三个项目共用的真实 API：
+---
 
-```text
-canGenerate(joinType, predicate)
-  → 当前 Join 能否成为 Producer
-
-canPassThrough(joinType, childSide, probeExpr, filterSemantics)
-  → 能否沿原血缘进入某个 Child
-
-rewriteToChild(joinPredicate, sourceExpr, targetChild)
-  → 能否安全改写到另一侧
-
-canConsume(scan, targetExpr, filterType)
-  → Scan 是否支持该落点
-
-validate(producer, consumers)
-  → 检查生命周期与依赖闭环
-```
-
-过滤器描述至少应携带：
-
-```text
-Filter ID
-Producer Join/Fragment
-Build Expression
-Probe Expression
-Comparison Type
-Null Allowed / Equal For Null
-Local / Global
-Partition Mapping
-Build Completeness / Ready State
-Fail-Open State
-```
-
-这样，Join Type、NULL 语义、表达式能力和执行协议不会散落在互不知情的函数中。
-
-### 下推前必须完成的证明
-
-只检查 Probe 是否为 Join Key，不足以证明传播安全。实现还需确认过滤器的 NULL 语义、表达式的 NULL 行为，以及提前丢行是否改变 Outer Join 的匹配状态。Producer 完整性、Fail-Open、原始 Join Predicate 和合法 Consumer 缺一不可；测试应同时比较结果与计划，不能用下推深度代替正确性。
-
-## 关键源码阅读索引
-
-| 主题 | 项目 | 源码入口 |
-|------|------|----------|
-| RF 生成与三级下推 | StarRocks | [`JoinNode.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/JoinNode.java) |
-| RF NULL 语义描述 | StarRocks | [`RuntimeFilterDescription.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/RuntimeFilterDescription.java) |
-| RF Producer | Doris | [`RuntimeFilterGenerator.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterGenerator.java) |
-| RF 下推 Visitor | Doris | [`RuntimeFilterPushDownVisitor.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterPushDownVisitor.java) |
-| Planner 单元测试 | Doris | [`RuntimeFilterTest.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/test/java/org/apache/doris/nereids/postprocess/RuntimeFilterTest.java) |
-| NULL 生成侧结果回归 | Doris | [`test_runtime_filter_outer_join_nullable_side.groovy`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/regression-test/suites/correctness_p0/test_runtime_filter_outer_join_nullable_side.groovy) |
-| DF 生成与 Outer Join 下推 | Trino | [`PredicatePushDown.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/optimizations/PredicatePushDown.java) |
-| 删除不支持的 DF | Trino | [`RemoveUnsupportedDynamicFilters.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/iterative/rule/RemoveUnsupportedDynamicFilters.java) |
-| Producer-Consumer 校验 | Trino | [`DynamicFiltersChecker.java`](https://github.com/trinodb/trino/blob/68dae096719f5ac7a14d5a5cbcbfa1b247c0620c/core/trino-main/src/main/java/io/trino/sql/planner/sanity/DynamicFiltersChecker.java) |
-
-本文基于钉钉文档 [《【调研】Dynamic Filter 下推能力调研》](https://alidocs.dingtalk.com/i/nodes/YMyQA2dXW7gYo6Mzc147ebrwWzlwrZgb) 重新整理，并结合三个项目的本地源码补充了统一正确性模型、实现差异和回归测试方法。
+> **源码基线说明**：本文重构自前期内部技术调研笔记[《Dynamic Filter 下推能力调研》](https://alidocs.dingtalk.com/i/nodes/YMyQA2dXW7gYo6Mzc147ebrwWzlwrZgb)，初稿源码快照基于 `StarRocks/starrocks` 提交 `0fd27fd`（2026-03-30）、`apache/doris` 提交 `5202d06`（2026-08-21）及 `trinodb/trino` 提交 `68dae09`（2026-08-22），并于 2026-10 对照上游快照 StarRocks `f977b53`、Doris `7ac0eb2f`、Trino `6369330` 完成全量复核。复核期间三套引擎的外连接穿越模型保持稳定；上游演进细节（StarRocks 修正 `RuntimeFilterDescription.isTopNSortAsc()` 多列 TopN 排序键下标 `0` 读取并为跨 Exchange 下推补充 `DescriptorTable` 校验、Doris 新增 `RuntimeFilterPruneClassifier` 支撑动态分区/分桶裁剪、Trino 将 `DynamicFiltersResult` 重构为 Java `record`）均已同步校准融入正文。

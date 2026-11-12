@@ -13,1633 +13,219 @@ tags:
   - ClickHouse
   - DuckDB
   - Spill
-description: "结合 StarRocks、Doris、ClickHouse、DuckDB 源码分析 Hash Join；文末附录收 Spark JoinSelection / HashedRelation / AQE / Spill 边界。"
+description: "从连接状态机与分区不变量出发，结合 StarRocks、Apache Doris、ClickHouse、DuckDB 与 Velox 源码剖析内存哈希表布局、三值逻辑与分区 Spill 恢复协议，并在附录拆解 Spark Hash Join 边界。"
 draft: false
+toc: true
+math: true
 ---
 
 > 本系列第 1/3 篇 · Join 执行 · [下一篇]({{< relref "2026-09-10-dive-hash-sort-strategy.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
 
-## 先定义 Hash Join 需要保存的状态
+算法教科书里的 Hash Join 只有两句话：挑较小的一侧建哈希表（Build），再拿较大的一侧逐行查表（Probe），平均时间复杂度 `O(N + M)`。如果照着这个模型，直接拿 `std::unordered_map` 写一个算子放进列式分析引擎，第一步会在哪里撞墙？
 
-### 引言：Hash Join 不只是一次哈希查找
+不妨拿一组只有 5 行数据的迷你查询在脑海里推演一遍。假设右表 `customers` 有两行 `c_id = 42`、一行 `c_id = 7`、一行 `c_id = NULL`；左表 `orders` 带着 `c_id = 42`、非等值残余条件 `o.amount > c.credit_limit` 做 `FULL OUTER JOIN` 或 `NOT IN`（即 Null-Aware Anti Join），并且在建表建到一半时撞上了算子内存上限：
 
-Hash Join 用 Build 侧索引减少等值匹配的查找工作，但其资源边界由键表示、重复行、并发与落盘协议共同决定。StarRocks、Doris、ClickHouse 和 DuckDB 展示了不同的状态组织方式。
+1. **输出膨胀与跨批断点**：一个 `c_id = 42` 命中多条右表记录，总输出规模是 $\sum_k \text{count}_L(k) \times \text{count}_R(k)$。向量化引擎每次最多向下游吐出 4,096 行（一个 Chunk/Block），一旦某条左表行的重复链把当前输出块塞满，算子绝不能丢掉剩下的匹配项，而必须把 `(probe_row_idx, build_chain_ptr)` 冻结在状态机里，等下游拉取下一批时接着扫链。
+2. **未命中标记与 `NULL` 三值陷阱**：做 `RIGHT OUTER` 或 `FULL OUTER` 时，右表那行 `c_id = NULL` 虽然在 `=` 下永远配不上任何左表行，却绝不能在 Build 入口顺手过滤掉——它必须留到全部左表探测结束后原样补空输出；反过来做 `NOT IN` 时，右表只要出现这一个 `NULL`，所有左表未命中行的三值逻辑结果瞬间从 `TRUE` 翻转成 `UNKNOWN`，整个算子应当直接返回空集。
+3. **半途落盘破坏全局不变量**：如果内存吃紧时天真地把“装不下的那一半右表”写到磁盘，先把内存里这一半和左表连完，灾难立刻发生——右表某行在内存轮次没配对成功，你怎么知道它在落盘的左表分片里也没配对？`FULL OUTER` 会吐出成堆假未命中行；更隐蔽的是，基于残缺内存表构建的 Runtime Bloom Filter 会把本该命中落盘分区的左表行提前在 Scan 层误杀，造成静默丢数。
 
-教科书对 Hash Join 的描述非常简洁：选择较小的一侧构建哈希表（Hash Table），再用另一侧逐行查表。在哈希函数近似均匀、Build 侧能够放入内存时，Build 与 Probe 主路径接近 `O(N + M)`；若需输出 `Z` 条结果，还要计入 `O(Z)`，多对多重复键可能使输出远大于输入。但真正的工程实现远比这个模型复杂：
+把这三个故障现场串起来就会发现：**工业级 Hash Join 从来不是一次无状态的键值查找，而是一台横跨“连接键编码、重复链游标、命中位图（Matched Flags）与对称分区落盘（Spill）不变量”的有状态机器。** Build 阶段向 Probe 阶段交付的不是一个孤立容器，而是一份严密的状态契约——键怎么序列化、哈希种子与桶掩码如何对齐、`NULL` 走哪条旁路、未命中位记在哪里，以及一旦发生内存撤销（Revoke），两侧如何用完全一致的分区函数 `P(hash(k), level)` 在外存重新相遇。
 
-- Join Key 是单个整数、定长组合键，还是需要序列化的变长键？
-- 一个 Key 对应一行还是多行，重复链如何组织？
-- Inner、Outer、Semi、Anti、Mark Join 如何共享同一条 Probe 主路径？
-- 多线程如何并行 Build，又如何避免让 Probe 为并行付出额外代价？
-- 哈希表占满内存后，哪些状态可以撤销，哪些状态不能直接落盘？
-- Build 与 Probe 如何使用完全一致的分区规则，保证匹配行最终相遇？
-- 单个热点 Key 大到任何分区都装不下时，递归分区是否仍然有效？
+下文结合 **StarRocks、Apache Doris、ClickHouse、DuckDB**（并对照 **Velox** 与文末 **[Apache Spark 附录](#spark-hash-join)**）的内核源码，顺着“内存布局与探测快路径 → 三值语义与并行构建 → 外存分区与递归恢复协议 → 数据倾斜边界与线上排障”的主线，拆解现代执行引擎如何把这台状态机压榨到极致。
 
-这些问题决定了 Hash Join 究竟是一个只在小表上很快的算法，还是一个能支撑复杂分析负载、在内存压力下仍然可靠的执行系统。
+---
 
-本文基于以下本地源码版本展开分析：
+## 一、内存哈希表布局：为什么不能只算原始表大小？
 
-| 项目 | 源码提交 | 重点实现 |
-| --- | --- | --- |
-| StarRocks | [`0fd27fd4`](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1) | 自适应哈希表、Pipeline、可撤销内存、分区 Spill |
-| Apache Doris | [`5202d06d`](https://github.com/apache/doris/tree/5202d06dd8feb3390ff32839227eeee89c345b57) | 模板化 Join 语义、Partitioned Hash Join、递归重分区 |
-| ClickHouse | [`c631f591`](https://github.com/ClickHouse/ClickHouse/tree/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23) | Hash/Parallel Hash/Grace Hash Join、多形态 Key |
-| DuckDB | [`1c4ecd81`](https://github.com/duckdb/duckdb/tree/1c4ecd8138ae0c63c73957a411e65484301bb300) | 行式 Tuple 布局、Radix 分区、External Hash Join、Perfect Hash Join |
+在深入各家源码前，先算一笔经常让线上作业意外 OOM 的内存账。许多工程师看到右表 Parquet 文件解压后只有 2 GiB，就以为给算子留 2.5 GiB 内存绰绰有余。实际上，Build 侧的工作集由七部分叠加而成：
 
-本文关注执行引擎的共性与差异。Spark 的 JoinSelection、`HashedRelation`、AQE 与「Hash Join 默认不可 Spill」边界见文末 [附录：Spark Hash Join 特有路径](#spark-hash-join)。
+$$
+M_{\text{build}} \approx M_{\text{key}} + M_{\text{payload}} + M_{\text{directory}} + M_{\text{chain}} + M_{\text{flags}} + M_{\text{rf}} + M_{\text{arena\_frag}}
+$$
 
-2026-10 在更新快照上复核了 StarRocks、Doris、DuckDB 三套实现（见下文「2026-10 复核记录」）；ClickHouse 本地没有快照，未复核。源码仍在演进，文中类名、配置与默认路径不应外推为所有版本。
+为了把开放寻址或桶链的冲突率压低，目录数组（`M_directory`）的装载因子（Load Factor）通常控制在 `50% ~ 75%`，且容量向上取整到 2 的幂——仅一次跨阈值扩容就可能瞬间翻倍桶空间；每行还要附带 `4 ~ 8` 字节的冲突链偏移或元组指针（`M_chain`）、外连接的命中标记位（`M_flags`）、变长字符串内存池对齐碎片（`M_arena_frag`），以及构建期并存的 Runtime Filter（`M_rf`）。原始 2 GiB 的窄表，建完哈希表占到 `5 ~ 8 GiB` 司空见惯。
 
-#### 2026-10 复核记录
+为了让单次探测尽可能停留在 CPU L1/L2 缓存内、减少随机 DRAM 跳转，现代列存引擎在“键怎么编码”和“桶与载荷怎么摆放”上演化出了清晰的流派分野。
 
-2026-10-28 复核所用的快照：StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）、DuckDB `2bb5316a`（2026-10-12）。只记录已对过源码的部分。
+### 1.1 连接键特化：把变长多列压进定长寄存器
 
-**StarRocks（`0fd27fd` → `f977b53`，join 相关目录 31 个提交）**
+通用数据库如果把所有连接键都包装成虚函数对象逐字段比对，CPU 流水线会被分支预测失败和间接寻址彻底拖垮。几乎所有高性能引擎都会在 Build 入口根据列类型与值域做**键归一化（Key Normalization）**：
 
-- 哈希表构造从编译期展开改为运行时工厂表。`JoinHashTable::build()` 不再通过 `dispatch_join_hash_map` 展开约 80 个 `std::visit` 分支，而是用 `find_join_hash_map_factory()` 查静态注册表，取回 `make_join_hash_map<LT, CT, MT>` 指针；之后 `build_prepare`、`probe` 等都经 `JoinHashMapBase` 虚调用。源码注释给出的动机是编译期方案需要在该 TU 实例化全部组合，单组合约 8 秒编译成本。正文「两级选择」末尾的实现已按新路径改写。
-- Spill Build 的取消路径补了保护：`set_finishing()` 在 `state->is_cancelled()` 时直接取消 spiller 并返回；`_convert_hash_map_to_chunk()` 先把 Build Chunk 以 `shared_ptr` 快照，再同步 `reset()` 哈希表，异步 spill 遍历不再可能解引用已被 close 释放的 `JoinHashTable`。遍历同时跳过只有哨兵行的空分区。
-- Spill Probe 的恢复路径补了同类保护：`_status()` 对已释放的 build spiller 判空；`trigger_restore()` 返回后重新检查取消状态；`_restore_probe_partition()` 在读 Probe 分区前检查 `_probe_spiller->task_status()`，否则写了一半的分区会被当作完整分区读回。
-- 可用内存改为 `OperatorMemoryResourceManager::compute_available_memory_bytes(*state)` 与 `_spill_hash_join_probe_op_max_bytes / DOP` 取小；「内存分区优先、落盘分区按字节批量恢复」的选择逻辑未变。
-- `HALF_L3_CACHE_SIZE` 改用 `CpuInfo::get_l3_cache_size()`：L3 未上报时退到 L2，再退到默认 32 MiB；旧实现直接使用 32 MiB 默认值。
-- 结论：分区 Spill 的协议（同一分区函数、只落盘逻辑行、逐分区重建、Hybrid 保留内存分区）没有变，变化集中在取消安全与内存记账。
-
-**Apache Doris（`5202d06d` → `7ac0eb2f`）**
-
-- `partitioned_hash_join_sink_operator.cpp` 与 `partitioned_hash_join_probe_operator.cpp` 在两个快照之间没有改动，正文描述的递归分区与状态机仍然成立。
-- `hashjoin_build_sink.cpp` 的改动集中在 ASOF Join 的索引分组重构（`asof_column_dispatch` 换成按 `key_getter` 的泛型 lambda），不涉及普通等值 Hash Join 的 Build/Probe 路径。
-
-**DuckDB（`1c4ecd81` → `2bb5316a`）**
-
-- `join_hashtable.cpp` 与 `physical_hash_join.cpp` 合计约 2800 行增删，没有逐处审完。核对到一处与 Probe 语义直接相关的修复：`ScanStructure::ApplyResidualPredicate()` 原本先压缩 `match_sel` 再计算 `no_match_sel`，带重复等值键与 Residual Predicate 的 SEMI/ANTI Join 会读错未匹配行；修复把 `no_match_sel` 的计算移到压缩之前（duckdb#23952）。这说明「Residual Predicate 与重复链共用选择向量」是必须单独验证的边界，不能从键唯一的情况外推。
-- DuckDB 其余改动（TupleDataCollection、外部 Join 的 Spill 状态等）未复核，正文描述仍以 `1c4ecd81` 为准。
-
-**ClickHouse**
-
-- 本地没有 ClickHouse 快照，`c631f591` 之后的实现未复核，正文 ClickHouse 部分保持原快照结论。
-
-### 比较方法
-
-本文以 SQL 语义、状态所有权和 Spill 恢复为共同坐标。先建立键、Payload、重复链与匹配标记的内存模型，再核对各引擎何时撤销状态、如何分区和恢复。源码展示的是固定快照中的机制，性能结论仍需对应负载的测量。
-
-### 从 SQL 到内存对象
-
-Join 输出列与谓词决定 Build 必须保留哪些状态，因而相同连接键也可能得到不同内存布局。考虑以下查询：
-
-```sql
-SELECT o.order_id, c.region
-FROM orders o
-JOIN customers c
-  ON o.customer_id = c.customer_id;
-```
-
-若优化器选择 `customers` 为 Build 侧，逻辑过程如下：
-
-```text
-Build side: customers
-  ├─ 计算 customer_id 的 Hash
-  ├─ 保存 Join Key 与输出所需 Payload
-  └─ 建立 Hash Bucket -> Build Row 的索引
-
-Probe side: orders
-  ├─ 批量计算 customer_id 的 Hash
-  ├─ 定位 Bucket
-  ├─ 校验完整 Key，排除 Hash 冲突
-  └─ Gather Build Payload，拼接输出
-```
-
-#### 内存不能只按原始数据量估算
-
-Build 侧哈希表的近似内存可以写成：
-
-```text
-M_build ≈ M_key
-        + M_payload
-        + M_bucket/control
-        + M_duplicate_link
-        + M_null_and_match_flags
-        + M_runtime_filter
-        + M_allocator_fragmentation
-```
-
-因此，“Build 表原始数据只有 2 GiB”并不意味着 2 GiB 内存足够。低装载因子的桶数组、对齐、字符串 Arena、重复链和输出列物化都可能把实际占用放大。
-
-另一个常被忽略的量是输出规模：
-
-```text
-JoinOutput = Σ count_probe(k) × count_build(k)
-```
-
-Hash Join 只能让查找接近常数时间，无法消除多对多 Join 的组合爆炸。一个高频 Key 同时出现在两侧时，即使哈希表能够放入内存，输出也可能成为真正瓶颈。
-
-#### Build 与 Probe 之间是一份状态契约
-
-Build 阶段至少要向 Probe 阶段交付：
-
-- Join Key 的编码方式；
-- 哈希函数与桶布局；
-- Build 行或 Payload 的定位方式；
-- NULL 是否参与匹配；
-- 重复 Key 的遍历方式；
-- Outer Join 所需的命中标记；
-- 分区与 Spill 的元信息。
-
-这份状态一旦建立，Probe 就不能随意更换 Hash 或 Key 编码。External Hash Join 只是把这份契约从“一张全局哈希表”扩展到“按分区反复建立的局部哈希表”。
-
-## 内存快路径：键、语义与并行 Build/Probe
-
-### 键编码决定哈希表形态
-
-数据库很少把所有 Join Key 都转换成通用对象。通用表示便于编程，却会引入虚函数、分支、间接访问、重复 Hash 和额外内存。
-
-更常见的选择是：
-
-| Key 形态 | 典型表示 | 优点 | 风险 |
+| 连接键物理形态 | 典型编码表示 | 访存与指令收益 | 退化边界与代价 |
 | --- | --- | --- | --- |
-| 单个小整数 | 原值或直接映射下标 | 无序列化，可能消除 Hash | 值域过大时浪费空间 |
-| 稠密整数区间 | `key - min_key` | 一次数组寻址 | 依赖可靠的 Min/Max 与稠密度 |
-| 多个定长字段 | 打包为 128/256 bit | 一次比较，少间接访问 | 需要处理 NULL 位与对齐 |
-| 单 String | String 引用或专用 String Key | 避免通用序列化 | 字符串生命周期必须稳定 |
-| 复杂变长组合键 | 序列化或宽 Hash + 回表比较 | 覆盖任意类型 | CPU、Arena 与碰撞校验成本高 |
+| **小整数或窄区间单键** | 原值下标或 `key - min_key` | 零哈希计算、零冲突，退化为数组直接寻址 | 值域跨度大但数据稀疏时会造成严重的空槽浪费 |
+| **多列定长组合键** | 拼装为 `64 / 128 / 256-bit` 无符号整数 | 一次寄存器比较或 `memcmp` 即可判定整组键相等 | 需把各列 `NULL` 位及 `NULL`-safe 标志一并编入定长位宽 |
+| **单列短字符串** | 内联定长整数或 `(len, prefix, ptr)` 引用 | 前缀不符立即短路，省去堆上拷贝 | 尾部 `\0` 填充可能引发编码歧义，且底层字符串块生命周期须锁死 |
+| **任意变长多列键** | Arena 紧凑序列化或 128-bit 宽哈希 + 回表校验 | 兜底覆盖任意复杂类型与十进制/嵌套键 | 序列化 CPU、字符串池占用与碰撞回表 Gather 成本最高 |
 
-#### StarRocks：Key Constructor 与 Hash Method 解耦
+StarRocks 在 [`join_hash_table.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/join/join_hash_table.cpp#L154) 的 `JoinHashMapSelector` 中干脆把这件事拆成正交的两级决策：先由 `JoinKeyConstructorType` 决定怎么从输入列提取键（单键直取、定长位打包 `SERIALIZED_FIXED_SIZE`、或通用变长序列化），再由 `JoinHashMapMethodType` 结合 L2/L3 缓存容量与 Join 类型挑选索引结构（直接映射、稠密范围映射、线性链或桶链）。早期版本（`0fd27fd`）靠 `std::visit` 在编译期暴力展开约 80 种组合，每个实例要花掉约 8 秒编译时间；到了 `f977b53`，内核改用静态注册工厂表 `find_join_hash_map_factory()` 按 Chunk 级虚调用进入具体模板 `JoinHashMap<LT, CT, MT>`，既砍掉了编译膨胀，又保住了逐行热循环里的零分支内联。
 
-StarRocks 在 [`join_hash_table.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/join/join_hash_table.cpp) 中把两个问题分开处理：
+ClickHouse 的 [`chooseMethod()`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.cpp#L304) 走了相似的精细特化路线：单数值键直走 `key8 ~ key64`，总宽不超过 16 或 32 字节的多列定长键压进 `keys128` / `keys256`，单字符串走专用池，其余复杂组合键计算无歧义序列化的 `UInt128` 宽哈希；同时按连接严格度把 Value 拆成单行 `RowRef`、多行链 `RowRefList` 与区间检索 `AsofRowRefs`（见 [`HashJoin.h`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.h#L357)），一旦构建期发现 `ALL` 连接右侧实际无重复键（`all_values_unique`），当场降级为单行快路径。
 
-1. `JoinKeyConstructorType` 决定如何从列中构造 Key，例如 `ONE_KEY`、`SERIALIZED_FIXED_SIZE` 和通用序列化；
-2. `JoinHashMapMethodType` 决定如何由 Key 定位行，例如 `DIRECT_MAPPING`、`RANGE_DIRECT_MAPPING`、`DENSE_RANGE_DIRECT_MAPPING`、`LINEAR_CHAINED` 和 `BUCKET_CHAINED`。
+### 1.2 三大哈希表内存组织与 SIMD 预筛
 
-这意味着“Key 是什么”和“如何索引 Key”可以独立优化。对值域足够小的整数，直接映射可能比通用 Hash 更合适；对唯一 Build Key，`*_SET` 变体可以省掉重复链；无法命中特化条件时，再退回通用 Bucket Chaining。
+键编码确定之后，Build 侧的目录与行数据究竟按行存还是按列存？把 DuckDB、Velox/Umbra 与 StarRocks/Doris/ClickHouse 的内存结构摊开对比，可以看到三种截然不同的局部性取舍：
 
-#### ClickHouse：从数值键到加密哈希键
+![现代列存引擎三类内存哈希表布局与向量化探测路径](/images/diagrams/aug-exec-hash-join-memory-layout.svg)
 
-ClickHouse 的 [`chooseMethod()`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.cpp#L304) 会根据实际列类型选择 Map：
+- **开放寻址指针表 + 行式元组块（DuckDB）**：DuckDB 的 [`JoinHashTable`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/include/duckdb/execution/join_hashtable.hpp) 把连接键、残余条件列、输出载荷列、可选 `found` 布尔位以及 64 位哈希值统一打包进按行连续存放的 `TupleDataCollection`。构建未封板（Finalize）前，每行元组末尾槽存的是 Hash 值，元组块随时可以搬迁或落盘；进入 Finalize 后，开放寻址目录 `ht_entry_t` 的高 16 位存哈希盐值（Salt）、低 48 位存元组指针，若遇到同键重复行，就把元组末尾原来的 Hash 槽原地覆写成旧链头指针（Next Pointer）。这样一来，**不同键的哈希碰撞靠紧凑目录里的线性探测 + Salt 快速过滤（Salt 不等根本不去解引用随机元组指针），相同键的多行重复则沿元组内部指针串链**，各司其职。
+- **SIMD 1-Byte Tag 组内探测与无链连续布局（Velox / Unchained）**：Meta Velox 的 `HashBuild` 将数据存入混合布局的 `RowContainer`（定长连接键与哈希列紧邻行头，变长字段进独立 Arena），上层目录借鉴 F14 思想，把哈希桶按缓存行对齐分组，提取哈希值的 1 字节指纹（Tag）集中摆放，探测时用一条 AVX2/NEON 指令并行比对 16 个槽位的 Tag，命中后才去核对 `RowContainer` 里的完整键；而 DaMoN 2024 提出的 Unchained Hash Table 更进一步，利用前缀计数把同桶所有元组紧凑排进连续数组，配合内嵌 Bloom Filter 彻底消灭冲突链指针跳转。
+- **原生列存 Chunk + 稠密 `uint32` 行号链（StarRocks / Doris）**：StarRocks 与 Doris（[`join_hash_table.h`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/common/hash_table/join_hash_table.h)）选择不做整表行列转置，直接保留列式 `build_chunk` / `Block`，额外分配两个紧凑的 `uint32_t` 数组 `first[bucket]` 和 `next[row_id]` 来表达桶头与同桶下一行。更巧妙的是**第 0 号哨兵行约定**：构建时先在每个 Build 列第 0 号槽塞入默认值/`NULL`，真实数据从行号 `1` 开始编号。这样 `0` 既代表冲突链终止符，又能在 `LEFT / FULL OUTER` 左表未命中时直接生成 `(probe_row, build_row = 0)` 索引对，让下游列式 Gather 算子走完全统一的向量化拷贝逻辑，热循环里连一句判断“是否补空”的 `if` 分支都不用写。
 
-- 单个数值键使用 `key8`、`key16`、`key32`、`key64` 等专用类型；
-- 多个定长键总宽度不超过 16 或 32 字节时，打包为 `keys128` 或 `keys256`；
-- 单个 String/FixedString 使用专用路径；
-- 其他情况使用无歧义序列化值的宽 Hash 表示。
+---
 
-对应的 Value 也并非一种：[`HashJoin.h`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.h#L357) 区分 `RowRef`、`RowRefList` 和 `AsofRowRefs`，分别服务于单行、重复行和 ASOF Join。
+## 二、语义状态机与并行管线：NULL、残余谓词与并发合流
 
-#### DuckDB：Pointer Table 与 TupleDataCollection
+只要查询停留在无重复键的 `INNER JOIN`，上面任何一种内存结构写出来都干净利落。真正把内核代码逼成复杂状态机的，是 SQL 的多样连接语义与多线程并行屏障。
 
-DuckDB 的 [`JoinHashTable`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/include/duckdb/execution/join_hashtable.hpp) 把 Build 行放在 `TupleDataCollection` 中，Pointer Table 的 Entry 保存行指针和部分 Hash Salt。
+### 2.1 三值逻辑、残余谓词与连接状态演化
 
-Probe 时先检查 Salt，只有 Salt 相符的候选才做完整 Key 比较。碰撞使用线性探测，而相同 Key 的多行通过 Tuple 尾部的 Next Pointer 串起来。这种设计有三个效果：
+不同连接类型要求哈希表维护截然不同的附加状态：
 
-1. Bucket Entry 保持紧凑，先用 Salt 过滤掉大量不可能匹配的行；
-2. Key 与 Payload 采用统一 Tuple 布局，匹配后可以向量化 Gather；
-3. 数据本体与 Pointer Table 分离，External Join 可以分区保存 Tuple，再为当前分区重建 Pointer Table。
-
-### 重复 Key、NULL 与 Join 语义
-
-Join 类型决定需要保存重复链、匹配标记还是仅判断存在，NULL 语义又限制可提前丢弃的行，因此哈希表不能只实现键到单值的映射。
-
-#### 重复 Key 不是边缘情况
-
-对 Inner Join，一个 Probe Key 可能命中多个 Build Row。执行器不能假设一批输入会在一次调用中完整输出，因为结果可能超过向量或 Chunk 的最大行数。
-
-因此 Probe 状态通常要保存两个位置：
-
-```text
-probe_row_index  -> 当前处理到哪一条 Probe Row
-build_match_ptr  -> 该 Probe Row 的重复链处理到哪里
-```
-
-DuckDB 的 `ScanStructure::AdvancePointers()` 会沿 Next Pointer 继续遍历；Doris 的 Probe 模板保存 Probe/Build 索引，在输出 Block 已满时挂起，下次继续。这是向量化 Hash Join 能够处理一对多结果的关键。
-
-#### Join Type 改变的是状态，不只是输出格式
-
-不同 Join Type 对哈希表提出不同要求：
-
-| Join Type | Probe 侧要求 | Build 侧附加状态 |
+| 连接类型 | Probe 阶段动作 | Build 侧附加状态与收尾要求 |
 | --- | --- | --- |
-| Inner | 输出所有匹配组合 | 重复链 |
-| Left Outer | 无匹配时输出 Probe 行 + NULL | 通常无需全表扫描 |
-| Right Outer | Probe 后输出未匹配 Build 行 | Build Row 命中标记 |
-| Full Outer | 两侧未匹配行都要输出 | Build Row 命中标记 + Probe 未命中处理 |
-| Semi | 只判断是否存在匹配 | 可使用 Set/Unique 优化 |
-| Anti | 只保留不存在匹配的 Probe 行 | NULL 语义尤其重要 |
-| Mark | 输出 `TRUE/FALSE/NULL` 标记 | 需要记录 Build 侧 NULL 与关联统计 |
+| `INNER JOIN` | 沿重复链展开全部匹配对，满块挂起续扫 | 维护同键重复链；无尾扫阶段 |
+| `LEFT OUTER` | 未命中行配对 `build_row = 0`（哨兵 `NULL` 行） | 无需全表尾扫；若有残余条件须整链皆假才补空 |
+| `RIGHT / FULL OUTER` | 命中时幂等置位 `visited[build_idx] = 1` | 保留右表 `NULL` 键行；Probe 耗尽后转入 `POST_PROBE` 扫 `visited == 0` |
+| `LEFT SEMI / ANTI` | 首条真命中即产出（Semi）或淘汰（Anti） | 若无残余谓词可去重存成 `Set`，大幅削减重复键内存 |
+| `NULL-Aware ANTI` / `MARK` | 输出左表存活行或 `TRUE / FALSE / NULL` 三值标记列 | 显式追踪 `has_null_in_build_side` 与关联子查询分组计数 |
 
-Doris 在 [`hashjoin_probe_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/hashjoin_probe_operator.cpp) 中通过 `ProcessHashTableProbe<JoinOpType>` 模板为多种 Join 语义生成专用路径。DuckDB 则在 Tuple 布局中为 Right/Full Join 追加 `found` 布尔位，并对 Correlated Mark Join 维护分组计数。
+沿着一条探测批次穿过这些状态门控，可以看到每一处看似不起眼的顺序约束背后都藏着正确性红线：
 
-#### NULL 需要服从 SQL 三值逻辑
+![NULL 三值逻辑与 Outer / Semi / Anti 连接的状态机演进](/images/diagrams/aug-exec-hash-join-null-outer-semantics.svg)
 
-普通 `=` 下，`NULL = NULL` 不是 `TRUE`。Build 阶段通常可以过滤不可能匹配的 NULL Key，但 Right/Full Outer Join 仍然必须保留这些 Build 行，以便最后输出未匹配结果。
+第一道红线是 **`NULL` 键的不对称生命周期**。在普通 `=` 条件下，`NULL = NULL` 的求值结果是 `UNKNOWN` 而非 `TRUE`，所以 `INNER` 和 `LEFT OUTER` 在 Build 入口直接把右表空键丢弃毫无问题；但在 `RIGHT OUTER` 或 `FULL OUTER` 中，这些永远配不上对的右表 `NULL` 行恰恰是最终必须输出的未匹配记录——Doris 为此在 `first` 数组末尾专门多开第 `bucket_size` 号槽挂接空键链，ClickHouse 则用独立的 `NullmapList` 把它们攒到最后。而一旦 SQL 写成 `a <=> b`（`IS NOT DISTINCT FROM`），`NULL` 又变成了可以彼此相等的一等公民，StarRocks 在定长键打包时必须为每列多塞 1 个空值标志字节，防止 `NULL` 与整数 `0` 撞成同一个二进制键。至于 `WHERE x NOT IN (SELECT y FROM r)` 翻译出的 Null-Aware Left Anti Join，Doris 在 `ProcessHashTableBuild` 中专门埋了 `short_circuit_for_null` 快路径：只要确认无残余条件且右表扫到了 `NULL`，当场终止构建返回空集，连哈希表都不用建完。
 
-如果谓词是 `IS NOT DISTINCT FROM`，NULL 又可以彼此匹配。于是 NULL 处理不能只写在 Hash 函数里，而必须同时进入：
+第二道红线是**重复链与非等值残余谓词（Residual Predicate）叠加时的选择向量更新顺序**。设想 `LEFT ANTI JOIN ... ON l.k = r.k AND l.v < r.v`，左表第 3 行在右表撞上了两条 `k` 相等的记录，第一条算出来 `l.v < r.v` 为假，第二条算出来为真。此时左表第 3 行到底算命中还是未命中？显然只要重复链上有一条为真就算命中！DuckDB 在 2026 年修复过一个极具代表性的内核 Bug（`duckdb#23952`）：旧版 `ScanStructure::ApplyResidualPredicate()` 在遍历重复链时，先原地压缩了 `match_sel` 选择向量，再去推导 `no_match_sel`，结果在“等值键有重复 + 带残余谓词”的 `SEMI / ANTI` 场景下算错了未命中下标；修复方案正是把 `no_match_sel` 的差集计算严格挪到 `match_sel` 压缩之前。这类 Bug 单靠主键唯一的基准测试永远测不出来。
 
-- Key 编码；
-- Build 行保留策略；
-- Probe 匹配判断；
-- Mark/Anti Join 的三值逻辑（Three-Valued Logic）；
-- Spill 分区后的恢复逻辑。
+### 2.2 并行 Build 屏障与延迟物化探测
 
-### 并行 Build 与 Pipeline 化 Probe
+在单机多核 Pipeline 执行模型里，Hash Join 天生横亘着一道 **Build Barrier**——在右表尚未收齐封板前，左表一个字节都不能开始探测。为了让几十个物理线程在屏障两侧都不闲置，工业界演化出两类并行构建机制：
 
-Hash Join 天然存在 Build Barrier：Probe 必须等到可用的 Build 状态建立后才能开始。现代执行引擎主要优化 Barrier 两侧的并行度（Degree of Parallelism），而不是假装它不存在。
+1. **线程本地无锁收集 + Finalize 并行建索引（DuckDB）**：在 `PhysicalHashJoin::Sink()` 阶段，每个工作线程只往私有的 `RadixPartitionedTupleData` 里做高吞吐纯追加，完全不碰全局指针表；等到 `Combine()` 汇总后，若内存够用，再由多线程通过 CAS 原子抢占空槽与链头（`InsertHashesLoop`）并行构建全局 `Pointer Table`。这把重数据搬运和易冲突的随机写索引拆在了两个阶段。
+2. **双层哈希表按桶分片构建 + 零拷贝移交共享探测（ClickHouse `ConcurrentHashJoin`）**：如果每个线程各建一张独立哈希表，Probe 阶段要么每批左表数据都得先按哈希分片路由（Scatter），要么每次查表都得轮询 `N` 张小表。ClickHouse 的 [`ConcurrentHashJoin`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/ConcurrentHashJoin.cpp) 采用 256 桶双层哈希表（Two-Level Map）：Build 期按桶号把输入路由给最多 256 个 Slot，第 `i` 号线程只写 `i, i+S, i+2S...` 号子表，全程无锁；Build 收尾时（`onBuildPhaseFinish`），只需把各线程持有的子表指针 `std::move` 拼回同一张逻辑总表，并归并 `Right / Full` 连接的 `NullMap` 与命中位。随后所有 Probe 线程直接并发只读同一张完整哈希表，省掉了探测侧的分片洗牌开销。
 
-#### 两种常见并行 Build 方案
+顺带需要区分一个常被误当成落盘分区的概念——StarRocks 的 [`AdaptivePartitionHashJoinBuilder`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/hash_join_components.cpp#L512)。它的目标纯粹是对抗 CPU 缓存失效：当右表大到溢出 L3 Cache（源码通过 `CpuInfo::get_l3_cache_size()` 动态探测，未上报时回退 L2 或 32 MiB）却又没大到需要写盘时，先缓冲估算每行触碰的 `8B(first+next) + Key + Payload` 字节数，只有确认“切成 16 张驻留缓存的子表所省下的 Cache Miss”大于“把左表按 CRC32 分发成 16 份的 Shuffle 成本”时才保持分区，一旦中途每 8 个 Chunk 重算发现不划算，立刻调用 `_convert_to_single_partition()` 退回单表。
 
-并行 Build 可以使用局部表合并或分区协作，前者增加合并与峰值内存，后者需要协调分区所有权。
+到了 Probe 热路径上，StarRocks 与 Doris 均采用**行号对先行 + 延迟物化（Lazy Materialization）**：探测循环不搬运任何宽列字节，只往 `probe_indexs[]` 和 `build_indexs[]` 塞入命中的行号对；先拉取残余谓词必需的少数列完成过滤，最后才对真正存活下来的行号批量 Gather 宽字符串或 JSON 输出列——如果某批左表行号恰好连续且无重复链悬挂，Doris 甚至直接 `std::move` 移交左表列指针所有权，连一次内存拷贝都省了。
 
-```text
-方案 A：线程本地 Hash Table
-  local build ─┐
-  local build ─┼─► merge/finalize ─► shared probe
-  local build ─┘
+---
 
-方案 B：按 Hash Shard 并行 Build
-  input block ─► hash scatter ─► shard 0 / shard 1 / ...
-                                  └─ 各线程独占部分 Bucket
-```
+## 三、外存协议：为什么哈希表不能直接写盘，必须回到逻辑分区？
 
-线程本地表写冲突少，但 Finalize/Merge 可能昂贵；共享表省掉合并，但要控制并发插入、扩容和内存分配竞争。
+当 Build 侧体积终于顶穿内存配额时，为什么没有任何一家主流数据库选择“把建好的内存哈希表直接 `fwrite` 到临时文件，要用时再 `mmap` 或 `fread` 回来”？
 
-ClickHouse 的 [`ConcurrentHashJoin`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/ConcurrentHashJoin.h) 给出了一个很有代表性的折中：Build 时按 Hash 把 Bucket 分给不同 Slot，每个线程只修改自己的 Two-Level Map Bucket；Build 完成后把 Bucket 移入公共 Map，Probe 线程读取同一张共享表，从而避免每批 Probe 数据再次 Scatter。
+回头看一眼第一节的内存结构就明白了：无论是 DuckDB 的 48 位元组裸指针、ClickHouse `Arena` 里的变长字符串地址，还是根据当前全局行数算出来的 2 的幂桶掩码，全都死死绑在当前进程虚拟地址空间与全局容量上。就算费尽周折把指针全部重定位成文件偏移，在磁盘文件上做随机哈希桶探测也会把顺序带宽打碎成每秒几万次 4 KiB 随机读，吞吐瞬间跌去两个数量级。
 
-#### Probe 的向量化流水线
-
-一批 Probe 数据通常经历：
-
-```text
-表达式计算
-  -> NULL 过滤/选择向量
-  -> 批量 Hash
-  -> Bucket 定位
-  -> Salt/Key 比较
-  -> 重复链展开
-  -> Build Payload Gather
-  -> Residual Predicate
-  -> 输出 Chunk
-```
-
-这里有两个性能重点：
-
-1. 先使用 Selection Vector 压缩候选，再做昂贵比较；
-2. 匹配阶段只传递 Build Row 的位置，最后按输出列 Gather，避免提前复制完整行。
-
-## 外存协议：为什么落盘后必须重新建立关系
-
-### 为什么 Hash Table 不能直接 Spill
-
-当内存不足时，一个看似自然的想法是“把哈希表写入磁盘，稍后读回来”。但内存哈希表常包含：
-
-- 指向 Arena 或 Block 的裸指针；
-- 依赖当前地址空间的 Next Pointer；
-- 根据 Capacity 构造的 Bucket 数组和 Bitmask；
-- 与当前分配器绑定的字符串内存；
-- Build Row 的并发命中标记。
-
-这些对象即使序列化成功，恢复到不同地址后也未必有效。而且随机读取磁盘 Bucket 会把一次顺序扫描变成大量随机 I/O。
-
-所以主流实现 Spill 的不是 Bucket，而是**可重新构建哈希表的逻辑数据**：
-
-```text
-In-memory Hash Table
-  └─ revoke
-      └─ logical build rows / column blocks
-          └─ hash partition
-              └─ sequential spill files
-
-restore one partition
-  └─ rebuild local Hash Table
-      └─ read matching probe partition
-          └─ normal vectorized probe
-```
-
-这也解释了为什么可 Spill Hash Join 不是给普通 Hash Join 增加一个 `write()` 方法，而是额外建立一套分区、文件、异步 I/O、恢复和状态调度系统。
-
-### Grace/Hybrid Hash Join 的正确性基础
-
-设分区函数为：
-
-```text
-partition_id = P(hash(join_key), level)
-```
-
-Build 行和 Probe 行只有在满足以下不变量时才会进入同一分区：
-
-```text
-Hash_build(key) == Hash_probe(key)
-P_build(hash, level) == P_probe(hash, level)
-```
-
-一个完整的外存 Join 通常分成五步：
-
-1. Build 数据按 Hash 分区；
-2. 内存允许时保留部分分区，其余顺序落盘；
-3. Probe 数据使用相同规则分区；
-4. 对每个分区恢复 Build 数据并重建局部哈希表；
-5. 读取对应 Probe 分区执行普通 Probe，完成后释放该局部状态。
-
-如果某个 Build 分区仍然太大，则增加分区位或更换层级，再对 Build/Probe 两侧同步重分区。这就是 Recursive Grace Hash Join。
-
-Hybrid 的含义是：并非所有数据都必须落盘。能够留在内存的分区直接完成 Join，可以少写一次 Build、少写一次 Probe，也少读两次文件。
+因此，所有外存 Hash Join（Grace / Hybrid Hash Join）都遵循同一条铁律：**落盘的永远是剥离了地址指针的逻辑行或列块，靠对称分区函数把全局大连接拆成若干互不相交的局部小连接。**
 
 ![外存 Hash Join 的分区与逐分区恢复协议](/images/hash-join-external-protocol.svg)
 
-*图 1：① Build 与 Probe 用同一个 `P(hash, level)` 分区，内存允许的分区留在内存（Hybrid），其余顺序落盘；② 恢复时按可用内存成批加载分区、重建局部哈希表，再读同号 Probe 分区。分区仍装不下时 `level + 1` 重分区，但同一热点键无法被拆开。*
+要让这套拆解在任意连接语义下滴水不漏，必须同时守住三条物理不变量：
 
-#### 源码阅读坐标：四层架构不要混在一起
+1. **双侧分区映射严格同构**：设第 `level` 层的分区函数为 `pid = P(hash(key), level)`。Build 侧与 Probe 侧必须使用完全相同的键编码、哈希种子与分区位数（例如高比特 Radix 位或不同种子的重哈希），确保任何可能相等的左右记录必然落进同一个 `pid`，不同分区之间绝无交叉匹配。
+2. **Hybrid 热分区留存与配对恢复**：内存预算允许时，保留部分 Build 分区常驻内存（Hybrid 模式），流经这些分区的左表行当场完成连接吐出，省去双侧写盘；其余冷分区的左右数据成对顺序追加到各自 Spill 文件。当上游全部流完后，执行器按剩余可用内存一次装入一个或多个配对 Build 分区，在内存中重建局部哈希表，流式扫完同号 Probe 文件并跑完该分区的 `POST_PROBE` 未命中扫描，随后整块销毁局部表。
+3. **Runtime Filter 的完整性断路**：一旦 Build 切换进部分落盘或全量落盘模式，内存里只剩残缺子集。除非引擎额外维护了跨分区无损合并的全局布隆过滤器并在全部 Build 流完后才发布，否则必须果断停用或发布空 Runtime Filter（StarRocks 与 Doris 均在触发 Spill 时显式走这条保护分支），严禁用半张哈希表的过滤器去裁剪上游 Scan。
 
-阅读四套代码时，最好始终区分以下四层，否则很容易把“算法选择”“Pipeline 调度”“哈希索引”和“Spill 文件”混成一个概念：
+---
 
-| 系统 | 规划/算法层 | Pipeline/控制层 | In-Memory Hash Table | External/Spill 层 |
-| --- | --- | --- | --- | --- |
-| StarRocks | FE 下发 `THashJoinNode` 与分布方式 | `HashJoinBuild/ProbeOperator`、`HashJoiner` | `JoinHashTable`、`JoinHashMap<LT, CT, MT>` | `SpillableHashJoinBuild/ProbeOperator`、Partitioned Spiller |
-| Apache Doris | `TPlanNode`、Join Distribution/Op | Build Sink/Probe Operator 与 Local State | `JoinHashTable<Key, Hash, DirectMapping>` | `PartitionedHashJoin*Operator`、`SpillRepartitioner` |
-| ClickHouse | `chooseJoinAlgorithm()`、`TableJoin` | `IJoin` 与 Joining Transform | `HashJoin`、`MapsOne/All/Asof` | `GraceHashJoin`、`FileBucket` |
-| DuckDB | `PhysicalHashJoin` | Sink/Combine/Finalize/Operator/Source | `JoinHashTable`、Pointer Table、TupleData | Radix Partition、`ProbeSpill`、External Source State |
+## 四、四套引擎（及 Velox）如何实现撤销、分区与递归恢复？
 
-后续四章都按同一顺序展开：先给出入口和对象关系，再分析 Hash Table 布局，然后进入 Build/Probe 热路径，最后讨论 Spill 状态机。这样能够看清“相同问题如何被不同架构拆分”，而不仅是对照类名。
+虽然底层数学协议都是 Hybrid / Recursive Grace Hash Join，但放进各自的内存管理与 Pipeline 调度框架里，StarRocks、Apache Doris、ClickHouse、DuckDB 和 Velox 走出了五种极具辨识度的状态机设计：
 
-## 四套引擎如何撤销、分区与恢复
+![四引擎并行构建与分区/基数 Spill 恢复状态管线](/images/diagrams/aug-exec-hash-join-four-engines-spill.svg)
 
-### StarRocks：从可撤销哈希表到多分区恢复
+> 想按执行阶段逐步跟踪内存驻留快路径与撤销递归重切分支的读者，可打开 [交互式视图：四引擎并行构建与分区 Spill 恢复管线](/diagrams/aug-exec-hash-join-four-engines-spill.html) 切换焦点路径查看。
 
-StarRocks 的普通 Hash Join 由 `JoinHashTable` 承担数据结构选择，Pipeline Build/Probe Operator 负责调度。可 Spill 路径位于：
+### 4.1 StarRocks：按需拆表转列与可用内存多分区装箱
 
-- [`spillable_hash_join_build_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_build_operator.cpp)
-- [`spillable_hash_join_probe_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_probe_operator.cpp)
-
-#### 架构路径：Operator、Controller 与数据结构分层
-
-StarRocks 没有把所有逻辑都塞进 `HashJoinNode`。Pipeline 执行路径可以沿下面的对象关系阅读：
-
-```text
-HashJoinBuildOperator                 HashJoinProbeOperator
-  │ push_chunk(build)                   │ push_chunk(probe) / pull_chunk()
-  ▼                                     ▼
-HashJoiner  <────── build dependency ───────┐
-  │                                        │
-  ├─ HashJoinBuilder                       ├─ HashJoinProber
-  │    ├─ SingleHashJoinBuilder            │    ├─ SingleHashJoinProberImpl
-  │    └─ AdaptivePartitionHashJoinBuilder │    └─ PartitionedHashJoinProberImpl
-  │                                        │
-  └────────────── JoinHashTable ───────────┘
-                    │
-                    └─ JoinHashMap<LogicalType,
-                                   KeyConstructor,
-                                   HashMapMethod>
-```
-
-各层职责非常明确：
-
-- `HashJoinBuildOperator` 和 `HashJoinProbeOperator` 对接 Pipeline 的 `push/pull/set_finishing` 协议；
-- [`HashJoiner`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/hash_joiner.h) 更像 Controller，维护依赖、阶段、Runtime Filter、残余谓词和 Lazy Materialization；
-- [`HashJoinBuilder/HashJoinProber`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/hash_join_components.h) 决定单表还是 Cache-Aware 分区表；
-- `JoinHashTable` 负责 Build 数据所有权、Key/Map 特化和 Join 语义；
-- `JoinHashMap<LT, CT, MT>` 是最终进入热循环的模板实例，`LT`、Key 构造方式和 Map 实现都已静态确定。
-
-`HashJoiner` 的阶段不是注释意义上的概念，而是控制 Pipeline 可执行操作的状态机：
-
-```cpp
-// 简化自 hash_joiner.h
-enum HashJoinPhase {
-    BUILD,       // 只允许追加 Build Chunk
-    PROBE,       // Hash Table 已只读，允许 Probe
-    POST_PROBE,  // 扫描未匹配/已匹配的 Build Row
-    EOS
-};
-
-bool has_post_probe(join_type) {
-    return RIGHT_OUTER || RIGHT_ANTI || FULL_OUTER;
-}
-```
-
-Build Operator 在 `set_finishing()` 中完成 `build_ht()`、Runtime Filter 构建并唤醒 Probe Dependency；Probe Operator 第一次获得输入时，通过 `_reference_builder_hash_table_once()` 引用只读表。Right/Full 类 Join 在 Probe 输入结束后进入 `POST_PROBE`，调用 `probe_remain()` 输出 Build 侧剩余行。
-
-因此 StarRocks 的 Barrier 是：
-
-```text
-build push
-  -> build_ht
-  -> create runtime filters
-  -> notify probe dependency
-  -> probe references read-only HT
-  -> probe push/pull
-  -> optional post-probe scan
-```
-
-#### JoinHashTable：列数据、行号链和哨兵行
-
-`JoinHashTable` 的数据本体仍是列式 `build_chunk`，哈希索引主要由 `first` 和 `next` 两个 `uint32_t` 数组构成：
-
-```text
-build_chunk
-  row 0      : dummy/default row
-  row 1..N   : real build rows, columnar storage
-
-first[bucket] = bucket chain 的第一条 build row id
-next[row_id]  = 同一 bucket 的下一条 build row id
-0             = 链表结束，同时可表示 outer join 的 NULL build row
-```
-
-第 0 行是一个关键约定。`_init_build_column()` 为每个 Build Column 先追加 Default 值；之后真实数据从 Row ID 1 开始。这样 Probe 输出 `(probe_row, build_row=0)` 时，可以直接从 Default/Nullable Column 取到 Outer Join 所需的 NULL，而不必在热循环中为“未匹配”维护完全不同的数据路径。
-
-源码中的内存统计也揭示了真实 Hash Table 的组成：
-
-```cpp
-// 简化自 JoinHashTable::mem_usage()
-usage  = build_chunk->memory_usage();         // Build 数据本体
-usage += first.capacity() * sizeof(uint32_t); // Bucket head
-usage += next.capacity()  * sizeof(uint32_t); // Row chain
-usage += build_pool->reserved_bytes();        // 变长 Build Key
-usage += probe_pool->reserved_bytes();        // Probe 临时序列化 Key
-usage += build_key_column->memory_usage();
-usage += build_slice.size() * sizeof(Slice);
-```
-
-这说明 StarRocks 的 Map Cell 并不保存完整 Payload。哈希表给出 Build Row ID，输出阶段再从列式 `build_chunk` 按索引 Gather。其优点是索引紧凑、输出列可裁剪；代价是 Build Chunk 生命周期必须覆盖整个 Probe/Post-Probe，并且 Spill 时不能只写 `first/next`。
-
-#### 两级选择：先构造 Key，再选择索引结构
-
-[`JoinHashMapSelector`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/join/join_hash_table.cpp#L154) 的设计重点是把 Key 表示与 Hash Map 形态解耦。
-
-第一步 `_determine_key_constructor()`：
-
-```cpp
-// 伪代码，分支与源码一致
-if (只有一个普通等值 Key) {
-    if (String 实际最大宽度 <= 4/8/16 && 末尾不存在歧义 0 字节)
-        return SERIALIZED_FIXED_SIZE_INT/BIGINT/LARGEINT;
-    return ONE_KEY;
-}
-
-for (每个组合 Key) {
-    if (定长连续类型，或可证明为短 String)
-        total_bytes += field_bytes + null_safe_flag_byte;
-    else
-        return SERIALIZED_VARCHAR;
-}
-return pack_to_32/64/128_bits_when_possible;
-```
-
-这里 `NULL-safe equal` 要额外写入空值标记，否则 `NULL` 与底层默认值会被编码成同一个 Key。短 String 特化还要排除尾部 `\0` 可能造成的编码歧义。
-
-第二步 `_determine_hash_map_method()`：
-
-```cpp
-// 简化自 _determine_hash_map_method()
-if (BOOLEAN/TINYINT/SMALLINT)
-    return DIRECT_MAPPING;
-
-if (ONE_KEY && (INT || BIGINT))
-    if (value range 足够小且内存模型更优)
-        return RANGE_DIRECT_MAPPING / DENSE_RANGE_DIRECT_MAPPING;
-
-if (bucket size 在实现上限内)
-    return LINEAR_CHAINED[_SET];
-
-return BUCKET_CHAINED; // 通用回退；ASOF 使用专用 chained 版本
-```
-
-Range Direct Mapping 不是只比较 `max-min` 与行数。源码把 L2/L3 Cache 和 Join Type 一起放入成本判断：
-
-- Semi/Anti 且没有 Other Conjunct 时，只需表达“Key 是否存在”，可以用 Bitset Set；
-- 普通 Join 要保存重复关系，比较 Direct Map 的值域内存与 `first/next` 成本；
-- Dense Range 使用约 2 bit 状态表示值域位置，再保留按行的 `first`，用于兼顾稠密度和重复行。
-
-最终 Build 通过工厂表构造具体模板。`0fd27fd` 用的是编译期的 `dispatch_join_hash_map`（约 80 个 `std::visit` 分支）；`f977b53` 改为静态注册表加多态基类：
-
-```cpp
-// 简化自 f977b53 的 JoinHashTable::build()
-tie(key_constructor, map_method) =
-    JoinHashMapSelector::construct_key_and_determine_hash_map(state, table_items.get());
-
-JoinHashMapFactoryFn factory =
-    find_join_hash_map_factory(key_constructor, map_method);   // 各 join_hash_map_*_inst.cpp 静态注册
-if (factory == nullptr) return Status::InternalError("no factory registered");
-
-_hash_map = factory(table_items, probe_state);                // unique_ptr<JoinHashMapBase>
-_hash_map->build_prepare(state);
-_hash_map->probe_prepare(state);
-_hash_map->build(state);
-```
-
-外层只查一次表，Probe 热循环拿到的仍是确定的 `LT/CT/MT` 模板实例，逐行不做类型判断；区别在于 `probe`、`lazy_output_for_probe` 这类入口改为经 `JoinHashMapBase` 虚分发，粒度是 Chunk 而不是行。这次改动的理由写在源码注释里：编译期展开要求在 `build()` 所在 TU 实例化全部组合，每个组合约 8 秒。代价是类型错误从编译期推迟到运行期，因此 `factory == nullptr` 必须显式转成 `InternalError`。
-
-#### Probe：可暂停的重复链与延迟物化
-
-`SingleHashJoinProberImpl` 对一批 Probe Chunk 保存三个核心对象：
-
-- `_probe_chunk`：原始 Probe 列；
-- `_key_columns`：表达式计算后的 Join Key；
-- `_current_probe_has_remain`：当前批次是否还有重复匹配未输出。
-
-```cpp
-// 简化自 hash_join_components.cpp
-push_probe_chunk(chunk) {
-    _probe_chunk = chunk;
-    prepare_probe_key_columns(_key_columns, _probe_chunk);
-}
-
-probe_chunk() {
-    hash_table->probe(keys, probe_chunk, output, &has_remain);
-    filter_probe_output_chunk(output);      // Other/Where Conjunct
-    lazy_output_chunk(output);              // 最后补齐延迟列
-    if (!has_remain) _probe_chunk = nullptr;
-}
-```
-
-`has_remain` 让哈希表能够在输出 Chunk 达到容量时暂停重复链，下次 `pull_chunk()` 继续，而不重新 Hash 已处理的 Probe Row。Residual Predicate 先在只包含必要列的中间 Chunk 上计算，只有通过过滤的行才物化 Lazy Column，这对宽表 Join 尤其重要。
-
-Right Outer、Right Anti 和 Full Outer 的 Build 命中状态不能在普通 Probe 输出结束时丢弃。它们通过 `POST_PROBE` 再扫描哈希表，`probe_remain()` 分批输出命中或未命中的 Build Row。
-
-#### Adaptive Partition Hash Join：为 Cache 分区，不是为 Spill 分区
-
-StarRocks 还有一个容易与 External Spill 混淆的 [`AdaptivePartitionHashJoinBuilder`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/hash_join_components.cpp#L512)。它的目标不是把数据写盘，而是让若干子 Hash Table 尽量落入 L2/L3 Cache。
-
-源码成本模型估算一次 Probe 会触碰：
-
-```text
-8 bytes(first + next)
-+ Join Key 比较字节
-+ Build 输出列字节
-```
-
-同时估算把 Probe Row Scatter 到 16 个分区的成本。只有“减少 Cache Miss 的收益”大于“Probe Shuffle 的代价”时，才保留分区模式：
-
-```text
-BUFFERING
-  ├─ 行数进入收益区间 ─► APPENDING，按 CRC32 + fmix32 分到 16 个 Builder
-  └─ 最终不划算 ──────► 合并成 SingleHashJoinBuilder
-
-APPENDING
-  ├─ 每 8 个 Chunk 重新估算每行 HT 字节
-  └─ 收益消失 ────────► _convert_to_single_partition()
-```
-
-Broadcast Join 还会根据最大 Probe DOP 下调 Cache Miss Factor，因为多个 Prober 共享同一张表，跨核 Cache 复用会改变分区收益。
-
-因此 StarRocks 实际存在两套“Partition”：
-
-| 机制 | 触发目标 | 数据位置 | 是否重建 Hash Table |
-| --- | --- | --- | --- |
-| Adaptive Partition Hash Join | 改善 L2/L3 Locality | 全部在内存 | 每个 Cache Partition 一张子表 |
-| Spillable Hash Join | 回收内存并保证查询继续 | 内存 + Spill File | 每个恢复批次重建局部表 |
-
-#### Spill 不是默认路径，而是内存撤销后的模式切换
-
-Build 初期仍走普通内存哈希表。收到内存撤销请求后，Operator 把策略切换为 `SPILL_ALL`。第一次切换时需要完成两个动作：
-
-1. 根据当前 `ht_mem_usage()` 与 Spill MemTable 阈值估算分区数量；
-2. 通过 `_convert_hash_map_to_chunk()` 把已建哈希表恢复为可分区的 Chunk，再与后续输入一起 Spill。
-
-这一步很重要：系统没有在查询开始时就为最坏情况支付全部 Spill 成本，而是在真正发生内存压力时，把已经建立的不可撤销结构转换成可撤销数据。
-
-Build Spill 采用按列格式，并给数据追加分区 Hash。列式写出更符合 StarRocks 的 Chunk 模型，也便于压缩和恢复。
-
-#### Probe 侧复用 Build 分区布局
-
-Probe Operator 从 Build Spiller 获取完整分区列表，并用它初始化 Probe Spiller。新到达的 Probe Chunk 计算相同 Hash 后有两条路径：
-
-- 对应 Build 分区已经选入当前处理集合：直接送给相应 Prober；
-- 对应 Build 分区尚未加载：写入相同 Partition ID 的 Probe Spill。
-
-于是内存分区可以边接收 Probe 边执行，落盘分区等后续恢复。这正是 Hybrid Hash Join 的效果。
-
-#### 一次加载多少分区由可用内存决定
-
-`_acquire_next_partitions()` 不只选择一个分区。它优先处理仍在内存中的 Build 分区，再按可用字节选择一个或多个落盘分区。对每个选中的分区分别创建 Builder/Prober，异步读取 Build 数据并重建局部哈希表。
-
-```text
-available memory
-  ├─ partition 1: 420 MiB ─► local HT 1
-  ├─ partition 7: 180 MiB ─► local HT 2
-  └─ partition 9: 90 MiB  ─► local HT 3
-
-probe rows ─► partition id ─► prober 1 / 2 / 3 / spill
-```
-
-这让小分区可以合批并行恢复，降低“一次只处理一个小分区”造成的 CPU 和 I/O 空闲。
-
-#### Spill 与 Runtime Filter 的冲突
-
-普通 Build 完成后，StarRocks 可以发布 IN Filter 或 Bloom Filter。但 Spill Build 当前会发布空 Runtime Filter。源码注释给出的原因很实际：若要构建全局 Filter，需要重新读取全部 Spill 数据，或者在切换前就知道完整 Build 规模。
-
-这揭示了一个普遍矛盾：
-
-> Runtime Filter 希望尽早看到完整 Build Key 集合，Spill 希望尽早释放 Build 状态；两者对生命周期的要求相反。
-
-可行方向包括分区级 Filter、可增量合并的 Bloom Filter，或在分区元数据中维护低成本摘要，但都要权衡误判率、发布时间和额外内存。
+StarRocks（[`spillable_hash_join_build_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_build_operator.cpp) 与 [`spillable_hash_join_probe_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_probe_operator.cpp)）的哲学是**不为没发生的落盘提前交税**。查询启动时默认走纯粹的内存 `JoinHashTable`，零分区洗牌开销；只有收到算子内存管理器的撤销（Revoke）指令时，才一次性切入 `SPILL_ALL` 模式：根据当前哈希表占用估算分区数，调用 `_convert_hash_map_to_chunk()` 把已建好的内存表拆回列式逻辑块（跳过第 0 号哨兵行），追加分区哈希列后与后续输入一并按列压缩写盘。
 
 ![StarRocks 可 Spill Hash Join 的模式切换与分区恢复](/images/hash-join-starrocks-spill.svg)
 
-*图 2：没有内存压力时走左侧普通路径；收到撤销请求后切到 `SPILL_ALL`，只切换一次，把已建哈希表还原成逻辑 Build 列，之后按可用内存成批恢复分区。底部两条补充两个边界：Spill Build 发布空 Runtime Filter 的原因，以及 `f977b53` 取消路径上的修复。*
+进入恢复阶段后，`_acquire_next_partitions()` 并不是呆板地每次只读回一个分区，而是参考 `min(compute_available_memory_bytes, spill_hash_join_probe_op_max_bytes / DOP)` 做**贪心装箱**：如果当前剩余 800 MiB 内存，而落盘分区 1、7、9 分别只有 420 MiB、180 MiB 和 90 MiB，就把这三个分区同时拉起并行重建局部哈希表，一次流过 Probe 数据处理掉一批小分区，大幅削减磁盘调度轮次。在 `f977b53` 的演进中，团队还专门加固了异步落盘与查询取消（Cancel）交错时的生命周期防线：拆表前先用 `shared_ptr` 快照锁住底层 `build_chunk` 再同步 `reset()` 哈希表，防止后台 I/O 线程解引用已被 `close()` 销毁的对象；恢复读取前强制校验 `_probe_spiller->task_status()`，杜绝把半途取消的残缺文件当成合法分区读回。
 
-### Apache Doris：把递归 Spill 做成显式状态机
+### 4.2 Apache Doris：外层包装器与恢复中途的二次递归重切
 
-Doris 的普通 Build/Probe 路径位于 [`hashjoin_build_sink.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/hashjoin_build_sink.cpp) 与 [`hashjoin_probe_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/hashjoin_probe_operator.cpp)。可 Spill 路径由 Partitioned Hash Join 包装普通 Hash Join：
+Apache Doris（[`partitioned_hash_join_sink_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/partitioned_hash_join_sink_operator.cpp) 与 [`partitioned_hash_join_probe_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/partitioned_hash_join_probe_operator.cpp)）采用了干净的**内外双层解耦架构**：内层始终是原封不动的内存算子 `HashJoinBuildSinkOperatorX` / `HashJoinProbeOperatorX`，外层套上 `PartitionedHashJoin*OperatorX` 专职管理 `(build_file, probe_file, level)` 工作队列。这样做最大的好处是：10 余种 `JoinOp`（含 `RIGHT_ANTI`、`NULL_AWARE_LEFT_ANTI`、带残余谓词的外连接）只写一套内层模板代码，恢复某个分区时只需实例化一套局部内部算子喂数据即可，彻底消灭“内存跑得对、一落盘就出语义偏差”的双轨维护噩梦。
 
-- [`partitioned_hash_join_sink_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/partitioned_hash_join_sink_operator.cpp)
-- [`partitioned_hash_join_probe_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/partitioned_hash_join_probe_operator.cpp)
+Doris 状态机里最精彩的一笔是**恢复中途遭遇二次撤销的断点续切**。`_pull_from_spill_queue()` 在读回某个 `build_file` 时每攒够 `spill_buffer_size` 就主动 `yield` 让出 Pipeline 线程，并且在真正建表前把 `first[] + next[] + visited[] + 序列化键` 的完整峰值算进内存预留。万一文件读到一半内存又被别的查询抢占，或者单分区体积超出预期，`repartition_current_partition()` 会以 `level + 1` 的新哈希种子同步拆分两侧：对 Build 侧，它先把已经读进内存 `_recovered_build_block` 的那半截行散列到子分区文件，再让 `SpillRepartitioner` **紧接着 `_current_build_reader` 的当前文件游标往后读完剩余半截**——既不漏行，也绝不从文件头重读引发重复行！整个递归深度受 `spill_repartition_max_depth` 硬约束，防止死循环耗尽磁盘句柄。
 
-#### 架构路径：外层 Operator 与内层 Hash Join Kernel
+### 4.3 ClickHouse：显式 `GraceHashJoin` 与 2 的幂动态裂变
 
-Doris 的普通路径可以按下面的调用链阅读：
+与 MPP 引擎透明撤销不同，ClickHouse 在 [`PlannerJoins.cpp`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Planner/PlannerJoins.cpp#L1259) 中把内存假设直接交由 `IJoin` 策略类显式承载：`HashJoin`、`ConcurrentHashJoin` 与 [`GraceHashJoin`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/GraceHashJoin.cpp)。
 
-```text
-HashJoinBuildSinkOperatorX
-  └─ HashJoinBuildSinkLocalState::process_build_block()
-       ├─ 执行 Build Key 表达式
-       ├─ init_hash_method<JoinDataVariants>()
-       ├─ try_convert_to_direct_mapping()
-       └─ ProcessHashTableBuild<HashTableCtx>::run<JoinOp>()
-            └─ JoinHashTable<Key, Hash, DirectMapping>::build()
+在 `GraceHashJoin` 中，桶数量始终保持 2 的幂。初始阶段可以只开少量 `FileBucket`（避免小查询一上来在磁盘上铺满几百个空文件），第 0 号当前桶直接写入内存 `HashJoin` 实例，其余桶写各自压缩临时流。一旦当前内存桶突破预算，`rehashBuckets()` 将总桶数翻倍（受 `max_num_buckets` 封顶），调用 `releaseJoinedBlocks()` 从内存表里取回原始逻辑右表 `Block`，多取 1 位哈希比特重新分发——属于新当前桶的留下来重建内存表，分出去的落入新桶文件。由于多线程可能持有扩容前的桶数快照，探测与延迟回放入口（`getDelayedBlocks`）每次都会校验记录所属桶号是否已随翻倍漂移，必要时二次路由，确保左右两侧最终严丝合缝地按桶号汇合。
 
-HashJoinProbeOperatorX
-  └─ HashJoinProbeLocalState
-       └─ ProcessHashTableProbe<JoinOp>::process<HashTableCtx>()
-            ├─ init_serialized_keys()
-            ├─ JoinHashTable::find_batch<JoinOp>()
-            ├─ 生成 probe_indexs/build_indexs
-            ├─ Gather 两侧输出列
-            └─ Other Join Conjunct / Mark Conjunct
-```
+### 4.4 DuckDB 与 Velox：预分区元组、工作集预留与仲裁协同
 
-这里使用了两次正交的模板化：
+嵌入式引擎 DuckDB（[`physical_hash_join.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/physical_hash_join.cpp)）从 `Sink` 第一行起就把元组放进 `RadixPartitionedTupleData`。到了 `PrepareFinalize()` 关卡，它向全局 `TemporaryMemoryManager` 申报预留额度时，算的是一笔极其严谨的全链路账：
 
-- `HashTableCtx` 固化 Key 类型、Hash Method、是否 Nullable/Serialized/Direct Mapping；
-- `JoinOp` 固化 Inner、Outer、Semi、Anti、Null-Aware 等语义。
+$$
+M_{\text{round}} = \sum_{p \in S} \left( \text{TupleBytes}(p) + \text{PointerTableBytes}(p) \right) + N_{\text{threads}} \times B_{\text{probe\_radix\_buf}}
+$$
 
-`std::visit` 只发生在 Block 级入口，真正的逐行热循环已经是具体模板实例。这与 StarRocks 的 Key Constructor/Map Method Dispatch 目标相同，但 Doris 把 Join Type 也更直接地下沉到 `ProcessHashTableBuild/Probe` 模板。
+只要拿到的 `reservation` 小于全量内存表需求，算子自动转入 External 模式：先把开放寻址装载因子收紧（有时仅靠缩小空槽就能免于落盘）；若最大分区加上探测缓冲仍超预算，`SetRepartitionRadixBits()` 会增加基数位，故意把单分区目标体积压到预算的 `1/4` 左右留足安全垫；随后每轮按近似大小排序挑出一组能塞进预算的 `current_partitions` 建表，未选中分区的左表行写进 `ProbeSpill`，等上游流尽后切入 `Source` 角色按 `BUILD → PROBE → SCAN_HT` 循环扫完剩余轮次。
 
-可 Spill 路径不是替换这个 Kernel，而是在外面再包一层：
+Meta Velox 的原生执行层（[`HashBuild.h`](https://github.com/facebookincubator/velox/blob/main/velox/exec/HashBuild.h) / [`HashProbe.h`](https://github.com/facebookincubator/velox/blob/main/velox/exec/HashProbe.h)）则通过 `HashJoinBridge` 在多个并发 Driver 线程间同步跨阶段分区契约，并与统一内存仲裁器（Memory Arbitrator）深度联动：当同节点其他查询突发申请内存时，仲裁器随时可挂起当前 Join 驱动组，挑出若干哈希分区顺序刷盘腾出配额，恢复时同样支持递归子分区拆分。
 
-```text
-PartitionedHashJoinSinkOperatorX
-  ├─ 未 Spill：转发给 inner HashJoinBuildSinkOperatorX
-  └─ 已 Spill：Build Block -> partition -> SpillFile[]
+把这几套工业实现的底层取舍放在同一张坐标表里，差异一目了然：
 
-PartitionedHashJoinProbeOperatorX
-  ├─ 未 Spill：转发给 inner HashJoinProbeOperatorX
-  └─ 已 Spill：Probe Block -> partition -> SpillFile[]
-                 -> recover one pair
-                 -> recreate inner build/probe operators
-```
-
-#### JoinHashTable：`first/next/visited` 三个数组
-
-Doris 的 [`JoinHashTable`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/common/hash_table/join_hash_table.h) 是理解普通 Join 的最短入口。它没有把 Payload 塞进 Cell，而是使用 Build Block 行号：
-
-```cpp
-// 源码数据成员的语义化摘录
-DorisVector<uint32_t> first;   // bucket -> first build row
-DorisVector<uint32_t> next;    // build row -> next row in bucket
-DorisVector<uint8_t>  visited; // Right/Full/Semi/Anti 的逐行命中状态
-const Key* build_keys;          // 完整 Key，碰撞后做相等比较
-```
-
-Build Block 同样保留第 0 行作为 Mock Row，真实行从 1 开始。`prepare_build()` 根据 Join Type 决定是否分配 `visited`：
-
-```cpp
-// 简化自 prepare_build<JoinOpType>()
-bucket_size = DirectMapping
-    ? force_bucket_size
-    : normalize((num_elem + 1) * 8 / 7); // 预留装载率空间
-
-first.resize(bucket_size + 1); // 额外一个位置保存 NULL Key 链头
-next.resize(num_elem);
-
-if (FULL_OUTER || RIGHT_OUTER || RIGHT_ANTI || RIGHT_SEMI)
-    visited.resize(num_elem);
-```
-
-插入本身非常直接：
-
-```cpp
-for (uint32_t row = 1; row < num_elem; row++) {
-    uint32_t bucket = bucket_nums[row];
-    next[row] = first[bucket];
-    first[bucket] = row;
-}
-
-if (!keep_null_key)
-    first[bucket_size] = 0; // bucket_size 这个额外槽专门表示 NULL 链
-```
-
-因此 Doris 的冲突处理是 Separate Chaining，但链节点不是堆对象，而是稠密 `uint32_t next[]`。这比每行分配 Node 更节省内存，也让 Prefetch 和顺序访问更可控。
-
-Direct Mapping 时，Bucket 已由 Key 唯一确定，`_eq()` 可以直接返回 `true`；普通 Hash 路径仍要用 `build_keys[row]` 做完整比较，避免 Hash 冲突产生错误匹配。
-
-#### Build：Key 初始化、NULL 编码与批量插入
-
-Build 的关键入口是 [`process_build_block()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/hashjoin_build_sink.cpp#L586)。可以把它拆成六步：
-
-```cpp
-// 结构化伪代码，保留源码调用关系
-convert_overflow_columns(block);                    // String/Variant 物理格式稳定化
-extract_join_column(block, null_map, raw_ptrs);    // 计算并拆出 Build Key
-hash_table_init(state, raw_ptrs);                  // 选择 HashMethod/DirectMapping
-
-visit(hash_table_variant, join_op, [&](ctx, op) {
-    ProcessHashTableBuild<Ctx> process(rows, raw_ptrs, ...);
-    process.run<op>(ctx, null_map,
-                    &has_null_in_build_side,
-                    short_circuit_for_null,
-                    have_other_join_conjunct);
-});
-```
-
-`ProcessHashTableBuild::run()` 内部再做：
-
-```text
-prepare_build<JoinOp>()
-  -> 如有必要，把单列 NULL 替换为默认值
-  -> init_serialized_keys(..., is_build=true)
-  -> 计算 bucket_nums
-  -> hash_table.build(keys, bucket_nums, rows, keep_null_key)
-```
-
-NULL 有两种表示策略：
-
-- Null-Safe Equal 需要把 NULL 编入 Key，使 `NULL <=> NULL` 可匹配；
-- 普通等值 Join 用外部 Null Map 排除 NULL，并在 Null-Aware/Outer 等特定语义下保留 NULL 行。
-
-`short_circuit_for_null` 是 Null-Aware Anti Join 的重要优化：当语义允许仅凭 Build 侧存在 NULL 就确定结果时，不再无意义地构建完整哈希表。
-
-#### Probe：行号向量把“搜索”与“输出”分开
-
-[`ProcessHashTableProbe<JoinOp>`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/join/process_hash_table_probe.h) 不会在命中时立即复制整行，而是先填两个索引向量：
-
-```text
-probe_indexs = [0, 0, 2, 5, ...]
-build_indexs = [7, 9, 3, 0, ...]
-
-(0, 7), (0, 9) -> Probe Row 0 命中两个 Build Row
-(5, 0)         -> Probe Row 5 未命中，Outer Join 输出 NULL Build Row
-```
-
-随后 `probe_side_output_column()` 与 `build_side_output_column()` 才按索引批量 Gather。若 Probe 索引连续、整批已消费且没有未完成的 Build 重复链，源码甚至直接转移 Probe Column 所有权，避免一次复制。
-
-Join Type 在 `find_batch<JoinOp>()` 中编译期分派：
-
-```cpp
-if constexpr (INNER || LEFT/RIGHT/FULL_OUTER)
-    find_batch_inner_outer_join<JoinOp>();
-else if constexpr (LEFT_SEMI || LEFT_ANTI || NULL_AWARE_LEFT_ANTI)
-    find_batch_left_semi_anti<JoinOp>();
-else if constexpr (RIGHT_SEMI || RIGHT_ANTI)
-    mark_build_rows_visited();
-```
-
-Inner/Outer 的主循环可以概括为：
-
-```cpp
-while (build_idx && output_not_full) {
-    if (probe_key == build_keys[build_idx]) {
-        probe_indexs.push(probe_idx);
-        build_indexs.push(build_idx);
-        if constexpr (RIGHT/FULL) visited[build_idx] = 1;
-    }
-    build_idx = next[build_idx];
-}
-
-// Left/Full 未命中时写 build_idx=0，复用 Mock Row
-```
-
-`HashJoinProbeLocalState::_probe_index` 和 `_build_index` 保存跨 Block Pull 的断点。当一条 Probe Row 的重复链产生超过 Batch Size 的结果时，下一次调用从同一个 `build_idx` 继续，而不是重新查 Bucket。
-
-Residual Conjunct 会使流程多一层：先产生候选 `(probe_idx, build_idx)`，再执行非等值条件，最后根据结果修正 Outer/Semi/Anti 语义。换言之，Hash 只负责 Equi-Key 候选集，SQL 的完整 `ON` 条件仍在其后。
-
-#### 正常路径与 Spill 路径复用同一个内核
-
-Partitioned Operator 初始仍把输入交给内部普通 Hash Join。发生内存撤销后，Build/Probe 数据按配置的 Partition Count 分区并写入 Spill File。
-
-恢复时，Doris 为当前 Build Partition 建立内部 Runtime State，再复用普通 Hash Join 完成：
-
-```text
-recover build partition
-  -> internal HashJoin build
-  -> stream corresponding probe partition
-  -> internal HashJoin probe
-  -> release
-```
-
-这种“外层负责 External 调度，内层保持 In-Memory 内核”的分层减少了两套 Join 语义不一致的风险。Inner、Outer、Semi、Anti 等复杂语义仍由同一个 Probe 模板完成。
-
-#### 工作队列显式保存递归层级
-
-Build 和 Probe 初次 Spill 完成后，系统把对应文件加入处理队列。队列项可以抽象成：
-
-```text
-PartitionTask {
-  build_file,
-  probe_file,
-  level
-}
-```
-
-如果恢复后的 Build Partition 仍然无法在预算内建表，`repartition_current_partition()` 会创建下一层的 Build/Probe Spill File，使用新的分区层级对两侧同时重分区，再把子任务放回队列。
-
-```text
-level 0 partition too large
-  ├─ level 1 / subpartition 0
-  ├─ level 1 / subpartition 1
-  ├─ ...
-  └─ level 1 / subpartition N-1
-```
-
-递归深度由 `spill_repartition_max_depth` 限制。达到最大深度仍无法放入内存时，系统返回明确错误，而不是无限生成 Spill 文件。
-
-#### 恢复状态机与二次内存撤销
-
-`_pull_from_spill_queue()` 将每个队列项处理成一个小型 Pipeline：
-
-```text
-SETUP PARTITION
-  -> 分批 read build_file 到 recovered_build_block
-  -> 达到 spill_buffer_size 时主动 yield
-  -> 文件读完后创建 inner RuntimeState/BuildSink/ProbeOperator
-  -> 用 recovered_build_block 完成 inner build
-
-PROBE PARTITION
-  -> 分批 read probe_file 到 queue_probe_blocks
-  -> push 给 inner ProbeOperator
-  -> pull output
-  -> inner EOS 后释放当前分区，处理下一项
-```
-
-这里的 `yield` 是关键设计：恢复文件不能在一次调度中无限读取，否则既占用 Pipeline Worker，也可能在 Hash Table 建立前就把整个分区物化进内存。
-
-更进一步，Doris 允许在恢复 Build Partition 的中途再次收到内存撤销。此时 `repartition_current_partition()` 必须同时处理两部分数据：
-
-```text
-already recovered rows in _recovered_build_block
-+ unread remainder behind _current_build_reader
-```
-
-源码先把已恢复 Block 路由到下一层子分区，再让 `SpillRepartitioner` 从 Reader 的当前位置继续，避免从文件头重读导致重复行。Probe 文件也使用同一新 Level 和 Fanout 重分区，最后把所有子文件重新放回工作队列。
-
-恢复前的内存预留也显式包含：
-
-```text
-spill I/O baseline
-+ first[bucket_count] * 4
-+ next[build_rows] * 4
-+ optional visited[build_rows]
-+ serialized key estimate
-```
-
-这比只按 `recovered_build_block.allocated_bytes()` 申请内存更接近真正的 Build 峰值。
-
-#### Spill 后为什么停用 Runtime Filter
-
-从普通 Hash Join 切换到 Partitioned 模式时，`_revoke_unpartitioned_block()` 会调用 `runtime_filter_producer_helper->skip_process()`。原因与 StarRocks 类似：原先的 Build 状态被拆散到文件，继续发布一个未覆盖全部 Build Key 的 Filter 会产生假阴性，直接破坏正确性。
-
-这也说明 Runtime Filter 不是 Hash Join 的附属统计，而是带正确性约束的 Build 输出。要在递归 Spill 中保留它，需要 Filter 本身能够跨 Partition/Level 无损合并，并且只有全局完成后才能作为排除型过滤器发布。
-
-#### 可观测性围绕退化路径设计
-
-Doris 暴露 `SpillMaxPartitionLevel`、分区总数、恢复 Build/Probe 行数与耗时等指标。相比只记录 Spill Bytes，这些指标更接近问题本质：
-
-- Level 持续升高，通常意味着分区估算不足或数据倾斜；
-- Build 恢复时间高，可能是磁盘吞吐、解压或重建哈希表成为瓶颈；
-- Probe 恢复行数远大于有效输出，说明过滤能力或 Build/Probe 选择可能不佳。
-
-### ClickHouse：Hash、Parallel Hash 与 Grace Hash
-
-ClickHouse 将不同资源假设直接呈现为不同 Join Algorithm：
-
-| 算法 | 核心假设 | 主要特点 |
-| --- | --- | --- |
-| `hash` | Build 侧能驻留内存 | 通用内存 Hash Join |
-| `parallel_hash` | 内存充足，希望并行 Build | Two-Level Map 分桶并行构建 |
-| `grace_hash` | Build 侧可能超过内存 | Hash 分桶、临时文件与逐桶恢复 |
-
-#### 从 Planner 到 `IJoin`：算法是显式策略对象
-
-ClickHouse 的选择入口位于 [`chooseJoinAlgorithm()`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Planner/PlannerJoins.cpp#L1259)。Planner 不只生成一个枚举，而是创建实现统一 `IJoin` 接口的策略对象：
-
-```cpp
-// 简化自 tryCreateJoin()
-switch (algorithm) {
-case DIRECT:          return tryDirectJoin(dictionary_or_key_value_storage);
-case HASH:            return make_shared<HashJoin>(...);
-case PARALLEL_HASH:   return make_shared<ConcurrentHashJoin>(..., max_threads);
-case GRACE_HASH:      return make_shared<GraceHashJoin>(initial_buckets,
-                                                        max_buckets, ...);
-case PARTIAL_MERGE:   return make_shared<MergeJoin>(...);
-case FULL_SORTING_MERGE:
-                       return make_shared<FullSortingMergeJoin>(...);
-case AUTO:            return supported_merge
-                            ? make_shared<JoinSwitcher>(...)
-                            : make_shared<HashJoin>(...);
-}
-```
-
-`parallel_hash` 还会参考右侧大小估计和 `parallel_hash_join_threshold`；`grace_hash` 则显式携带初始/最大 Bucket 数和临时存储 Scope。因此 ClickHouse 的架构不是“一种 Hash Join 内部自动切换所有模式”，而是：
-
-```text
-Planner/TableJoin
-  -> chooseJoinAlgorithm
-      -> IJoin
-          ├─ HashJoin
-          ├─ ConcurrentHashJoin (内部包含多个 HashJoin)
-          └─ GraceHashJoin      (当前 Bucket 内部包含一个 HashJoin)
-```
-
-`ConcurrentHashJoin` 和 `GraceHashJoin` 都复用 `HashJoin` 作为内存内核：前者解决 Build 并行，后者解决外存分桶。
-
-#### `RightTableData`：Map、Block 与 Arena 的所有权
-
-ClickHouse 的 [`HashJoin::RightTableData`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.h#L390) 把索引与右表数据分开：
-
-```cpp
-// 语义化摘录
-struct RightTableData {
-    Type type;                        // key32/key64/keys128/hashed/...
-    vector<MapsVariant> maps;         // ON 中每个 OR disjunct 一张 Map
-    ScatteredColumnsList columns;     // 右表 Block 的列所有权
-    NullmapList nullmaps;             // Right/Full 的 NULL/ON 未命中行
-    Arena pool;                       // String Key、RowRefList 扩展节点
-    size_t rows_to_join;
-    size_t keys_to_join;
-};
-```
-
-`MapsVariant` 的 Value 由 Join Strictness 决定：
-
-```text
-MapsOne  : Key -> RowRef       // ANY，只保留一个右表引用
-MapsAll  : Key -> RowRefList   // ALL，保留同 Key 的全部行
-MapsAsof : Key -> AsofRowRefs  // ASOF，Key 下再维护可检索结构
-```
-
-`RowRef` 不是复制 Payload，而是引用 `ColumnsInfo + row_num`。`ScatteredColumns` 还保留 Selector，允许 Concurrent Hash Join 的不同 Slot 共享原始 Block，只记录本 Slot 拥有哪些行。
-
-这个所有权模型解释了三个源码现象：
-
-1. 右表 Block 必须一直保存到 Probe/未匹配行输出结束；
-2. String Key 和重复链扩展节点由 `Arena` 统一释放，避免大量小对象析构；
-3. Right/Full Join 的 NULL Key 不能插入普通 Map，却要通过 `nullmaps` 留到最后输出。
-
-#### Key Method、Build 与 Probe 的双重 Dispatch
-
-`chooseMethod()` 先根据右侧实际列选择 Key Map：
-
-```cpp
-if (one_numeric_key)       return key8/key16/key32/key64;
-if (all_fixed && bytes<=16) return keys128;
-if (all_fixed && bytes<=32) return keys256;
-if (one_string)             return key_string;
-if (one_fixed_string)       return key_fixed_string;
-return hashed; // 对复杂组合键生成无歧义序列化后的 UInt128 Hash
-```
-
-Build 入口 [`addBlockToJoin()`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.cpp#L636) 的核心路径是：
-
-```text
-materialize right columns
-  -> 提取所有 ON disjunct 的 Key Column
-  -> 保存需要输出的右表列为 ScatteredColumns
-  -> 从 Key 中拆出 NullMap
-  -> joinDispatch(kind, strictness, map)
-  -> HashJoinMethods<kind, strictness, map>::insertFromBlockImpl()
-```
-
-这里 `joinDispatch()` 同时分派 `JoinKind × JoinStrictness × MapsOne/All/Asof`，所以具体插入函数知道是否只留一行、是否保留重复、是否需要 Used Flag。
-
-Probe 入口 `joinBlock()` 以同样方式分派：
-
-```cpp
-joinDispatch(kind, strictness, maps, [&](auto kind, auto strictness, auto typed_maps) {
-    result = HashJoinMethods<kind, strictness, TypedMaps>::joinBlockImpl(
-        left_block, columns_to_add, typed_maps);
-});
-```
-
-这种模板爆炸换来的收益是热循环没有 `switch(join_kind)`。同时 `JoinResultPtr` 允许一次 Left Block 产生多次输出：`next()` 返回当前结果、未完成的 Block 和 `is_last`，用于控制 ALL Join 的重复展开。
-
-Build 完成后还有一个数据相关优化：如果 `ALL INNER/LEFT` 的右侧 Key 实际唯一，`all_values_unique` 会保持为真，系统可以把 ALL 提升为 RightAny 路径，消除无意义的 `RowRefList` 遍历。
-
-#### ConcurrentHashJoin：Build 分片，Probe 尽量共享
-
-[`ConcurrentHashJoin`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/ConcurrentHashJoin.cpp) 创建最多 256、且为 2 的幂的 Slot。Build Block 先计算与 Hash Map 一致的 Hash，再路由到不同 Slot：
-
-```text
-right block
-  -> calculate hash/bucket
-  -> selector = bucket & (slots - 1)
-  -> ScatteredBlock[slot]
-  -> slot-local HashJoin::addBlockToJoin()
-```
-
-Two-Level Map 把一张逻辑 Map 划成固定数量的 Submap Bucket。每个 Slot 只写 `slot, slot+N, slot+2N...` 这些 Bucket，因此 Build 阶段不需要让所有线程争用同一张普通 Hash Map。
-
-`onBuildPhaseFinish()` 不是逐行重新插入，而是把其他 Slot 的 Submap Bucket 移到 Slot 0：
-
-```cpp
-for (slot = 1; slot < slots; ++slot) {
-    for (bucket = slot; bucket < NUM_BUCKETS; bucket += slots)
-        common_map.impls[bucket] = move(slot_map.impls[bucket]);
-
-    common_columns.splice(slot_columns); // Block 所有权也转移
-}
-
-for (slot = 1; slot < slots; ++slot)
-    slot.maps = common_maps;              // Probe 共享同一逻辑 Map
-```
-
-因此它试图实现“Build 时分治，Probe 时共享”。如果使用的是 Two-Level Map，Probe Block 无需再次按 Slot Scatter，所有线程可读公共 Map；无法使用 Two-Level 的特例仍需把 Probe Block 路由到各内部 HashJoin。
-
-Right/Full Join 还要合并各 Slot 的 NullMap 和 Used Flag，否则同一右表未匹配行可能被重复输出。这部分状态合并说明 Parallel Hash Join 的难点不只在并发插入，还包括 Build 完成后的语义状态归并。
-
-#### Grace Hash Join 保留当前 Bucket，其余落盘
-
-[`GraceHashJoin.h`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/GraceHashJoin.h) 对三个阶段有非常清楚的说明：
-
-1. Build Block 按 Key Hash 拆到多个 Bucket；当前 Bucket 加入内存 `HashJoin`，其余写临时文件；
-2. Probe Block 同样拆分；当前 Bucket 直接 Probe，其余写对应左侧文件；
-3. 逐个读取后续 Bucket 的右侧数据重建 Hash Join，再读取左侧数据完成 Probe。
-
-```text
-right/build block
-  ├─ bucket 0 ─► in-memory HashJoin
-  ├─ bucket 1 ─► right temp file 1
-  └─ bucket N ─► right temp file N
-
-left/probe block
-  ├─ bucket 0 ─► probe now
-  ├─ bucket 1 ─► left temp file 1
-  └─ bucket N ─► left temp file N
-```
-
-#### 超限时动态倍增 Bucket
-
-如果当前内存 Hash Join 超过限制，`rehashBuckets()` 将 Bucket 数量翻倍，并受 `max_num_buckets` 约束。因为 Bucket 数保持 2 的幂，增加一位 Hash 即可细分原分区。
-
-动态倍增有两个优点：
-
-- 初始数据不大时，不必创建大量小文件；
-- 真正超限后再增加分区，能够根据运行时规模适配。
-
-它也带来状态复杂度：并发线程可能持有旧 Bucket Snapshot，源码需要检测 Bucket 数变化并重新 Scatter 当前 Block；早先写入旧 Bucket 的行，也可能在后续阶段再次分发到新 Bucket。
-
-源码中的溢出处理比“Bucket 数乘二”多两次关键重建：
-
-```text
-current in-memory HashJoin overflow
-  -> rehashBuckets(): bucket_count *= 2
-  -> releaseJoinedBlocks(): 从 HashJoin 取回逻辑右表 Block
-  -> 用新 bucket_count 重新 Scatter
-  -> 当前 Bucket 的行重建一个新 HashJoin
-  -> 其他 Bucket 写各自临时流
-```
-
-这再次印证：扩分区时迁移的是逻辑 Block，不是带地址的 Hash Map Bucket。
-
-#### 临时文件是 Join 状态的一部分
-
-每个 `FileBucket` 同时拥有左、右临时流，并在 `WRITING_BLOCKS`、`JOINING_BLOCKS`、`FINISHED` 状态间转换。临时文件使用 Native Block 流和压缩配置，并记录压缩/未压缩字节以及 Join 临时文件数。
-
-这不是外围 I/O 工具，而是 Join 状态机的一部分：只有在 Bucket 停止写入后，才能安全切换为读取并 Build；只有其非匹配 Build 行输出完成后，才能释放当前 Hash Join。
-
-后续 Bucket 由 `getDelayedBlocks()` 串联处理：它找到下一个非空 Bucket，读取右侧文件并调用 `addBlockToJoinImpl()` 重建内存表，`onBuildPhaseFinish()` 后返回 `DelayedBlocks`；后者读取左侧文件、必要时再次按最新 Bucket 数 Scatter，再调用普通 `HashJoin` Probe。于是 Grace 层只负责文件和 Bucket 生命周期，Join Kind/Strictness 语义继续由内层 `HashJoinMethods` 保证。
-
-### DuckDB：让分区选择服从内存预留
-
-DuckDB 的 [`physical_hash_join.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/physical_hash_join.cpp) 与 [`join_hashtable.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/join_hashtable.cpp) 把内存 Hash Join 与 External Hash Join 组织在同一套 `JoinHashTable` 中。
-
-#### 架构路径：Sink、Finalize、Operator 与 Source
-
-DuckDB 的 Hash Join 同时实现 Pipeline Sink、Operator 和 Source 三种角色：
-
-```text
-Build child
-  -> PhysicalHashJoin::Sink()          每线程 Local JoinHashTable
-  -> PhysicalHashJoin::Combine()       收集 local_hash_tables
-  -> PrepareFinalize()                 估算总工作集和最坏分区
-  -> PhysicalHashJoin::Finalize()
-       ├─ In-memory: merge -> unpartition -> build pointer table
-       └─ External : repartition -> choose current partitions -> build pointer table
-
-Probe child
-  -> ExecuteInternal()
-       ├─ PerfectHash probe
-       ├─ normal JoinHashTable::Probe
-       └─ external ProbeAndSpill
-
-Source phase
-  -> 输出 Right/Full 未匹配 Build Row
-  -> External 模式继续 BUILD -> PROBE -> SCAN_HT 多轮循环
-```
-
-为什么 External Join 还需要 Source？第一轮 Probe 来自上游 Pipeline，可以直接走 `ExecuteInternal()`；没有进入当前 Build 分区的 Probe Row 已写入 `ProbeSpill`。之后上游输入已经结束，剩余分区需要由 Hash Join 自己驱动“重建表—读 Probe Spill—输出”，因此转为 Source 状态机。
-
-Build 的线程本地路径也不是立刻并发写同一 Pointer Table：
-
-```cpp
-// 简化自 PhysicalHashJoin::Sink/Combine
-Sink(chunk) {
-    join_key_executor.Execute(chunk, join_keys);
-    payload_chunk.ReferenceColumns(chunk, payload_columns);
-    local_hash_table.Build(append_state, join_keys, payload_chunk);
-}
-
-Combine() {
-    local_hash_table.GetSinkCollection().FlushAppendState();
-    global.local_hash_tables.push_back(move(local_hash_table));
-}
-```
-
-线程只向本地 `RadixPartitionedTupleData` 追加；到 Finalize 才决定合并、重分区和并行建立全局 Pointer Table。这把高并发的“数据物化”与更容易产生原子冲突的“索引构建”分开了。
-
-#### Tuple Layout：Hash 在 Finalize 后变成 Next Pointer
-
-`JoinHashTable` 构造时创建统一 [`TupleDataLayout`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/join_hashtable.cpp#L66)：
-
-```text
-Tuple row
-┌──────────────────────┐
-│ equality conditions  │  完整 Key，最终相等比较
-├──────────────────────┤
-│ residual columns     │  非等值 ON 条件需要的 Build 列
-├──────────────────────┤
-│ output payload       │  查询真正输出的 Build 列
-├──────────────────────┤
-│ optional found flag  │  Right/Full 类 Join 的逐行命中标记
-├──────────────────────┤
-│ hash / next pointer  │  Build 暂存 Hash；Finalize 后改作重复链 Next
-└──────────────────────┘
-```
-
-`Build()` 先计算 Key Hash，并把它连同 Key/Payload 一起追加到 `sink_collection`。此时 Tuple 最后一槽保存 Hash，方便 Radix Partition 和 Finalize，尚不存在地址相关状态。
-
-Finalize 遍历已经 Pin 住的 Tuple Block，读取最后一槽的 Hash，把 Tuple 地址插入 Pointer Table；若同 Key 已存在，则最后一槽被覆盖为旧链头地址，成为 Next Pointer。`pointer_offset` 同时标识这两个阶段的复用位置。
-
-这种布局有两个重要结果：
-
-1. Spill/移动阶段保存的是 Hash，Tuple 仍可安全重定位；
-2. 一旦 Finalize 建立指针链，当前 `data_collection` 必须保持 Pin 住，直到本轮 Probe 完成。
-
-#### Pointer Table：开放寻址与重复链是两套机制
-
-Pointer Table Entry `ht_entry_t` 保存 Tuple Pointer 和 Hash Salt。插入时先做：
-
-```text
-offset = hash & bitmask
-salt   = extract_high_hash_bits(hash)
-```
-
-随后进入开放寻址循环：
-
-```cpp
-// 结构化自 InsertHashesLoop()
-while (entry[offset] occupied && entry[offset].salt != salt)
-    offset = (offset + 1) & bitmask;
-
-if (entry empty) {
-    entry[offset] = {salt, tuple_ptr};
-} else {
-    candidate_ptr = entry[offset].pointer;
-    gather candidate full key;
-
-    if (full_key_equal) {
-        tuple.next = candidate_ptr;       // 相同 Key：接入重复链
-        entry[offset].pointer = tuple_ptr;
-    } else {
-        offset = next_offset;             // 只是 Salt/Hash 碰撞：继续线性探测
-    }
-}
-```
-
-所以要区分：
-
-- **不同 Key 的 Hash 冲突**：Pointer Table 中线性探测；
-- **相同 Key 的重复行**：Entry 指向链头，Tuple 内 Next Pointer 串链。
-
-Salt 是一次廉价预过滤。Salt 不同就不需要访问随机 Tuple；Salt 相同才 Gather 完整 Key 并调用 `RowMatcher`。表较小时 Salt 收益不够，`UseSalt()` 可以关闭它。
-
-并行 Finalize 使用 Atomic Entry：抢占（Preemption）空槽时 CAS；把重复行接到已有链头时用 Compare-Exchange 更新 Entry，同时把旧指针写进新 Tuple 的 Next。`chains_longer_than_one` 记录是否真的出现重复，Probe 可以为 Unique Key 走无链 Fast Path。
-
-#### Probe：先定位指针，再由 ScanStructure 实现语义
-
-`JoinHashTable::Probe()` 只完成 Key 准备、Hash 和候选 Pointer 定位：
-
-```text
-PrepareKeys(NULL/filter)
-  -> Hash(keys)
-  -> GetRowPointers(open addressing + salt + full-key compare)
-  -> ScanStructure.pointers[]
-```
-
-真正的 Join Type 语义位于 `ScanStructure::Next()`：
-
-```cpp
-switch (join_type) {
-case INNER/RIGHT:       NextInnerJoin(); break;
-case LEFT/OUTER:        NextLeftJoin();  break;
-case SEMI:              NextSemiJoin();  break;
-case ANTI:              NextAntiJoin();  break;
-case MARK:              NextMarkJoin();  break;
-case RIGHT_SEMI/ANTI:   NextRightSemiOrAntiJoin(); break;
-case SINGLE:            NextSingleJoin(); break;
-}
-```
-
-对于 Inner Join，`ScanInnerJoin()` 对当前 Pointer 批量执行完整 Equality/Residual Predicate；产生结果后 `GatherResult()` 按 Pointer 从 `TupleDataCollection` 读取 Build 列。`AdvancePointers()` 再沿 Tuple Next Pointer 前进，直到所有重复链耗尽。
-
-如果一个输入 Chunk 产生超过 `STANDARD_VECTOR_SIZE` 的结果，`last_match_count/last_sel_vector` 保存尚未输出的选择向量；下次 `ExecuteInternal()` 返回 `HAVE_MORE_OUTPUT`，继续消费同一输入 Chunk。这个设计把 Pipeline 的有限 Chunk 与 Join 的无限输出放大解耦。
-
-Right/Full Join 的 `found` 位在匹配时被写为 `true`，上游 Probe 结束后再通过 Source 扫描 Build Tuple，输出未命中行。源码允许多个线程并发写同一个布尔位，因为唯一写入值都是 `true`，最终语义是幂等（Idempotency）的。
-
-#### Build 从一开始就保留 Radix 分区能力
-
-Build Chunk 被组织成：
-
-```text
-[equality keys]
-[non-equality condition columns]
-[payload]
-[optional found flag]
-[hash]
-[next pointer in tuple layout]
-```
-
-数据先进入 `RadixPartitionedTupleData`。Finalize 时，如果全部数据能够装入内存，就把分区合并并构建一张表；如果预算不足，则增加 Radix Bits，把数据保留为多个分区。
-
-与“内存不足后再从哈希表反解行”相比，这种设计更早保存了可分区数据，但也要求 Build 数据布局从开始就兼顾内存与外存路径。
-
-#### External 决策同时考虑 Tuple 与 Pointer Table
-
-DuckDB 估算每个分区时，不只计算 Tuple 数据，还加上按行数估算的 Pointer Table：
-
-```text
-partition_ht_size = partition_data_size
-                  + PointerTableSize(partition_count)
-```
-
-如果最大分区超过 `max_ht_size`，`SetRepartitionRadixBits()` 会增加分区位，并把目标估算到预算的一部分，为 Hash Table 构建和 Probe 留出余量。
-
-这一点非常重要：只让逻辑行“勉强塞满”内存，会导致 Pointer Table 一分配就 OOM。可靠的 External Join 必须对恢复阶段的完整工作集做预算。
-
-#### Finalize：由内存 Reservation 决定执行形态
-
-`PrepareFinalize()` 先计算：
-
-```text
-total_size             = 所有 Tuple + 全局 Pointer Table
-max_partition_ht_size  = 最大分区 Tuple + 该分区 Pointer Table
-probe_side_requirement = Probe Radix Partition 的线程 × 分区 Buffer
-```
-
-然后向 `TemporaryMemoryManager` 注册最小 Reservation：至少要能处理一个最大 Build Partition，并为 Probe 分区 Buffer 留空间。`Finalize()` 的核心判断是：
-
-```cpp
-external = reservation < total_size;
-
-if (external) {
-    load_factor = EXTERNAL_LOAD_FACTOR; // 更紧凑的 Pointer Table
-    if (max_partition_ht_size + probe_requirement > reservation)
-        SetRepartitionRadixBits(...);
-    PrepareExternalFinalize(reservation - probe_requirement);
-} else {
-    merge_local_hts();
-    Unpartition();
-    try PerfectHash;
-    otherwise ScheduleFinalize();
-}
-```
-
-External 模式将 Load Factor 从默认值调整为更紧凑的配置，有时仅靠减少 Pointer Table Capacity 就能重新落回 In-Memory 路径。若仍超限，新增 Radix Bits 的目标不是刚好低于预算，而是把估算最大分区压到约 `max_ht_size / 4`，为偏差、并行和中间 Buffer 留余量。
-
-如果单个分区已占总大小 80% 以上，源码判断为 `very_very_skewed`，不再假设增加 Radix Bits 能有效均分。这是把“相同热点 Key 无法被 Hash 位拆开”直接编码进执行决策。
-
-#### 每轮选择一组能装下的分区
-
-`PrepareExternalFinalize()` 会把未完成分区按大小近似排序，再选择一组总计不超过本轮预算的分区，移动到当前 `data_collection` 并构建 Pointer Table。
-
-Probe 时，`ProbeAndSpill()` 根据 `current_partitions` 把输入分成两类：
-
-- 当前已 Build 的分区立即 Probe；
-- 其他分区写入 `ProbeSpill`，等待后续轮次。
-
-每轮结束后释放当前数据，再选择下一组 Build Partition。这个过程与 StarRocks 的“多分区装箱”相似，但 DuckDB 明确把 `TemporaryMemoryState` 的 Reservation、Probe Side Requirement 和 Pointer Table 一并纳入选择。
-
-External Source 的全局状态机更完整地表示为：
-
-```text
-INIT
-  -> BUILD current_partitions
-  -> PROBE matching ProbeSpill partitions
-  -> SCAN_HT (仅 Right/Full 等需传播 Build 侧的 Join)
-  -> Reset current HT
-  -> BUILD next_partitions
-  -> ...
-  -> DONE
-```
-
-`PrepareExternalFinalize()` 会优先按近似大小从小到大选择分区，但对小差异做取整，尽量保留 Partition ID 顺序以降低 Eviction/I/O 抖动；并且即使单个分区超预算也至少选择一个，保证状态机能前进或暴露真实倾斜问题，而不是空转。
-
-#### 倾斜会反向限制并行度
-
-DuckDB 在 Finalize/External Build 阶段检测 Key 是否倾斜。严重倾斜时，它可能改用单线程构建，避免多个线程同时争用同一冲突链或原子 Bucket。
-
-这说明并行度不是越高越好：当 Key 分布高度集中时，增加线程既不能增加有效分区，也会放大同步和 Cache Coherence 成本。
-
-## 特化与边界：直接映射、过滤及热点键
-
-### Direct Mapping 与 Perfect Hash Join
-
-如果单整数 Key 的值域很小且足够稠密，通用哈希表并非最佳结构：
-
-```text
-slot = key - min_key
-```
-
-这可以消除 Hash、碰撞与大部分 Key 比较。StarRocks 的 Range/Dense Range Direct Mapping 和 DuckDB 的 Perfect Hash Join 都在利用这个事实。
-
-DuckDB 的 [`PerfectHashJoinExecutor`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/perfect_hash_join_executor.cpp) 会检查：
-
-- 只有一个 Join 条件；
-- Key 是整数类型且有 Min/Max 统计；
-- 值域跨度低于阈值；
-- Build Key 不存在无法表达的重复关系。
-
-满足条件后，Build Payload 可以按值域直接放入数组，Probe 只需范围判断和偏移寻址。
-
-这类优化的适用边界也很明确：
-
-- 值域很大但数据稀疏时，数组空间会严重浪费；
-- Key 重复时，一个 Slot 仍需表示多行；
-- 统计错误可能导致原本节省内存的方案反而扩大内存。
-
-因此直接映射不是“更快的通用 Hash Join”，而是基于值域证明成立后的专用物理算子。
-
-### Runtime Filter：在 Probe 之前减少工作
-
-Hash Join 的 Build Key 集合天然可以生成过滤器：
-
-- Min/Max Filter：适合有序或范围集中的数值；
-- IN Filter：适合基数很小的 Build Key；
-- Bloom Filter：适合较大集合，允许假阳性；
-- Prefix/Range Filter：适合部分 String 或范围谓词。
-
-Runtime Filter 的收益不只是减少 Probe 哈希查找。如果它能够下推到 Scan，还会减少解码、谓词计算、网络传输和上游 Exchange。
-
-但 Filter 有三个约束：
-
-1. **完整性。** 过滤器不能产生假阴性，否则会丢失正确结果；
-2. **时机。** 等 Build 全部完成再发布，Probe 可能已经读完大量数据；
-3. **Join 语义。** Outer/Anti/Mark Join 并不都允许用同样方式过滤 Probe 行。
-
-Spill 又增加了第四个约束：Build Key 分散在文件中，系统要么维护可增量合并的全局摘要，要么只做分区级 Filter，要么放弃提前发布。
-
-### 四个引擎的实现对照
-
-相同的分区 Spill 名称可以对应不同撤销、恢复与调度协议，比较时需要同时看数据布局和状态生命周期。
-
-| 维度 | StarRocks | Apache Doris | ClickHouse | DuckDB |
+| 核心维度 | StarRocks (`f977b53`) | Apache Doris (`7ac0eb2`) | ClickHouse (`c631f59`) | DuckDB (`1c4ecd8`) |
 | --- | --- | --- | --- | --- |
-| 控制对象 | `HashJoiner` 四阶段 Controller | Local State + `ProcessHashTable*<JoinOp>` | `IJoin` 策略对象 | `PhysicalHashJoin` Sink/Operator/Source |
-| Build 数据所有权 | 列式 `build_chunk` | Build `Block` | `ScatteredColumnsList` | `TupleDataCollection` |
-| Bucket 组织 | Map Method 决定 Direct/Linear/Bucket Chained | `first[] + next[]` 行号链 | Typed HashMap Cell -> `RowRef/List` | Pointer Table 开放寻址 |
-| Hash 冲突校验 | 具体 `JoinHashMap` 比较完整 Key | 沿 `next[]` 比较 `build_keys` | Typed Map Key 比较 | Salt 预筛 + Gather 完整 Key |
-| Key 特化 | 单键、定长序列化、直接/范围映射、多种 Hash Map | 模板化 Hash Table Context 与 Join Op | 数值、128/256 bit、String、Hashed | 统一 Tuple Layout，Hash Salt + 完整比较 |
-| Build 并行 | Pipeline Builder 与分区恢复 | Local State + 内部 Hash Join | Concurrent Hash Join/Two-Level Map | Local HT/分区 Finalize Task |
-| 重复 Key | Chained/Set 等专用 Map | Build Unique 与 Probe 模板 | `RowRef` / `RowRefList` | Tuple Next Pointer |
-| Spill 触发 | 内存撤销后切换 `SPILL_ALL` | 内存撤销后切换 Partitioned Join | Grace Hash 超限后扩 Bucket | Temporary Memory Reservation 不足时 External |
-| Build 落盘 | Hash Table 转 Chunk 后列式分区 | Block 分区到 Spill File | 当前 Bucket 留内存，其余临时流 | `RadixPartitionedTupleData` |
-| Probe 落盘 | 复用 Build Partition ID | 与 Build 文件成对入队 | 左右临时文件按 Bucket 配对 | `ProbeSpill` 同 Radix Partition |
-| 恢复调度 | 可一次选择多个适配预算的分区 | 显式 `(build, probe, level)` 队列 | 逐 Bucket 重建与 Probe | 每轮选择一组当前分区 |
-| 超大分区 | Spiller 分区层级与预算选择 | 显式递归重分区，深度受限 | 动态倍增 Bucket，上限受控 | 增加 Radix Bits，按预算重分区 |
-| 特别优化 | Runtime Filter、Direct Mapping | Runtime Filter、Build Unique | Parallel Hash、Two-Level Map | Perfect Hash、Join Filter Pushdown |
+| **Build 数据形态** | 列式 `build_chunk` + 哨兵行 0 | 列式 `Block` + 哨兵行 0 | `ScatteredColumnsList` + `Arena` | 行式 `RadixPartitionedTupleData` |
+| **目录与碰撞机制** | 静态工厂注册 Direct / Linear / Bucket 链 | 稠密 `first[] + next[]` 行号链 | Typed Map → `RowRef` / `RowRefList` | 开放寻址 `Pointer Table` + 16-bit Salt |
+| **Spill 切入时机** | 内存快路径优先，撤销时拆表转列落盘 | 内存快路径优先，撤销时切换外层包装器 | 显式启用 `grace_hash`，超限动态翻倍桶 | 构建期即保 Radix 分区，Finalize 按预留切换 |
+| **单轮恢复粒度** | 按可用内存贪心合批加载多个分区 | 队列逐对恢复，读盘超阈值主动 `yield` | 逐个非空 `FileBucket` 恢复并探测 | 每轮装箱一组不超预留额度的分区集 |
+| **超大单区应对** | 分区预算控制与多级写出 | 断点续读 + `level + 1` 显式递归重分区 | `bucket_count *= 2` 取回逻辑块重散列 | 追加 Radix 位压至 `1/4` 预算；识别极度倾斜 |
 
-这张表不意味着某个实现绝对更好。不同设计反映的是不同运行环境：
+---
 
-- 分布式 MPP 引擎更关注 Workgroup、内存撤销、异步 I/O 与 Runtime Filter；
-- ClickHouse 把算法选择显式暴露，更方便用户按负载取舍；
-- 嵌入式 DuckDB 必须把单进程内的 Buffer Manager、临时内存与并行任务统一调度。
+## 五、算法特化、热点倾斜死局与线上排障闭环
 
-### 数据倾斜：递归分区的边界
+看懂了常规哈希与分区恢复，再来看两个决定长尾查询生死的极值边界：**分布极度规整时如何绕开哈希？分布极度倾斜时为什么递归分区会彻底失灵？**
 
-假设一个 Key `hot_key` 占 Build 侧 60% 数据。无论使用 Hash 的第几位：
+### 5.1 值域直接映射（Direct / Perfect Hash）：消灭哈希本身
 
-```text
-hash(hot_key) = constant
-```
+当连接键是单个整数（如日期键 `20260101 ~ 20261231` 或连续编码的维表主键），且统计信息证明 `max_key - min_key` 跨度可控时，算哈希和跑冲突链纯属多此一举。直接用 `slot = key - min_key` 做数组下标寻址，就能把探测指令压到“一次范围检查 + 一次偏移读取”。
 
-所有 `hot_key` 行仍会进入同一个子分区。增加分区数量只能拆开不同 Hash 的 Key，不能拆开同一个 Key。
+DuckDB 的 [`PerfectHashJoinExecutor`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/perfect_hash_join_executor.cpp) 在单等值条件、整数值域跨度低于阈值且 Build 侧键唯一时自动接管探测；StarRocks 的 `RANGE_DIRECT_MAPPING` 与 `DENSE_RANGE_DIRECT_MAPPING` 更进一步，把重复键场景也纳了进来——即使值域略稀疏，先用每槽约 `2-bit` 位图标记哪些偏移存在真实键，再紧凑映射到行号链数组，兼顾了 CPU 缓存命中率与多对一连接。不过这类特化极其依赖精确的 `Min/Max` 边界：一旦遇到异常脏数据（如一个 `99999999` 哨兵值把跨度撑大一亿倍），必须立刻回退常规哈希表，否则直接按值域开数组会当场撑爆内存。
 
-因此递归分区面对倾斜时可能出现：
+### 5.2 单个超级热点键：为什么换一百次哈希种子也没用？
 
-```text
-level 0: partition 3 too large
-  -> level 1: partition 3.7 still too large
-      -> level 2: partition 3.7.2 still too large
-          -> reach max depth / fail
-```
+递归 Grace Hash Join 有一个无法靠哈希数学绕过去的阿喀琉斯之踵：**哈希函数是确定性映射，只要两行数据的连接键值完全相同（例如十亿条日志里占了 60% 的默认账户 `user_id = 0` 或空串 `""`），无论你换什么哈希种子、取哪几位 Radix 比特，`hash(hot_key)` 算出来永远是同一个常数！**
 
-可选的工程策略包括：
+这意味着，那 60% 的热点行在 `level = 0` 时挤爆 3 号分区，重切成 `level = 1` 时原封不动挤爆 `3.7` 号子分区，一路切到 `max_depth` 依然一字节都拆不开，白白把同一坨数据在磁盘上反复读写了好几遍后报错退出。DuckDB 在 `Finalize` 源码里专门写下了 `very_very_skewed` 判定：一旦监测到单个分区吞掉了全表 `80%` 以上的体积，当场放弃无效的增加 Radix 位尝试，甚至主动把并行构建收敛回单线程，免得几十个核围着同一根冲突链做 CAS 自旋把总线锁死。
 
-- 对热点 Key 使用单独路径；
-- 在允许时选择另一侧 Build；
-- 改用 Sort Merge Join；
-- 对特定 Join 语义给数据加 Salt，并复制另一侧热点行；
-- 对 Semi/Anti Join 只保留 Key 是否存在，消除重复 Payload；
-- 通过统计与采样提前识别热点，而不是等 Spill 多层后才发现。
+在工程上要真正化解单键倾斜，必须跳出“单算子死磕哈希位”的局限：
 
-Salting 并不是免费方案。若给 Build 热点 Key 拆成多个 Salt，Probe 侧可能需要复制或使用相同拆分规则；对 Outer Join 还要避免重复输出未匹配行。它是一个新的 Join 算法设计，而不是简单修改 Hash Seed。
+- **语义削减**：若是 `LEFT SEMI / ANTI` 且无残余非等值依赖，在 Build 入口开启按键去重（如 StarRocks `*_SET` 变体、Spark `ignoreDuplicatedKey`），把一千万条相同 `user_id = 0` 当场压成 1 条，倾斜瞬间消失；
+- **交换 Build/Probe 方向**：若热点集中在右表而左表相对均匀（且连接语义允许翻转，如 `INNER` 或 `LEFT ↔ RIGHT` 对偶改写），把无热点的一侧拿来 Build，让热点侧流式穿过探测；
+- **分区级算法降级或加盐裂变（Skew Salting）**：像 CockroachDB 外部哈希连接那样，仅把切不小的那一个倾斜分区单独转交外排 + Sort-Merge Join（详见[下一篇《Hash 还是 Sort》]({{< relref "2026-09-10-dive-hash-sort-strategy.md" >}})）；或者在分布式规划层识别热点值，给热点侧随机打上 `0..K-1` 盐值拆散，同时把另一侧对应的同键记录精确复制 `K` 份配对连接（注意外连接复制侧须谨慎处理未命中去重）。
 
-## 评估与调优：连接数据结构、内存和执行证据
+### 5.3 线上慢查询与 OOM 排障定位表
 
-### 如何评估一套 Hash Join 设计
+当线上监控报出某个 Hash Join 节点卡死、耗时飙升或触发内存上限时，只盯“总落盘字节数（Spill Bytes）”往往抓不到病根。最高效的排查顺序是沿指标链逐层剥离：
 
-数据结构、内存与 Spill 协议需要共同满足语义要求；只测内存快路径无法验证超限后的恢复与进展。
-
-#### 数据结构
-
-键与负载表示决定查找和复制成本，评估时应区分整数特化、组合键和变长键。
-
-- 是否为单整数、定长组合键和变长键选择不同表示？
-- Bucket 中存完整行、Row ID，还是指针？
-- 重复 Key 是否会产生大量小对象和随机分配？
-- Outer Join 的命中标记按 Key 还是按 Row 保存？
-
-#### 内存模型
-
-峰值内存包括索引、原始负载与临时状态；遗漏 Arena、重复链或恢复缓冲会低估资源需求。
-
-- 内存估算是否包含 Bucket、Payload、Arena、重复链和碎片？
-- 扩容峰值是否同时持有旧表与新表？
-- 哪些内存可撤销，撤销需要多长时间？
-- 当前分区恢复时是否为 Pointer Table 和 Probe Buffer 留出空间？
-
-#### Spill 协议
-
-分区一致性与恢复后的语义必须同时成立；Build 与 Probe 只要使用了不同映射，就可能漏掉匹配。
-
-- Build/Probe 是否使用完全一致的 Hash 与 Partition Metadata？
-- Spill 文件保存逻辑数据还是不可恢复的地址？
-- 是否保留内存分区以减少 I/O？
-- 超大分区如何递归处理，最大深度和失败信息是什么？
-- 查询取消时，异步 I/O、临时文件和内存状态能否及时回收？
-
-#### Pipeline 与可观测性
-
-Build Barrier 与恢复轮次改变可运行任务数量，调度和指标需要显式区分快路径、等待和恢复。
-
-- Build Barrier 前后如何保持线程忙碌？
-- I/O、解压、重建 Hash Table 与 Probe 能否重叠？
-- 是否能看到每层分区大小、倾斜度、Spill/Restore Bytes、重分区次数和 Build/Probe 耗时？
-- Profile 能否区分“磁盘慢”“哈希表重建慢”和“输出爆炸”？
-
-#### Benchmark 必须覆盖状态转换，而不只是内存快路径
-
-只用均匀随机 Key、内存充足、Inner Join 和 `count(*)` 测试，会系统性高估一套 Hash Join 的成熟度。更有区分度的矩阵应覆盖：
-
-| 维度 | 至少包含的用例 | 主要验证目标 |
+| 线上观测症状 | 底层真实物理根因 | 针对性核查与治理动作 |
 | --- | --- | --- |
-| Key | 单整数、定长组合、长字符串、NULL、碰撞输入 | Key Encoding、Hash 与比较开销 |
-| 分布 | 均匀、Zipf、单热点、重复 Build Key | 倾斜、重复链与最大分区 |
-| 语义 | Inner、Left/Full Outer、Semi/Anti、Null-Safe | 匹配标记、NULL 与未匹配输出 |
-| 内存 | 充足、临界、持续撤销、远小于 Build | In-Memory → Spill → Restore 状态转换 |
-| 输出 | 低命中、高命中、多对多爆炸 | Probe Continuation 与 Backpressure |
-| 存储 | NVMe、网络盘、对象存储（Object Storage）式高延迟 | Spill 粒度、压缩与 I/O 并发 |
+| **Build 阶段未落盘即迅速 OOM** | 大小表估反（拿百亿行事实表做了 Build）、未开启可撤销 Spill，或宽列/低装载因子放大 | 核对 `EXPLAIN` 估算行数与真实行数；收集统计信息翻转 Build 方向，或切入可 Spill 算子管线 |
+| **Spill 总量不大，但递归层级打满报错** | 存在超高频单一热点键（如默认值 `-1` / 空串），多轮重哈希完全无法拆小最大分区 | 对比 `MaxPartitionBytes` 与 `AvgPartitionBytes`；拆分过滤异常默认键、预聚合去重或启用倾斜优化 |
+| **Probe CPU 占满，但最终输出行数极少** | 大量根本连不上的左表行穿过了上游，或因 Build 发生 Spill 导致 Runtime Filter 被停用 | 检查 Runtime Filter 是否生效下推到 Scan；尽量给 Build 留足免 Spill 内存以保住完整 Bloom Filter |
+| **哈希表很小、内存平稳，但算子长期挂起** | 两侧同键多对多笛卡尔放大，单输入块反复触发 `has_remain` 挂起吐出百倍结果块 | 对比 Probe 输入行数与 Join 输出行数；排查业务连接键是否漏写租户/分区条件导致非预期发散 |
+| **磁盘带宽与 CPU 利用率双低，恢复极慢** | 初始分区切得过碎产生上千个小文件，或每次仅串行恢复单个微小分区导致 I/O 空转 | 调小初始分区扇出，确认引擎开启按可用内存多分区合批恢复（Batch Restore）与压缩块读写 |
 
-每组实验都应同时报告吞吐、P50/P99、峰值内存、Hash Table Expansion、Spill/Restore Bytes、临时文件数、最大分区、递归深度、输出行数和取消清理时间。否则一个“更快”的实现可能只是多占内存、没有进入 Spill，或者把工作推迟到下游输出。
-
-跨引擎比较还要固定语义与物理前提：相同 Join 顺序、Build Side、并行度、内存上限、输入编码、压缩方式和热/冷缓存状态。比较默认配置更接近产品体验；比较算法则必须控制这些变量，两者不能混为同一结论。
-
-### 排障与调优：应该看什么
-
-Hash Join 慢或 OOM 时，不应只看总 Spill Bytes。建议按以下顺序分析：
-
-1. **确认 Join 选择与 Build 方向。** 统计是否把大表误判成小表？Outer Join 是否限制了可选方向？
-2. **看 Build Row、Distinct Key 与值域。** 行数大但 Key 很少，重复链可能比 Bucket 更贵；小整数稠密时应关注直接映射机会。
-3. **看最大分区而不是平均分区。** 平均 200 MiB 不代表最大分区不会达到 8 GiB。
-4. **看 Spill Level 与 Repartition 次数。** 层级增长通常比总写盘量更能说明倾斜。
-5. **看 Probe 输入与 Join 输出。** Probe 行多但输出少，应强化 Runtime Filter；输出远大于输入，则是多对多放大。
-6. **看恢复阶段的内存峰值。** Tuple 数据装得下，不代表 Pointer Table、解压 Buffer 和输出 Chunk 同时装得下。
-7. **看 CPU 与 I/O 是否重叠。** 磁盘未打满且 CPU 也空闲，往往是状态机串行化或分区过碎。
-
-调优动作应该对应根因：
-
-| 现象 | 可能原因 | 优先动作 |
-| --- | --- | --- |
-| Build 直接 OOM | Build 方向错误、估算漏项 | 更新统计、交换 Build 侧、启用 Spill |
-| Spill 文件很多且很小 | 初始分区过多 | 减少初始分区、批量写与合并恢复 |
-| 单分区反复重分区 | 热点 Key 倾斜 | Skew 策略、换算法或热点专用路径 |
-| Probe CPU 很高但命中少 | 缺少前置过滤 | Runtime Filter、Scan 下推 |
-| 输出 Chunk 持续爆满 | 多对多重复放大 | 检查业务语义、预聚合或去重 |
-| Restore 慢 | I/O/解压/重建表瓶颈 | 调整压缩、并发恢复与分区装箱 |
-
-### 进一步思考：好的 Hash Join 是资源自适应算子
-
-从四套源码可以看到，Hash Join 的演进方向并不是不断优化某个 Hash 函数，而是把更多不确定性纳入运行时控制：
-
-- Key 分布决定数据结构；
-- Distinct Count 决定 Set、Map 与重复链；
-- 值域决定 Direct/Perfect Hash；
-- 实际内存决定是否 Spill、分多少区、一次恢复几个分区；
-- 倾斜决定递归是否有效、并行度是否应该降低；
-- Join 语义决定哪些行可过滤、哪些匹配状态必须跨分区保存。
-
-这也给优化器与执行器的边界提出了新要求。优化器不应只下发一个静态的 `HASH_JOIN` 节点，还应传递：
-
-- Build 侧大小、NDV、Min/Max 与热点 Key 估计；
-- Join Key 是否唯一；
-- Runtime Filter 的候选类型；
-- Spill 是否允许，以及资源预算；
-- 可接受的退化算法与失败边界。
-
-执行器应反馈实际分区大小、重分区层级、峰值内存和命中率，以便区分估计偏差与算法边界。这是接口设计建议；能否改善后续选择，还需验证反馈的适用范围与失效条件。
-
-### 验证与失败边界
-
-验证应覆盖阈值两侧、重复键与 NULL、Spill 恢复和清理失败，并记录最大分区与并发内存。单个热键无法被同一哈希规则继续拆散；支持 Spill 不等于任意数据都能完成，也不能解决超大结果集本身的输出成本。
-
+---
 
 ## 附录：Spark Hash Join 特有路径 {#spark-hash-join}
 
-本附录只保留 Spark 相对主文四引擎的差异：**JoinSelection 决策树、HashedRelation、AQE 动态切换，以及内置 Hash Join 不可 Spill 的失败边界**。通用哈希表/分区恢复协议见正文。
+看完了四款原生 MPP / 列存引擎的可恢复分区状态机，很多习惯了大数据栈的读者会产生一个疑问：**为什么在 Apache Spark SQL 里，只要两张表大到不能广播，默认执行计划几乎清一色落到 `SortMergeJoin`（SMJ），而不是 `ShuffledHashJoin`（SHJ）？**
 
-### 选择前提：语义、分发与资源估计
+翻开 Spark 源码（基线 `786bb3d`），答案不在于“JVM 算哈希慢”，而在于**内置 `HashedRelation` 压根没有实现分区级落盘与恢复协议**。
 
-#### 背景：为什么 Spark 没有默认选择 Hash Join
+### A.1 `JoinSelection` 准入漏斗与二进制相等契约
 
-在 StarRocks、ClickHouse 等分析型数据库中，Hash Join 通常是等值连接的核心实现：选择较小一侧构建哈希表（Hash Table），另一侧流式 Probe，在哈希分布近似均匀且内存充足时，Build/Probe 主路径接近 `O(N + M)`；若显式输出 `Z` 条匹配结果，总工作量还要计入 `O(Z)`。
-
-Spark SQL 的默认选择却不同。小表满足广播条件时，Spark 会优先使用 `BroadcastHashJoin`；一旦两侧都不能广播，常见执行计划往往变成 `SortMergeJoin`，而不是 `ShuffledHashJoin`。
-
-差异需要从内存与恢复路径解释：本文快照中的 `HashedRelation` 缺少可恢复的 Join Spill，而 SMJ 的排序和同 Key 缓冲有落盘路径。AQE 可以修正统计与策略，不能改变算子的内存模型，因此比较还需计入数据倾斜（Data Skew）和失败边界。
-
-本文基于 Apache Spark 提交 [`786bb3d`](https://github.com/apache/spark/tree/786bb3d9751fc6c4993997c088345ceba1b7a8d5) 分析以下问题：
-
-- Spark 原生支持哪些 Join 算子？
-- `JoinSelection` 如何在 BHJ、SHJ、SMJ 之间做静态选择？
-- Broadcast 与 Shuffle Hash Join 的物理执行路径有什么区别？
-- `HashedRelation` 为什么不能像 Sort 一样稳定 Spill？
-- AQE 如何在运行时升级或降级 Join？
-- Native Engine 为什么更倾向实现可 Spill 的 Partitioned Hash Join？
-
-这里的配置默认值和 Rule 顺序只对应这一源码快照。Spark 官方当前的[配置文档](https://spark.apache.org/docs/latest/configuration)仍列出 `spark.sql.shuffledHashJoinFactor=3`，但具体发行版、Vendor Runtime 和 Native Plugin 可能改写 JoinSelection 或替换物理算子。排查生产计划时，应同时记录 Spark Build Version、Session Conf、Initial/Final Plan 和插件版本，不能仅凭文章中的默认值判断。
-
-#### 选择顺序与估计边界
-
-BHJ、SHJ 与 SMJ 的选择依赖语义、分发和内存条件。广播要求全局 Build 较小，SHJ 则要求每个 Task 的局部 Build 能驻留；不能广播且无法可靠估计内存时，可外排的 SMJ 提供另一条路径。这里的大小判断通常来自统计估计，并不是对实际峰值内存的证明。下面依次核对准入条件、执行结构与 AQE 的调整范围。
-
-#### Spark Join 的算子坐标
-
-Spark SQL 的常见物理 Join 可以分为以下几类：
-
-| 物理算子 | 前提 | 数据移动 | 主要内存对象 | Spill 能力 |
-| --- | --- | --- | --- | --- |
-| `BroadcastHashJoinExec` | 等值 Key、Build 侧可广播 | Build 侧广播；Stream 侧通常不 Shuffle | 全局广播 `HashedRelation` | Hash Table 不 Spill |
-| `ShuffledHashJoinExec` | 等值 Key、分区 Build 侧足够小 | 两侧按 Key Shuffle | 每个 Task 一张 `HashedRelation` | Hash Table 不 Spill |
-| `SortMergeJoinExec` | Join Key 可排序 | 两侧按 Key Shuffle 并排序 | Sort Buffer、相同 Key Row Buffer | 支持 Spill |
-| `BroadcastNestedLoopJoinExec` | 任意条件 | 一侧广播 | 广播侧完整集合 | 高风险兜底 |
-| `CartesianProductExec` | Inner-like 非等值连接 | 取决于输入 | 分区笛卡尔积 | 结果可能爆炸 |
-
-对于等值 Join，BHJ、SHJ 和 SMJ 并不是三个完全独立的实现：
-
-- BHJ 与 SHJ 共享 [`HashJoin`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashJoin.scala) 中的 Probe、Join Type 和 WholeStage Codegen 逻辑；
-- BHJ 与 SHJ 都使用 [`HashedRelation`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala)；
-- SHJ 与 SMJ 都继承 [`ShuffledJoin`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/ShuffledJoin.scala)，要求两侧满足 Join Key 的聚簇分布。
-
-这种分层很重要：选择 BHJ 还是 SHJ，首先改变的是数据如何到达 Build/Probe 算子；选择 Hash 还是 Merge，才真正改变分区内部的 Join 算法。
-
-#### 静态规划：JoinSelection 的决策树
-
-物理选择入口位于 [`SparkStrategies.JoinSelection`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala#L181)。公共判断逻辑位于 [`JoinSelectionHelper`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/joins.scala#L290)。
-
-##### 先区分等值与非等值 Join
-
-`ExtractEquiJoinKeys` 把 Join 条件拆成：
-
-- 左右等值 Key；
-- 不能放入 Key 的剩余条件 `nonEquiCond`；
-- Join Type、左右子计划与 Hint。
-
-BHJ、SHJ 和 SMJ 都依赖等值 Key。剩余条件可以在匹配后继续过滤，但如果完全没有等值 Key，Hash Join 和 SortMergeJoin 都不能直接使用，规划器会转向 Cartesian Product 或 Broadcast Nested Loop Join。
-
-```text
-Join condition
-   │
-   ├─ 有 equi keys ──► BHJ / SHJ / SMJ
-   │                    └─ residual condition 在匹配后过滤
-   │
-   └─ 无 equi keys ──► Cartesian / Broadcast Nested Loop
-```
-
-##### Hint 的优先级
-
-当用户提供 Hint 时，`JoinSelection` 按以下顺序尝试：
-
-1. `BROADCAST`；
-2. `SHUFFLE_MERGE`；
-3. `SHUFFLE_HASH`；
-4. `SHUFFLE_REPLICATE_NL`。
-
-Hint 不是无条件命令。比如 Full Outer Join 不能规划为 BHJ，Hash Key 不满足二进制相等语义时也不能强制使用 Hash Join。无法应用的 Hint 会报告告警，并继续尝试其他策略或无 Hint 路径。
-
-##### 无 Hint 的默认顺序
-
-`createJoinWithoutHint()` 的源码顺序非常直接：
+在 [`SparkStrategies.JoinSelection`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala#L181) 与 [`JoinSelectionHelper`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/optimizer/joins.scala#L290) 中，无 Hint 的等值连接按固定优先级依次尝试：
 
 ```scala
 createBroadcastHashJoin(false)
@@ -1649,258 +235,13 @@ createBroadcastHashJoin(false)
   .getOrElse(createBroadcastNestedLoopJoin())
 ```
 
-对应准入条件如下：
+要想挤进前两档 Hash Join，首先必须过两道硬性语义关：一是连接键全部满足 `UnsafeRowUtils.isBinaryStable(e.dataType)`——如果字符串列带了大小写不敏感或口音折叠排序规则（非二进制 Collation），两个语义相等的字符串在 `UnsafeRow` 里字节序列不同、算出的哈希值也不同，Spark 会直接拒绝 Hash Join；二是 Build 侧方向必须合法——例如 `BroadcastHashJoinExec`（BHJ）绝不支持 `FULL OUTER JOIN`，因为每个 Executor 都持有一份全量广播表的副本，却只看到本地那一份 Stream 分片，谁都没资格判断某条广播行在全局是不是“真未命中”。
 
-| 顺序 | 策略 | 关键条件 |
-| --- | --- | --- |
-| 1 | BHJ | Hash Key 支持、Join Type 允许、某侧大小不超过广播阈值 |
-| 2 | SHJ | Hash Key 支持、Join Type 允许、关闭 prefer-SMJ、Build 侧分区可控且明显更小 |
-| 3 | SMJ | Join Type 支持且 Key 可排序 |
-| 4 | Cartesian | Inner-like Join |
-| 5 | BNLJ | 最终兜底，源码明确提示可能很慢或 OOM |
+跨过语义门槛后，BHJ 只需估算体积不超过 `spark.sql.autoBroadcastJoinThreshold`（默认 `10MB`），由 Driver 收集全表构建 [`HashedRelation`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala)（单非空 `Long` 键走支持 `key - minKey` 稠密数组优化的 `LongHashedRelation`，通用键走 `UnsafeHashedRelation`）并通过 Torrent 协议分发给各 Executor（[`BroadcastExchangeExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/BroadcastExchangeExec.scala#L121)）。而 [`ShuffledHashJoinExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/ShuffledHashJoinExec.scala) 在静态规划期默认直接被 `spark.sql.join.preferSortMergeJoin = true` 拦在门外；即便手动关掉这个开关，还必须同时满足 `BuildSize < autoBroadcastJoinThreshold * numShufflePartitions` 且 `BuildSize * 3 <= StreamSize`（`shuffledHashJoinFactor = 3`）。
 
-所以，“Spark 默认选择 SMJ”并不完全准确。更精确的说法是：
+### A.2 为什么 `BytesToBytesMap.spill()` 救不了 Spark Hash Join？
 
-> Spark 首先尝试 BHJ；对不能广播的大表等值 Join，SHJ 的准入条件默认关闭，于是 SMJ 成为最常见落点。
-
-#### Hash Join 的三个准入条件
-
-哈希连接（Hash Join）必须同时满足键相等语义、合法 Build 方向和资源判断；Hint 不能让语义不支持的 Join 变得合法。
-
-##### Key 必须支持二进制稳定相等
-
-当前源码的 `hashJoinSupported()` 要求所有 Join Key 都满足：
-
-```scala
-UnsafeRowUtils.isBinaryStable(e.dataType)
-```
-
-这意味着 `UnsafeRow` 的二进制相等必须与 SQL 语义相等一致。当前实现重点排除包含非 Binary Collation String 的类型：两个字符串可能在大小写不敏感或重音不敏感规则下语义相等，但底层字节不同。
-
-这里不能简单理解为“所有可 Hash 的 JVM 类型都能 Join”。Spark 要求 Hash、Equality 和 SQL Collation 语义闭合；不满足时会记录 Warning，并放弃 BHJ/SHJ。
-
-##### Join Type 决定哪一侧可以 Build
-
-Build 侧不是永远选右表。外连接（Outer Join）必须保留特定一侧的未匹配行，因此不同 Join Type 的合法 Build 方向不同。
-
-| Join Type | BHJ 常见合法 Build 侧 | SHJ 合法性特点 |
-| --- | --- | --- |
-| Inner / Cross Equi | 左或右，选统计更小侧 | 左或右 |
-| Left Outer | 右侧 | SHJ 也支持 Build Left，但需额外扫描 Hash Table |
-| Right Outer | 左侧 | SHJ 也支持 Build Right |
-| Full Outer | 不支持 BHJ | SHJ 支持，需追踪 Build 侧匹配状态 |
-| Left Semi / Left Anti | 右侧 | 通常 Build Right |
-
-当两侧都合法时，`getBuildSide()` 根据 `stats.sizeInBytes` 选择更小的一侧。统计不准确不仅影响是否广播，也会影响哪一侧承担 Hash Table 内存。
-
-##### 大小判断不是一个阈值
-
-BHJ 只需要满足 `canBroadcastBySize()`：
-
-```text
-0 <= sizeInBytes <= autoBroadcastJoinThreshold
-```
-
-当前源码默认 `spark.sql.autoBroadcastJoinThreshold=10MB`。
-
-SHJ 静态选择则需要同时满足：
-
-```text
-preferSortMergeJoin == false
-
-BuildSize < autoBroadcastJoinThreshold × numShufflePartitions
-
-BuildSize × shuffledHashJoinFactor <= StreamSize
-```
-
-当前基线的 `spark.sql.shuffledHashJoinFactor` 默认值是 **3**。第二个条件用全局大小近似“平均每个 Shuffle 分区能装入与广播阈值相近的 Hash Table”；第三个条件要求 Build 侧明显小于 Stream 侧，以抵消构建 Hash Table 的成本。
-
-这个估算有明显局限：平均值无法发现倾斜。总数据量满足条件，不代表最大的 Build 分区一定能放进单个 Task 的内存。
-
-
-### Hash 执行：两种分发方式与同一个内存核心
-
-#### BroadcastHashJoin：用全局小表换掉 Shuffle
-
-[`BroadcastHashJoinExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/BroadcastHashJoinExec.scala) 的核心价值不是 Hash Probe 本身，而是避免 Stream 侧 Shuffle。
-
-```text
-                  Driver
-                    │
-        collect Build side rows
-                    │
-             build HashedRelation
-                    │
-              Torrent Broadcast
-          ┌─────────┼─────────┐
-          ▼         ▼         ▼
-      Executor 1 Executor 2 Executor N
-          │         │         │
-       probe local stream partitions
-```
-
-##### Build 侧在哪里构建
-
-`BroadcastExchangeExec.relationFuture` 执行以下步骤：
-
-1. `child.executeCollectIterator()` 把 Build 侧收集到 Driver；
-2. `HashedRelationBroadcastMode.transform()` 构建 `HashedRelation`；
-3. 检查行数上限和构建后字节数上限；
-4. 通过 Spark Broadcast 发送序列化 Relation；
-5. Executor Task 调用 `asReadOnlyCopy()`，以只读方式 Probe。
-
-源码位于 [`BroadcastExchangeExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/BroadcastExchangeExec.scala#L121)。
-
-BHJ 的内存风险因此横跨多个层次：
-
-- Driver 需要收集并构建整个 Relation；
-- Broadcast Block 需要网络传输和缓存；
-- Executor 需要反序列化并持有只读 Hash Table；
-- 多个并发 Broadcast 会竞争 Driver 与 Executor 内存。
-
-当前源码还设置了执行期保护：
-
-- `spark.sql.broadcastTimeout` 默认 300 秒；
-- 普通 `UnsafeHashedRelation` 受 `BytesToBytesMap` 最大 Key 数约束；
-- `spark.sql.maxBroadcastTableSize` 当前默认 8 GiB。
-
-自动广播阈值与执行期上限不是一回事。Hint 可以绕过 10 MiB 的自动选择门槛，但不能让 Driver 内存和 Hash Table 容量变成无限。
-
-##### Probe 与 WholeStage Codegen
-
-非 Null-Aware Anti Join 路径的核心非常短：
-
-```scala
-val broadcastRelation = buildPlan.executeBroadcast[HashedRelation]()
-
-streamedPlan.execute().mapPartitions { streamedIter =>
-  val hashed = broadcastRelation.value.asReadOnlyCopy()
-  join(streamedIter, hashed, numOutputRows)
-}
-```
-
-`HashJoin` 根据 Join Type 生成不同路径：
-
-- Inner Join：查到一个或多个 Build Row 后输出；
-- Outer Join：没有命中时补 Null Row；
-- Semi Join：首次满足条件后即可返回 Stream Row；
-- Anti Join：确认无匹配后返回；
-- Existence Join：输出是否存在匹配的标记。
-
-若 `keyIsUnique=true`，代码生成可以调用 `getValue()`，避免为重复 Key 创建 Iterator；非唯一 Key 则调用 `get()` 遍历同 Key Value 链。唯一性因此不仅影响语义，还会改变生成代码的控制流和对象分配。
-
-#### ShuffledHashJoin：每个分区独立 Build
-
-[`ShuffledHashJoinExec`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/ShuffledHashJoinExec.scala) 要求两侧按 Join Key 形成相同的 `ClusteredDistribution`。`EnsureRequirements` 会在需要时插入 Shuffle Exchange。
-
-```text
-Left  ──Hash Shuffle──┐
-                     ├─ Partition 0: build local hash + stream probe
-Right ──Hash Shuffle──┘
-
-                     ├─ Partition 1: build local hash + stream probe
-                     └─ Partition N: build local hash + stream probe
-```
-
-##### 一次 Task 的执行模型
-
-`doExecute()` 使用 `zipPartitions` 配对两侧相同分区：
-
-```scala
-streamedPlan.execute().zipPartitions(buildPlan.execute()) {
-  (streamIter, buildIter) =>
-    val hashed = buildHashedRelation(buildIter)
-    join(streamIter, hashed, numOutputRows)
-}
-```
-
-这个流程存在明确的不对称：
-
-- Build 分区必须被完整消费并形成 Hash Table；
-- Stream 分区可以惰性读取，一行一行 Probe；
-- Relation 在 Task Completion Listener 中关闭；
-- 峰值内存由最大的 Build 分区决定，而不是平均分区大小决定。
-
-所以 SHJ 的真正准入问题不是“总表是否足够小”，而是：
-
-> 对每一个 Shuffle 分区，Build Rows、Hash Index、重复 Key 链和外连接匹配标记能否同时装入该 Task 可获得的 Execution Memory？
-
-##### Outer Join 为什么更复杂
-
-当 Full Outer Join，或者外侧恰好被选为 Build 侧时，只流式 Probe 无法输出未匹配的 Build Row。`buildSideOrFullOuterJoin()` 使用两阶段算法：
-
-1. Probe Stream 侧，并记录哪些 Build Row 已匹配；
-2. 遍历整个 `HashedRelation`，补出未匹配 Build Row。
-
-Key 唯一时用 `BitSet` 记录 `keyIndex`；Key 不唯一时用 `OpenHashSet[Long]` 编码 `(keyIndex, valueIndex)`。这会增加额外内存，也会使这类 Join 无法保持普通 Stream 侧输出顺序。
-
-##### Semi/Anti Join 的重复 Key 优化
-
-对 Left Semi、Left Anti 等存在性语义，如果剩余条件不依赖 Build 侧非 Key 列，Build Hash Table 每个 Key 只需保留一行。
-
-`ignoreDuplicatedKey` 会让 `HashedRelation` 在 Key 已存在时跳过后续 Value：
-
-```text
-普通 Inner Join：key -> row1 -> row2 -> row3
-存在性 Join：    key -> one row
-```
-
-这一优化可以显著减少高重复维表的内存，但不能解决高基数 Build 分区无法装入内存的问题。
-
-#### HashedRelation：Hash Join 的内存核心
-
-`HashedRelation.apply()` 根据 Key 形态选择两种实现：
-
-| Key 形态 | Relation | 底层结构 |
-| --- | --- | --- |
-| 单个 `LongType` 且不允许 Null Key | `LongHashedRelation` | `LongToUnsafeRowMap` |
-| 通用 UnsafeRow Key | `UnsafeHashedRelation` | `BytesToBytesMap` |
-
-##### UnsafeHashedRelation
-
-`UnsafeHashedRelation` 使用 [`BytesToBytesMap`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/core/src/main/java/org/apache/spark/unsafe/map/BytesToBytesMap.java)：
-
-- Append-only 开放寻址 Hash Table；
-- Key/Value 以连续二进制记录写入 Memory Page；
-- Hash Array 保存记录地址与 Hash Code；
-- 同 Key 多 Value 通过地址链连接；
-- 负载因子达到约 70% 时尝试扩容并 Rehash；
-- 内存来自 `TaskMemoryManager`，可使用 On-Heap 或 Off-Heap Tungsten Memory。
-
-逻辑布局可以简化为：
-
-```text
-Hash Array
-┌──────────┬──────────┬──────────┐
-│ addr/hash│ addr/hash│ addr/hash│
-└────┬─────┴──────────┴────┬─────┘
-     │                      │
-     ▼                      ▼
-Memory Pages
-[key length][value length][key bytes][value bytes][next value address]
-```
-
-`UnsafeHashedRelation.apply()` 持续读取 Build Iterator，生成 Join Key 并调用 `loc.append()`。一旦 append 返回 false，代码释放 Map 并抛出 `cannotAcquireMemoryToBuildUnsafeHashedRelationError`。
-
-##### LongHashedRelation
-
-单 Long Key 可以走更专门的 `LongToUnsafeRowMap`：
-
-- 初始使用 Sparse Open Addressing；
-- Build 完成后 `optimize()` 尝试切换 Dense Mode；
-- Dense Mode 通过 `key - minKey` 直接定位地址；
-- 所有 UnsafeRow 字节紧凑放在 Page 中。
-
-当 Key 范围紧凑时，Dense Mode 能减少 Hash 计算与冲突探测；当 Key 分布稀疏时则保留 Sparse Mode，避免按巨大数值范围分配数组。
-
-
-#### Spill 真相：Spark Hash Join 为什么会直接失败
-
-底层容器具有 `spill()` 接口不等于 Join 能落盘恢复；本文版本的 BytesToBytesMap 只有进入特定破坏性迭代路径才执行相应 spill，常规 HashedRelation 查找不具备这套协议。
-
-##### BytesToBytesMap 的 spill() 为什么帮不到 Join
-
-`BytesToBytesMap` 是 `MemoryConsumer`，看上去实现了 `spill()`：
+Spark 之所以对 SHJ 如此保守，根源就在 [`BytesToBytesMap.java`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/core/src/main/java/org/apache/spark/unsafe/map/BytesToBytesMap.java) 的内存回收实现里。很多开发者看到这个类继承了 `MemoryConsumer` 并带有 `spill()` 方法，误以为它能自动落盘：
 
 ```java
 public long spill(long size, MemoryConsumer trigger) throws IOException {
@@ -1911,257 +252,28 @@ public long spill(long size, MemoryConsumer trigger) throws IOException {
 }
 ```
 
-关键是 `destructiveIterator`。它用于 `UnsafeKVExternalSorter` 接管 Map 内容的聚合/排序路径；Hash Join Build 不会建立这个迭代器。因此 Join 使用的 Map 被要求释放内存时，通常只能返回 `0L`。
+看清那个前置条件 `destructiveIterator != null`！这个破坏性迭代器只在 Hash Aggregate 退化为外部排序聚合（交给 `UnsafeKVExternalSorter` 接管）时才会创建；而在 `ShuffledHashJoin` 构建 `UnsafeHashedRelation` 的全过程中，`destructiveIterator` 永远是 `null`（`LongToUnsafeRowMap.spill()` 更是直白地硬编码返回 `0L`）。
 
-`LongToUnsafeRowMap.spill()` 更直接：
+这就造成了单 Task 内极其凶险的不对称内存博弈：当 SHJ 在某个倾斜分区上不断 `append` 撑满执行内存时，它可以逼迫同 Task 上游的 Sort 或 Shuffle Reader 把缓冲刷盘给自己腾地方；可一旦同 Task 里没有别的可驱逐算子，或者单个分区的 Build 数据（外加开放寻址空槽、70% 扩容峰值以及 `Full Outer` 的 `BitSet` / `OpenHashSet` 命中集）硬生生超过了单 Task 内存上限，它没有任何“按哈希位再切子分区写盘”的退路，只能当场抛出 `cannotAcquireMemoryToBuildUnsafeHashedRelationError` 让作业挂掉。
 
-```scala
-def spill(size: Long, trigger: MemoryConsumer): Long = 0L
-```
+### A.3 AQE 动态纠偏与原生引擎（Velox / Photon）的补位
 
-因此，Spark Hash Join 的内存行为是：
+正因为静态统计用“总字节数除以分区数”根本算不出单分区倾斜，Spark 把翻盘希望寄托在了 **AQE（Adaptive Query Execution）** 的 Stage 边界重规划（[`AdaptiveSparkPlanExec.reOptimize()`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala#L793)）上：
 
-```text
-申请 Hash Array / Memory Page
-          │
-          ├─ 成功：继续 Build
-          │
-          └─ 失败：无法把已有 Hash Partition 落盘
-                     │
-                     └─ append=false -> 释放 Relation -> Task 失败
-```
+- **拿到真实 Shuffle 体积后升级算子**：当上游 Map Stage 物化完毕，`ShuffleQueryStageExec.mapStats.bytesByPartitionId` 精确暴露了每一个分区的真实压缩字节数。如果某侧过滤后大幅缩水，AQE 可将其升级为 BHJ，并借 [`OptimizeShuffleWithLocalRead`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/OptimizeShuffleWithLocalRead.scala) 免掉另一侧的跨机重洗牌（注意：已经完成广播的 `BroadcastQueryStageExec` 受 [`LogicalQueryStageStrategy`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala) 沉没成本保护，不会反向退回 Shuffle）；同时 [`DynamicJoinSelection`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/DynamicJoinSelection.scala) 在确认**每一个分区**都不超过 `spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold` 时可注入 `PREFER_SHUFFLE_HASH` 把 SMJ 改写成 SHJ——不过为了安全，该阈值在开源默认配置里依然设为 `0`（关闭）。
+- **倾斜拆分的缓解与局限**：[`OptimizeSkewedJoin`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/OptimizeSkewedJoin.scala) 能把超大分区按 Map 端块范围切成多份并复制配对侧，摊薄单 Task 输入，但它依然无法赋予 `HashedRelation` 落盘恢复能力。
+- **Native 插件彻底补齐状态机**：这也解释了为什么 Apache Gluten + Velox 等原生向量化插件接入 Spark 后，敢于大胆把大表 `SortMergeJoin` 批量改写成 `ShuffledHashJoin`——真正给底气的不只是 C++ SIMD 指令，而是用第四节剖析的 **Velox 可递归分区落盘 `HashBuild / HashProbe` 状态机**替换掉了不可落盘的 JVM `HashedRelation`，终于把单分区估算失误的代价从“Task 直接 OOM 崩溃”拉回了“受控的局部磁盘读写退化”。
 
-##### 统一内存管理不等于所有算子都可 Spill
+---
 
-`TaskMemoryManager` 可以在 Execution Memory 紧张时要求其他 `MemoryConsumer` 释放内存。Sort、Aggregation 或 Shuffle Buffer 可能把数据写盘，为 Hash Table 腾出空间；但 Hash Table 自己没有 Partitioned Spill 状态机。
+## 参考资料与源码基线
 
-这会形成一个不对称结果：
+> **源码基线说明**：主文四套引擎源码基于以下提交核对——StarRocks `0fd27fd`（并在 `f977b53` 上复核了哈希表静态工厂注册表、L3 Cache 动态探测及异步 Spill 取消保护演进）、Apache Doris `5202d06`（复核至 `7ac0eb2`，分区 Spill 状态机一致）、ClickHouse `c631f59`、DuckDB `1c4ecd8`（复核至 `2bb5316`，含 `duckdb#23952` 残余谓词与重复链选择向量修复）；Spark 附录基于 Apache Spark `786bb3d`。
 
-- Hash Join 可以从其他可 Spill 算子释放的内存中受益；
-- 它自己无法有效响应内存回收；
-- 如果同一 Task 中没有其他可驱逐对象，或者 Build 分区仍超过可用内存，Task 最终失败。
+### 核心源码入口索引
 
-所以把 `spark.memory.fraction` 调大只能扩大失败边界，不能把 SHJ 变成 Grace Hash Join。
-
-##### 倾斜是 SHJ 最危险的输入
-
-假设 Build 侧总大小 20 GiB、200 个分区，平均每个分区约 100 MiB，看起来可以接受；但如果一个热点 Key 形成 5 GiB 分区，该 Task 仍需一次性构建 5 GiB 以上的 Relation。
-
-Hash Table 实际内存还高于原始输入：
-
-```text
-Build 原始 UnsafeRow
-  + Join Key 副本
-  + Hash Array 空槽
-  + 地址与长度元数据
-  + 重复 Key 链指针
-  + Rehash 峰值
-  + Outer Join 匹配标记
-```
-
-因此不能用 Shuffle 文件压缩后的字节数直接等价 Hash Table 峰值。
-
-
-#### Sort-Merge 对照（不展开）
-
-大表默认路径仍是 SortMergeJoin：外排可完成、内存上限更清晰，但 merge 并非 O(1) 内存，倾斜与重复键仍可变慢。通用 Hash vs Sort 决策见 [Hash 还是 Sort]({{< relref "2026-09-10-dive-hash-sort-strategy.md" >}})；此处只强调 **Spark 内置 Hash Join 缺省不可 Spill**，大表不能假设“选了 Hash 就与主文四引擎一样可恢复”。
-
-
-### 运行时调整：AQE、倾斜与 Native Engine
-
-#### AQE：运行时重新选择 Join
-
-AQE 不是在执行到一半时把 `SortMergeJoinExec` 对象直接改成 `BroadcastHashJoinExec`。其核心流程是：
-
-```text
-Query Stage 物化
-      │
-      ▼
-获得真实 size / mapStats
-      │
-      ▼
-把 Stage 包装回 LogicalQueryStage
-      │
-      ▼
-invalidateStatsCache + AQEOptimizer
-      │
-      ▼
-更新 Runtime Stats 或注入 Join Hint
-      │
-      ▼
-重新执行 planner.plan()
-      │
-      ▼
-再次进入 JoinSelection
-```
-
-入口位于 [`AdaptiveSparkPlanExec.reOptimize()`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/AdaptiveSparkPlanExec.scala#L793)。
-
-##### Runtime Stats：SMJ/SHJ 升级为 BHJ
-
-物化后的 `QueryStageExec` 产生 `isRuntime=true` 的统计。`canBroadcastBySize()` 检测到运行时统计后，会使用：
-
-```text
-spark.sql.adaptive.autoBroadcastJoinThreshold
-```
-
-未配置时回退到普通自动广播阈值。若某侧真实大小远小于静态估算，重新规划就可能从 SMJ/SHJ 变为 BHJ。
-
-需要注意：如果 Shuffle Stage 已经物化，之前的 Shuffle 成本不会神奇消失。AQE 能避免后续 Sort/Merge，并可能用 Local Shuffle Read 读取已有 Block，但无法回收已经发生的网络和写盘成本。
-
-##### DynamicJoinSelection：基于分区统计注入 Hint
-
-[`DynamicJoinSelection`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/DynamicJoinSelection.scala) 读取 `ShuffleQueryStageExec.mapStats.bytesByPartitionId`，有两类核心判断。
-
-###### 避免不划算的 Broadcast
-
-如果某侧包含大量空分区，Shuffle Join 的许多 Task 可以快速短路；把另一侧广播后，反而可能失去这个优势。规则会根据 Join Type 和哪一侧为空，注入 `NO_BROADCAST_HASH`。
-
-Outer/Anti Join 需要保留未匹配行，不能简单在任意空侧短路，因此源码对 `LeftOuter`、`RightOuter`、`LeftAnti` 做了额外区分。
-
-###### SMJ 升级为 SHJ
-
-如果所有分区都满足：
-
-```text
-partitionSize <= maxShuffledHashJoinLocalMapThreshold
-```
-
-并且 `advisoryPartitionSizeInBytes` 也不大于该阈值，规则会注入 `PREFER_SHUFFLE_HASH`。若同时需要禁用 Broadcast，则注入更强的 `SHUFFLE_HASH`。
-
-这个条件的本质是：AQE 已经看到每个 Build 分区的真实字节数，可以比静态“总大小除以分区数”更可靠地判断局部 Hash Table 风险。
-
-但当前基线中：
-
-```text
-spark.sql.adaptive.maxShuffledHashJoinLocalMapThreshold = 0
-```
-
-因此，除非用户显式配置，AQE 通常不会主动把 SMJ 升级为 SHJ。这再次说明 Spark 对无 Spill Hash Join 的默认态度非常保守。
-
-##### 用户 Hint 优先于 AQE Hint
-
-`DynamicJoinSelection` 只在对应一侧没有用户 Join Strategy Hint 时写入 AQE Hint。优先级由此保持一致：
-
-```text
-用户显式 Hint
-    > AQE 根据真实统计注入的 Hint
-    > 静态自动选择
-```
-
-##### 已经广播的 Stage 不允许回退
-
-[`LogicalQueryStageStrategy`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/LogicalQueryStageStrategy.scala) 排在普通策略之前。
-
-如果 Join 某一侧已经是 `BroadcastQueryStageExec`，规则会强制保留 BHJ，防止因 Stage 完成顺序或统计波动，把已经构建和广播的数据重新改成 Shuffle Join。
-
-这是一种 Sunk Cost 保护：物理 Stage 一旦完成，重新规划必须尊重已经付出的执行成本。
-
-##### Local Shuffle Read 的准确位置
-
-[`OptimizeShuffleWithLocalRead`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/OptimizeShuffleWithLocalRead.scala) 常被误解为“BHJ 降级为 Shuffle Join 后使用 Local Read”。源码实际处理的是：
-
-- AQE 重规划得到 BHJ；
-- Probe 侧已经存在物化的 Shuffle Stage；
-- 在不引入额外 Shuffle 的前提下，改用本地 Shuffle Block 读取。
-
-它服务于 **Shuffle Join → BHJ** 的升级复用，而不是给 **BHJ → Shuffle Join** 的降级提供本地读。
-
-#### 倾斜优化能否解决 SHJ OOM
-
-[`OptimizeSkewedJoin`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/OptimizeSkewedJoin.scala) 可以识别显著大于中位数和绝对阈值的分区，将一侧切成多个 Mapper Range，并复制另一侧对应分区。
-
-```text
-原始：        (L-skew, R)
-
-拆分后：      (L-1, R-copy-1)
-              (L-2, R-copy-2)
-              (L-3, R-copy-3)
-```
-
-它能降低单 Task 输入并增加并行度（Degree of Parallelism），但不能从根本上赋予 `HashedRelation` Spill 能力：
-
-- Build 分区拆分后仍需完整驻留；
-- 若倾斜来自单个超高频 Key，另一侧复制可能增加总 I/O；
-- 两侧同时倾斜时，Split 组合可能形成更多 Task；
-- Hash Table 放大系数仍未被 Map Output Bytes 精确表达。
-
-因此，Skew Join Optimization 是风险缓解，不是 SHJ 内存安全证明。
-
-#### Native Engine：为什么 Hash Join 更容易成为默认方案
-
-Velox 等执行引擎把向量化 Probe、显式内存管理与 Partitioned Spill 结合，改变了 Hash Join 的可用内存边界；“Native”这一实现语言标签本身不保证收益。Velox 的职责拆分为 `HashBuild`、`HashProbe` 与 `HashJoinBridge`：
-
-```text
-Build vectors -> HashBuild -> in-memory HashTable
-                      │
-                      ├─ memory arbitration / reclaim
-                      │
-                      └─ spill selected hash partitions
-                                  │
-Probe vectors -> HashProbe --------┤
-                      │            │
-                      └─ spill matching probe partitions
-                                  │
-                          restore partition and re-join
-```
-
-公开源码中的 [`HashBuild`](https://github.com/facebookincubator/velox/blob/main/velox/exec/HashBuild.h) 和 [`HashProbe`](https://github.com/facebookincubator/velox/blob/main/velox/exec/HashProbe.h) 都包含 Spill、Memory Reclaim 和递归恢复状态。
-
-这与 Spark JVM `HashedRelation` 的关键区别不是 C++ 一定比 JVM 快，而是算法状态机不同：
-
-- Spark SHJ：一个 Build 分区对应一张必须完整驻留的 Hash Table；
-- Partitioned Hash Join：先按 Hash Bit 切分，内存不足时只保留部分 Partition，Build/Probe 对称落盘，随后逐 Partition 恢复。
-
-Native Engine 还可以利用批量 Probe、SIMD、Dictionary Vector 和更精细的 Memory Arbitration 降低 CPU 与对象开销。但 Spill 一样会引入磁盘 I/O、递归分区、文件数量和长尾问题，并不是免费的性能保险。
-
-对于 Databricks Photon、Snowflake 等闭源引擎，公开资料可以说明它们采用 Native/Vectorized Execution，但无法像本文分析 Spark 和 Velox 一样验证具体 Hash Table、Partition 数、Spill 触发和恢复协议。因此不应把产品层性能描述当成可复现的源码结论。
-
-
-#### 验证时看什么（精炼）
-
-- Explain / AQE：是否 BHJ↔SHJ/SMJ 切换、Broadcast 是否被拒绝回退、Local Shuffle Read 位置。
-- Task 指标：peak execution memory、spill（Hash Join 上通常应接近 0；若出现 OOM 看分区倾斜而非“再加大内存就算 Spill”）。
-- 适用边界：用户 Hint > AQE Hint；已广播 Stage 不回退；热键无法靠同一 hash 再拆。
-
-
-#### Spark 源码阅读坐标
-
-1. `JoinSelection`：等值/非等值、Hint、BHJ/SHJ/SMJ 准入。
-2. `HashedRelation` / `UnsafeHashedRelation` / `LongHashedRelation`：内存核心。
-3. `BroadcastHashJoinExec` / `ShuffledHashJoinExec`：Build/Probe 与 codegen。
-4. AQE：`DemoteBroadcastJoin`、`DynamicJoinSelection`、runtime stats 升级路径。
-
-
-
-## 源码阅读路线
-
-如果希望继续深入，建议按以下顺序阅读。
-
-### StarRocks
-
-1. [`join_hash_table.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/join/join_hash_table.cpp)：Key Constructor 与 Hash Map Method 选择；
-2. [`hash_joiner.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/hash_joiner.cpp)：Build/Probe 状态封装；
-3. [`spillable_hash_join_build_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_build_operator.cpp)：内存撤销与 Build 分区；
-4. [`spillable_hash_join_probe_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_probe_operator.cpp)：分区选择、恢复与 Probe Spill。
-
-### Apache Doris
-
-1. [`join_hash_table.h`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/common/hash_table/join_hash_table.h)：Join Hash Table 结构；
-2. [`hashjoin_build_sink.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/hashjoin_build_sink.cpp)：普通 Build 与 Runtime Filter；
-3. [`hashjoin_probe_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/hashjoin_probe_operator.cpp)：Join Type 模板与向量化 Probe；
-4. [`partitioned_hash_join_probe_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/partitioned_hash_join_probe_operator.cpp)：恢复队列与递归重分区。
-
-### ClickHouse
-
-1. [`HashJoin.cpp`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.cpp)：Key Method、Build 与 Probe；
-2. [`ConcurrentHashJoin.h`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/ConcurrentHashJoin.h)：Two-Level Map 并行构建；
-3. [`GraceHashJoin.h`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/GraceHashJoin.h)：外存 Join 的三阶段模型；
-4. [`GraceHashJoin.cpp`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/GraceHashJoin.cpp)：Bucket 文件、动态 Rehash 与延迟 Probe。
-
-### DuckDB
-
-1. [`join_hashtable.hpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/include/duckdb/execution/join_hashtable.hpp)：Tuple Layout、Probe State 与 Spill State；
-2. [`join_hashtable.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/join_hashtable.cpp)：Pointer Table、Salt、重复链与外存分区；
-3. [`physical_hash_join.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/physical_hash_join.cpp)：Pipeline、Finalize Task 与临时内存预留；
-4. [`perfect_hash_join_executor.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/perfect_hash_join_executor.cpp)：稠密整数值域的直接寻址。
+- **StarRocks (`0fd27fd` / `f977b53`)**：[键构造与哈希表选型 `join_hash_table.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/join/join_hash_table.cpp) · [四阶段控制器 `hash_joiner.h`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/hash_joiner.h) · [Cache 自适应分区 `hash_join_components.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/hash_join_components.cpp#L512) · [可撤销落盘与多分区恢复 `spillable_hash_join_build_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_build_operator.cpp) / [`spillable_hash_join_probe_operator.cpp`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/be/src/exec/pipeline/hashjoin/spillable_hash_join_probe_operator.cpp)
+- **Apache Doris (`5202d06`)**：[`first/next/visited` 数组结构 `join_hash_table.h`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/common/hash_table/join_hash_table.h) · [构建与空值短路 `hashjoin_build_sink.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/hashjoin_build_sink.cpp#L586) · [行号向量化探测 `process_hash_table_probe.h`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/join/process_hash_table_probe.h) · [递归分区恢复状态机 `partitioned_hash_join_probe_operator.cpp`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/be/src/exec/operator/partitioned_hash_join_probe_operator.cpp)
+- **ClickHouse (`c631f59`)**：[算法策略选择 `PlannerJoins.cpp`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Planner/PlannerJoins.cpp#L1259) · [多形态键与 `RightTableData` `HashJoin.cpp`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/HashJoin/HashJoin.cpp) · [Two-Level Map 并行构建 `ConcurrentHashJoin.cpp`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/ConcurrentHashJoin.cpp) · [动态倍增外存桶 `GraceHashJoin.cpp`](https://github.com/ClickHouse/ClickHouse/blob/c631f591cef3ecc0fcbba8fff30d16cc7a67ec23/src/Interpreters/GraceHashJoin.cpp)
+- **DuckDB (`1c4ecd8`)**：[开放寻址 Salt 与元组复用槽 `join_hashtable.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/join_hashtable.cpp) · [Radix 预留与多轮 External 状态机 `physical_hash_join.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/physical_hash_join.cpp) · [稠密值域完美哈希 `perfect_hash_join_executor.cpp`](https://github.com/duckdb/duckdb/blob/1c4ecd8138ae0c63c73957a411e65484301bb300/src/execution/operator/join/perfect_hash_join_executor.cpp)
+- **Velox & Apache Spark (`786bb3d`)**：[Velox `HashBuild.h`](https://github.com/facebookincubator/velox/blob/main/velox/exec/HashBuild.h) / [`HashProbe.h`](https://github.com/facebookincubator/velox/blob/main/velox/exec/HashProbe.h) · [Spark `JoinSelection`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/SparkStrategies.scala#L181) · [`HashedRelation.scala`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/joins/HashedRelation.scala) · [`BytesToBytesMap.java`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/core/src/main/java/org/apache/spark/unsafe/map/BytesToBytesMap.java) · [`DynamicJoinSelection.scala`](https://github.com/apache/spark/blob/786bb3d9751fc6c4993997c088345ceba1b7a8d5/sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/DynamicJoinSelection.scala)

@@ -1,119 +1,143 @@
 ---
 title: "SIGMOD 2026 Industry Papers"
 date: 2026-08-09T00:00:00+08:00
-lastmod: 2026-10-18T00:00:00+08:00
+lastmod: 2026-11-12T00:00:00+08:00
 categories:
   - 数据库
 tags:
   - SIGMOD
   - 数据库
   - 论文
-description: "SIGMOD 2026 工业界论文阅读笔记，29 篇论文按 7 大主题整理，涵盖云原生数据库、分布式 OLTP、查询优化、向量检索与 AI 数据基础设施等方向。"
+description: "SIGMOD 2026 工业界 29 篇论文全景阅读笔记：从云原生分层存储、分布式 OLTP、AISQL 与学习型优化器，到弹性 Shuffle、并行共识与 Code-to-SQL 可观测闭环，拆解生产约束下的真实系统取舍。"
 draft: false
+toc: true
+math: true
 ---
 
 > 本系列第 2/3 篇 · 论文雷达 · [上一篇]({{< relref "2026-09-19-database-research-frontiers.md" >}}) · [下一篇]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})
 
-[SIGMOD 2026](https://2026.sigmod.org/) 今年 May 31 - June 05, 2026 在 Bengaluru, India 举行。每年我都会抽时间读工业界论文，关注系统在生产约束下怎样取舍。今年 Industry Track 共 29 篇论文，参与方包括 AWS、Microsoft、Google、Snowflake、Databricks、Oracle、IBM、Adobe、Dynatrace、Neo4j，以及阿里巴巴、字节跳动、腾讯、美团等国内公司。下面按方向整理为 7 个主题，每篇附上下载链接和个人的快速分析。
+[SIGMOD 2026](https://2026.sigmod.org/) 于 2026 年 5 月 31 日至 6 月 5 日在印度班加罗尔（Bengaluru）举行。每年读顶会论文时，我都会把工业界赛道（Industry Track）单独拎出来通读一遍——学术论文擅长在受控假设下把单一算子或算法推向极致，而工业界论文最迷人的地方，在于它不得不摊开**生产环境里的守恒定律**：当你把存储拆成冷热多层、把单机事务拆成跨节点分片、或者把大模型塞进 SQL 算子时，被挪走的那部分开销究竟转移到了哪条链路，尾延迟（Tail Latency）和云账单靠什么兜底？
 
-## 概览
+今年 Industry Track 共录用 **29 篇**论文，来自 AWS、Microsoft、Google、Snowflake、Databricks、Oracle、IBM、Adobe、Dynatrace、Neo4j，以及阿里巴巴、字节跳动、腾讯、美团等一线工程团队。如果按公司名字罗列，很容易看成一盘散沙；但只要顺着现代数据平台的数据流与控制流把它们摆进同一张系统架构图，就会发现这 29 篇工作全都围绕着七个紧耦合的演化界面展开：
 
-按系统责任划分论文比按公司排列更便于比较：先看存储与事务约束，再看查询执行和 AI 数据路径，最后检查诊断与资源管理。以下七组是本文的阅读分类，不是会议官方分类。
+![SIGMOD 2026 工业界 29 篇论文系统版图：生产级数据栈的七大演进界面](/images/diagrams/aug-dbpaper-sigmod2026-landscape.svg)
 
-| **主题** | **篇数** | **代表论文** |
-|---|---|---|
-| 1. Production Database / Cloud-Native DB / Storage | 7 | CloudJump III、Aurora Limitless、TDSQL-Boundless、Twenty Years of Bigtable |
-| 2. Query Engine / OLAP / Data Warehouse / AISQL | 6 | Learned Query Optimizer (LOAM)、Cortex AISQL、ByteHouse、Enzyme |
-| 3. Recommendation / Feature Engineering / Shuffle / ML Data Infrastructure | 3 | TokaDB、NebulaSQL、FuxiShuffle |
-| 4. Graph / Consensus / Blockchain | 4 | Poseidon (Neptune Analytics)、RIOT、Fabric-X |
-| 5. Vector / Multimodal / AI Data Platform | 3 | LindormVector、ConDABench |
-| 6. Observability / AIOps / Code-to-SQL / Migration | 3 | SQLens、Root-Cause SQL Diagnosis |
-| 7. Time Series / Compression / Caching / Cloud Storage Resource Pooling | 3 | LakeMem、CLAPS |
+| **主题方向** | **篇数** | **代表系统与论文** | **核心工程矛盾** |
+|---|---:|---|---|
+| 1. 云原生数据库、分层存储与扩展 OLTP | 7 | CloudJump III、Aurora Limitless、Hyperscale、TDSQL-Boundless、Bigtable 20 年 | 打破单机容量与单写者上限后，如何压住远端页延迟、租约风暴与跨分片提交代价 |
+| 2. 查询引擎、云数仓、硬件加速与 AISQL | 6 | LOAM、Cortex AISQL、ByteHouse、Enzyme、Fabric Bitmap / CoddSpeed | 在缺统计、多租户抖动与昂贵 LLM 推理约束下，守住计划稳定性与增量刷新总账 |
+| 3. 推荐特征计算、训推存储与弹性 Shuffle | 3 | TokaDB、NebulaSQL、FuxiShuffle | 弥合离线大吞吐训练与在线低延迟特征服务裂痕，让中间数据交换具备细粒度容错 |
+| 4. 一体化图引擎、并行共识与受监管账本 | 4 | Poseidon、G2+D、RIOT、Fabric-X | 兼顾图遍历局部性与并发更新，打破单 Leader 全序复制对无冲突事务的串行束缚 |
+| 5. 分布式向量检索、企业 AI 助手与交互评测 | 3 | LindormVector、Adobe Enterprise AI、ConDABench | 把向量检索融入多模过滤与权限治理，评估多轮模糊意图下的真实分析能力 |
+| 6. Code-to-SQL 归因、AIOps 诊断与迁移 | 3 | SQLens、美团根因 SQL 排序、JSON-to-Duality 迁移 | 穿透 ORM 抽象找回代码与慢 SQL 的因果链，在全实例资源争用中定位真凶 |
+| 7. 解耦内存缓存、接入池化与时序压缩 | 3 | LakeMem、CLAPS、Dynatrace 浮点压缩 | 区分共享基表与私有中间态语义，用负载感知池化与轻量无损压缩削减冗余水位 |
+
+下面按这七组生产主线逐一拆解每篇论文的下载入口、核心机制与阅读抓手。
+
+---
 
 ## 1. Production Database / Cloud-Native DB / Storage
 
-生产数据库扩展需要同时保住事务语义与资源效率；拆分存储、计算或分片会引入新的路由、协调和恢复路径。阅读这一组时，应区分吞吐扩展与跨分片事务的代价。
+如果用最朴素的方式给生产数据库扩容，无非两条路：存储装不下就挂更便宜的远程盘，单机写不动就按哈希切分片。但一旦动手拆分，三个隐性代价就会立刻冒头：**操作系统块层根本不知道哪个 8KB 页马上还要被访问、上百万个共识分片光是续租心跳就能把 CPU 打满、跨分片事务一旦引入中心协调器又会变成新的单点瓶颈。** 本组 7 篇论文正是各大厂针对这些拆解副作用交出的工程答卷。
 
-| **#** | **Paper** | **下载链接** | **主要内容分析** |
-|---|---|---|---|
-| 1 | **ByteGraph-Dione: An Adaptive Dual-Format Graph Engine with Hotspot Awareness and Transaction Efficiency for Production-Scale Workloads** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803073) / [ACM DOI](https://dl.acm.org/doi/10.1145/3788853.3803073) | ByteDance 的生产级图数据库/图引擎论文。关键词是 **dual-format graph engine、hotspot awareness、transaction efficiency**。**标题级阅读入口，机制待全文核对。** 可带着以下问题阅读：双格式各自服务哪些访问？热点识别与格式切换有何代价？遍历局部性与事务更新冲突如何协调？不能仅由标题断言它采用特定冷热切换算法。 |
-| 9 | **Scalable Leader Leases For Multi Consensus Groups in CockroachDB** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803081) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803081) | CockroachDB 的多 Raft range / 多 consensus group 下 leader lease 扩展性问题。核心是如何让读请求在不走 quorum 的情况下安全服务，同时避免 lease 管理本身成为大规模 range 数量下的瓶颈。对分布式数据库工程师来说，它对应的是 **read lease、leaseholder、range movement、failover correctness、stale read safety** 这几个底层主题。 |
-| 11 | **Scalable and Resilient Storage Tier for Azure SQL Hyperscale** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803083) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803083) | Azure SQL Hyperscale 的存储层设计。Hyperscale 这类系统的核心问题是把传统单机数据库的 page/log/storage path 拆成可扩展、可恢复、可独立扩容的云原生存储层。重点应包括 page server、log service、remote storage、redo/recovery、failover、replica catch-up、tail latency 和弹性扩展。 |
-| 12 | **CloudJump III: Optimizing Cloud Databases for Tiered Storage** | [作者版 PDF](https://desert0616.github.io/pdf/CloudjumpIII.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803084) | Alibaba Cloud 的 CloudJump 第三代，重点是把 **page-level tiered storage** 集成进数据库内核，而不是放在 block/filesystem 层。论文明确说它在 buffer manager 的 eviction/flush 等控制点做 engine-aware placement，在 NVMe、远程块存储、对象存储（Object Storage）之间做数据分层，并与 recovery/snapshot 协议协同，目标是降低 fast tier footprint，同时维持接近本地 SSD 的吞吐和稳定 tail latency。这个方向非常值得数据库内核工程师看，因为它说明 cloud-native DB 的 tiering 不能只看 I/O trace，必须理解 page type、page age、table identity、buffer-pool residency、backup/recovery 语义。 |
-| 18 | **Aurora PostgreSQL Limitless Database: Building a Highly Scalable OLTP Database** | [作者版 PDF](https://software.imdea.org/~gotsman/papers/limitless-sigmod26.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803089) | AWS Aurora PostgreSQL Limitless 的 scale-out OLTP 设计。论文摘要强调目标是让 PostgreSQL 兼容数据库在不需要复杂应用分片的情况下扩展到 millions TPS 和 petabytes data。主要内容应围绕 shard/routing、distributed transaction、global metadata、query pushdown、elastic scale-out、PostgreSQL compatibility，以及如何把 Aurora 原有 shared-storage 架构扩展到多 writer/multi-shard OLTP。 |
-| 19 | **TDSQL-Boundless: A Distributed Database System for Large-scale Heterogeneous Multi-Table Workloads** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803090) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803090) | Tencent TDSQL 的分布式数据库系统论文。关键词是 **large-scale heterogeneous multi-table workloads**，说明它不只是单表分片 OLTP，而是面向多表、多业务形态、不同访问模式混合的生产负载。**具体机制待全文核对。** 后续检查自动分区与路由、跨分片事务、多表 Join、隔离和运维分别由哪些模块承担；这些是阅读问题，不是已经确认的功能清单。 |
-| 24 | **Twenty Years of Bigtable** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803095) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803095) | Google Bigtable 20 年回顾。原始 Bigtable 是大规模结构化数据存储系统，服务 web indexing、Google Earth、Google Finance 等异构需求；**具体演进细节待全文核对。** 阅读时可沿 tablet、LSM/SSTable、metadata、compaction、replication 与租户隔离追踪变化，不预先把这些主题都归为论文已证明的结论。对系统工程师最有价值的是“长期生产系统如何演化”：接口稳定、内部不断重构。 |
+| **#** | **Paper** | **下载链接** | **主要内容与核心看点** |
+|---:|---|---|---|
+| 1 | **ByteGraph-Dione: An Adaptive Dual-Format Graph Engine with Hotspot Awareness and Transaction Efficiency for Production-Scale Workloads** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803073) / [ACM DOI](https://dl.acm.org/doi/10.1145/3788853.3803073) | 字节跳动面向超大规模生产负载的双格式（Dual-Format）图引擎。图系统长期卡在一个结构性矛盾上：紧凑邻接数组适合高速多跳遍历，但高频边增删改极易引发锁争用与重写放大；可变动态结构写入友好，读局部性又差。从议题定位看，精读全文时最值得重点追问三件事：两种物理格式各自承接哪类读写路径？在线热点感知与后台格式转换如何控制切换抖动？图遍历快照与并发事务更新之间怎样定义冲突边界？ |
+| 9 | **Scalable Leader Leases For Multi Consensus Groups in CockroachDB** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803081) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803081) | CockroachDB 剖析海量 Raft Range（多共识组）下的 Leader Lease 扩展瓶颈。为了免去每次本地读都走一轮多数派 Quorum，分布式数据库普遍依赖租约（Lease）由 Leaseholder 直接安全服务读请求；但当单节点承载成千上万个 Range 时，逐个 Range 独立续租和迁移就会演变成控制面风暴。这篇论文直击 **Read Lease 生命周期、Range 负载均衡迁移、故障切换安全性与防陈旧读（Stale Read Safety）** 的工程细节，做 Multi-Raft 或分布式 KV 的工程师不容错过。 |
+| 11 | **Scalable and Resilient Storage Tier for Azure SQL Hyperscale** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803083) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803083) | 微软系统复盘 Azure SQL Hyperscale（早期代号 Socrates）存储底座的可扩展与韧性演进。它把传统单机 SQL Server 紧耦合的页面缓冲、日志刷盘与备份恢复彻底拆解为独立的日志服务（Log Service）、弹性分片页服务（Page Server）与远端持久存储。阅读重点在于生产规模化之后如何压平 Page Server 补页尾延迟、加速副本追赶（Catch-up）与崩溃恢复，并在局部节点失联时守住 SLA。 |
+| 12 | **CloudJump III: Optimizing Cloud Databases for Tiered Storage** | [作者版 PDF](https://desert0616.github.io/pdf/CloudjumpIII.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803084) | 阿里云 CloudJump 第三代架构，核心主张非常犀利：**云数据库的冷热分层绝不能做在语义盲目的块设备或文件系统层，而必须深植进数据库内核的 Buffer Manager。** 它在页面淘汰（Eviction）与刷盘（Flush）控制点引入引擎感知的数据放置策略，综合页面类型（索引内节点 vs 数据叶页）、年龄、表身份及恢复/快照语义，在本地 NVMe、远程块存储与对象存储（Object Storage）之间动态调度，从而大幅压缩昂贵快层容量占用，同时保住接近全本地 SSD 的吞吐与平稳尾延迟。 |
+| 18 | **Aurora PostgreSQL Limitless Database: Building a Highly Scalable OLTP Database** | [作者版 PDF](https://software.imdea.org/~gotsman/papers/limitless-sigmod26.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803089) | AWS Aurora PostgreSQL Limitless 的横向扩展（Scale-out）架构论文。经典 Aurora 虽然解耦了存储，但仍受困于单 Writer 计算上限；Limitless 在保留原汁原味 PostgreSQL 生态兼容性的前提下，引入无提交状态的 Router Fleet 与底层各自挂载 Aurora 共享存储的 Shard Fleet，依托有界时钟（Amazon Time Sync）实现标量时间戳 MVCC，并用参与分片自举的 Lead-Shard 非阻塞 2PC 避开了全局中心事务管理器，向百万级 TPS 与 PB 级事务规模演进。 |
+| 19 | **TDSQL-Boundless: A Distributed Database System for Large-scale Heterogeneous Multi-Table Workloads** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803090) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803090) | 腾讯 TDSQL 面向大规模异构多表混合负载的分布式数据库实践。真实企业核心库很少是教科书里那种“单主键点查”的规整模型，往往同时混杂着高频短事务、跨多表复杂关联与倾斜热点。从公开定位出发，阅读全文时可以顺着“数据自动切分与共置（Collocation）路由 → 跨分片分布式事务开销 → 多表复杂 Join 下推 → 多业务资源隔离”这条链路检验其内核取舍。 |
+| 24 | **Twenty Years of Bigtable** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803095) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803095) | Google Bigtable 二十年工业演进长卷。2006 年的原始 Bigtable 奠定了 Tablet 切分、LSM-Tree + SSTable 与底层分布式文件系统协同的经典范式；二十年间硬件从机械盘换成了闪存与高速网络，工作负载也从网页索引一路扩展到全球多租户实时服务。阅读这类跨时代复盘，最宝贵的视角是看它**如何在维持上层宽表契约稳定的同时，在内部持续重写元数据管理、Compaction 调度、跨地域复制与多租户隔离边界。** |
+
+---
 
 ## 2. Query Engine / OLAP / Data Warehouse / AISQL
 
-引擎层的新策略只有在规划、执行和维护成本计入后才构成收益；模型选计划、AI SQL 和增量刷新分别改变不同环节。下面的数字需连同各论文的负载条件理解。
+在分析型引擎里，单核向量化扫描的红利已经接近饱和，真正的生产账单开始向两头转移：一头是**计划与维护成本**——缺统计信息或集群资源抖动导致选错计划，或者每天全量重算 ETL 管道烧掉成倍算力；另一头是**异构算子成本**——把硬件加速器或大模型推理原语直接嵌进 SQL 后，PCIe 数据搬运和每秒几美分的 Token 账单随时可能吞掉全部优化收益。
 
-| **#** | **Paper** | **下载链接** | **主要内容分析** |
-|---|---|---|---|
-| 2 | **Learned Query Optimizer in Alibaba MaxCompute: Challenges, Analysis, and Solutions** | [arXiv PDF](https://arxiv.org/pdf/2602.07336) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803074) | 这篇非常适合 Query Optimizer 工程师精读。论文提出 LOAM，指出 learned optimizer 在真实分布式多租户数仓中面临四类生产挑战：动态执行环境导致 cost variance、缺失输入统计信息、传统模型 refinement 不现实、不同 workload 收益不确定。LOAM 通过 statistics-free plan encoding、历史执行信息、环境编码、domain adaptation 和 project selector，让 learned optimizer 更可部署；生产结果最高带来约 30% CPU cost savings。 |
-| 3 | **Bitmap Filtering in the Fabric Data Warehouse** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803075) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803075) | Microsoft Fabric Data Warehouse 中的 bitmap filtering。Bitmap filter 本质是运行时过滤/半连接过滤的一种工程化形态，核心价值是在 join/build side 产生 compact bitmap，然后尽早过滤 probe/scan side，减少网络、I/O 和 join 输入规模。对 MPP/云数仓来说，难点不是算法本身，而是 optimizer 何时插入 filter、bitmap 如何分发、如何和列存 scan/vectorized execution/runtime filter 结合，以及如何避免 false positive/构建成本超过收益。 |
-| 5 | **CoddSpeed: Hardware Accelerated Query Processing in Microsoft Fabric** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803077) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803077) | Microsoft Fabric 的硬件加速查询处理。重点应是把部分关系算子或数据路径映射到异构硬件/加速器上，并与 Fabric 的 query optimizer、execution engine、scheduler 和 fallback path 集成。真正难点在系统层：哪些算子值得 offload、host-device 数据移动是否抵消收益、如何做 cost model、如何保持 SQL 语义兼容、如何在生产环境做多租户隔离和资源调度。 |
-| 8 | **ByteHouse: ByteDance’s Cloud-Native Data Warehouse for Real-Time Multimodal Data Analytics** | [arXiv PDF](https://arxiv.org/pdf/2602.08226) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803080) | ByteDance ByteHouse 的云原生实时多模态数仓。论文摘要提到统一表引擎、两层逻辑抽象、物理一致布局、SSD-backed cluster-scale cache CrossCache、虚拟文件系统 NexusFS、分析/批/增量执行模式、hybrid query 优化、tiered vector index 上的 runtime filtering，以及基于历史执行轨迹和 AI-assisted plan selection 的优化器。它代表 OLAP 向 **structured + vector + multimodal retrieval + incremental computation** 融合。 |
-| 22 | **Cortex AISQL: A Production SQL Engine for Unstructured Data** | [arXiv PDF](https://arxiv.org/pdf/2511.07663) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803093) | Snowflake Cortex AISQL 生产系统论文，强烈建议精读。它把 AI semantic operations 作为 SQL 原生算子处理，问题是 AI inference cost/latency/selectivity 在优化阶段都很难估计。论文提出 AI-aware query optimization，把 LLM cost 作为优化目标；adaptive model cascades，用便宜 proxy model 处理大部分样本、把不确定样本交给强模型；semantic join rewriting，把某些 O(\|L\|×\|R\|) 的语义 join 改写成分类任务，论文报告 2–8×、2–6×、15–70× 等级的加速。 |
-| 27 | **Enzyme: Incremental View Maintenance With Spark Declarative Pipelines** | [arXiv PDF](https://arxiv.org/pdf/2603.27775) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803098) | Databricks Enzyme，Spark Declarative Pipelines 背后的 IVM engine。核心是让 materialized views 成为数据 pipeline 的一等构件，并自动做 refresh planning，让用户关注业务逻辑，而不是手写增量维护策略。重点应包括 SQL operator coverage、增量 refresh plan、fallback 到 full refresh、pipeline DAG、状态管理、正确性和成本模型。对 Spark/MaxCompute/StarRocks 工程师来说，这对应“把 ETL/ELT 从 batch recompute 推向 optimizer-driven incremental maintenance”。 |
+| **#** | **Paper** | **下载链接** | **主要内容与核心看点** |
+|---:|---|---|---|
+| 2 | **Learned Query Optimizer in Alibaba MaxCompute: Challenges, Analysis, and Solutions** | [arXiv PDF](https://arxiv.org/pdf/2602.07336) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803074) | 强烈推荐查询优化器工程师精读的阿里巴巴 MaxCompute 学习型优化器 **LOAM**。论文坦诚摊开了学术界 LQO 在超大规模共享数仓落地的四堵墙：五千台规模资源池动态波动导致同计划耗时方差极大、海量表缺失新鲜统计信息、线上绝不允许为攒训练样本而试跑高危烂计划、十万级 Project 收益分化悬殊。LOAM 用不依赖显式直方图的算子语义编码、Stage 运行环境建模、梯度反转领域自适应（免在线试跑评估候选）以及事前 Project ROI 筛选器打通了生产闭环，在高潜项目回放中最高节省约 30% CPU 开销。 |
+| 3 | **Bitmap Filtering in the Fabric Data Warehouse** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803075) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803075) | 微软 Fabric 云数仓中的位图运行时过滤（Bitmap Filtering）工程化剖析。原理上看，在 Join 的 Build 侧构造紧凑位图并尽早下推到 Probe 侧列存扫描，是削减网络 Shuffle 与无效解压的利器；但在分布式 MPP 引擎里，魔鬼全在细节：优化器怎样预判过滤率以防“构造与广播位图的开销倒挂”？位图如何跨交换算子低延迟汇聚并与 SIMD 向量化扫描无缝啮合？这篇给出了完整的工业界实现拆解。 |
+| 5 | **CoddSpeed: Hardware Accelerated Query Processing in Microsoft Fabric** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803077) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803077) | 微软 Fabric 的硬件加速查询执行系统。在生产多租户云数仓里引入异构硬件加速，最怕掉进“单算子跑分飞快、端到端查询更慢”的陷阱。阅读重点在于系统层面的四道护栏：优化器代价模型如何计入 Host–Device 内存搬运税、哪些算子与数据类型允许部分卸载、显存或加速器饱和时如何无感回退（Fallback）到常规 CPU 路径，以及多租户共享硬件时的配额隔离。 |
+| 8 | **ByteHouse: ByteDance’s Cloud-Native Data Warehouse for Real-Time Multimodal Data Analytics** | [arXiv PDF](https://arxiv.org/pdf/2602.08226) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803080) | 字节跳动云原生实时多模态数仓 **ByteHouse** 全景架构。面对结构化标量、高维向量与多模态检索日益频繁的同查询混跑需求，ByteHouse 构建了统一表引擎与物理一致布局，底层配有集群级 SSD 缓存 **CrossCache** 与虚拟文件系统 **NexusFS**，执行层打通批处理与增量计算模式，针对分层向量索引定制了运行时过滤（Runtime Filtering），并在优化器侧融合历史执行轨迹与 AI 辅助计划选择。 |
+| 22 | **Cortex AISQL: A Production SQL Engine for Unstructured Data** | [arXiv PDF](https://arxiv.org/pdf/2511.07663) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803093) | Snowflake 生产级语义 SQL 引擎 **Cortex AISQL**，今年最值得细读的 AI + DB 系统论文之一。一旦把 LLM 过滤、提取和关联提升为原生 SQL 算子，传统优化器“I/O 最贵、表达式求值近乎免费”的假设瞬间倒塌——一次大模型调用比普通谓词贵出好几个数量级，且选择率在编译期完全未知。论文祭出三招破局：把 Token/推理成本纳入一等优化目标、用**自适应模型级联（Adaptive Model Cascades）**让廉价小模型先筛掉绝大多数确定样本、再通过**语义连接改写（Semantic Join Rewriting）**把原本 $O(|L|\times|R|)$ 的两表逐对提示词调用转化为多类分类映射，在对应实验场景下取得了 2–8×、2–6× 乃至 15–70× 的显著提速。 |
+| 27 | **Enzyme: Incremental View Maintenance With Spark Declarative Pipelines** | [arXiv PDF](https://arxiv.org/pdf/2603.27775) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803098) | Databricks 声明式数据管道背后的增量视图维护（IVM）引擎 **Enzyme**。企业数仓里大量 T+1 或小时级 ETL 管道每天都在把整张底表重算一遍，而手写增量合并逻辑又极易在复杂窗口、外连接或非单调聚合上写出错数 Bug。Enzyme 把物化视图刷新变成一个**基于代价的全局规划问题**：自动分析算子可增量性，在行级 Delta 合并、分区级局部重算与退回全量刷新之间算清总账，并沿管道 DAG 协同上下游策略。 |
+
+---
 
 ## 3. Recommendation / Feature Engineering / Shuffle / ML Data Infrastructure
 
-特征处理与 Shuffle 优化依赖数据复用和状态生命周期；独立服务可能降低重复计算，也会增加网络依赖、资源调度与故障恢复成本。
+大规模推荐与机器学习基础设施长期忍受着两处高昂的“管道割裂税”：一是**训推数据割裂**——离线训练追求高带宽顺序吞吐历史样本，在线推理（Serving）追求毫秒级点查最新特征与 Embedding，维护两套存储既翻倍烧钱又常闹特征穿越/不一致；二是**Shuffle 中间态脆弱**——超大规模分布式作业卡在细碎随机 I/O 与单节点故障引发的连环重算上。
 
-| **#** | **Paper** | **下载链接** | **主要内容分析** |
-|---|---|---|---|
-| 6 | **TokaDB: A Unified Storage Engine for Training-Serving Data Management in Large Recommendation Models** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803078) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803078) | ByteDance/HUST 的推荐系统存储引擎。题目里的 **training-serving data management** 很关键：大规模推荐模型既要离线训练读大规模历史样本/特征，又要在线 serving 读低延迟特征/embedding，还要处理 freshness、一致性、版本、冷热分层、写入放大等问题。标题提出统一训练与 serving 的数据管理目标；是否减少同步成本、如何处理一致性与资源争用，需要全文与实验支持，本文不据标题推定已达到这些收益。 |
-| 7 | **NebulaSQL: A Large-scale Feature Computation System for Online Recommendation** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803079) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803079) | Alibaba 的在线推荐特征计算系统。它把特征工程抽象到 SQL/SQL-like 体系中，面向在线推荐的低延迟、高吞吐、实时/准实时更新。工程重点应包括特征表达语言、UDF、离线在线一致性、增量更新、状态管理、custom optimization rules 和推荐场景下的 SLA 保障。 |
-| 14 | **FuxiShuffle: An Adaptive and Resilient Shuffle Service for Distributed Data Processing on Alibaba Cloud** | [arXiv PDF](https://arxiv.org/pdf/2602.22580) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803085) | MaxCompute/Alibaba Cloud 的生产 shuffle service。论文指出 shuffle 常因小随机 I/O、网络竞争、动态 job 特征和失败恢复成为瓶颈。FuxiShuffle 的核心设计包括：基于运行时信息动态选择 shuffle mode，progress-aware scheduling 下游 worker，为每个 shuffle chunk 自动选择 backup 策略，多副本 failover，精细内存管理，incremental recovery 避免失败后丢失大量进度。它本质上是在做 **data exchange operator 的服务化、弹性化和容错化**。 |
+| **#** | **Paper** | **下载链接** | **主要内容与核心看点** |
+|---:|---|---|---|
+| 6 | **TokaDB: A Unified Storage Engine for Training-Serving Data Management in Large Recommendation Models** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803078) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803078) | 字节跳动联合华中科技大学提出的推荐大模型训推一体存储引擎 **TokaDB**。要把离线海量顺序读与在线高并发低延迟读写塞进同一套引擎，核心硬仗在于物理布局与资源隔离：高频实时特征写入怎样压制写放大？训练任务大吞吐拉取快照样本时，如何保证不抢占在线 Serving 的内存与尾延迟预算？从公开议题出发，全文的快照多版本机制与冷热分层策略非常值得对照研读。 |
+| 7 | **NebulaSQL: A Large-scale Feature Computation System for Online Recommendation** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803079) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803079) | 阿里巴巴面向在线推荐的大规模特征计算系统 **NebulaSQL**。推荐业务里充斥着复杂的滑动窗口、多路序列交叉与自定义算子（UDF），过去常由业务团队手写 C++ 胶水代码拼凑。NebulaSQL 将在线特征工程收拢进类 SQL 声明式编译与优化框架中，重点解决**离线/在线特征计算逻辑同源一致、有状态增量更新，以及严苛毫秒级 SLA 下的执行定制优化**。 |
+| 14 | **FuxiShuffle: An Adaptive and Resilient Shuffle Service for Distributed Data Processing on Alibaba Cloud** | [arXiv PDF](https://arxiv.org/pdf/2602.22580) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803085) | 阿里云 MaxCompute/Fuxi 生产级远程 Shuffle 服务 **FuxiShuffle**。它跳出了静态“全走内存”或“全落磁盘”的非黑即白选择，把数据交换做成一套由实时遥测驱动的自适应控制面：根据预测运行时与实时内存水位动态切换内存/盘古磁盘介质，用 **Progressive Scheduling** 在上游进度跨过动态阈值时提前拉起下游边产边读，按每个数据块的重建代价按需挂载双副本备份，并在节点故障时通过版本与校验和实现**不丢弃下游已读进度的增量恢复（Incremental Recovery）**。 |
+
+---
 
 ## 4. Graph / Consensus / Blockchain
 
-图执行和共识协议不能用同一个吞吐指标比较：前者受访问模式影响，后者还受故障模型与一致性条件约束。本组共置便于索引，不表示它们解决同一问题。
+这一组 4 篇论文分别落脚在**图计算/图挖掘**与**分布式共识/状态机复制**。看似分属两个子领域，底层搏斗的其实是两类经典的系统扩展极限：图负载挑战的是**非规则指针跳转与高阶子图枚举带来的组合中间态爆炸**；而新型共识与账本引擎挑战的则是 **Paxos/Raft 单 Leader 全序日志在无冲突并发事务面前的中心化排队瓶颈**。
 
-| **#** | **Paper** | **下载链接** | **主要内容分析** |
-|---|---|---|---|
-| 4 | **Poseidon: A OneGraph Engine** | [作者版 PDF](https://olafhartig.de/files/BebeeEtAl_SIGMOD2026_CameraReadyVersion.pdf) / [arXiv PDF](https://arxiv.org/pdf/2510.11166) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803076) | AWS Neptune Analytics 背后的 Poseidon graph engine。论文摘要说它支持 openCypher，并扩展语法以支持 RDF/LPG OneGraph 互操作；覆盖图 pattern matching、variable-length paths、aggregation、graph algorithm invocation、dynamic graph transaction。系统层亮点包括 lock-free adjacency list maintenance、secondary succinct indices、partitioned heaps、cost-based optimizer statistics、logical log durability。它是图数据库从“存储+遍历”走向“一体化 graph query + graph analytics + transactions”的代表。 |
-| 15 | **G2+D: A High Performance Distributed Graph Mining System** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803086) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803086) | ByteDance 的分布式图挖掘系统。图挖掘和普通图遍历不同，常见任务包括 pattern mining、motif/subgraph enumeration、community/fraud/recommendation 相关分析，难点是中间状态爆炸、负载倾斜、通信量大和高阶 pattern 组合复杂。**具体实现待全文核对。** 分区、负载均衡、剪枝和压缩是值得检查的候选机制，不是本文已确认的实现。 |
-| 21 | **Fabric-X: Scaling Hyperledger Fabric for Asset Exchange** | [IACR ePrint](https://eprint.iacr.org/2023/1717) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803092) | IBM Research 的 Hyperledger Fabric 扩展系统，面向 regulated asset exchange。ePrint 版本标题强调重新设计 Hyperledger Fabric architecture，以支持高吞吐的受监管资产交换应用。主要方向应包括交易 pipeline、ordering、validation、endorsement、state access、隐私/监管约束和吞吐瓶颈消除。对数据库视角来说，它和 deterministic transaction processing、serializability、replicated log、asset state machine 很接近。 |
-| 23 | **RIOT: Replicated Independently-Ordered Transactions** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803094?download=true) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803094) | Neo4j/Nvidia/UC Berkeley 的 replicated transaction/consensus 论文。作者主页摘要说传统 Raft/Paxos 通过单 leader 和 totally ordered log 做状态机复制，简单但引入顺序瓶颈；RIOT 用 DAG entries 上的 decentralized coordination 取代中心化 leader/log replication。它的关键问题是：如果事务之间不冲突，能否独立排序、并行复制、并行提交，同时保持等价的可串行化/一致性语义。 |
+| **#** | **Paper** | **下载链接** | **主要内容与核心看点** |
+|---:|---|---|---|
+| 4 | **Poseidon: A OneGraph Engine** | [作者版 PDF](https://olafhartig.de/files/BebeeEtAl_SIGMOD2026_CameraReadyVersion.pdf) / [arXiv PDF](https://arxiv.org/pdf/2510.11166) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803076) | AWS Neptune Analytics 背后的核心图引擎 **Poseidon**。长期以来，属性图（LPG）与语义网（RDF）、在线图事务查询与全图分析算法往往分属不同系统。Poseidon 扩展 openCypher 打通 RDF/LPG 互操作（OneGraph），在内核层通过**无锁邻接表维护（Lock-free Adjacency List）、简洁二级索引（Succinct Indices）、分区堆内存、代价优化器统计信息与逻辑日志持久化**，把可变长路径匹配、图算法调用与动态事务更新揉进同一套存储执行底座。 |
+| 15 | **G2+D: A High Performance Distributed Graph Mining System** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803086) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803086) | 字节跳动面向风控、反欺诈与社区发现场景的高性能分布式图挖掘系统。不同于只找最短路径或一跳邻居的常规遍历，子图模式挖掘（Motif / Pattern Enumeration）每向外扩展一跳，候选同构状态就可能呈指数级膨胀，且超级节点极易把单台机器的通信与内存拖垮。精读全文时，重点关注它如何协同子图对称性破缺剪枝、跨机邻接缓存压缩与动态窃取负载均衡。 |
+| 21 | **Fabric-X: Scaling Hyperledger Fabric for Asset Exchange** | [IACR ePrint](https://eprint.iacr.org/2023/1717) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803092) | IBM Research 针对受监管金融资产交换重构的 **Fabric-X** 架构。换上数据库内核的眼镜来看，联盟链账本就是一台跨多信任域的确定性复制状态机（Deterministic Replicated State Machine）：传统“模拟背书 → 全局排序 → 串行验证落账”流水线在高并发资产划转下极易卡在排序带宽与状态校验锁上。Fabric-X 系统拆解了背书、排序与并行状态验证的流水线解耦，同时守住监管合规与防双花可串行化边界。 |
+| 23 | **RIOT: Replicated Independently-Ordered Transactions** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803094?download=true) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803094) | Neo4j、NVIDIA 与 UC Berkeley 联合提出的去中心化事务复制协议 **RIOT**。标准 Raft/Paxos 之所以简单稳健，是因为强迫所有写入无论是否冲突都去单 Leader 领一个全局单调递增的日志槽位；一旦跨地域部署或热点分散，这种人为全序就成了吞吐枷锁。RIOT 改在有向无环图（DAG）日志条目上做去中心化协调，让互不冲突的事务独立定序、并行复制提交，在消除单点 Leader 瓶颈的同时严格保持可串行化等价语义。 |
+
+---
 
 ## 5. Vector / Multimodal / AI Data Platform
 
-向量检索收益必须连同召回率、过滤语义和更新成本评价；仅比较无过滤静态数据上的吞吐，无法说明混合查询是否可用。
+把向量检索与大模型助手搬进真实企业生产环境后，早年围绕“纯内存静态数据集裸跑 ANN QPS”的比拼迅速退居次席。真正决定系统生死的变成了三件事：**带复杂标量过滤与实时增删改时的召回率/成本曲线、细粒度企业权限与审计隔离，以及面对人类含糊不清的数据问题时能否多轮追问对齐意图。**
 
-| **#** | **Paper** | **下载链接** | **主要内容分析** |
-|---|---|---|---|
-| 17 | **LindormVector: A Distributed Vector Engine on a Cloud-Native Multi-Model NoSQL Database** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803088) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803088) | Alibaba Cloud Lindorm 上的分布式向量引擎。官方产品文档显示 Lindorm vector engine 支持大规模向量存储、索引和检索，并支持多种索引算法、距离函数，以及 full-text/vector integrated retrieval，用于 RAG 场景。论文重点应在如何把 vector search 纳入 multi-model NoSQL：分片、索引构建、增量更新、过滤条件、全文+向量混合检索、成本和资源隔离。 |
-| 13 | **Building, Serving, and Growing a Conversational AI Assistant for Enterprise** | [作者版 PDF](https://www.sumitbhatia.net/papers/sigmod26.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3801880) | Adobe 的企业级 Conversational AI Assistant 生产经验论文。重点不是单纯模型能力，而是企业场景中的构建、服务和增长：知识接入、权限、安全、评估、incident prevention、用户反馈、在线 serving、质量监控和组织内推广。它和数据库/数据平台的关系在于：企业 AI assistant 最终必须接企业数据、权限、审计和可观测性。 |
-| 28 | **ConDABench: Interactive Evaluation of Language Models for Data Analysis** | [arXiv PDF](https://arxiv.org/pdf/2510.13835) / [Microsoft PDF](https://www.microsoft.com/en-us/research/wp-content/uploads/2026/05/3788853.3803099-1.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803099) | Microsoft 的 conversational data analysis benchmark。论文指出真实数据分析任务目标常常不完整、数据也不干净，需要多轮交互来澄清意图；现有 benchmark 很难评估这种交互式能力。ConDABench 通过 multi-agent workflow 生成 1,420 个 conversational data analysis problems，并提供 evaluation harness。结论很有意思：新模型能解决更多实例，但不一定更擅长需要长期、多轮、持续协作的任务。 |
+| **#** | **Paper** | **下载链接** | **主要内容与核心看点** |
+|---:|---|---|---|
+| 17 | **LindormVector: A Distributed Vector Engine on a Cloud-Native Multi-Model NoSQL Database** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803088) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803088) | 阿里云云原生多模 NoSQL 数据库 Lindorm 上的分布式向量引擎。在 RAG 与海量电商/内容检索中，业务几乎从不发裸向量查询，而是要求“租户 ID + 时间窗口 + 全文关键词 BM25 + 向量相似度”联合过滤，同时底层文档还在持续实时写入。论文重点剖析如何在分布式多模底座内协同分片路由、增量向量索引更新、标量/全文/向量混合检索计划选择，以及高开销向量任务与常规 KV 点查之间的资源隔离。 |
+| 13 | **Building, Serving, and Growing a Conversational AI Assistant for Enterprise** | [作者版 PDF](https://www.sumitbhatia.net/papers/sigmod26.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3801880) | Adobe 面向企业生产环境构建、服务与持续演进对话式 AI 助手的全链路工程复盘。企业级助手最怕的不是某道百科题没答上来，而是越权吐出无权限访问的内部文档，或者在产品迭代后静默出现回答质量滑坡。论文从数据平台视角详述了企业异构知识接入、行/文档级访问控制透传、线上护栏与事故预防（Incident Prevention）、离线/在线双轨评估闭环及用户反馈飞轮。 |
+| 28 | **ConDABench: Interactive Evaluation of Language Models for Data Analysis** | [arXiv PDF](https://arxiv.org/pdf/2510.13835) / [Microsoft PDF](https://www.microsoft.com/en-us/research/wp-content/uploads/2026/05/3788853.3803099-1.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803099) | 微软针对交互式数据分析设计的评测基准 **ConDABench**。现有 Text-to-SQL 榜单大多假设用户一次性给出了毫无歧义的自然语言规范，且底表干净整洁；可现实里业务方的提问往往口径模糊、底表满是脏数据与隐式空值，分析师必须先查探数据再多轮追问确认。ConDABench 用多智能体工作流构造了 1,420 个多轮交互数据分析任务及配套评测底座，并揭示了一个警醒结论：**单轮解题分数更高的新模型，在需要长期多轮澄清与协作的数据探索中未必更稳。** |
+
+---
 
 ## 6. Observability / AIOps / Code-to-SQL / Migration
 
-诊断系统需要可核对的归因证据，而不只是合理解释；代码映射、执行画像和对照实验决定建议能否进入工程流程。
+数据库内核团队常有一种无力感：线上出了故障，监控大盘满屏飘红，几百条 SQL 同时变慢，DBA 既分不清谁是引发雪崩的始作俑者、谁只是被锁和 I/O 连累的受害者；好不容易抓到那条烂 SQL，转身去微服务代码库里一搜，却发现它早已被三层 ORM 框架动态拼接得面目全非。本组 3 篇论文精准切中了数据库与业务研发交界处的治理痛点。
 
-| **#** | **Paper** | **下载链接** | **主要内容分析** |
-|---|---|---|---|
-| 16 | **Learned Root-Cause SQL Prioritization and Diagnosis for Complex Database Performance Issues** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803087) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803087) | Meituan/ECNU 的数据库性能诊断论文。题目说明它关注复杂性能问题下的 root-cause SQL prioritization：在海量 SQL、指标、慢查询、实例负载、资源竞争中，识别真正导致性能异常的 SQL，并给出诊断优先级。这个方向对云数据库/AIOps 很关键，因为生产问题通常不是“找一个慢 SQL”，而是从 workload-level degradation 中定位 causality 和 priority。 |
-| 20 | **SQLens: Continuous Code–to–SQL Visibility in the Wild** | [作者版 PDF](https://desert0616.github.io/pdf/SQLens.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803091) | Alibaba 的 code-to-SQL visibility 系统。论文摘要非常明确：现代服务中的 SQL 被语言、框架、ORM、配置和抽象层隐藏，导致代码变更和 SQL 行为之间的联系丢失，带来性能回退、安全风险和诊断成本。SQLens 结合静态程序分析和 LLM-guided reasoning，从数据库 emission sites 出发，让 cooperative agents 沿 control/data flow 重建 SQL construction 和 parameter binding，再用历史 SQL logs 反向验证，形成 versioned knowledge layer，支持 code-to-SQL lookup 和 SQL-to-code attribution。 |
-| 25 | **From JSON to Duality: Automated Application Migration from Document to Relational Databases** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803096) / [ACM DOI](https://dl.acm.org/doi/10.1145/3788853.3803096) | Oracle 的 JSON/document 到 relational/duality migration 论文。**迁移机制待全文核对。** 阅读重点是 JSON 访问如何映射到关系模式、哪些约束与事务语义可保留，以及自动生成映射后仍需多少人工修复；不能由题目推出完整的自动迁移能力。 |
+| **#** | **Paper** | **下载链接** | **主要内容与核心看点** |
+|---:|---|---|---|
+| 16 | **Learned Root-Cause SQL Prioritization and Diagnosis for Complex Database Performance Issues** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803087) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803087) | 美团联合华东师范大学提出的复杂数据库性能异常根因 SQL 排序与诊断系统。线上雪崩时，单纯按执行耗时或次数排 Top SQL 往往会抓错人——一条耗时并不算最长的未走索引更新，可能正死死攥着热点行锁或打满 IOPS，拖慢了后面上千条无辜点查。该工作聚焦从全实例负载退化、锁等待与多维资源竞争信号中剥离因果关系，直接输出可行动的根因 SQL 诊断优先级。 |
+| 20 | **SQLens: Continuous Code–to–SQL Visibility in the Wild** | [作者版 PDF](https://desert0616.github.io/pdf/SQLens.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803091) | 阿里巴巴打通业务代码与线上 SQL 双向映射的 **SQLens**。现代微服务里的 SQL 散落在 ORM 注解、动态条件分支与配置文件里，导致代码发版评审时看不见生成的慢 SQL，线上报警抓到慢 SQL 后又找不到该回滚哪个 Git 函数。SQLens 没有盲目把整座代码仓塞给大模型硬猜，而是**以静态程序分析锚定数据库调用点，驱动多协作智能体沿控制流与数据流精准还原 SQL 拼接模板与参数绑定，最后拿线上真实历史 SQL 日志做反向交叉验证**，沉淀出带版本演进的双向归因知识层。 |
+| 25 | **From JSON to Duality: Automated Application Migration from Document to Relational Databases** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803096) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803096) | Oracle 围绕 JSON Relational Duality Views（关系—文档对偶视图）展开的应用自动化迁移实践。文档数据库胜在应用层读写嵌套对象的直观敏捷，却常在跨文档规范化一致性与复杂分析关联上吃亏；Oracle 的对偶视图允许底层按规范化关系表存储、上层继续按 JSON 文档读写。阅读全文时值得重点核查：它如何从存量文档负载与查询模式自动推导底层关系模式分解？嵌套更新冲突、约束语义与残余人工校验边界落在何处？ |
+
+---
 
 ## 7. Time Series / Compression / Caching / Cloud Storage Resource Pooling
 
-资源池化收益取决于复用能否覆盖远程访问与协调成本；共享缓存还必须区分只读基础数据与私有中间状态，否则命中率不能反映正确性和隔离要求。
+最后一组聚焦于云基础设施最底层的**利润率工程**：在超大规模集群里，网关代理为了扛突发峰值往往常年空转冗余，监控时序浮点数每秒都在吞噬PB级磁盘，而湖仓一体分析引擎则夹在“本地 DRAM 太贵装不下”与“对象存储直接拉取太慢”之间。想把这笔冗余省下来，前提是**资源池化与缓存协议必须认清不同数据的生命周期与读写语义差异**。
 
-| **#** | **Paper** | **下载链接** | **主要内容分析** |
-|---|---|---|---|
-| 10 | **CLAPS: A Load-Aware Proxy Resource Pooling System for Reducing Resource Redundancy in Large-Scale Cloud Storage** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803082) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803082) | ByteDance/浙江大学的大规模云存储 proxy resource pooling。云存储系统里 proxy 层通常为了峰值和隔离而过度 provision，造成资源冗余。CLAPS 的方向是 load-aware pooling：在多租户/多业务负载下动态复用 proxy 资源，同时保证隔离、tail latency 和故障域控制。这个问题和数据库连接池、shuffle service、gateway/cache tier 的资源池化非常类似。 |
-| 26 | **Analyzing and Improving Floating-Point Compression for Application Monitoring Time Series** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803097) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803097) | Dynatrace 的应用监控时间序列浮点压缩。监控数据有高写入、长保留、查询聚合频繁、浮点值变化模式复杂等特点。论文方向是分析现有 floating-point compression 在真实 APM 时间序列上的表现，并改进压缩策略；公开摘要关键词显示其关注 lossless compression、floating-point compression、lightweight compression、heuristic algorithm selection。 |
-| 29 | **LakeMem: An Elastic Disaggregated-Memory Caching Layer for Analytical Processing Systems** | [作者版 PDF](https://cighao.com/papers/lakemem.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803100) | Alibaba Cloud/Xiamen University 的 lakehouse 分析缓存系统。论文指出 shared-storage + open table format 上的分析负载经常是 memory-bound 的：引擎既要缓存大 base table 保吞吐，又要维护大量中间状态（hash table、shuffle buffer），disaggregated memory（DM）因此成为自然的弹性容量选择。但现有 DM cache 大多是 byte-uniform 的，忽略了 shared base-table 数据与 node-private 中间数据之间的语义不对称。LakeMem 采用 dual-path 架构：PrivateCache 用 client-centric 模型低延迟服务私有中间数据，SharedCache 用 server-coordinated、globally coherent 的方式服务共享 base-table 数据以最大化复用，并配合动态 rebalancing 机制在两条路径之间自适应分配内存。原型基于 DuckDB 实现，在 DuckLake/smallpond 上评测，memory-bound 查询相比 DRAM-SSD hybrid cache 提速 2.0–5.9×。 |
+| **#** | **Paper** | **下载链接** | **主要内容与核心看点** |
+|---:|---|---|---|
+| 10 | **CLAPS: A Load-Aware Proxy Resource Pooling System for Reducing Resource Redundancy in Large-Scale Cloud Storage** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803082) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803082) | 字节跳动联合浙江大学研发的大规模云存储接入代理（Proxy）负载感知资源池化系统 **CLAPS**。在云存储架构中，无状态或轻状态的 Proxy 层过去常按业务线独立部署并按各自最高水位预留机器，造成惊人的常态算力闲置；可一旦粗暴混部共享，突发大流量租户又会瞬间击穿邻居的 P99 尾延迟。CLAPS 给出了兼顾动态削峰填谷、多租户隔离与故障爆炸半径控制的池化调度机制，其思路对数据库网关与 Serverless 连接池同样极具参考价值。 |
+| 26 | **Analyzing and Improving Floating-Point Compression for Application Monitoring Time Series** | [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803097) / [ACM DOI](https://dl.acm.org/doi/abs/10.1145/3788853.3803097) | 可观测性厂商 Dynatrace 基于海量真实 APM（应用性能监控）监控流对浮点数无损压缩的实证剖析与改进。APM 指标流既有平稳贴近常数的利用率曲线，也有剧烈跳变的延迟毛刺和稀疏计数器，单一通用浮点压缩算法（如 Gorilla/Chimp 变体）很难通吃所有序列特征，且解压速度直接卡住高频聚合大盘的响应延迟。论文系统评测了真实分布下的算法短板，并结合轻量启发式特征选择改进了吞吐与压缩比平衡。 |
+| 29 | **LakeMem: An Elastic Disaggregated-Memory Caching Layer for Analytical Processing Systems** | [作者版 PDF](https://cighao.com/papers/lakemem.pdf) / [ACM PDF](https://dl.acm.org/doi/pdf/10.1145/3788853.3803100) | 阿里云联合厦门大学面向湖仓分析引擎打造的弹性解耦内存缓存层 **LakeMem**。这篇点破了一个长期被忽视的语义不对称：分析查询吃内存主要花在两块——**跨查询跨节点高度共享的只读底表列块**，以及**单节点单算子生命周期内高频读写的私有中间状态（Hash Table 溢出、Shuffle 缓冲）**。传统远端内存缓存把所有字节一视同仁，要么为私有状态多付了全局一致性协调税，要么丢掉了底表跨节点共享复用。LakeMem 据此拆出双路径架构：**PrivateCache** 走客户端主导模型低延迟承接私有溢出，**SharedCache** 走服务端全局协调模型最大化共享表命中率，并动态再平衡两侧配额。基于 DuckDB 在 DuckLake/smallpond 上的评测显示，内存受限查询较 DRAM-SSD 混合缓存提速 2.0–5.9×。 |
 
-## 阅读取舍与后续核对
+---
 
-这 29 篇材料适合形成研究问题，不能据此推断整个行业的采用率。后续阅读可以围绕三组依赖展开：
+## 横向收束：从 29 篇工业论文看生产系统的三笔硬账
 
-1. **AI 改变哪一层决策，谁验证结果。** LOAM、ByteHouse、Meituan 和 SQLens 分别涉及计划选择、诊断与归因；Cortex AISQL 把推理纳入 SQL 执行，TokaDB、NebulaSQL 则组织训练与特征数据。前者要检查回归控制，后者要确认模型级联的质量约束，以及推理成本是否计入端到端收益。
-2. **资源拆分以后，协调成本落在哪里。** Hyperscale、CloudJump III、LakeMem、CLAPS、FuxiShuffle 分别改变存储、页、内存缓存、接入层和中间数据的归属。Aurora Limitless、TDSQL-Boundless 与 CockroachDB 还需同时处理路由和事务。存算分离（Storage–Compute Disaggregation）或节点增加本身，都不能证明跨分片和故障场景中的扩展性。
-3. **新增能力怎样进入已有接口。** LindormVector、ByteHouse 和 Poseidon 展示了向量、多模态或图模型的集成；Enzyme 将物化视图（Materialized View）维护交给优化决策，需继续核对增量适用范围、全量回退与新鲜度；Twenty Years of Bigtable 则提供了接口兼容与内部演进的案例。这里的集成趋势不构成对独立产品必要性或市场份额的判断。
+合上这 29 篇论文的目录，今年工业界在架构取舍上呈现出三条格外清晰的脉络：
 
-本文仍是快速阅读笔记：表中依据标题提出的解释属于待核对假设，论文报告的倍数属于作者实验，并非本文复现。采用某项方案前，应回到全文确认数据规模、对照基线、故障模型和不适用条件；证据不足的条目只作为阅读入口。
+1. **资源越解耦，“语义感知”越要往底层沉。** 早年存算分离讲究分层透明——文件系统只管块，远端内存只管页，Shuffle 只管搬字节。但到了 CloudJump III、LakeMem 和 FuxiShuffle 这里，大家异口同声地承认“语义盲目的通用层太贵了”：分层存储必须认得数据库页类型与快照边界，远端内存必须分清只读底表和私有溢出态，Shuffle 服务必须结合算子阻塞属性决定何时拉起下游。**解耦移除了硬件孤岛，而跨层传递轻量语义提示（Hints）则是把协调税重新压下去的唯一办法。**
+2. **AI 进入数据栈正在分化为“严守底线的控制面”与“算清账单的数据面”。** 在优化器、可观测与运维控制面上（LOAM、ByteHouse、SQLens、美团根因诊断），工业界没有谁敢让黑盒模型裸奔接管线上决策——LOAM 靠领域自适应免除在线高危试跑，SQLens 靠静态分析框定范围再用真实日志验真；而在数据执行面上（Cortex AISQL），核心命题则是用关系代数改写和大小模型级联，把原本天价的大模型逐行推理压回企业付得起的成本区间。
+3. **新能力的终极归宿往往是长进既有标准接口里，而不是再造一个孤岛系统。** 无论是 Aurora Limitless 把分布式分片藏在标准 PostgreSQL 连接背后、Poseidon 在一套引擎内弥合属性图与 RDF 并支持事务、LindormVector 与 ByteHouse 把向量过滤变成多模/数仓内生算子，还是 Enzyme 让普通 SQL 物化视图自动获得代价驱动的增量刷新——用户永远偏爱更少的数据搬迁、更稳定的接口契约（正如运行二十年的 Bigtable 所展示的那样），把异构复杂性留在内核内部消化，正是工业级数据库系统最深的护城河。
+
+---
+
+## 检索与阅读说明
+
+本文整理自 [SIGMOD 2026 Industry Track](https://2026.sigmod.org/) 全部 29 篇录用论文目录（表内 `#1`–`#29` 保留原始整理序号以便交叉检索）。其中附有作者版或 arXiv 预印本的条目（如 CloudJump III、Aurora Limitless、LOAM、ByteHouse、Cortex AISQL、Enzyme、FuxiShuffle、Poseidon、Fabric-X、RIOT、Adobe Enterprise AI、ConDABench、SQLens、LakeMem 等）结合公开全文与实验章节提炼机制；仅公开 ACM DOI/摘要页面的条目则依据官方元数据与生产问题域梳理核心看点与精读追问方向。文中引述的性能加速比与成本节省比例均出自对应论文在特定工作负载与基线下的报告值，工程选型落地前建议对照原文复核负载特征与失效边界。

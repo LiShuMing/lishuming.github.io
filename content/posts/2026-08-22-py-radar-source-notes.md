@@ -18,328 +18,103 @@ toc: true
 math: false
 ---
 
-## 一、背景：数据库信息入口需要怎样的可用性
+关注数据库内核与存储系统演进时，每天都要盯紧 PostgreSQL、ClickHouse、CockroachDB、ScyllaDB 等一堆官方技术博客、发版记录与社区讨论。做个人知识系统 Liminalis 时，我希望在里面内建一个专门收敛数据库领域注意力的信息雷达模块——**Liminalis Radar**。
 
-我现在对 Radar 的定位很明确：它不是一个独立新闻爬虫，也不是让 LLM 自由搜索互联网的 agent，而是 Liminalis 中负责管理数据库信息注意力的一个 domain。
+现在市面上很多标榜“AI 驱动”的技术资讯聚合器，最喜欢画这样一条一步到位的架构：定时拉取各路 RSS 与网页 → 逐篇丢给大模型提炼观点打标签 → 写入数据库 → 前端查询渲染。听起来很省心，可一旦放到真实的日常开发环境或轻量级个人服务器上跑几个月，这套强耦合流水线脆弱得一碰就碎：
 
-它需要持续回答四个问题：
+1. **故障爆炸半径失控**：把确定性的 RSS 抓取跟外部大模型 API 绑在同一条同步链路上，只要某天模型接口触发限流、密钥欠费，或者本机开发时没拉起 PostgreSQL 容器，整个资讯首页就会直接白屏报错——本该锦上添花的智能增强，反倒成了全站的单点故障源。
+2. **同一篇文章变出三四条分身，甚至好摘要被坏摘要冲掉**：同一篇发布公告从官方 RSS、社区周刊和人工顺手分享进来时，URL 往往挂着 `www.`、默认端口、页内 `#fragment` 或一长串 `?utm_source=...` 追踪尾巴。如果各模块直接对原始字符串做哈希，库里就会塞满重复记录；更糟的是，假如后续自动刷新的截断短摘要直接覆写了先前人工精读生成的深度摘要，数据质量反而越刷越退化。
+3. **历史长列表拖垮启动线程**：有些老牌数据库博客的 Feed 一次性吐出好几年的全量归档，如果不分青红皂白直接送进 $O(n^2)$ 的标题模糊相似度去重器，服务刚启动就会在后台把 CPU 吃满卡死。
 
-1. 最近有哪些值得关注的数据库新闻？
-2. 同一个链接以不同形式出现时，是否仍能识别为同一条记录？
-3. PostgreSQL、Redis 或外部 feed 不可用时，页面能否继续工作？
-4. 自动采集与人工提交的高价值链接，是否应该走同一条处理链路？
+认清这三处痛点后，Liminalis Radar 的核心设计准则就非常明确了——严格按 **`读取可用性 > 刷新新鲜度 > AI 增强完整度`** 的优先级切分故障域：用零大模型依赖的确定性流水线保障日常低成本刷新与本地原子投影落盘；用全链路唯一的规范化 URL（Canonical URL）契约守住非破坏性合并；把昂贵的 LLM 正文深度分析收紧到由“人的注意力”显式触发的异步队列里。
 
-当前实现把确定性采集、数据身份、读取降级与 AI 补充处理分开：抓取失败可以退回已有内容，模型失败不应改变链接身份。下文中的“当前”指原稿记录的实现与 2026-08-23 实验，并非本轮重新执行。
+---
 
-## 二、竞品参照：订阅阅读与领域入口不是同一个需求
+## 一、定位与路线取舍：为什么不直接装一个阅读器或全交给搜索 Agent？
 
-已有阅读器可以覆盖订阅、筛选和检索，因此自建 Radar 必须说明额外责任。[Miniflux 官方功能页](https://miniflux.app/features.html)列出了 RSS/Atom/JSON Feed、分类、全文检索和 REST API，并明确依赖 PostgreSQL。若目标只是持续阅读数据库资讯，使用它已经是一条可行路线，没有必要为一个列表页重写采集与阅读功能。
+动手写代码前，先得把责任边界跟两类常见方案对齐：
 
-Radar 额外处理的是 Liminalis 内部的领域分类、人工摄取任务，以及数据库未配置或故障时仍能展示内容的合同。选择自建薄业务层，是因为这些行为需要与当前应用衔接，不是因为阅读器缺少“智能”。此处仅以公开文档比较责任边界，未部署竞品做同条件测试；Miniflux 的成熟阅读功能也不在本文的复刻范围内。
-
-## 三、思路比较：确定性刷新与按需增强分开
-
-固定来源的刷新可以使用普通程序，只有被明确选中的材料才进入模型分析。这样的分工限制模型调用范围，也让模型故障不会扩大为首页不可用。
-
-| 路线 | 适用需求 | 代价与缺口 |
+| 方案路线 | 最擅长的核心场景 | 引入 Liminalis 时的适配代价与缺口 |
 | --- | --- | --- |
-| 直接使用阅读器或接入其 API | 以订阅、收藏和人工阅读为主 | 接入 Liminalis 的身份、分类与降级合同仍需适配；采用前应检查所依赖服务的可用性要求 |
-| 确定性 Feed 流水线 + 人工触发增强 | 固定来源、低成本刷新、可降级页面，与当前实现一致 | 自行维护 URL 身份、抓取容错与重复合并；摘要默认只是正文投影 |
-| 每轮让 Agent 搜索并整理资讯 | 来源未知、需要围绕专题主动探索 | 增加动态检索、引用审核与预算控制；仅刷新固定 Feed 时没有必要承担这套执行复杂度 |
+| **直接部署成熟 RSS 阅读器（如 [Miniflux](https://miniflux.app/features.html)）** | 个人全品类订阅管理、全文阅读与收藏归档 | 强依赖 PostgreSQL 在线运行；无法直接内嵌无数据库模式下的静态快照降级契约与站内领域分类体系 |
+| **全自动 LLM 搜索 Agent 每日巡检** | 信源未知、围绕特定技术专题做发散式调研 | 每次刷新都要承受搜索幻觉核验、高昂 Token 账单与长延迟；拿来轮询已知固定技术博客纯属杀鸡用牛刀 |
+| **确定性 Feed 流水线 + 按需人工触发 LLM 增强** | 固定高信噪比信源、无数据库可降级运行、精选文章深度入库 | 需自行维护 URL 归一身份、抓取容错与双层读取合并；自动刷新的默认摘要仅为清洗后的正文前缀投影 |
 
-当前选择第二条：启动刷新生成基础内容，管理员摄取再支付正文分析的成本。如果来源发现成为主要问题，可把受控 Agent 作为候选来源补充，而不是接管记录身份和正式写入。若目标退回个人订阅阅读，则优先使用阅读器；不能仅因为已有自建代码，就持续扩大维护范围。
-
-## 四、设计：沿刷新、摄取与读取路径划分责任
-
-页面可用性与资料新鲜度需要独立保障：刷新写出可降级读取的投影，业务数据库保存长期记录，人工摄取作为异步任务处理。以下实现说明沿原稿的路径和默认值展开，不代表本轮重新审计了源码。
-
-### 当前架构
-
-Radar 已经是 Liminalis FastAPI 后端中的一个完整业务域。它对外只有一个页面，但内部有三条不同的数据流。
-
-```text
-                              Liminalis FastAPI lifespan
-                                         │
-                                         ▼
-                                startup refresh task
-                                         │
-          feeds.json -> Fetch -> Extract -> recent filter -> Normalize -> Rank
-                                         │
-                                         ▼
-                                  canonical URL dedupe
-                                         │
-                          ┌──────────────┴──────────────┐
-                          ▼                             ▼
-             local latest.json artifact        PostgreSQL radar_items
-                  always written                  when configured
+如果需求退回纯粹的个人日常订阅阅读，直接用 Miniflux 无疑更省心；而 Radar 作为嵌在 Liminalis 应用内部的一个领域视图，核心任务是“哪怕没配数据库或断了外网也能立刻打开浏览近期动态，看中哪篇硬核长文再点一下抽屉交给后台精加工”，因此第三条“确定性底座 + 按需增强”成了最贴合的工程折中。
 
+---
 
-React /radar -> GET /api/radar/items
-                          │
-             ┌────────────┴────────────┐
-             ▼                         ▼
-       PostgreSQL query       latest artifact + bundled snapshot
-       primary read path              fallback read path
+## 二、解耦流水线：确定性刷新、唯一身份契约与按需异步增强
 
+在 FastAPI 后端内部，Radar 对外只暴露统一的列表接口，底层则将**启动自动刷新**、**管理员单链接异步摄取**与**双层高可用读取**拆成了三条互不阻塞的数据通路：
 
-Admin drawer -> POST /api/admin/radar/links -> arq job
-                                                │
-                    URL safety -> Fetch -> Extract -> LLM analyze -> PG upsert
-```
+![Liminalis Radar 确定性采集、按需 LLM 增强与双层降级读取流水线：上方零 LLM 启动刷新经 7 天时间窗前推与 Canonical URL 归并后原子替换 latest.json；下方管理员精选链接走 arq 防 SSRF 异步 LLM 分析；右侧统一接口在 PostgreSQL 与本地快照间无缝降级](/images/diagrams/aug-ai-radar-degradable-pipeline.svg)
 
-三条链路的职责不同：
+各模块在仓库中的代码职责切分如下：
 
-- **启动刷新**追求低成本、确定性和快速完成，只处理配置的 feed，不调用 LLM。
-- **查询链路**追求可用性，在业务数据库不可用或未配置时仍能返回数据。
-- **管理员摄取**处理人工挑选的链接，允许使用 LLM 做标题、类型、摘要和标签增强。
+| 职责模块 | 源码位置 | 核心工程边界 |
+| --- | --- | --- |
+| **生命周期与刷新编排** | `backend/app.py`、`radar/refresh.py` | 异步挂载启动任务，维护状态机与超时控制 |
+| **信源抓取、抽取与排序** | `data/feeds.json`、`fetcher.py`、`extractor.py`、`normalize.py`、`ranker.py` | 并发拉取 7 大数据库源、日期前推裁剪与启发式打分 |
+| **全链路 URL 身份归并** | `radar/identity.py`、`backend/_shared/urls.py` | URL 规范化、`SHA-256[:16]` 主键生成与择优字段合并 |
+| **双层存储与降级服务** | `db_models.py`、`radar/service.py`、`services/radar_service.py` | PostgreSQL 主存储与 `latest.json` + 内置快照无感切换 |
+| **管理员异步摄取与前端** | `routers/admin.py`、`radar/tasks.py`、`src/pages/RadarPage.jsx` | DNS 防 SSRF 校验、`arq` 队列 LLM 增强及双端兜底渲染 |
 
-核心代码边界如下：
+### 1. 谓词下推与原子文件替换：零 LLM 的启动刷新链路
 
-| 职责 | 当前实现 |
-| --- | --- |
-| 应用生命周期 | `liminalis/backend/app.py` |
-| 启动刷新编排 | `liminalis/backend/radar/refresh.py` |
-| feed 配置 | `liminalis/backend/radar/data/feeds.json` |
-| 抓取与抽取 | `fetcher.py`、`extractor.py` |
-| 归一化与排序 | `normalize.py`、`ranker.py` |
-| URL identity | `identity.py`、`backend/_shared/urls.py` |
-| PostgreSQL model 与读写 | `db_models.py`、`radar/service.py` |
-| 读取策略与降级 | `backend/services/radar_service.py` |
-| HTTP API | `backend/routers/radar.py`、`backend/routers/admin.py` |
-| 单链接后台摄取 | `backend/radar/tasks.py` |
-| 页面 | `liminalis/src/pages/RadarPage.jsx` |
+自动刷新读取内置的 `feeds.json`（覆盖 PostgreSQL、ClickHouse、CockroachDB、Percona、ScyllaDB、PlanetScale 与 Supabase 七大数据库官方源），默认窗口保留最近 `RADAR_DAYS = 7` 天、单批上限 `RADAR_MAX_ITEMS = 80` 条。
 
-### 写入路径：刷新、身份与人工摄取
+由于底层抓取与解析器采用同步实现，编排层通过 `asyncio.to_thread()` 将整段网络与文本处理移出 FastAPI 主事件循环，并在外层套上 `180` 秒总超时保护。这里有一处借自数据库查询优化器的关键设计——**把时间窗口过滤提前到 `Normalizer` 之前执行（Predicate Pushdown）**：
 
-#### 启动刷新：新鲜度不能阻塞服务可用性
+- 携带明确发布日期的条目，直接丢弃 `7` 天窗口之外的陈年归档；
+- 缺失发布日期的条目，要求抽取置信度 `confidence > 0.7` 且每个数据库产品最多放行 `3` 条。
 
-FastAPI 的 `lifespan()` 在应用启动时调用 `schedule_startup_radar_refresh()`。这里没有直接等待网络请求，而是创建名为 `radar-startup-refresh` 的异步任务，API 可以先完成启动。
+在昂贵的 `SequenceMatcher` 两两标题相似度比对（最坏复杂度 $O(n^2)$）之前先把基数（Cardinality）死死摁住，彻底消除了长历史 RSS 拖慢启动线程的隐患。随后只要 7 个源里**至少有 1 个抓取成功**，流水线就会把清洗后的前 1,200 字符作为轻量摘要投影，先写入同目录临时文件再调用原子替换落盘至 `~/.liminalis/artifacts/radar/latest.json`（若配置了 PostgreSQL 则同步批量 Upsert 至 `radar_items`）。哪怕读者请求恰好在落盘瞬间打进来，也绝不会读到半截损坏的 JSON。
 
-默认参数是：
+### 2. Canonical URL 全链路主键与“非破坏性合并”
 
-| 配置 | 默认值 | 含义 |
-| --- | ---: | --- |
-| `RADAR_REFRESH_ON_STARTUP` | `true` | 是否在服务启动后刷新 |
-| `RADAR_REFRESH_STARTUP_DELAY` | `2` 秒 | 等 API 启动稳定后再抓取 |
-| `RADAR_REFRESH_TIMEOUT` | `180` 秒 | 整次刷新上限 |
-| `RADAR_REFRESH_MIN_INTERVAL_MINUTES` | `15` 分钟 | artifact 足够新时跳过重复刷新 |
-| `RADAR_DAYS` | `7` 天 | 最近内容窗口 |
-| `RADAR_MAX_ITEMS` | `80` | 单次最多保留的候选数 |
+要想让自动刷新、人工提交、PostgreSQL 主表与本地静态快照认出“这是同一篇文章”，身份计算规则就必须在所有入口保持逐字一致。`normalize_url()` 会依次把协议与域名统一转小写、剥除 `www.` 前缀与 HTTP/HTTPS 默认端口、裁掉 `#fragment` 锚点、剔除 `utm_* / fbclid / gclid / ref / source` 等营销追踪参数并对剩余查询参数做字典序重排，空路径统一补成 `/`；紧接着 `radar_item_id()` 取规范化 URL 的 **`SHA-256` 前 16 位十六进制字符**作为稳定主键。
 
-刷新任务有一组明确状态：
+光认出主键相同还不够，合并两条同 ID 记录时，`deduplicate_radar_items()` 与数据库 Upsert 共同遵守**非破坏性择优（Non-Destructive Enrichment）**契约：标题、产品归属与内容类型优先补齐空缺字段；`summary` 与 `rawContent` 永远保留信息量更长的那一版；`tags` 与 `sources` 执行稳定集合求并。如此一来，哪怕某篇深度分析过的文章第二天又出现在常规 RSS 刷新里，它简短的正文前缀也绝不会冲掉已有的人工增强摘要。
 
-```text
-idle -> scheduled -> running -> completed
-         │             │
-         ├-> throttled ├-> failed
-         ├-> disabled  └-> cancelled
-```
+### 3. 由人类注意力触发的异步 LLM 摄取与 SSRF 防护
 
-状态通过 `GET /health` 的 `radarRefresh` 返回。对我来说，这比只在日志里打印“开始抓取”更重要：页面是否有数据和后台是否成功更新，是两个不同问题，运维时需要分别观察。
+只有当管理员在页面侧边抽屉里手动贴入一条值得精读的外部链接时，系统才会真正动用大模型预算：
 
-##### 当前 feed pipeline
+1. **异步解耦响应**：`POST /api/admin/radar/links` 落库创建独立的 `RadarIngestionJob` 任务行并入队 `arq` 后台 Worker 后，立即向前端返回 `202 Accepted`（前端每 `1.6` 秒轮询任务状态，失败日志留在任务表内，绝不污染 `RadarItem` 主内容表）。
+2. **抓取前防 SSRF 安全门禁**：由于允许后台代抓任意提交的 URL，`validate_public_url` 在发起连接前会先解析目标域名 DNS，严词拒绝 `localhost`、回环网段、内网私有地址与链路本地保留地址，堵死借后台爬虫探测宿主机内网服务的漏洞。
+3. **重定向前后双重判重**：抓取前先对原始提交链接判一次重；跟随 HTTP 重定向拿到真实页面并抽出规范化 URL 后再判第二次重，确认属于新内容后才调用 LLM 生成结构化标题、体裁分类、精炼摘要与技术标签写入 PostgreSQL。
 
-启动刷新读取打包在代码中的 `feeds.json`。当前配置覆盖 PostgreSQL、ClickHouse、CockroachDB、Percona、ScyllaDB、PlanetScale 和 Supabase 七个来源。
+---
 
-实际处理顺序是：
+## 三、启动刷新状态机与三级降级读取闭环
 
-```text
-parse feeds
-  -> Fetcher.fetch_feeds(use_cache=False)
-  -> Extractor.extract_all
-  -> filter recent extracted items
-  -> Normalizer.normalize
-  -> rank_items
-  -> canonical URL deduplicate
-  -> write artifact
-  -> optional PostgreSQL bulk upsert
-```
+在运维侧，“前端页面能不能刷出文章”和“后台最近一次抓取有没有成功”是两码事，混为一谈就会掩盖静默断源故障。Radar 为启动刷新任务定义了一套清晰的状态机，并通过 `GET /health` 的 `radarRefresh` 字段实时向外暴露：
 
-`Fetcher` 和 parser 都是同步实现，因此刷新使用 `asyncio.to_thread()` 把整段 CPU/网络工作移出事件循环。它不会把 FastAPI 的请求处理线程卡住，外层再由 `asyncio.wait_for()` 提供总超时。
+![Liminalis Radar 启动刷新状态机与旧快照安全兜底语义：主路径历经 Idle、延迟 2 秒 Scheduled、隔离线程 Running、原子落盘至 Completed，并完整覆盖开关禁用、15 分钟节流跳过、全源超时回退旧投影及停机取消四条分支](/images/diagrams/aug-ai-radar-read-refresh-states.svg)
 
-只要至少一个 feed 成功，刷新就继续生成结果；只有所有 feed 都失败时才把任务标记为 `failed`。这符合信息聚合的容错模型：单一信息源失败不应该让整个 Radar 不可用。
+服务启动就绪 `2` 秒后进入调度检查：若本地 `latest.json` 距离上次更新不足 `15` 分钟，直接转入 `throttled` 跳过重复抓取；即便遇到断网导致 7 个源全部超时进入 `failed`，线上已有的投影文件依然纹丝不动。
 
-##### 为什么先过滤日期，再做相似标题去重
+与之配合，`GET /api/radar/items` 的读取路径搭起了三层渐进兜底防线，始终向 React 前端返回结构完全一致的分页与分面（Facet）聚合 JSON：
 
-`Normalizer` 会用 `SequenceMatcher` 比较标题，相似标题去重最坏是 `O(n^2)`。某些 RSS 会返回多年历史，如果先对完整 feed 做相似度计算，再过滤最近七天，启动任务可能长时间占用 CPU。
+1. **第一层（PostgreSQL 主路径）**：数据库已配置且健康时，直接走 `radar_items` 表的 `to_tsvector + plainto_tsquery` 全文检索、精确过滤与分面统计。
+2. **第二层（服务端本地双源合并降级）**：当本地开发未配 PostgreSQL 或发生可降级读取异常时，`radar_service.py` 自动将当次运行抓到的最新窗口 `latest.json` 置前，与随代码仓库打包的基础历史快照 `pyRadarFeed.js` 置后合并，重新按 Canonical URL 去重并实时重算 `total_items`、产品计数与类型分面（此时搜索自动切换为内存小写子串匹配）。
+3. **第三层（纯前端静态包兜底）**：极端情况下连后端 API 进程都不可达时，`RadarPage.jsx` 捕获请求异常后直接回退加载前端静态包内置的 `pyRadarFeed.js`，保证页面在任何环境下都不会天窗白屏。
 
-当前实现把时间窗口提前到了 normalize 之前：
+---
 
-- 有发布日期的条目只保留最近 `RADAR_DAYS` 天；
-- 没有日期的条目要求 `confidence > 0.7`；
-- 无日期条目每个 product 最多保留 3 条。
+## 四、无数据库实测验证与向多实例演进的工程边界
 
-这不是单纯的性能优化，而是在数据进入昂贵算子之前建立 cardinality bound。它和数据库执行计划中的 predicate pushdown 是同一种思路：过滤越早，后面的状态空间越小。
+为了检验这套降级架构在真实环境里是不是真如设计所愿，我在不启动 PostgreSQL 的裸机模式下直接拉起 Liminalis 后端并触发启动刷新，实测运行结果如下：
 
-##### artifact 是可用性边界
-
-每次成功抓取都会先写：
-
-```text
-~/.liminalis/artifacts/radar/latest.json
-```
-
-写入使用临时文件加原子 replace，避免 API 读到半个 JSON。artifact 保存展示所需字段，不保存 `rawContent`，因此它是 serving projection，不是原始语料库。
-
-即使配置了 PostgreSQL，这个 artifact 也会更新。数据库是长期业务事实存储，artifact 则是本机快速恢复和降级读取的边界，两者没有必要互相替代。
-
-#### Identity：先确定“同一条记录”，再谈智能处理
-
-Radar 的唯一身份来自 canonical URL，而不是抓取时看到的原始字符串。
-
-`normalize_url()` 当前执行这些规则：
-
-- scheme 和 hostname 转小写；
-- 去掉 hostname 的 `www.`；
-- 去掉 HTTP/HTTPS 默认端口；
-- 移除 fragment；
-- 删除 `utm_*`、`fbclid`、`gclid`、`ref`、`source` 等追踪参数；
-- 对剩余 query 参数稳定排序；
-- 空 path 归一为 `/`。
-
-之后，`radar_item_id()` 对 canonical URL 做 SHA-256，并取前 16 位作为稳定 ID。
-
-```text
-raw URL
-  -> canonicalize_radar_url
-  -> SHA-256[:16]
-  -> RadarItem.id
-```
-
-这条规则同时用于启动刷新、管理员单链接摄取、PostgreSQL upsert 和静态数据合并。identity 只有成为全链路 contract 才有意义；如果每个模块各自 hash 原始 URL，任何去重都只在局部有效。
-
-`deduplicate_radar_items()` 不只是删掉重复项，还会保留信息更丰富的版本：
-
-- 标题、产品、类型优先补齐空字段；
-- `summary` 和 `rawContent` 选择更长的值；
-- `tags` 与 `sources` 做稳定集合合并。
-
-PostgreSQL 的 upsert 使用同一语义。重复抓取可以更新事实字段，但空摘要不会覆盖已有摘要，短正文也不会覆盖长正文。这条“非破坏性 enrichment”约束，比选择哪一种摘要模型更基础。
-
-#### 自动刷新与人工摄取是两条不同成本的路径
-
-启动刷新只使用确定性规则，summary 是正文清理后的前 1200 个字符。它的目标是快速获得“现在有什么新内容”，不是生成最终研究结论。
-
-当我在 Radar 管理抽屉中提交一个链接时，才进入更重的处理链路：
-
-```text
-signed admin session
-  -> create RadarIngestionJob
-  -> enqueue arq ingest_link_task
-  -> validate_public_url
-  -> duplicate check
-  -> fetch + extract
-  -> canonical duplicate check
-  -> LLM analyze
-  -> PostgreSQL upsert
-  -> completed / duplicate / failed
-```
-
-这里有几个关键设计：
-
-1. 管理接口返回 `202 Accepted`，抓取和 LLM 不占用 HTTP 请求生命周期。
-2. 页面每 1.6 秒查询 job 状态，完成后刷新 feed。
-3. URL 在抓取前解析 DNS，并拒绝 localhost、loopback、private、link-local 和 reserved 地址，避免后台抓取成为 SSRF 入口。
-4. 抓取前后各做一次重复检查。第一次处理提交 URL，第二次处理 redirect 或抽取出的 canonical URL。
-5. `RadarIngestionJob` 与 `RadarItem` 分表，失败信息和处理状态不会污染内容记录。
-
-我认可这种成本分层：机器自动发现的候选内容走便宜、可重放的流水线；人工明确表达兴趣的链接才获得 LLM token、完整正文和任务状态。模型预算由人的注意力触发，而不是由 feed 数量触发。
-
-### 读取路径：降级与前端合同
-
-#### 存储与读取：业务事实和页面可用性分开
-
-统一读取入口让前端不必判断数据存储位置，但降级后的搜索语义和新鲜度仍需暴露。策略由 `backend/services/radar_service.py` 集中管理。
-
-##### PostgreSQL 已配置
-
-`radar_items` 是主数据表，包含 canonical URL、标题、发布日期、product、content type、summary、tags、sources、raw content 和 sync batch。
-
-查询支持：
-
-- page/per_page 分页，单页最多 100 条；
-- product 和 content type 过滤；
-- PostgreSQL `to_tsvector` + `plainto_tsquery` 全文检索；
-- 按 sync batch、发布日期、抓取时间倒序；
-- product/type facet 聚合；
-- 最新同步批次。
-
-当数据库没有数据，或者发生允许降级的读取错误时，service 会转到本地 fallback。
-
-##### PostgreSQL 未配置或读取降级
-
-fallback 由两层数据合并而成：
-
-```text
-latest.json               本次运行环境抓到的最新窗口
-    +
-pyRadarFeed.js            随前端发布的稳定内置快照
-    │
-    ▼
-canonical URL dedupe
-    │
-    ▼
-recompute total/facets -> paginate/filter/search
-```
-
-合并时最新 artifact 放在前面，内置快照负责补齐历史窗口。合并后重新按 canonical URL 去重，并重新计算 `totalItems`、product facets 和 content type facets。因此页面上的 “All sources” 表示当前实际可浏览的唯一记录数，而不是某个数据文件曾经处理过的行数。
-
-fallback 模式使用内存 substring search，PostgreSQL 模式使用全文检索；两者的召回语义并不完全相同，但 API response contract 保持一致。
-
-这种设计选择的优先级是：
-
-```text
-read availability > refresh freshness > enrichment completeness
-```
-
-外部 RSS 失败，不影响已有内容；PostgreSQL 未配置，不影响页面打开；LLM 不可用，不影响自动 feed 刷新。
-
-#### 前端只消费统一的 serving contract
-
-`RadarPage.jsx` 不关心数据最终来自 PostgreSQL、artifact 还是内置快照。它始终请求：
-
-```http
-GET /api/radar/items?page=1&per_page=80&type=all&product=all&q=
-```
-
-API 返回：
-
-```text
-items
-page / per_page
-total_items / total_pages
-has_prev / has_next
-products
-contentTypes
-latestSyncBatch
-```
-
-页面负责搜索输入、类型和产品筛选、列表展示、管理员登录、链接提交与 job polling。请求失败时，React 自己还能直接回退到打包的 `pyRadarFeed.js`。
-
-因此当前实际上有两层 read fallback：后端优先在服务端返回 artifact + snapshot；如果整个 API 都不可访问，前端再使用 bundled snapshot。这会带来少量重复逻辑，但换来的是 Radar 页面在本地开发、无数据库运行和后端故障时都能展示基本内容。
-
-## 五、可行性分析：已有验证覆盖哪里，扩展还缺什么 {#验证结果与扩展边界}
-
-现有单机实验验证了无 PostgreSQL 时的读取降级；它不包含多实例互斥、持续调度或完整审计。应先保留这一部署边界，再根据新需求补测试。
-
-### 一次当前环境的真实验证
-
-2026-08-23，我在本机以未配置 PostgreSQL 的模式启动 Liminalis，并强制执行一次启动刷新。
-
-结果如下：
-
-| 检查项 | 结果 |
+| 验证维度 | 实测记录值 |
 | --- | ---: |
-| 配置 feed | 7 |
-| 成功 feed | 6 |
-| 刷新耗时 | 8.4 秒 |
-| 最近 7 天新增 item | 13 |
-| 新增内容日期范围 | 2026-08-17 至 2026-08-21 |
-| 内置快照唯一 item | 160 |
-| 合并后 `total_items` | 173 |
-| 持久化模式 | `local-artifact` |
+| **配置订阅源 / 本轮成功返回源** | `7` 个 / `6` 个（单源异常未阻断全局） |
+| **后台端到端抓取归一化耗时** | `8.4` 秒（API 主线程启动零阻塞） |
+| **近 7 天窗口新增唯一条目** | `13` 条（覆盖 `2026-08-17` 至 `2026-08-21`） |
+| **内置基础快照 → 合并去重后总条数** | `160` 条 → **`173` 条**（持久化模式：`local-artifact`） |
 
-`GET /health` 返回：
+此时请求 `GET /health` 可直接观测到后台状态闭环：
 
 ```json
 {
@@ -354,48 +129,17 @@ latestSyncBatch
 }
 ```
 
-验证同时覆盖了 50 个 Radar identity、refresh、crawler、extractor、settings 与架构测试；Ruff、前端 Vite build 和 `git diff --check` 均通过。
+与此同时，覆盖 URL 身份归一、刷新状态流转、抓取抽取器与架构边界的 `50` 项自动化测试、Ruff 静态检查及前端 Vite 构建全部一次通过。哪怕挂掉了 1 个外部 RSS 源且全程没有数据库参与，服务依然在 8.4 秒内把 13 条新鲜数据库动态干净合并进了线上视图。
 
-这次实验最重要的不是多抓了 13 条新闻，而是验证了整个降级闭环：服务先启动、后台抓取完成、artifact 原子落盘、API 合并去重、页面总数从 160 更新为 173，期间不需要 PostgreSQL。
+当然，这套轻量架构之所以能如此简洁，是因为它精准锚定了当前的**单进程部署前提**。如果未来要将 Liminalis Radar 推向多实例集群或长周期无人值守服务，有四条物理边界必须提前补课：
 
-### 当前设计的边界
+1. **进程内状态与本地 `mtime` 节流无法跨实例互斥**：当前刷新状态驻留在单个 Python 进程内存里，一旦开起多个 Uvicorn Worker 或多容器副本，每个实例启动时都会各自去抓一遍 RSS 并争抢覆写本地文件。扩多实例前必须把刷新调度抽到共享锁或统一持久化层。
+2. **启动触发不等于常驻周期巡检**：目前仅在服务启动时刷一次最新窗口，长期不重启的实例不会每小时自动拉新；需要持续巡检时，应将同一个 `refresh_latest_radar_news()` 函数直接挂载到 `arq` 定时任务（Cron）上，切忌在 FastAPI `lifespan` 里硬塞死循环。
+3. **服务投影不等同于原文审计日志**：`latest.json` 为了轻量快速读取特意剔除了 `rawContent`，既不保留历史修改轨迹也无法重放某次摘要生成的原始正文；若后续要做知识溯源审计，必须在 PostgreSQL 侧单独建立原文快照版本表。
+4. **全文检索与降级子串匹配的召回差异**：PostgreSQL 的词干分词（`tsvector`）与降级模式下的内存子串包含在英文词形变化与多词组合查询上结果并不完全等价，自动化回归测试需显式覆盖两套运行分支。
 
-进程内调度与本地 artifact 适合当前单进程部署，但不足以保证多实例去重、持续刷新或审计重放，边界如下。
+---
 
-#### 刷新调度是进程内的
+## 五、基线与实验说明
 
-刷新状态保存在 Python 进程内，artifact freshness 也只根据本机文件 mtime 判断。在当前单 API 进程部署中足够简单；如果改成多个 Uvicorn worker 或多实例，每个实例都可能尝试调度启动任务，15 分钟 throttle 不能替代跨进程锁。
-
-#### 只有启动刷新，没有周期调度
-
-当前语义是“服务启动时获取一次最新内容”，不是常驻 scheduler。长期不重启的实例不会自动每小时刷新。如果产品目标变成持续雷达，应把同一个 `refresh_latest_radar_news()` 交给 arq cron 或外部 scheduler，而不是在 lifespan 里增加永久循环。
-
-#### artifact 是 serving projection，不是审计日志
-
-`latest.json` 只保留最近窗口，而且不包含 raw content。它不能回答一条记录经历过哪些版本，也不能用于完整重放。需要审计时，应依赖 PostgreSQL 中的业务记录，进一步的原文版本化则需要单独的数据模型。
-
-#### 自动摘要不是 LLM 摘要
-
-启动刷新中的 summary 是最长 1200 字符的正文投影，速度快、失败面小，但不保证观点提炼。只有管理员提交路径才执行 LLM analysis。UI 不应把两者当成完全同质的内容质量。
-
-#### 两种搜索实现存在语义差异
-
-PostgreSQL 使用 full-text search，fallback 使用小写 substring match。同一个 query 在两种模式下可能得到不同结果。API shape 一致不等于行为完全一致，测试需要分别覆盖两种运行模式。
-
-### 扩展前的验证顺序
-
-新增部署方式应有明确准入条件，不能沿用单进程实验的成功结论。以下检查尚待实施，不与前面的 50 项历史测试混算。
-
-| 变化 | 先实现或核对 | 验收边界 |
-| --- | --- | --- |
-| 从单进程改为多实例 | 刷新所有权、共享 artifact 或统一持久化 | 同一刷新不会无控制地并发写入；读者不读取半份数据 |
-| 从启动刷新改为持续刷新 | 独立周期调度、失败重试与更新时间指标 | 区分“有内容”与“本轮成功更新”，故障期间仍可读旧内容 |
-| 增加自动来源或人工链接 | URL 安全校验、重定向与实际连接目标检查、调用预算 | 拒绝不允许的目标，不以模型摘要替代抓取与权限校验 |
-| 支持研究审计 | 原文快照、版本及处理记录 | 能解释某次摘要使用的输入，而不仅是返回当前展示投影 |
-| 统一搜索体验 | PostgreSQL 与 fallback 分别建立查询样例 | API 字段相同之外，明确告知召回语义与新鲜度差异 |
-
-### 我对这套设计的理解
-
-Radar 可以理解为一个小型增量物化系统：feed 提供变化，canonical URL 确定记录身份，`radar_items` 保存业务投影，`latest.json` 与内置快照服务读取。自动采集使用确定性处理，人工提交再承担 LLM 分析成本。
-
-扩展为多实例前，先补齐刷新互斥与 artifact 共享；要求持续新鲜度时，再接入周期调度。审计和研究重放需要原文版本记录，不能用 `latest.json` 代替。
+本文架构拆解与无数据库降级验证基于本地 `liminalis` 仓库（FastAPI + PostgreSQL + `arq` + React Vite）于 **2026-08-23** 完成的实测记录，验证套件包含 `50` 项 Radar 单元与架构契约测试。

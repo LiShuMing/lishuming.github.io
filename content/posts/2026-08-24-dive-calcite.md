@@ -1,7 +1,7 @@
 ---
 title: "【源码】深入 Calcite 优化器：Hep、Volcano、谓词推导与 Join Reorder"
 date: 2026-08-24T00:00:00+08:00
-lastmod: 2026-10-28T00:00:00+08:00
+lastmod: 2026-11-12T00:00:00+08:00
 slug: "dive-calcite-optimizer"
 categories:
   - 数据库
@@ -12,188 +12,66 @@ tags:
   - Join Reorder
   - StarRocks
   - Apache Doris
-description: "结合 Apache Calcite、StarRocks 与 Apache Doris 源码，分析 Hep、Volcano、Memo、Null-Rejecting 谓词推导、Outer Join Reorder、物理计划后处理、运行时统计与 Dynamic Filter 的实现边界。"
+description: "从启发式原地重写与等价类代价搜索的根本张力出发，结合 Apache Calcite、StarRocks 与 Apache Doris 源码剖析 Hep/Volcano 双引擎架构、Null-Rejecting 推导、Outer Join 重排以及优化器与执行器的真实职责边界。"
 draft: false
+toc: true
+math: true
 ---
 
 > 本系列第 1/4 篇 · 优化器 / Cascades · [下一篇]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}})
 
-Apache Calcite 经常被称为“通用 SQL 优化器”，但这个称呼容易造成两个误解：第一，Calcite 不是把 SQL 输入后直接输出分布式执行计划的完整数据库内核；第二，接入 Calcite 也不意味着自动获得成熟的 Join Reorder、Runtime Filter 和自适应执行能力。
+初学查询优化器的工程师在设计第一版内核时，几乎都会撞上一道非此即彼的两难选择题：
 
-更准确地说，Calcite 提供了一套可嵌入的关系代数（Relational Algebra）、元数据、Trait、规则匹配与代价搜索框架。Flink、Hive、Druid 等系统可以在这套框架上定义自己的关系节点、物理 Convention、Metadata 和 Rule，再把优化结果翻译成各自的执行计划。它的抽象层次较多，学习曲线确实高，但这些抽象主要服务于“让不同引擎复用框架，同时保留自己的语义和物理实现”。
+- **如果只写一个原地替换树的规则引擎（每匹配一条规则就把旧子树覆盖成新子树）会怎样？** 面对子查询解关联、常量折叠、谓词下推这类“做了大概率稳赚不赔”的化简，它跑得飞快；可一旦遇到多表连接顺序（Join Order）或分布式数据洗牌（Shuffle vs Broadcast），把 `A ⋈ B` 原地改成 `B ⋈ A` 就会把旧树彻底抹掉——万一上层紧跟着 `GROUP BY A.k`，刚才被抹掉的旧树恰好能省掉一次全网重洗牌呢？
+- **那干脆反过来，把刚解析完的原始 SQL 关系代数树直接扔进保留所有历史候选的等价类图（Memo）里全量穷举，行不行？** 灾难来得更快！假设 SQL 写了 `a LEFT JOIN b ON a.id = b.id WHERE b.score > 10`，如果不在进搜索空间前先利用 `b.score > 10` 把 `LEFT JOIN` 化简成 `INNER JOIN`，连接交换律与结合律根本推不动；而如果把几十条表达式归一化、投影裁剪与连接重排规则一锅粥全塞进 Memo，等价类数量会在几毫秒内指数级爆炸。
 
-本文不做 Calcite API 罗列，而是从五个实际问题切入，并使用 StarRocks、Apache Doris 的自研优化器作为对照：
+正是这道绕不开的物理张力，塑造了现代生产级查询优化器几乎一致的骨架：**先用可编排的启发式重写（RBO）做原地规范化、打薄输入树并解锁代数对称性，再送进按“语义等价类 + 物理属性（Trait）”分桶的动态规划空间（CBO）比拼全局代价，最后在选定的唯一物理树上做局部执行适配。**
 
-1. Null-Rejecting 条件如何推导出 `IS NOT NULL`，并把 Outer Join 转换为 Inner Join？
-2. Left Outer Join 为什么不能随意换序，Calcite 如何枚举合法 Join Order？
-3. Hep 与 Volcano 分别解决什么问题，为什么成熟优化器通常同时需要 RBO 与 CBO？
-4. CBO 选出物理计划后，为什么还要再做一轮物理计划优化？
-5. 运行时统计与 Dynamic Filter 属于优化器还是执行器，Calcite 的能力边界在哪里？
+作为大数据生态中最具代表性的可嵌入优化器框架，Apache Calcite（支撑着 Flink、Hive、Druid 等众多系统）把这套骨架抽象成了双引擎——[`HepPlanner`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepPlanner.java) 与 [`VolcanoPlanner`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java)。然而围绕 Calcite 常有两个截然相反的误解：有人以为“接上 Calcite 就白得了一整套成熟的分布式 CBO 与 Runtime Filter”；也有人嫌它的 `RelTraitSet`、`RelMetadataQuery` 层层套娃过于繁琐。
 
-## 框架分工与源码基线
+要看清哪些复杂度是“通用框架为适配多引擎必须付的税”，哪些又是“任何严肃优化器都逃不掉的硬骨头”，最好的办法就是把 **Apache Calcite** 与两套垂直整合的自研 MPP 优化器——**StarRocks Optimizer** 和 **Apache Doris Nereids**——摆在同一个解剖台上，顺着一条查询从逻辑化简、外连接重排到运行时反馈的真实闯关路径逐层比对。
 
-### 源码版本与宿主引擎边界
+---
 
-| 项目 | 源码快照 | 日期 | 重点范围 |
-|------|----------|------|----------|
-| Apache Calcite | [e8e0dd5](https://github.com/apache/calcite/tree/e8e0dd54145c44f61b73acad1ffb96c14bddff78) | 2026-05-04 | Hep、Volcano、Predicate Metadata、MultiJoin、HyperGraph/DPHyp |
-| StarRocks | [0fd27fd](https://github.com/StarRocks/starrocks/tree/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1) | 2026-03-30 | QueryOptimizer、Join Predicate Pushdown、Outer Join Reorder、Physical Rewrite |
-| Apache Doris | [5202d06](https://github.com/apache/doris/tree/5202d06dd8feb3390ff32839227eeee89c345b57) | 2026-08-21 | Nereids、Null 推导、DPHyp、HBO、Runtime Filter Post Process |
+## 一、双引擎骨架：Hep 原地归约、Volcano 等价账本与 Metadata 总线
 
-三个项目都在快速演进。本文结论以这些源码快照为准，尤其 Calcite 的 HyperGraph/DPHyp 仍标记为 Experimental，不应外推为所有 Calcite 应用的默认执行路径。
+在 Calcite 里，一条 SQL 经历 `SqlNode`（语法解析）和 `Validator`（名称绑定与类型校验）后，落地为关系算子树 `RelNode` 与标量表达式 `RexNode`。为了不把具体的存储引擎或算子实现写死在框架里，Calcite 把优化所需的全部要素拆成了四组正交抽象：
 
-本文使用的 Calcite 提交位于 1.41.0 之后、1.42.0 正式发布之前。Apache Calcite [1.42.0 发布记录](https://calcite.apache.org/docs/history.html#1420--2026-05-31) 显示该稳定版发布于 2026-05-31，因此本文应被理解为对一个确定 Git Snapshot 的源码分析，而不是“1.42.0 所有发行包都具有完全相同默认行为”的产品说明。Rule 是否注册、Program 如何编排以及 Adapter 覆盖了哪些 Metadata，仍由具体集成系统决定。
+| 核心抽象 | Calcite 载体 | 承载的工程契约 |
+| --- | --- | --- |
+| **关系结构** | `RelNode` | 描述 `TableScan`、`Filter`、`Project`、`Join`、`Aggregate` 等代数拓扑 |
+| **标量与三值逻辑** | `RexNode` | 表达列引用（`RexInputRef`）、常量、函数调用及包含 `UNKNOWN` 的 SQL 三值逻辑 |
+| **物理属性契约** | `RelTraitSet` | 刻画执行引擎方言（`Convention`）、数据分布（`Distribution`）与排序方向（`Collation`） |
+| **事实与统计总线** | `RelMetadataQuery` | 按需推导行数、选择率、唯一键、上提谓词（Pulled-up Predicates）与累积代价 |
 
-2026-10 在更新快照上复核了本文引用的类：Calcite [`68f1613`](https://github.com/apache/calcite/tree/68f16139b5ca26a1519eae071ab217de3ae8c9df)（2026-10-28，`calcite.version=1.43.0` 开发线，尚未发布）、StarRocks `f977b53`（2026-09-23）、Doris `7ac0eb2f`（2026-10-04）。主体结论未变：三套系统在 Null-Rejecting、Outer Join 重排和运行期旁路反馈上的分工与正文一致。变化主要落在四处：Calcite 修掉了 Row 级 `IS DISTINCT FROM` 的翻译错误并新增 Row Type 校验，StarRocks 的物理后处理序列增加两条规则，Doris 把“替换为 NULL”的判据按谓词与聚合参数拆开，Doris 的 RF 剪枝开始保留可裁剪分区/分桶的过滤器。逐项记录见下文。
+有了这四块积木，`HepPlanner` 与 `VolcanoPlanner` 的协同分工就水落石出了：
 
-#### 2026-10 复核记录
+![Calcite Hep 确定性重写与 Volcano/Memo 等价空间搜索协同](/images/diagrams/aug-opt-calcite-hep-vs-volcano.svg)
 
-复核方式是对每组快照做文件级 diff：Calcite 取 `e8e0dd5..68f1613`，StarRocks 取 `0fd27fd..f977b53`，Doris 取 `5202d06d..7ac0eb2f`。下面只列与本文论证相关的类，不包含各项目的 Adapter 模块与 BE（Backend）代码。
+*图 1：Calcite 双引擎流水线——先由 `HepPlanner` 在单根可变 DAG 上按确定次序完成解关联、谓词下推与外连接化简，再交由 `VolcanoPlanner` 在 `RelSet / RelSubset` 两层账本中结合 `RelMetadataQuery` 搜索全局最低成本物理树。*
 
-**已核实未变**
+### 1. `HepPlanner`：把控执行次序的原地手术刀
 
-- `RelSubset`、`HepProgram`、`HepProgramBuilder`、`RelMetadataQuery` 没有改动，本文对等价类、Program 指令和 Metadata 调用的描述仍然成立。
-- `FilterJoinRule`、`JoinPushTransitivePredicatesRule`、`JoinToMultiJoinRule` 未改；`JoinDeriveIsNotNullFilterRule` 的 operand 仍只匹配 `JoinRelType.INNER`，Semi/Anti 的不对称结论成立。
-- `RelMdPredicates` 的 SEMI / INNER / LEFT / ANTI 分支未改：SEMI 仍上提左侧谓词与推导谓词，ANTI 仍只保留左侧谓词。
-- `JoinToHyperGraphRule` 仍用 `long` Bitmap 且显式拒绝超过 64 个输入；`ConflictDetectionHelper` 仍是 CD-C；`DphypJoinReorderRule` 仍以 `bloat=127`（按 `2^7-1` 设定）限制 DP Table，并仍标注 `@Experimental`。
-- `Programs.standard()` 的阶段序列未变，仍是 SubQuery → Decorrelate → Measure → TrimFields → `findBestExp()` → 第二次 `calc()`；`heuristicJoinOrder()` 的多阶段用法也未变。
-- StarRocks 的 `JoinPredicatePushdown`、`JoinReorderProperty` 未改，`memoOptimize()` 的 Join 数量阈值与策略选择未改。
-- Doris 的 `InferFilterNotNull`、`InferJoinNotNull`、`EliminateOuterJoin` 未改；Nereids 主链路（Analyze → RBO Rewrite → Pre-MV Rewrite → Memo → chooseBestPlan → PlanPostProcessors → PhysicalPlanTranslator）未改。
+[`HepPlanner`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepPlanner.java) 把当前计划维护为一棵单根有向无环图（DAG，利用表达式 Digest 合并公共子结构），严格遵照 [`HepProgramBuilder`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepProgramBuilder.java) 编排的指令剧本推进：你可以精确指定先按 `Depth-First` 还是 `Bottom-Up` 跑哪一组规则、最多匹配多少轮，或者一直迭代到不再产生新变化的不动点（Fixpoint；新近主干还将图顶点存活校验前置到遍历循环并增加了 `matches()` 快速预检以削减空转开销）。
 
-**变化（影响正文表述）**
+为什么规则的**先后次序**如此重要？拿外连接与连接重排举例：如果先做连接重排，树里躺着一堆 `LEFT JOIN`，重排规则束手无策；唯有先跑常量折叠与谓词推导，识别出拒绝空值的过滤条件，接着把 `LEFT JOIN` 降级为 `INNER JOIN`，最后再交给重排阶段，搜索空间才能彻底打开。`HepPlanner` 每次命中规则都会原地替换节点、不留历史包袱，恰好以极低内存开销胜任这类确定性前置归约。
 
-- Calcite `HepPlanner`：`applyRule()` 内的图成员检查被移到 `depthFirstApply()` 与 fixpoint 循环的顶点迭代处，并对 operand 先做一次 `matches()` 预检；空 Rule 集直接返回。这是性能与健壮性重构，规则语义未变。
-- Calcite `VolcanoPlanner`：新增 `EmptyRowTypePolicy`，从 `Context` 读取；取值为 `FORBIDDEN` 时注册零字段 RelNode 会抛 `IllegalArgumentException`，默认值为 `DISCOURAGED`。这是新增输入校验，不影响等价类与 Trait 的搜索模型。
-- Calcite `RelOptUtil.isDistinctFrom()`：旧快照对多字段 Row 无论 `neg` 取值都用 `AND` 组合各字段，等于把 `IS DISTINCT FROM` 写成“所有字段都不同”；新实现改为 `neg ? AND : OR`，并递归处理嵌套 struct，同时修正了 `neg` 的 javadoc（`true` 才是 IS NOT DISTINCT FROM）。
-- Calcite `RelMdPredicates`：RIGHT 分支的推导谓词原来全部塞进左侧列表、右侧留空，现在按 `leftInferredPredicates` / `rightInferredPredicates` 分别归类。此前 RIGHT Join 的右侧推导谓词会在 Metadata 中错位。
-- Calcite `Strong` 新增 `SqlKind.COLON` 为 `Policy.ANY`；`Programs` 的 `RULE_SET` 新增 `ENUMERABLE_IE_JOIN_RULE`，`subQuery()` 新增 `TABLE_FUNCTION_SCAN_SCALAR_QUERY_TO_CORRELATE`。都不影响本文结论。
-- StarRocks `physicalRuleRewrite()`：新增 `PushDownNonGroupedAggregateBelowUnion` 与 `WidenProjectionNullableRule`；后者必须在 `GlobalLateMaterializationRewriter` 之前运行，因为 FETCH 直接从存储写目标 Slot，Projection 的输出可空性若比输入窄，late materialization 会按错误的可空性生成引用。`dynamicRewrite()` 未变。正文的序列是摘要，不是全量规则清单。
-- StarRocks 的 TVR 改写换成 `IvmRewriter`，Join 实现规则不再走 `isMVPlanner()` 分支。
-- StarRocks `RuntimeFilterDescription` 的 TopN RF 排序读取改为固定索引 0（`exprOrder` 是 group-by 位置，不是排序列位置）；`PlanTuningAdvisor` 只新增了 guide 生成计数指标。
-- Doris `ExpressionUtils`：`isNullRejecting()` 改为带判据参数的 `matchesWhenSlotIsNull()`。Filter 场景默认仍用“求值为 NULL 或 FALSE”，但新增的 `inferNotNullForNullIgnoringAggregate()` 只接受 NULL，因为 FALSE 是合法的聚合参数，不能按过滤谓词处理。
-- Doris `RuntimeFilterPruner`：行级过滤无效时不再删除该 Join 的全部 RF，而是保留 `canPruneScanRanges()` 为真的分区/分桶过滤；类注释新增第 5 条判据（RF 能否淘汰整个扫描范围）。
-- Doris `PlanPostProcessors`：在 `PrunePartitionPredicate` 之后新增 `AddMonotonicFunctionPruningPredicates`，把单调函数谓词转换为可裁剪谓词。
-- Doris `OuterJoinLAsscomProject` / `OuterJoinAssocProject`：`checkCondition()` 从 Pattern 前置条件移入变换体，先经 `ProjectJoinReorderHelper.normalize()` 规范化 Project 再检查 Null-Rejecting，前置的 `isAllSlots()` 约束被移除；检查失败仍返回 `null`。可匹配的 Join 形状变多，语义约束仍在。
-- Doris `ExpressionUtils` 其他改动：`isInjectiveAgg()` 收紧为要求参数经可逆 Cast 追溯到一个 Slot，SUM/AVG 还要求结果类型转换可逆；`deapAnyMatch()` / `deapNoneMatch()` 更名为 `deep*`，并去掉重复的嵌套 `anyMatch`。
+### 2. `VolcanoPlanner`：两层等价集合与物理 Trait 竞标
 
-**未复核**
+一旦进入“局部占优不等于全局最优”的深水区，就必须轮到 [`VolcanoPlanner`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java) 登场（其底层如何传播成本与协商 Trait，我们将在[下一篇专题]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}})中深入源码拆解）。它不再覆盖旧树，而是维护两级容器（同时支持通过 `EmptyRowTypePolicy` 拦截异常零列关系节点）：
 
-- 各项目的 Adapter 集成、StarRocks BE 与 Doris BE 的执行侧实现。
-- 实际部署中 `EmptyRowTypePolicy` 是否被集成方覆盖为 `FORBIDDEN`；本文只描述 Core 代码的默认值。
+- **`RelSet`（逻辑等价组）**：凡是关系语义完全相同的表达式（如 `A ⋈ B` 与 `B ⋈ A`），统统归入同一个 `RelSet`；
+- **[`RelSubset`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/RelSubset.java)（物理属性分桶）**：在同一个 `RelSet` 内部，再按 `RelTraitSet`（例如 `[Convention=ENUMERABLE, Distribution=HASH(k)]` vs `[Convention=ENUMERABLE, Distribution=SINGLETON]`）切分成若干子集，每个 `RelSubset` 独立打擂台，只记住满足该物理契约的最低代价胜出者。
 
-### Calcite 的整体设计：先建立正确的心智模型
+这与 StarRocks 和 Doris Nereids 中的 `Memo → Group → GroupExpression + lowestCostPlans[PhysicalProperties]` 在数学上完全同构。唯一的架构分野在于统计与属性是如何喂给规则的：StarRocks 与 Doris 把统计推导器（`StatisticsCalculator`）与属性推导器直接内聚在自家算子体系里；而 Calcite 为了让 Flink、Hive 各自挂载不同的统计源，抽出了动态分派总线 [`RelMetadataQuery`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/metadata/RelMetadataQuery.java)——规则本身不存状态，每当需要知道行数、唯一键或下层谓词时，就向 `RelMetadataQuery` 发问，由底层字节码生成的 Handler 沿着 `RelNode` 树推导并缓存。这层间接性换来了无与伦比的跨引擎扩展力，代价则是阅读源码时必须同时追踪规则与 Metadata Handler 两条调用链。
 
-SQL 语义、物理要求和执行实现分别由表达式、Trait 与 Convention 承载，分层使扩展成为可能，也增加了适配与调试成本。
+---
 
-#### 从 SQL 到可执行计划
+## 二、撬开搜索空间的第一把钥匙：三值逻辑与 Null-Rejecting 推导
 
-Calcite 的典型规划链路可以抽象为：
+理解了搜索引擎，我们马上来看实战中最能拉开计划质量差距的第一关：**如何把束手束脚的 `OUTER JOIN` 安全化简为自由度极高的 `INNER JOIN`？**
 
-```text
-SQL
-  → SqlNode：解析后的 SQL AST
-  → Validator：名称解析、类型推导、语义检查
-  → RelNode + RexNode：关系代数与标量表达式
-  → HepProgram：规范化、消除、下推等确定性改写
-  → VolcanoPlanner：逻辑等价探索、Trait 转换、物理实现与 Cost 搜索
-  → Physical RelNode
-  → 第二阶段局部物理改写
-  → Adapter/Engine Translator
-  → 引擎自己的执行计划
-```
-
-这里有四组概念需要分开：
-
-| 概念 | Calcite 表示 | 解决的问题 |
-|------|--------------|------------|
-| 关系算子 | `RelNode` | Scan、Filter、Project、Join、Aggregate 等关系结构 |
-| 标量表达式 | `RexNode` | 列引用、常量、函数、谓词及三值逻辑（Three-Valued Logic） |
-| 物理要求 | `RelTraitSet` | Convention、Distribution、Collation 等输出性质 |
-| 优化依据 | `RelMetadataQuery` | RowCount、Selectivity、Cost、Predicates、Unique Keys 等元数据 |
-
-这种拆分看似繁琐，却解决了通用框架最困难的问题：同一个逻辑 Join 可以有 Enumerable、JDBC 或某个计算引擎自己的物理实现；同一种语义可以在不同 Distribution 和 Collation 下形成不同候选；统计信息也不必写死在关系节点中。
-
-#### Hep：可编排的启发式重写
-
-[`HepPlanner`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepPlanner.java) 是 `RelOptPlanner` 的启发式实现。它把计划保存成单根 DAG，通过 Digest 合并等价节点，并按 [`HepProgram`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepProgram.java) 中的指令执行规则。
-
-[`HepProgramBuilder`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepProgramBuilder.java) 可以控制：
-
-- Rule Instance、Rule Collection 或 Rule Class；
-- 多条规则组成的 Group；
-- Top-Down、Bottom-Up、Depth-First 等 Match Order；
-- 匹配次数上限或执行到 Fixpoint；
-- 子 Program、Converter Rule 和 Common Subexpression Rule；
-- 是否把相同表达式共享为 DAG。
-
-因此 Hep 的重点不是“找全局最低代价”，而是**精确控制规则何时、按什么顺序、执行多少次**。以下任务通常适合 Hep：
-
-```text
-Subquery Decorrelation
-  → 常量折叠与表达式规范化
-  → Filter/Project 合并
-  → Predicate Pushdown
-  → Outer Join Simplification
-  → 无效算子消除
-```
-
-规则顺序具有工程价值。例如先识别 Null-Rejecting Filter，再消除 Outer Join，最后做 Join Reorder，通常比把三类规则无序混在一起更容易收敛，也更容易调试。
-
-Hep 的限制同样明确：它可以不断生成“更规范”的树，却不会自动保留同一 Group 下的多个物理候选并比较完整代价。规则局部看起来更好，不代表组合后全局最优。
-
-#### Volcano：等价类、Trait 与 Cost 的统一搜索
-
-[`VolcanoPlanner`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java) 使用动态规划（Dynamic Programming）式搜索管理候选计划。它的核心不是一棵不断被覆盖的树，而是两层等价集合：
-
-```text
-RelSet
-  同一关系语义的所有表达式
-  ├── RelSubset[Convention=NONE, Distribution=ANY]
-  ├── RelSubset[Convention=ENGINE, Distribution=HASH(k)]
-  └── RelSubset[Convention=ENGINE, Distribution=SINGLE]
-           ├── Candidate A
-           ├── Candidate B
-           └── 当前最低代价表达式
-```
-
-- `RelSet` 表示逻辑等价的关系表达式；
-- [`RelSubset`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/RelSubset.java) 在等价语义上进一步限定相同 Trait；
-- Transformation Rule 生成逻辑等价表达式；
-- Implementation/Converter Rule 生成物理实现或 Trait 转换；
-- Metadata 与 `RelOptCost` 计算候选成本；
-- 子节点成本变化会向父节点传播，最终从 Root Subset 提取最便宜计划。
-
-这与 Cascades 风格 Memo 高度相似。StarRocks 和 Doris Nereids 的 `Memo → Group → GroupExpression`，都在解决相同问题：**按语义等价类共享子计划，并在需要的物理属性下记录最优实现。**
-
-Volcano 也不是“注册规则后自然得到最优计划”。最终质量仍取决于 Rule 是否生成完整候选、Trait 是否表达真实物理性质、Metadata 是否可靠，以及 Cost Model 是否反映网络、内存、并发和算子实现。
-
-#### Metadata 是规则之间的事实总线
-
-Calcite 通过 [`RelMetadataQuery`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/metadata/RelMetadataQuery.java) 查询 Row Count、Selectivity、Unique Keys、Collation、Distribution 和 Pulled-up Predicates。它把基础统计、关系推导、规则判断与 Cost Model 解耦：
-
-```text
-Table/Adapter 提供基础统计
-         ↓
-Metadata Handler 沿 RelNode 推导
-         ↓
-Rule 判断是否可变换
-         ↓
-Cost Model 比较物理实现
-```
-
-代价是调用链较隐蔽：读一条 Rule 往往看不到完整逻辑，必须继续追踪 Metadata Provider 和 Handler。对于单一数据库内核，这种间接层可能显得冗余；对于多 Adapter 框架，它是扩展性的核心。
-
-## 从 NULL 语义进入合法 Join 搜索空间
-
-### Null-Rejecting：从谓词推导到 Outer Join 消除
-
-只有上层谓词排除补 NULL 行时，外连接（Outer Join）才可能安全简化；判断依据是 SQL 三值逻辑，而不是连接键是否出现相等符号。
-
-#### SQL 三值逻辑才是变换依据
-
-WHERE 只保留 TRUE，因此拒绝 NULL 的右侧谓词会滤掉 Left Join 产生的补 NULL 行；以下例子用这个性质说明简化条件。
-
-考虑：
+看一条日常业务报表里再普通不过的查询：
 
 ```sql
 SELECT a.id, b.score
@@ -202,437 +80,126 @@ LEFT JOIN b ON a.id = b.id
 WHERE b.score > 10;
 ```
 
-Left Join 为未匹配的 `a` 行补出 `b.score = NULL`。`NULL > 10` 的结果是 `UNKNOWN`，而 `WHERE` 只保留 `TRUE`，所以这个 Left Join 可以安全收紧为 Inner Join。
+左外连接的语义是：当左表 `a` 的某行在右表 `b` 中找不到配对时，在右侧所有列补上 `NULL` 后照常输出。可紧接着上层的 `WHERE` 子句要求 `b.score > 10`——按照 SQL 三值逻辑（`TRUE` / `FALSE` / `UNKNOWN`），把补出来的 `b.score = NULL` 代入 `NULL > 10`，求值结果是 `UNKNOWN`；而 `WHERE` 过滤算子只放行严格为 `TRUE` 的行！这意味着那些辛苦补出来的 `NULL` 行在跨过 `Filter` 时全军覆没，一条也活不下来。既然如此，这层 `LEFT JOIN` 从头到尾就等价于 `INNER JOIN`！
 
-真正需要证明的是：**当某一侧相关列替换为 NULL 时，谓词是否一定不可能为 TRUE。** 这就是 Null-Rejecting 判断。
+要让优化器自动完成这次推理，核心数学命题只有一个：**当把某侧补空列集合全部代换为 `NULL` 时，目标谓词求值结果是否绝对不可能为 `TRUE`（必然落在 `{FALSE, UNKNOWN}` 中）？** 满足这一性质的谓词，就叫做 **Null-Rejecting（拒绝空值谓词）**。
 
-#### Calcite：Strong、FilterJoinRule 与 Predicate Metadata
+![Null-Rejecting 三值逻辑推导与 Outer Join 合法重排空间](/images/diagrams/aug-opt-calcite-null-join-reorder.svg)
 
-Calcite 把这条链路拆成三种能力。
+*图 2：从三值逻辑 Null-Rejecting 证明到合法重排空间的完整决策链——能拒绝补空行的外连接直接降级为内连接解锁全空间交换；必须保留补空语义的外连接则交由 CD-C 超图冲突规则约束枚举，同时严防 Anti Join 与 `<=>` 误删合法空值。*
 
-第一，[`Strong`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/Strong.java) 为不同 `SqlKind` 定义 Null 传播策略，`Strong.isNotTrue(expr, nullColumns)` 判断指定列为 NULL 时表达式是否必然为 NULL 或 FALSE。
+### 1. 三套引擎实现 Null-Rejecting 的精妙手法对比
 
-第二，[`RelOptUtil.simplifyJoin()`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/RelOptUtil.java) 检查左右 Null-Generating Side；[`FilterJoinRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/FilterJoinRule.java) 在 Smart 模式下先收紧 Join Type，再把 Filter 分类到 Join 或左右输入。
+围绕同一个数学命题，Calcite、StarRocks 与 Doris 写出了三种风格迥异的内核实现：
 
-第三，[`RelMdPredicates`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/metadata/RelMdPredicates.java) 从子节点谓词和 Join 等值关系推导两侧谓词；[`JoinPushTransitivePredicatesRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinPushTransitivePredicatesRule.java) 再把结果变成 Filter。
+- **Calcite（基于算子策略类的静态归纳）**：[`Strong.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/Strong.java) 为每种 `SqlKind` 标注了空值传播策略（例如 `Policy.ANY` 表示任一输入为空则结果必为空，如 `+`、`=`、`>`；而 `IS NULL`、`COALESCE`、`IS NOT DISTINCT FROM` 则走定制分支）。调用 `Strong.isNotTrue(expr, nullColumns)` 即可判定给定列集全为空时表达式是否必不为真。在此基础上，[`FilterJoinRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/FilterJoinRule.java)（Smart 模式配合 [`RelOptUtil.simplifyJoin()`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/RelOptUtil.java)）先一步将 `LEFT / RIGHT / FULL JOIN` 收紧降级，随后 [`RelMdPredicates`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/metadata/RelMdPredicates.java) 与 [`JoinPushTransitivePredicatesRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinPushTransitivePredicatesRule.java) 沿着连接等值条件把一侧谓词跨侧传染给另一侧（新近主干 `68f1613` 还专门修复了 `RelMdPredicates` 中 `RIGHT JOIN` 推导谓词曾错塞进左表列表的归类缺陷）。
+- **StarRocks（一站式闭环下推）**：不走独立的元数据总线，直接在重写器 [`JoinPredicatePushdown.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rewrite/JoinPredicatePushdown.java) 里一气呵成——`convertOuterToInner()` 利用 `Utils.canEliminateNull()` 将双侧均拒空的 `Full Outer` 直降 `Inner`、单侧拒空的分别收紧为 `Left` 或 `Right Outer`，紧接着调用 `rangePredicateDerive()`、`equivalenceDerive()` 与 `deriveIsNotNullPredicate()` 把派生出的非空与范围谓词存入 `OptimizerContext` 供整棵树共享。
+- **Doris Nereids（直接代换 `NULL` 字面量做常量折叠）**：[`ExpressionUtils.inferNotNullSlots()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/util/ExpressionUtils.java) 走了一条极其务实的捷径——无需为几百个内置函数单独维护 `Strong` 策略表，直接把表达式里的目标 `Slot` 替换成同类型的 `NULL Literal`，扔给现成的常量折叠器 `FoldConstantRule.evaluate()` 算一把！只要折叠结果是 `NULL` 或 `FALSE`，该列就是铁板钉钉的拒空列（为防超宽表达式组合爆炸，代码对表达式宽度、深度与槽位数设了硬上限）。随后 [`InferFilterNotNull`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/InferFilterNotNull.java)、[`InferJoinNotNull`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/InferJoinNotNull.java) 与 [`EliminateOuterJoin`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/EliminateOuterJoin.java) 在不动点循环中层层剥笋，把嵌套外连接连环降级。
 
-此外，[`JoinDeriveIsNotNullFilterRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinDeriveIsNotNullFilterRule.java) 会对 Inner Join Condition 引用的 Null-Rejecting Key 生成 `IS NOT NULL`，既缩小输入，也减少大量 NULL Key 进入 Hash Join 后造成的数据倾斜（Data Skew）。
+这里藏着两个极易翻车的语义暗礁，正好在最近的上游提交中留下了鲜活教材：
 
-```text
-Strong 判断 Null-Rejecting
-  → simplifyJoin 收紧 Join Type
-  → classifyFilters 决定合法下推方向
-  → RelMdPredicates 沿等值关系推导
-  → JoinPushTransitivePredicatesRule 创建 Filter
-```
+第一，**“过滤谓词拒空”与“聚合函数参数忽略空”绝不能共用同一个判据**。在 Doris `7ac0eb2f` 中，研发团队特意把原先统一的判据拆成了两套入口：`Filter` 谓词继续用“折叠结果为 `NULL` 或 `FALSE`”；而针对 `COUNT / SUM` 等忽略空值聚合函数推导非空输入时，新增的 `inferNotNullForNullIgnoringAggregate()` **只承认折叠结果为 `NULL`，绝不承认 `FALSE`**！为什么？因为 `FALSE` 在 `WHERE` 里确实留不下行，但 `COUNT(expr)` 里若 `expr` 求值为布尔值 `FALSE`，它是实打实要被计入总数的合法非空值，一旦当成拒空滤掉就会少算行数！
 
-#### Semi/Anti Join 为什么不能统一推导
+第二，**Semi / Anti Join 与多列空值安全比较的非对称陷阱**。在内连接 `a.k = b.k` 中，顺手给左右两边各补一个 `IS NOT NULL`（如 Calcite 的 [`JoinDeriveIsNotNullFilterRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinDeriveIsNotNullFilterRule.java)）不仅能裁剪扫描页，还能防止海量 `NULL` 键灌进同一个哈希分桶引发严重数据倾斜（Data Skew）。但到了 `LEFT ANTI JOIN`（`NOT EXISTS`），左表里 `a.k = NULL` 的行恰恰因为“跟右表谁都配不上”而成为**必须保留的合法未匹配输出**！因此 Calcite 严格限制 `JoinDeriveIsNotNullFilterRule` 只匹配 `JoinRelType.INNER`，且 `RelMdPredicates` 在 `ANTI` 分支严禁向上透传右表谓词。同样容易写错的还有复合行级空值比较——Calcite 在 `68f1613` 中刚刚修掉了 `RelOptUtil.isDistinctFrom()` 的一处陈年 Bug：旧代码展开多字段 `ROW(a, b) IS DISTINCT FROM ROW(c, d)` 时竟然无论正反都用 `AND` 拼接，导致“必须两个字段同时不同才算不同”，修正为 `neg ? AND : OR` 并递归展开嵌套 `struct` 后才恢复了正确的德摩根对偶语义。
 
-Semi 只保留存在匹配的行，Anti 保留不存在匹配的行，NULL 过滤因此不能套用同一规则。
+---
 
-| Join 类型 | 输出哪一侧 | `IS NOT NULL` 的安全边界 |
-|-----------|------------|--------------------------|
-| Inner Join | 左右匹配行 | 普通等值条件下，两侧 NULL Key 都无法匹配 |
-| Left Semi Join | 左侧匹配行 | Probe NULL 通常无匹配；Build NULL 也不贡献普通等值匹配 |
-| Left Anti Join / `NOT EXISTS` | 左侧未匹配行 | Probe NULL 可能正是未匹配结果，过滤它可能改变语义 |
-| Null-Aware Anti / `NOT IN` | 受 Build NULL 影响 | 必须保留 UNKNOWN/NULL 语义，不能按普通 Anti 处理 |
+## 三、带镣铐跳舞：Outer Join Reorder 的合法枚举算法
 
-Calcite 当前实现体现了这种不对称：
+经过上一轮化简后，如果计划里依然留着无法消除的真·外连接，优化器还能调整连接顺序吗？
 
-- `JoinDeriveIsNotNullFilterRule` 默认只匹配 Inner Join；
-- `RelMdPredicates` 对 Semi Join 可以沿两侧推导，但只 Pull Up 左侧输出语义；
-- 对 Anti Join 主要保留左侧已知谓词，并严格限制推导方向；
-- `FilterJoinRule` 明确禁止把 Anti Join 的 ON 条件随意推入左右输入。
+在内连接世界里，交换律 $A \bowtie B = B \bowtie A$ 与结合律 $(A \bowtie B) \bowtie C = A \bowtie (B \bowtie C)$ 畅通无阻；可一旦换成左外连接 $\mathbin{\text{⟕}}$，不仅交换律当场失效，连结合律与左交换结合律（Left-Asscom）都是有条件成立的。随便举个例子：
 
-因此，从 Semi/Anti Join 条件统一推导 Not Null 不是安全规则，必须同时考虑输出侧、普通 Equality 与 Null-Safe Equality，以及 `NOT EXISTS` 和 `NOT IN` 的差异。
+$$(A \mathbin{\text{⟕}}_{A.k = B.k} B) \bowtie_{B.k = C.k} C = A \bowtie (B \bowtie C)$$
 
-Null-Safe Equality 的翻译本身就容易出错。Calcite 在 2026-10 的快照里修掉了 `RelOptUtil.isDistinctFrom()` 的一个多字段错误：旧快照对多字段 Row 无论 `neg` 取何值都用 `AND` 组合各字段判定，于是 `ROW(a, b) IS DISTINCT FROM ROW(c, d)` 被译成“两个字段都不同”，而正确语义是任一字段不同即整体不同，应该用 `OR`。新实现同时让嵌套 struct 递归展开，并改正了 `neg` 的注释方向。单列测试不会暴露这类问题，只有 Row 值或 struct 比较才会触发。
+上面这步因为内连接谓词引用并拒绝了 `B.k = NULL`，外连接其实已经被吞掉了；但如果是两个左外连接串联：
 
-#### StarRocks：在 JoinPredicatePushdown 中闭环
+$$(A \mathbin{\text{⟕}}_{A.x = B.x} B) \mathbin{\text{⟕}}_{B.y = C.y} C \neq A \mathbin{\text{⟕}}_{A.x = B.x} (B \mathbin{\text{⟕}}_{B.y = C.y} C)$$
 
-StarRocks 将更多逻辑集中在 [`JoinPredicatePushdown`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rewrite/JoinPredicatePushdown.java)：
+随便给一组单行数据就能戳破不等式：令 `A` 为空集、`B = {(1, 2)}`、`C = {(2)}`——左边先做 `A ⟕ B` 得到空集，再 `⟕ C` 还是**空集**；右边先做 `B ⟕ C` 吐出 `(1, 2, 2)`，虽然在这个空 `A` 上仍为空，可一旦令 `A = {(1)}`、`B` 为空集、`C = {(NULL)}` 且外层条件含空值敏感逻辑（或普通等值下看 `B` 未匹配时右侧何时补空），当 `A = {(1)}`、`B` 为空时左边吐出 `(1, NULL, NULL)`，若把内层换成反连接或非拒空谓词，两侧行数与补空列值立刻分道扬镳！正如论文 [《On the Correct and Complete Enumeration of the Core Search Space》](https://dl.acm.org/doi/10.1145/2463676.2465314)（Moerkotte 等，SIGMOD 2013）系统证明的那样，任何代价模型都只能在**语义合法的候选子集**里挑便宜货——代价算得再准，也救不回一棵语义不等价的错树。
 
-1. `rangePredicateDerive()` 和 `equivalenceDerive()` 生成范围及等价谓词；
-2. `deriveIsNotNullPredicate()` 从等值 Join Key 构造冗余 Not-Null；
-3. Inner Join 向两侧推导，Right Semi 向左侧推导，Left Semi 向右侧推导；
-4. Not-Null 同时保存到 `OptimizerContext`，供上层 Join 使用；
-5. `convertOuterToInner()` 通过 `Utils.canEliminateNull()` 或已下推 Not-Null 收紧 Outer Join。
+在工程实现上，三套系统沿着两条技术代际给出了各自的答卷：
 
-Full Outer Join 的处理尤其清楚：
+1. **扁平化启发式与受限变换矩阵（Calcite 传统路径 & StarRocks）**：
+   - Calcite 经典的 [`JoinToMultiJoinRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinToMultiJoinRule.java) 在拍平连接树时，只拉平内连接骨干，对补空侧（Null-Generating Side）保持边界隔离并登记外连接条件，随后由 [`LoptOptimizeJoinRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/LoptOptimizeJoinRule.java) 构造启发式顺序（若发现补空表连接键唯一且无任何输出列被引用，还能顺手整表裁掉！[`Programs.heuristicJoinOrder()`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/tools/Programs.java) 在表数超阈值时就会切到这条防爆路径）。
+   - StarRocks 在 [`JoinReorderProperty.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/join/JoinReorderProperty.java) 中硬编码了一张二维连接类型能力矩阵（区分无条件支持、不支持与 `CONDITIONAL_SUPPORTED`），由于尚未在重排矩阵内嵌通用运行时拒空证明，对标记为 `CONDITIONAL_SUPPORTED` 的危险组合一律保守跳过，配合 `QueryOptimizer.memoOptimize()` 的表数分级熔断阀守住规划时延。
+2. **基于超图（HyperGraph）与 CD-C 冲突规则的 `DPHyp` 完备枚举（Calcite 实验路径 & Doris Nereids）**：
+   - 为了不靠零散规则拼凑而漏掉最优树形，Doris Nereids（[`ConflictRulesMaker.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/hypergraph/ConflictRulesMaker.java) + [`JoinOrderJob.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/JoinOrderJob.java)，大图辅以 `GraphSimplifier` 剪枝，小图与局部变换同时配备 [`OuterJoinLAsscomProject`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/exploration/join/OuterJoinLAsscomProject.java) 与 [`OuterJoinAssocProject`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/exploration/join/OuterJoinAssocProject.java)）以及 Calcite 的实验特性（[`JoinToHyperGraphRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinToHyperGraphRule.java)，用 64 位 `long` 位图表示最多 64 个关系顶点 + [`ConflictDetectionHelper`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/ConflictDetectionHelper.java) + [`DpHyp`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/DpHyp.java)，默认以 `bloat = 127` 限制 DP 表膨胀）双双落地了 **CD-C + DPHyp** 算法：把破坏结合律与交换结合律的顺序约束直接编码成超边（HyperEdge）上的前置位掩码依赖，`DpHyp` 在自底向上枚举连通子图与连通补图对（`CSG-CMP`）时，凡是不满足冲突位掩码的组合在生成前就被一刀切掉，做到既不漏掉合法核心空间、又绝不踩进非法重排雷区。
 
-```text
-左右两侧都 Null-Rejecting  → Inner Join
-只过滤左侧补 NULL 行       → Left Outer Join
-只过滤右侧补 NULL 行       → Right Outer Join
-两侧都不能证明             → Full Outer Join
-```
+---
 
-#### Doris Nereids：Slot 替换为 NULL 后常量折叠
+## 四、出了 Memo 还没完：物理计划后处理与 Calcite 的真实执行边界
 
-Doris 的 [`ExpressionUtils.inferNotNullSlots()`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/util/ExpressionUtils.java) 采用直接方法：
+当 `VolcanoPlanner.findBestExp()`（或 StarRocks `extractBestPlan`、Doris `chooseBestPlan`）从根等价组里捞出总成本最低的那棵物理算子树时，规划工作结束了吗？恰恰相反，工业界优化器在这之后全都排着一长串**物理后处理（Post-CBO Physical Rewrite）**流水线！
 
-1. 把目标 Slot 替换为对应类型的 `NULL Literal`；
-2. 调用 `FoldConstantRule.evaluate()`；
-3. 结果为 NULL 或 FALSE，则该 Slot 对当前谓词是 Null-Rejecting。
+为什么不在 Memo 里一步到位算完所有物理细节？算一笔搜索复杂度账就明白了：像 **Runtime Filter 拓扑穿线、低基数全局字典延迟解码（Decode）、全局延迟物化（Global Late Materialization，简称 GLM）、局部公共子表达式抽取以及 Fragment 管道切分**，它们要么强依赖“谁是 Build、谁是 Probe、哪里插了 Shuffle Exchange”的最终定型拓扑，要么如果在 Memo 里给成千上万个半成品候选逐一挂载，会把规划耗时直接拖垮十倍以上。
 
-代码还限制表达式宽度、深度与参与 Slot 数量，避免规划时间爆炸。[`InferFilterNotNull`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/InferFilterNotNull.java) 为 Filter 生成 Not-Null；[`InferJoinNotNull`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/InferJoinNotNull.java) 处理 Inner/Semi Join；[`EliminateOuterJoin`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/EliminateOuterJoin.java) 收紧 Outer Join。
+因此三套系统都在 CBO 出口之后设立了专门的“精装修阶段”：
 
-Outer Join 转为 Inner Join 后，Doris 还从等值条件继续生成两侧 `IS NOT NULL`，使更深层 Outer Join 能在后续 Fixpoint 中递归消除。
+- **Calcite [`Programs.standard()`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/tools/Programs.java)**：在 `findBestExp()` 之后紧跟第二轮 Hep `calc()` 通道做物理表达式合并与微调（源码称之为物理 `tweaks`）；
+- **StarRocks [`QueryOptimizer`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java)**：依次跑 `physicalRuleRewrite()`（冗余 Shuffle 裁剪、流式 `SortAgg` 标记、低基数字典插入、谓词重排、`WidenProjectionNullableRule` 对齐槽位可空性、最后运行 `GlobalLateMaterializationRewriter` 插入 `FETCH` 算子）与 `dynamicRewrite()`（倾斜洗牌消除与历史调优指南应用）；
+- **Doris [`PlanPostProcessors.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/PlanPostProcessors.java)**：在 [`NereidsPlanner`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/NereidsPlanner.java) 选出最优树后，串行完成单调函数分区裁剪推导（`AddMonotonicFunctionPruningPredicates`）、公共子表达式消除、TopN 延迟物化、Fragment 切分以及 `RuntimeFilterGenerator` 穿线与无效剪枝。
 
-这套“替换为 NULL 再折叠”的判据有适用边界。2026-10 的代码把它拆成两个入口：Filter 谓词用 `isFalseOrNull` 判据（求值为 NULL 或 FALSE 都算拒绝），聚合参数则用 `inferNotNullForNullIgnoringAggregate()`，只承认 NULL。理由是 FALSE 作为过滤谓词不保留行，但作为 `SUM`、`COUNT` 之类聚合的参数是合法值，丢掉会改变结果。引用这条链路时要把“谓词”与“参数”分开，不能把同一个判据套到两处。
+这里必须恪守一条铁律：**CBO 后处理只能做不推翻全局代价契约的局部增效手术，并且必须严守执行器的物理类型契约**（例如 StarRocks 主干特意规定 `WidenProjectionNullableRule` 必须在全局延迟物化之前跑，因为 `FETCH` 算子直接从存储层往目标 Slot 填数据，倘若上层投影把列的可空性收窄了，延迟物化就会生成可空性不匹配的非法内存引用！）。
 
-### Left Join Reorder：先证明合法，再比较代价
+顺着物理后处理再往前迈一步，就触及了很多人最关心的边界问题：**运行时统计反馈与 Dynamic Filter，到底归不归 Calcite 管？**
 
-外连接重排必须保留未匹配行与补 NULL 行的行为，因此候选生成先受语义约束，代价搜索只能在合法集合中选择。
+首先要把经常被一锅乱炖的四类“统计与动态优化”按时间轴切开：
 
-#### 为什么普通交换律不成立
+| 优化机制 | 事实产生时机 | 作用半径 | 是否重构当前查询的 Join 树？ |
+| --- | --- | --- | --- |
+| **静态统计信息（Static Stats）** | 查询规划前 | 当前查询 CBO 计价 | 是，编译期敲定物理树 |
+| **历史执行反馈（HBO / Tuning Guide）** | 上一次查询跑完后 | **后续**同骨架相似查询 | 是，纠偏下一次规划的基数或算子选型 |
+| **运行时过滤（Runtime / Dynamic Filter）** | 当前查询 Build 端跑完瞬间 | 当前查询 Probe 端未读数据 | **否**，保持原树不变，走旁路摘要裁剪 |
+| **执行中途重优化（Mid-Query Re-opt / AQE）** | 当前 Shuffle / Stage 物化边界 | 当前查询尚未启动的上游阶段 | 是，需运行期中断并迁移中间状态 |
 
-Inner Join 在满足条件时具有交换律和结合律，但 Left Join 保留左侧未匹配行并在右侧补 NULL：
-
-```text
-A LEFT JOIN B ≠ B LEFT JOIN A
-```
-
-重排是否安全还取决于 Preserved Side、Null-Generating Side、上层谓词是否拒绝 NULL、Join Condition 引用范围、Semi/Anti 投影语义，以及使用 Associativity、Left Asscom 还是 Right Asscom。
-
-```text
-语义规则生成合法候选
-        ↓
-统计与 Cost 比较候选
-        ↓
-选择最低代价 Join Tree
-```
-
-Cost 再低也不能让错误重排变得正确。
-
-#### Calcite 传统路径：MultiJoin 与 Lopt
-
-[`JoinToMultiJoinRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinToMultiJoinRule.java) 把 Join Tree 压平成 `MultiJoin`，但保留 Outer Join 语义：
-
-- Null-Generating Side 的子树不会被无条件拉平；
-- 每个输入保留 Join Type 和 Outer Join Condition；
-- Post-Join Filter、Projection Field 和字段引用计数被记录。
-
-[`LoptOptimizeJoinRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/LoptOptimizeJoinRule.java) 再根据 Metadata 构造顺序。它还能在 Null-Generating Factor 的 Join Key 唯一且没有列被投影时删除无用 Outer Join，并选择可能降低扫描成本的 Semi Join。
-
-[`Programs.heuristicJoinOrder()`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/tools/Programs.java) 展示了分阶段用法：Join 数量超过阈值后，先用 Hep 生成 MultiJoin，再移除会导致穷举爆炸的 Commute/Associate Rule，最后使用 Lopt 展开。
-
-#### Calcite 新路径：HyperGraph、Conflict Rule 与 DPHyp
-
-当前快照还包含一套 Experimental HyperGraph 路径：
-
-```text
-Join Tree
-  → JoinToHyperGraphRule
-  → HyperGraph：Node + HyperEdge + ConflictRule
-  → DphypJoinReorderRule
-  → DpHyp 枚举 CSG-CMP
-  → Metadata Cost 选出最佳 Join Tree
-```
-
-[`JoinToHyperGraphRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinToHyperGraphRule.java) 支持 INNER、LEFT、FULL、SEMI 和 ANTI，把 Join Condition 转成 HyperEdge。它用 `long` 表示节点 Bitmap，因此最多处理 64 个输入。
-
-[`ConflictDetectionHelper`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/ConflictDetectionHelper.java) 根据论文 [On the Correct and Complete Enumeration of the Core Search Space](https://dl.acm.org/doi/10.1145/2463676.2465314) 的 CD-C 算法，为不同 Join Type 编码 Associativity、Left Asscom 和 Right Asscom 约束。
-
-[`DpHyp`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/DpHyp.java) 只枚举由 HyperEdge 连接且满足冲突约束的 Connected Subgraph/Complement Pair。[`DphypJoinReorderRule`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/DphypJoinReorderRule.java) 默认用 `bloat=127` 限制 DP Table 增长。
-
-Core 中存在这些 Rule，不等于 Standard Program 会自动启用它们。应用仍要选择规则、阶段、阈值和 Cost Model。
-
-#### StarRocks：小图穷举、大图启发式
-
-StarRocks [`QueryOptimizer.memoOptimize()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java) 根据 Join 数量选择策略：
-
-- 小规模 Inner/Cross Join 向 Memo 加入 Commute、Associate、Left Asscom；
-- 超过 Exhaustive 阈值后调用 `ReorderJoinRule`，使用 Left-Deep、DP 或 Greedy；
-- 超过最大阈值时停止 Reorder，避免规划失控；
-- Outer Join Reorder 由 Session 开关和 `capableOuterReorder()` 约束。
-
-[`JoinReorderProperty`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/join/JoinReorderProperty.java) 用矩阵记录 Join Type 的结合与 Asscom 能力。源码明确指出尚无通用 Null-Rejecting Evaluation，因此标记为 `CONDITIONAL_SUPPORTED` 的组合不执行。
-
-这形成两层策略：先由 `convertOuterToInner()` 消除可收紧的 Outer Join；对剩余 Outer Join，只生成矩阵明确安全的候选。
-
-#### Doris：局部 Exploration 与 DPHyp 并存
-
-Doris Nereids 同时具备局部 Rule 和 HyperGraph：
-
-- [`OuterJoinLAsscomProject`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/exploration/join/OuterJoinLAsscomProject.java) 列出允许的 `(Bottom Join, Top Join)` 组合；
-- [`OuterJoinAssocProject`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/exploration/join/OuterJoinAssocProject.java) 在特定 Left-Left 组合上检查 Null-Rejecting；
-- [`ConflictRulesMaker`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/hypergraph/ConflictRulesMaker.java) 把不满足结合律的关系编码为 HyperEdge 依赖；
-- [`JoinOrderJob`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/JoinOrderJob.java) 使用 DPHyp；图过大时由 `GraphSimplifier` 简化。
-
-2026-10 的实现把 Null-Rejecting 检查移入变换体：规则先用 `ProjectJoinReorderHelper.normalize()` 规范化左侧的 Project，再判断条件是否成立，失败则返回 `null`。因此能进入候选的形状比本文快照更多，但语义门槛没有放松。
-
-支持 Outer Join 不代表所有形态都能任意重排，Projection、Hint、谓词范围和 Null-Rejecting 条件仍会缩小空间。
-
-## 物理计划与执行反馈的交接边界
-
-### CBO 之后为什么还需要物理计划优化
-
-部分变换依赖最终执行拓扑，无法仅靠逻辑等价类完成；但若后处理改变了分布或算子成本，也需要检查原先选择是否仍合理。
-
-#### 三类阶段不能混为一谈
-
-语义改写、全局计价与物理收尾承担不同责任；是否需要重新计价取决于变换是否改变候选间的资源关系。
-
-| 阶段 | 输入 | 典型工作 | 是否需要全局重新计价 |
-|------|------|----------|----------------------|
-| 逻辑规范化 | Logical Tree | Subquery、常量、谓词、Outer Join 消除 | 通常不需要 |
-| CBO/Memo 搜索 | 等价 Group + Trait | Join Order、Join 实现、Distribution、Aggregate Phase | 需要 |
-| 物理后处理 | 已选 Physical Tree | Runtime Filter、局部节点合并、表达式复用、Fragment 信息 | 原则上不应改变全局决策 |
-
-Hash Join 的 Build/Probe、Exchange、Distribution 和 Fragment 边界只有在最佳计划提取后才完整。Runtime Filter、Dictionary、Late Materialization 和局部 Common Subexpression 面向唯一物理树执行即可；为 Memo 中每个候选都构建它们成本过高。
-
-#### Calcite：Program Sequence 与第二次 Calc Pass
-
-[`Programs.standard()`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/tools/Programs.java) 的默认阶段是：
-
-```text
-SubQuery
-  → Decorrelate
-  → Measure Rewrite
-  → Trim Fields
-  → 主 Planner.findBestExp()
-  → 第二次 Hep Calc Pass
-```
-
-源码把最后一次 `calc(metadataProvider)` 称为物理 “tweaks”。`Programs.sequence()` 允许应用继续组合自己的 Program。稳妥原则是：CBO 后处理应保持输出 Trait 和全局结构的代价假设；如果重新选择 Join Order、Build Side 或 Distribution，就应重新进入 Cost Search。
-
-#### StarRocks：PhysicalRewrite 与 DynamicRewrite
-
-StarRocks 从 Memo 提取计划后执行 [`physicalRuleRewrite()`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java)：
-
-```text
-PreAggregate
-  → Exchange/Sort 与无效 Shuffle 裁剪
-  → Distribution/Aggregate 局部优化
-  → 低基数字典与 Decode
-  → MinMax Statistic
-  → Predicate Reorder
-  → Join Local Shuffle
-  → Index-only Predicate
-  → Data Cache
-  → Global Late Materialization
-```
-
-2026-10 快照在这个序列里增加了两条规则：`PushDownNonGroupedAggregateBelowUnion`，以及必须在 `GlobalLateMaterializationRewriter` 之前运行的 `WidenProjectionNullableRule`。后者的注释解释了顺序约束：FETCH 直接从存储写目标 Slot，如果 Projection 的输出可空性比输入窄，late materialization 会按错误的可空性生成引用。这是一个“物理后处理必须服从执行层契约”的具体例子。
-
-随后 `dynamicRewrite()` 应用 Skew Shuffle Join Elimination 和历史 Tuning Guide。源码特意在 Physical Rewrite 前记录 Cost，因为后处理后的 Statistics 不再保证与原 CBO 阶段一致。
-
-#### Doris：PlanPostProcessors
-
-Doris [`NereidsPlanner`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/NereidsPlanner.java) 的主线是：
-
-```text
-Analyze → RBO Rewrite → Pre-MV Rewrite → Optimizer/Memo
-  → chooseBestPlan → PlanPostProcessors → PhysicalPlanTranslator
-```
-
-[`PlanPostProcessors`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/PlanPostProcessors.java) 处理 Filter/Project、Partition Predicate、Shuffle Key、Common Subexpression、TopN、Fragment、Runtime Filter 和 Validator。
-
-Runtime Filter 位于 Fragment Processor 之后，因为它需要最终 Join 方向、表达式映射和 Scan Target；Pruner 还要删除收益不足或不能到达 Scan 的过滤器。
-
-### 运行时统计与 Dynamic Filter：Calcite 的边界
-
-运行时数据只有经过引擎的采集、分发与执行协议才能影响查询；Calcite 的元数据接口本身不提供这条分布式闭环。
-
-#### 先区分四种机制
-
-编译期统计、跨查询反馈和当前执行中的过滤到达时间不同，不能因为都使用“运行信息”就视为同一种自适应优化。
-
-| 机制 | 信息产生时间 | 影响范围 | 是否改变当前查询物理计划 |
-|------|--------------|----------|--------------------------|
-| Static Statistics | 规划前 | 当前查询 CBO | 是，规划期选择 |
-| History-Based Optimization | 历史执行后 | 后续同类查询 | 是，下一次规划 |
-| Runtime/Dynamic Filter | 当前 Build Side 运行后 | 当前查询尚未扫描的数据 | 通常不改 Join Tree |
-| Mid-query Re-optimization | 当前查询执行中 | 当前查询剩余 Pipeline | 是，需要状态迁移 |
-
-Runtime Filter 通常不重新选择 Join Order，而是把 Build Side 键集合摘要送到 Probe Scan。
-
-#### Calcite Core：能接入反馈，但不拥有执行闭环
-
-在本文快照的 `core/src/main/java` 中，没有统一的分布式 Runtime Filter/Dynamic Filter RelNode、Build/Merge/Wait 协议或 Mid-query Re-optimization 生命周期。这与 Calcite 定位一致：Core 不拥有 Fragment、Exchange Channel、Scan Reader 和运行状态。
-
-Calcite 提供的支点包括：
-
-- 自定义 `RelMetadataProvider` 注入外部或历史统计；
-- 通过 `Context` 向 Rule 和 Cost Model 传递信息；
-- 自定义物理 RelNode 和 Rule 承载 Dynamic Filter 描述（由集成方实现，Core 不提供）；
-- 用 `Programs.sequence()` 或重新调用 Planner 组织阶段。
-
-而 Build 键收集、IN/MinMax/Bloom 选择、分区合并、跨节点传输、Probe 等待、Scan 下推和 Profile 必须由引擎实现。
+翻遍 Calcite Core 的 `core/src/main/java`，你找不到任何一个分布式 `RuntimeFilter` 执行协议、跨节点 Bloom 合并器或者执行中途挂起流水线的状态机——这绝不是 Calcite 的缺陷，而是**可嵌入规划库与宿主执行内核的天然楚河汉界**：
 
 ![Calcite 的职责边界：规划、执行与反馈各自由谁负责](/images/calcite-feedback-boundary.svg)
 
-图中的前两段分别是宿主引擎的规划层与执行侧：统计进入 CBO，Best Plan 提取后由集成方生成 RF 描述，执行侧完成 Build、Probe Scan 下推和 Profile；第三段是下一次规划收到的历史反馈。Calcite Core 只提供接入点，图中的 RF 描述不是它的内置能力。虚线框的执行中重规划，本文在三个快照里都没有找到完整闭环；底部两张卡片列出 Calcite Core 的接入点与引擎必须实现的闭环。这张图表达职责划分，不代表任何单一引擎的实际执行顺序。
+*图 3：Calcite Core 与宿主引擎的职责切分——Calcite 提供 `RelMetadataProvider` 统计注入点、`Context` 参数通道与自定义物理 `RelNode` 表达能力；而 Build 端键值收集、跨节点合并投递、Scan 页级下推以及 Profile 历史统计回流（如 StarRocks [`PlanTuningAdvisor`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/qe/feedback/PlanTuningAdvisor.java)、Doris [`HboPlanStatisticsProvider`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/stats/HboPlanStatisticsProvider.java) + [`HboStatsCalculator`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/stats/HboStatsCalculator.java)），必须由拥有网络交换与存储扫描器的宿主引擎闭环实现。*
 
-所以准确答案是：**Calcite 可以承载 Dynamic Filter 的规划表达，但 Calcite Core 没有完整执行实现。**
+---
 
-#### StarRocks：Runtime Filter 与跨查询 Tuning Guide
+## 五、三套优化器全景对照、排障证据链与源码索引
 
-StarRocks 在物理 PlanNode 阶段创建 [`RuntimeFilterDescription`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/planner/RuntimeFilterDescription.java)，再通过 `PlanNode.pushDownRuntimeFilters()` 穿过 Project、Exchange 等节点寻找 Probe Target。BE 负责分区过滤器合并、传输和 Scan 下推。这是当前查询的信息旁路，不是重新运行 Memo。
+走完从代数接入到运行期反馈的全程，我们可以把 Apache Calcite、StarRocks Optimizer 与 Doris Nereids 的架构选型浓缩进一张全景对比表：
 
-另一条跨查询链路是 [`PlanTuningAdvisor`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/qe/feedback/PlanTuningAdvisor.java)：它缓存 Profile 分析得到的 `OperatorTuningGuides`，后续相似查询由 `ApplyTuningGuideRule` 在 Dynamic Rewrite 阶段应用。这属于 History-based Tuning，而不是 Mid-query Replan。
+| 对比维度 | Apache Calcite | StarRocks Optimizer | Doris Nereids |
+| --- | --- | --- | --- |
+| **核心架构定位** | 多数据源可嵌入代数与搜索框架 | 垂直整合 MPP 原生优化器 | 垂直整合 MPP 原生优化器 |
+| **算子与标量表示** | `RelNode` / `RexNode` | `Operator` / `ScalarOperator` | `Plan` / `Expression` |
+| **启发式重写层（RBO）** | `HepPlanner` + `HepProgram` | 树重写任务栈 + 分阶段 `RuleSet` | `Rewriter` + `RewriteJob` |
+| **代价搜索账本（CBO）** | `VolcanoPlanner`（`RelSet / RelSubset`） | `Memo`（`Group / GroupExpression`） | `Memo`（`Group / GroupExpression`） |
+| **物理属性载体** | 开放扩展 `RelTraitSet` | 固定三元组 `PhysicalPropertySet` | `PhysicalProperties` |
+| **统计与元数据传递** | 动态分派总线 `RelMetadataQuery` | 内置 `StatisticsCalculator` 与属性推导器 | 内置 `StatsCalculator` 与 `DataTrait` |
+| **Null-Rejecting 证明** | `Strong` 算子策略表 + 谓词元数据 | `Utils.canEliminateNull` + `JoinPredicatePushdown` | 槽位代换 `NULL` 后常量折叠（区分谓词与聚合参数） |
+| **Outer Join 重排** | `MultiJoin + Lopt`；实验级 CD-C `DPHyp` | 二维能力矩阵 + 按表数分级回退 | 局部探索规则 + CD-C `DPHyp` 超图枚举 |
+| **CBO 物理后处理** | `Programs.sequence` + 二阶段 `Calc` | `physicalRuleRewrite` + `dynamicRewrite` | `PlanPostProcessors` |
+| **跨查询历史反馈** | 开放 `RelMetadataProvider` 供外部注入 | `PlanTuningAdvisor` 调优指南缓存 | `HboPlanStatisticsProvider` 历史统计匹配 |
 
-#### Doris：HBO 与 Runtime Filter Post Process
+一句话总结框架与自研的取舍：**Calcite 用多层抽象税换取了跨生态多 Convention 复用的上限；StarRocks 与 Doris 则用自研建设成本换取了从优化器物理属性直通列存 `Segment` 与向量化算子的极致垂直协同。**
 
-Doris Nereids 具有 HBO 基础设施：
+在实际研发与线上慢 SQL 调优中，无论面对哪一套 CBO，最忌讳的就是“一看到烂计划就去改代价公式系数”。请务必按以下七步证据链顺藤摸瓜，并且时刻牢记两条工程底线——**“统计未知（Unknown）绝不等于零成本（Zero）”**，**“搜索超时截断（Timeout）绝不等于证明了全局最优”**：
 
-- [`HboPlanStatisticsProvider`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/stats/HboPlanStatisticsProvider.java) 保存历史 Plan Statistics；
-- [`HboStatsCalculator`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/stats/HboStatsCalculator.java) 匹配历史信息；
-- Cost Model 可参考历史 Row Count、Runtime Filter 安全性和倾斜；
-- Session Variable 分别控制信息采集、HBO 优化和宽松匹配。
+1. **看合法候选到底生成了没有？**（借助 Calcite [`RuleMatchVisualizer`](https://calcite.apache.org/javadocAggregate/org/apache/calcite/plan/visualizer/RuleMatchVisualizer.html) / `RelOptListener` 或引擎 `TRACE LOGS OPTIMIZER` 确认外连接是否成功消除、重排规则是否因表数超限被熔断）；
+2. **看目标物理属性（Trait / Property）是否可达？**（是否缺了对应的 Converter 或 Enforcer 导致整条分支无法满足根节点要求）；
+3. **抓基数估算第一次偏离数量级的算子**（从底表 `Scan` NDV 到 `Filter` 联合选择率再到 `Join` 输出行数逐层核对，检查是否因缺统计回退到了荒谬默认值）；
+4. **拆解胜出与落选候选的 Cost 分项**（究竟是内存惩罚、网络洗牌还是 CPU 权重主导了翻盘）；
+5. **检查搜索预算闸门**（DP 表 `bloat` 上限、规则匹配次数与超时阈值是否提前砍掉了好计划）；
+6. **比对出 Memo 瞬间的物理树与最终 Fragment**（确认物理后处理有没有意外破坏分布或可空性契约）；
+7. **用 Positive / Negative / Fixpoint / Property 四维单测锁死规则边界**（特别是覆盖 `b.x IS NULL`、`coalesce(b.x, 0) > 1`、`ROW(a,b) IS DISTINCT FROM ROW(c,d)` 与 `NOT IN / NOT EXISTS` 等反例数据）。
 
-这仍是历史执行反馈给下一次规划。
+最后整理三套优化器最核心的源码入口供对照精读：
 
-当前查询的 Runtime Filter 由 [`RuntimeFilterGenerator`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterGenerator.java) 在物理后处理阶段生成：
+| 核心主题 | 所属项目 | 关键源码路径 |
+| --- | --- | --- |
+| Hep 与 Volcano 双引擎核心 | Apache Calcite | [`HepPlanner.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepPlanner.java)、[`HepProgramBuilder.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepProgramBuilder.java)、[`VolcanoPlanner.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java)、[`RelSubset.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/RelSubset.java) |
+| Null-Rejecting 与谓词传递推导 | Apache Calcite | [`Strong.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/Strong.java)、[`FilterJoinRule.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/FilterJoinRule.java)、[`RelMdPredicates.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/metadata/RelMdPredicates.java) |
+| MultiJoin 启发式与超图 DPHyp 重排 | Apache Calcite | [`JoinToMultiJoinRule.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinToMultiJoinRule.java)、[`JoinToHyperGraphRule.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinToHyperGraphRule.java)、[`ConflictDetectionHelper.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/ConflictDetectionHelper.java)、[`DpHyp.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/DpHyp.java) |
+| 优化总控、外连接收紧与重排矩阵 | StarRocks | [`QueryOptimizer.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java)、[`JoinPredicatePushdown.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rewrite/JoinPredicatePushdown.java)、[`JoinReorderProperty.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/join/JoinReorderProperty.java) |
+| Nereids 空值折叠、CD-C 超图与后处理 | Apache Doris | [`NereidsPlanner.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/NereidsPlanner.java)、[`EliminateOuterJoin.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/EliminateOuterJoin.java)、[`ConflictRulesMaker.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/hypergraph/ConflictRulesMaker.java)、[`PlanPostProcessors.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/PlanPostProcessors.java) |
 
-1. Bottom-Up 遍历 Physical Join；
-2. 从 Hash Conjunct 生成允许的 IN、MinMax、Bloom；
-3. PushDown Visitor 穿过 Project/Join 解析 Scan Target；
-4. `RuntimeFilterPruner` 删除行级无效的过滤器，但保留能裁剪分区/分桶的过滤器（`canPruneScanRanges()`）；
-5. `RuntimeFilterTranslator` 绑定执行层 Fragment/Scan。
+---
 
-这清晰划分了职责：CBO 决定 Join Tree 和 Build/Probe，Post Process 构造运行时旁路，执行层负责数据结构与等待协议。
-
-## 三套优化器的横向对比
-
-框架扩展性与引擎集成度是不同维度：Calcite 可容纳多种 Convention，StarRocks 和 Doris 则能直接衔接自己的存储与执行器。
-
-| 维度 | Apache Calcite | StarRocks Optimizer | Doris Nereids |
-|------|----------------|---------------------|---------------|
-| 定位 | 可嵌入优化框架 | 一体化查询优化器（Query Optimizer） | 一体化查询优化器 |
-| 逻辑/表达式 | `RelNode` / `RexNode` | `Operator` / `ScalarOperator` | `Plan` / `Expression` |
-| 启发式改写 | Hep + Program | Tree Rewrite Task + RuleSet | Rewriter + Rewrite Job |
-| 代价搜索 | Volcano `RelSet/RelSubset` | Memo `Group/GroupExpression` | Memo `Group/GroupExpression` |
-| 物理属性 | 可扩展 `RelTraitSet` | `PhysicalPropertySet` | `PhysicalProperties` |
-| 元数据 | 可插拔 `RelMetadataQuery` | 内置 Statistics/Property Deriver | 内置 Stats/DataTrait |
-| Null-Rejecting | `Strong` + Metadata | `canEliminateNull` + Join Pushdown | Slot→NULL 后常量折叠 |
-| Outer Join Reorder | MultiJoin/Lopt；Experimental DPHyp | CD-C 矩阵 + Memo/启发式 | Outer Join Rule + DPHyp |
-| CBO 后处理 | Program Sequence | PhysicalRewrite + DynamicRewrite | PlanPostProcessors |
-| 历史反馈（History-Based Feedback） | 由应用注入 | Plan Tuning Advisor | HBO Provider/Calculator |
-| Runtime Filter | Core 无执行闭环 | FE 规划 + BE Build/Merge/Scan | Nereids Post Process + BE |
-
-### Calcite 的抽象是不是冗余
-
-对于固定执行引擎，Calcite 确实有额外成本：概念多、Metadata 调用隐蔽、通用 Rule 偏保守、版本升级会影响扩展点，而且执行能力无法仅靠 Core 获得。
-
-但这些抽象让多数据源共享 Parser、Validator 和逻辑规则，让 Adapter 定义自己的 Convention 与 Pushdown，也让 Metadata、Rule、Cost 和物理实现可以独立替换。
-
-因此更准确的评价是：**Calcite 用框架复杂度换生态复用；自研优化器用重复建设成本换垂直整合和演进控制。**
-
-### 真正决定质量的不是 Memo 类名
-
-Memo 保存候选，但候选质量还受规则覆盖、统计与搜索预算共同约束；缺失候选无法靠成本校准补回。
-
-```text
-语义覆盖：NULL、Outer/Semi/Anti、相关子查询是否正确
-搜索空间：是否生成关键 Join Order、Distribution、Aggregate Phase
-统计质量：NDV、MCV、Histogram、Correlation、历史反馈是否可靠
-代价模型：网络、并发、内存、Spill、缓存是否匹配执行器
-搜索预算：复杂查询能否在时限内保留高价值候选
-执行闭环：Runtime Filter、Profile、HBO 是否反馈到后续决策
-```
-
-Memo 只是保存和复用搜索状态的数据结构，不会自动解决这些问题。
-
-## 实现与验证：从等价性到执行收益
-
-### 如何设计和验证优化器
-
-优化器验证需要同时检查语义、候选生成、属性满足和成本比较；结果正确只证明其中一部分。
-
-#### 推荐阶段边界
-
-分阶段优化需要明确每一步保留的语义与物理属性，防止后处理悄悄推翻前一阶段的条件。
-
-```text
-Analyze / Type / Nullability
-  → Subquery 与 Apply 消除
-  → Expression Normalize / Constant Fold
-  → Predicate Infer / Pushdown
-  → Outer Join Simplification
-  → Column / Partition Prune
-  → Memo Exploration + Implementation + Enforcer + Cost
-  → Extract Best Physical Plan
-  → Runtime Filter / Fragment / Local Physical Rewrite
-  → Validate
-  → Execute / Profile / History Feedback
-```
-
-两条原则：
-
-1. **能扩大搜索空间的语义改写尽量进入 CBO 之前。** Outer→Inner 会解锁更多 Join Reorder。
-2. **CBO 后只做局部、可验证、不推翻全局代价选择的改写。** 改变 Distribution 或 Build Side 时应重新计价。
-
-#### Rule 测试不能只验证结果行
-
-规则未触发时结果仍可能正确，因此测试还需要检查计划结构、属性和反例拒绝路径。
-
-| 测试类型 | 需要验证的内容 |
-|----------|----------------|
-| Positive | 应触发的 SQL 是否生成预期结构 |
-| Negative | Outer/Anti/Null-safe 危险语义是否保持 |
-| Fixpoint | 多规则组合是否收敛、是否重复生成等价节点 |
-| Property | Row Type、Nullability、Trait、Output Slot 是否一致 |
-
-Null-Rejecting 和 Outer Join Reorder 应覆盖：
-
-```sql
-b.x > 1
-b.x IS NULL
-coalesce(b.x, 0) > 1
-a.x IS NOT DISTINCT FROM b.x
-NOT EXISTS (...)
-NOT IN (...)
-LEFT / RIGHT / FULL OUTER JOIN
-```
-
-还应使用包含 NULL、重复键和空 Build Side 的数据集验证等价性。
-
-#### CBO 调试的证据链
-
-调试应先确认合法候选存在，再检查统计、成本与搜索过程；顺序颠倒会把规则缺失误当成成本偏差。
-
-1. **候选是否存在？** Rule 未生成候选时，调 Cost 没有意义。
-2. **Trait 是否可达？** 缺少 Converter/Enforcer 时，候选无法满足 Root Property。
-3. **基数从哪里错？** 检查 Scan、Filter、Join 每层 RowCount。
-4. **Cost 哪一项主导？** CPU、Memory、Network、Spill 权重是否合理？
-5. **是否被预算截断？** Join 数、Rule 次数、DP Table、Timeout 是否提前终止？
-6. **后处理是否改坏计划？** 比较 Memo Best Plan 与最终 Fragment。
-7. **Runtime Filter 是否到达 Scan？** 生成 Filter 不等于有有效 Target，也不等于及时到达。
-
-#### Unknown 不是 Zero，超时也不是最优
-
-未知统计不等于空数据，搜索超时也不等于已证明最优；两者都会影响成本与诊断，必须在状态中显式区分。
-
-第一，Metadata Provider 返回未知值，不应被解释成零行、零成本或“没有网络”。未知意味着当前证据不足，系统应使用保守默认值、区间或置信度，并把 fallback 原因暴露出来。否则缺统计的计划反而会因为虚假的低成本获胜。
-
-第二，Volcano/Memo 保存了更大的候选空间，不等于有限时间内一定得到全局最优计划。Rule Queue、Match Limit、Join Enumeration Threshold、Planner Timeout 和 Cost Pruning 都会改变实际搜索边界。线上计划应记录：候选数、Rule 命中/产出数、被剪枝原因、Metadata fallback 次数、优化耗时，以及是否因预算提前结束。
-
-Calcite 已提供 [`RuleMatchVisualizer`](https://calcite.apache.org/javadocAggregate/org/apache/calcite/plan/visualizer/RuleMatchVisualizer.html) 和 `RelOptListener` 事件来观察 Rule Attempt、Production、Equivalence 与 Chosen Plan。对复杂 Rule 集而言，可视化“候选如何产生和消失”通常比只看最终 `EXPLAIN` 更快定位问题：最终计划差，可能是 Cost 选错，也可能是正确候选从未生成。
-
-### 采用框架前的检查
-
-采用 Calcite 前，应明确需要复用哪些 SQL 与关系代数能力，以及哪些优化必须进入执行器和存储层。多 Convention、多数据源场景可以利用其扩展边界，但 Rule 注册、Statistics、Cost Model、调试工具和执行翻译仍需长期维护。
-
-验证从语义等价与候选可达开始，再比较代价和运行收益。物理后处理若改变 Join Order 或 Distribution，需要重新检查全局成本；运行时过滤和反馈还需宿主引擎提供 Build、传输、消费与恢复协议。
-
-## 关键源码阅读索引
-
-| 主题 | 项目 | 源码入口 |
-|------|------|----------|
-| Hep Planner | Calcite | [`HepPlanner.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepPlanner.java) |
-| Hep Program | Calcite | [`HepProgramBuilder.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/hep/HepProgramBuilder.java) |
-| Volcano Planner | Calcite | [`VolcanoPlanner.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/volcano/VolcanoPlanner.java) |
-| Predicate Metadata | Calcite | [`RelMdPredicates.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/metadata/RelMdPredicates.java) |
-| Null-Rejecting | Calcite | [`Strong.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/plan/Strong.java) |
-| Outer Join Simplification | Calcite | [`FilterJoinRule.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/FilterJoinRule.java) |
-| HyperGraph Join Reorder | Calcite | [`JoinToHyperGraphRule.java`](https://github.com/apache/calcite/blob/e8e0dd54145c44f61b73acad1ffb96c14bddff78/core/src/main/java/org/apache/calcite/rel/rules/JoinToHyperGraphRule.java) |
-| CBO 与物理后处理 | StarRocks | [`QueryOptimizer.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/QueryOptimizer.java) |
-| Predicate 推导与 Join 收紧 | StarRocks | [`JoinPredicatePushdown.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rewrite/JoinPredicatePushdown.java) |
-| Outer Join Reorder 属性 | StarRocks | [`JoinReorderProperty.java`](https://github.com/StarRocks/starrocks/blob/0fd27fd409f3a1ad8a4634d30baf8f22f48254f1/fe/fe-core/src/main/java/com/starrocks/sql/optimizer/rule/join/JoinReorderProperty.java) |
-| Nereids 主流程 | Doris | [`NereidsPlanner.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/NereidsPlanner.java) |
-| Outer Join 消除 | Doris | [`EliminateOuterJoin.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/rules/rewrite/EliminateOuterJoin.java) |
-| HyperGraph 冲突规则 | Doris | [`ConflictRulesMaker.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/jobs/joinorder/hypergraph/ConflictRulesMaker.java) |
-| 物理计划后处理 | Doris | [`PlanPostProcessors.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/PlanPostProcessors.java) |
-| Runtime Filter 生成 | Doris | [`RuntimeFilterGenerator.java`](https://github.com/apache/doris/blob/5202d06dd8feb3390ff32839227eeee89c345b57/fe/fe-core/src/main/java/org/apache/doris/nereids/processor/post/RuntimeFilterGenerator.java) |
+> **源码基线说明**：本文初稿基于 `apache/calcite` 提交 `e8e0dd5`（2026-05-04，介于 1.41.0 与 [1.42.0 正式版](https://calcite.apache.org/docs/history.html#1420--2026-05-31)之间）、`StarRocks/starrocks` 提交 `0fd27fd`（2026-03-30）及 `apache/doris` 提交 `5202d06`（2026-08-21），并于 2026-10 对照上游开发线快照 Calcite `68f1613`、StarRocks `f977b53`、Doris `7ac0eb2f` 完成全量复核。两快照间核心框架分工未变；上游关键修正与演进（Calcite 修复多字段 `RelOptUtil.isDistinctFrom()` 的 `OR/AND` 组合逻辑及 `RelMdPredicates` 右外连接推导归类、新增 `EmptyRowTypePolicy`；StarRocks 在 `GlobalLateMaterializationRewriter` 前置入 `WidenProjectionNullableRule`；Doris 将 `inferNotNull` 按过滤谓词与忽略空值聚合参数分拆、放宽 `OuterJoin*Project` 规范化匹配并在 `RuntimeFilterPruner` 保留分区/分桶裁剪过滤器）均已同步融入正文。
