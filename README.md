@@ -21,11 +21,9 @@
 ## 本地预览
 
 ```bash
-hugo server -D
+hugo server --disableFastRender
 ```
 
-## 论文精读
+## 数据库经典论文精读
 
-2026-10-22 的数据库论文精读已整理为独立文章草稿、原页截图和分类索引。可用 `hugo server -D` 预览；普通构建不发布草稿。
-
-转换器、离线检查、后续批次与发布前审查见 [论文文章维护](docs/paper-import.md)。
+67 篇数据库经典文献已按演化脉络整合为 1 篇总纲索引（`content/posts/2026-10-22-database-papers-source-reading.md`）与 10 篇专题精读长文（`content/posts/2026-10-22-db-papers-*.md`），配套矢量架构与状态流转图位于 `static/images/diagrams/paper-*.svg`。

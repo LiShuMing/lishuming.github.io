@@ -108,7 +108,7 @@ WHERE b.score > 10;
 
 经过上一轮化简后，如果计划里依然留着无法消除的真·外连接，优化器还能调整连接顺序吗？
 
-在内连接世界里，交换律 $A \bowtie B = B \bowtie A$ 与结合律 $(A \bowtie B) \bowtie C = A \bowtie (B \bowtie C)$ 畅通无阻；可一旦换成左外连接 $\mathbin{\text{⟕}}$，不仅交换律当场失效，连结合律与左交换结合律（Left-Asscom）都是有条件成立的。随便举个例子：
+在内连接世界里，交换律 \(A \bowtie B = B \bowtie A\) 与结合律 \((A \bowtie B) \bowtie C = A \bowtie (B \bowtie C)\) 畅通无阻；可一旦换成左外连接 \(\mathbin{\text{⟕}}\)，不仅交换律当场失效，连结合律与左交换结合律（Left-Asscom）都是有条件成立的。随便举个例子：
 
 $$(A \mathbin{\text{⟕}}_{A.k = B.k} B) \bowtie_{B.k = C.k} C = A \bowtie (B \bowtie C)$$
 

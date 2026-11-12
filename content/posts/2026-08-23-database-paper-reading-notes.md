@@ -51,7 +51,7 @@ math: true
 
 ![现代硬件上的范围索引演进：从固定页 B+-Tree 到细粒度混合缓存](/images/diagrams/aug-dbpaper-range-index-evolution.svg)
 
-在纯内存一侧，**[ART（Adaptive Radix Tree）](https://db.in.tum.de/~leis/papers/ART.pdf)** 用按字节动态伸缩的 4/16/48/256 扇出节点取代了 B+-Tree 节点内的二分比较，配合 SIMD 把单步查找压进了极少的 CPU Cache Line；遇到长 URL 或复合字符串键导致前缀树层数过深时，**[Wormhole](https://dl.acm.org/doi/10.1145/3302424.3303955)** 又在内部节点架起哈希表锚点，把寻路复杂度从键长线性相关压回 $O(\log L)$，同时保留有序叶链表支撑范围扫描。再激进一点的**学习型索引（Learned Index，如 ALEX、PGM-Index）**干脆用分段线性函数去拟合键的累积分布（CDF），把内部导航节点压缩成几个浮点斜率参数；只是每当线上遭遇高倾斜局部集中写入（Write Skew），预留间隙（Gapped Array）被迅速填满并触发局部数组重排与模型重训时，写入尾延迟就会剧烈抖动，而且这类模型很难直接接管磁盘页的持久化与崩溃恢复。
+在纯内存一侧，**[ART（Adaptive Radix Tree）](https://db.in.tum.de/~leis/papers/ART.pdf)** 用按字节动态伸缩的 4/16/48/256 扇出节点取代了 B+-Tree 节点内的二分比较，配合 SIMD 把单步查找压进了极少的 CPU Cache Line；遇到长 URL 或复合字符串键导致前缀树层数过深时，**[Wormhole](https://dl.acm.org/doi/10.1145/3302424.3303955)** 又在内部节点架起哈希表锚点，把寻路复杂度从键长线性相关压回 \(O(\log L)\)，同时保留有序叶链表支撑范围扫描。再激进一点的**学习型索引（Learned Index，如 ALEX、PGM-Index）**干脆用分段线性函数去拟合键的累积分布（CDF），把内部导航节点压缩成几个浮点斜率参数；只是每当线上遭遇高倾斜局部集中写入（Write Skew），预留间隙（Gapped Array）被迅速填满并触发局部数组重排与模型重训时，写入尾延迟就会剧烈抖动，而且这类模型很难直接接管磁盘页的持久化与崩溃恢复。
 
 一旦数据规模越过内存容量墙（Larger-Than-Memory），传统引擎又退回了 **B+-Tree 与 LSM-Tree 的二选一困局**：B+-Tree 点查和范围扫直接，但哪怕只改页内一条 100 字节的小记录，缓存里也得占住整张 4KB 页，刷盘时还得整页写回；LSM-Tree 把随机写攒成顺序追加与后台归并（Compaction），却逃不掉跨层读放大、空间放大与周期性归并毛刺。
 
@@ -173,10 +173,10 @@ SIGMOD 2026 Industry 上的两篇重量级工业论文——AWS 的 **Aurora Pos
 
 **[FuxiShuffle（SIGMOD Companion 2026）](https://arxiv.org/pdf/2602.22580)**（[DOI](https://doi.org/10.1145/3788853.3803085)）的解法，是把 Shuffle 从一锤子买卖变成一套由 `Job Manager`、`Shuffle Service Manager`、Writer 同机合并碎片的 `Shuffle Proxy` 以及可共机（走内存）或驻留存储节点（走盘古磁盘）的 `Shuffle Agent Group` 组成的**连续自适应控制系统**：
 
-1. **受实时容量约束的内存/磁盘动态准入**：系统根据输入规模、算子类型与历史画像预测任务耗时 $\hat{t}$，只有当 $\hat{t} \le \tau_{\text{mode}}$ 时才走内存通道；而阈值 $\tau_{\text{mode}}^*$ 并非拍脑袋写死的常数，而是后台每隔约 30 秒结合各节点实时上报的空闲内存 $Z_{\text{available}}$ 动态求解的最优边界：
+1. **受实时容量约束的内存/磁盘动态准入**：系统根据输入规模、算子类型与历史画像预测任务耗时 \(\hat{t}\)，只有当 \(\hat{t} \le \tau_{\text{mode}}\) 时才走内存通道；而阈值 \(\tau_{\text{mode}}^*\) 并非拍脑袋写死的常数，而是后台每隔约 30 秒结合各节点实时上报的空闲内存 \(Z_{\text{available}}\) 动态求解的最优边界：
    $$\tau_{\text{mode}}^* = \arg\max_{\tau} y(\tau) \quad \text{s.t.} \quad z(\tau) \le Z_{\text{available}}$$
-   其中 $y(\tau)$ 为可被内存加速的数据比例，$z(\tau)$ 为单机期望内存消耗。集群闲时自动吸纳更多短平快内存 Shuffle，吃紧时配合 Yellow/Red 双水位线平滑溢写（Spill）乃至果断丢弃已有备份的低优内存块，绝不挤爆计算任务。
-2. **渐进式调度（Progressive Scheduling）与边产边读**：避开 Staged 与 Gang 的两极分化（排序等强阻塞边自动将阈值设为 1 退回 Staged，极小低并发作业直接走 Gang），`Job Manager` 在上游进度跨过动态阈值 $\lambda_S$ 时触发 `Pre-start` 拉起下游 Reader，Reader 通过 `Pre-read` 轮询消费已提交的连续聚合块；与此同时，`Shuffle Agent` 收集的分区大小与基数统计直接反哺运行期动态拆倾斜分区（Adaptive Skew Join）。
+   其中 \(y(\tau)\) 为可被内存加速的数据比例，\(z(\tau)\) 为单机期望内存消耗。集群闲时自动吸纳更多短平快内存 Shuffle，吃紧时配合 Yellow/Red 双水位线平滑溢写（Spill）乃至果断丢弃已有备份的低优内存块，绝不挤爆计算任务。
+2. **渐进式调度（Progressive Scheduling）与边产边读**：避开 Staged 与 Gang 的两极分化（排序等强阻塞边自动将阈值设为 1 退回 Staged，极小低并发作业直接走 Gang），`Job Manager` 在上游进度跨过动态阈值 \(\lambda_S\) 时触发 `Pre-start` 拉起下游 Reader，Reader 通过 `Pre-read` 轮询消费已提交的连续聚合块；与此同时，`Shuffle Agent` 收集的分区大小与基数统计直接反哺运行期动态拆倾斜分区（Adaptive Skew Join）。
 3. **按重建代价挑备份，故障恢复绝不浪费下游进度**：小而重算极便宜的数据块不备份，长耗时高代价块挂载本地或跨机 `Remote Backup`，本身就足够大的巨型块干脆走 `Backup Only` 直写双副本跳过 Agent 二次转发。更漂亮的是 **Incremental Recovery（增量恢复）**：传统引擎一旦发现某段 Shuffle 块读取失败，往往一刀切杀掉下游 Reader 重跑；FuxiShuffle 则让 Reader 继续消费手头完好的其他分片，同时重拉缺失 Writer，最后靠 `Writer Version + RetryIdx + 聚合 Checksum` 双阶段校验只补读缺口数据（一旦校验发现缺失或重复残留立即安全退回全量重算）。
 
 在 20 台 96 核计算节点 + 18 台存储节点的 1TB/10TB TPC-DS 与 TeraSort 基准对比中，FuxiShuffle 仅用单机约 3%～5% 的绑定 Agent 核心，便相对内部定制 Hadoop/Spark 基线平均压低了 **76.36% 的端到端耗时**与 **67.14% 的计算资源成本（CU Cost）**；在注入随机网络闪断时，开启容错后耗时与成本仅微增 9.6% 与 8.1%（关闭容错则耗时暴涨近三倍）。

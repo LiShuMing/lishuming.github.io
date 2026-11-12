@@ -1,7 +1,4 @@
 {{ define "extra_head" }}
-{{- if .Params.paper_reading }}
-<link rel="stylesheet" href="/assets/css/paper-reading.css">
-{{- end }}
 {{- if .Param "math" }}
   {{ partial "math.html" . }}
 {{- end }}

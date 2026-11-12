@@ -20,7 +20,7 @@ math: true
 
 > 本系列第 3/3 篇 · Join 执行 · [上一篇]({{< relref "2026-09-10-dive-hash-sort-strategy.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
 
-在内连接（`INNER JOIN`）里，运行时过滤（Runtime Filter / Dynamic Filter，下文按语境简称 RF 或 DF）的原理直观得几乎不会出错：Hash Join 在构建（Build）端扫完小表后，顺手把连接键的值域压成紧凑摘要（`IN` 列表、`Min/Max` 区间或 `Bloom Filter`），逆流投递给探测（Probe）端的底层扫描算子。只要摘要集合 $D_{\text{filter}}$ 完整覆盖真实构建键集合 $D_{\text{build}}$（满足 $D_{\text{build}} \subseteq D_{\text{filter}}$，允许假阳性、绝无假阴性），被提前丢弃的探测行反正进不了最终连接结果，早扔晚扔在语义上完全等价。
+在内连接（`INNER JOIN`）里，运行时过滤（Runtime Filter / Dynamic Filter，下文按语境简称 RF 或 DF）的原理直观得几乎不会出错：Hash Join 在构建（Build）端扫完小表后，顺手把连接键的值域压成紧凑摘要（`IN` 列表、`Min/Max` 区间或 `Bloom Filter`），逆流投递给探测（Probe）端的底层扫描算子。只要摘要集合 \(D_{\text{filter}}\) 完整覆盖真实构建键集合 \(D_{\text{build}}\)（满足 \(D_{\text{build}} \subseteq D_{\text{filter}}\)，允许假阳性、绝无假阴性），被提前丢弃的探测行反正进不了最终连接结果，早扔晚扔在语义上完全等价。
 
 顺着这个直觉往下走，最容易写出一条看似天经地义的推论：**既然连接条件代表等值传递，只要上下两层连接共享连接键，为什么不把上层连接构建的过滤器顺着等值链一路推到底层所有表上？**
 
@@ -69,13 +69,13 @@ INNER JOIN C ON coalesce(B.k, 0) = C.k;
 但如果父层过滤器想要踏入**补空侧 `B`**（无论是原本就引用 `B` 列，还是想顺着 `A.k = B.k` 把 `A` 上的过滤器复制给 `B`），就必须同时过完**双重 `NULL` 安全核验**：
 
 - **第一重核验（父层比较算子本身拒绝 `NULL`，即 Null-Rejecting）**：普通等值 `=` 在一侧为 `NULL` 时求值为 `UNKNOWN`，天然拒绝空值；但如果是空值安全等值（`<=>` 或 `IS NOT DISTINCT FROM`），当父层 Build 端恰好含有 `NULL` 时，下层新合成的补空行就能合法配对！此时绝不能随意删减补空侧候选。
-- **第二重核验（探测端标量表达式保持空值传递，即 Null-Propagating）**：探测表达式 $e(x)$ 必须满足 $e(\text{NULL}) = \text{NULL}$。裸列引用 `b.k`、保空类型转换 `CAST(b.k AS BIGINT)` 满足这一性质——一旦删掉 `B` 行触发补空，$e(\text{NULL})$ 吐出 `NULL`，撞上第一重核验中拒绝 `NULL` 的父层 `=`，新合成的补空行照样死路一条，语义严丝合缝；而 `coalesce(b.k, 0)`、`ifnull(b.k, 0)` 或行为未知的黑盒 UDF 会把 `NULL` 洗白成非空常数，必须严禁踏入补空侧！
+- **第二重核验（探测端标量表达式保持空值传递，即 Null-Propagating）**：探测表达式 \(e(x)\) 必须满足 \(e(\text{NULL}) = \text{NULL}\)。裸列引用 `b.k`、保空类型转换 `CAST(b.k AS BIGINT)` 满足这一性质——一旦删掉 `B` 行触发补空，\(e(\text{NULL})\) 吐出 `NULL`，撞上第一重核验中拒绝 `NULL` 的父层 `=`，新合成的补空行照样死路一条，语义严丝合缝；而 `coalesce(b.k, 0)`、`ifnull(b.k, 0)` 或行为未知的黑盒 UDF 会把 `NULL` 洗白成非空常数，必须严禁踏入补空侧！
 
 把生产者完整性、目标侧角色、双重 `NULL` 证明与防死锁闭环串起来，就得到了动态过滤器穿越外连接的完整安全决策流：
 
 ![Dynamic Filter 穿越 Outer Join 的六步安全判据决策流](/images/diagrams/aug-opt-df-outer-join-boundary.svg)
 
-*图 2：动态过滤器穿越外连接的六步安全判据——落向保留侧可直接放行；一旦试图进入补空侧，必须同时证明“父比较算子拒绝 `NULL`”且“探测表达式满足 $e(\text{NULL}) = \text{NULL}$”，否则必须截停在连接算子上方。*
+*图 2：动态过滤器穿越外连接的六步安全判据——落向保留侧可直接放行；一旦试图进入补空侧，必须同时证明“父比较算子拒绝 `NULL`”且“探测表达式满足 \(e(\text{NULL}) = \text{NULL}\)”，否则必须截停在连接算子上方。*
 
 下面这张速查表把最容易踩坑的六种工程场景定死在了明处：
 
@@ -85,7 +85,7 @@ INNER JOIN C ON coalesce(B.k, 0) = C.k;
 | `RIGHT JOIN` 拿右表 Build 过滤自身左表 | **允许**：左侧本就是非保留侧，确保完整 Build 与异常 Fail-Open 即可 |
 | 父层过滤器穿过子 `LEFT JOIN` 落向保留侧 `A` | **允许**：提前剔除最终在父层必死无疑的行，不改变任何存活行的配对状态 |
 | 父层过滤器（普通 `=`）以裸列 `B.k` 落向补空侧 `B` | **允许**：即便删行诱发补 `NULL`，裸列传递 `NULL` 后仍被父层 `=` 拦截 |
-| 父层以 `coalesce(B.k, 0) = C.k` 落向补空侧 `B` | **禁止**：破坏 $e(\text{NULL}) = \text{NULL}$，合成的补空行会被转成 `0` 假阳性放行 |
+| 父层以 `coalesce(B.k, 0) = C.k` 落向补空侧 `B` | **禁止**：破坏 \(e(\text{NULL}) = \text{NULL}\)，合成的补空行会被转成 `0` 假阳性放行 |
 | 父层条件为 `B.k <=> C.k`（或 `IS NOT DISTINCT FROM`） | **禁止无向复制**：父层允许 `NULL` 配对，不可当作普通拒空等值穿透外连接 |
 
 手握这把标尺，我们走进 StarRocks、Doris 和 Trino 的代码库，看看工业界三套主流引擎分别用怎样的架构表达这条边界。
@@ -218,7 +218,7 @@ Trino 没有单独为动态过滤器发明一套物理树游走器，而是把 `
 如果你正在参与优化器内核研发，或者准备给自己的查询引擎补齐外连接上的动态过滤下推，可以把整套证明浓缩成五个接口职责与六步核验门禁：
 
 1. **`canGenerate(joinType, eqPred)`**：核验当前连接是否非保留侧探测（拒绝 `Left/Full/Anti` 滤除保留行），记录构建端完整性契约与空值比较标志（`equalForNull` / `nullAllowed`）；
-2. **`canPassThrough(joinType, targetSide, probeExpr, filterMeta)`**：沿既有列血缘下穿时，若目标是保留侧则放行；若目标是补空侧，必须同时断言“父比较拒绝 `NULL`”且“`probeExpr` 满足空值传递 $e(\text{NULL}) = \text{NULL}$”；
+2. **`canPassThrough(joinType, targetSide, probeExpr, filterMeta)`**：沿既有列血缘下穿时，若目标是保留侧则放行；若目标是补空侧，必须同时断言“父比较拒绝 `NULL`”且“`probeExpr` 满足空值传递 \(e(\text{NULL}) = \text{NULL}\)”；
 3. **`rewriteAcrossJoin(joinType, joinEq, srcExpr, dstSide)`**：跨连接键向对侧派生新过滤器时，严禁把外连接的等值条件当作无向等价类双向乱抄（要么像 Doris 那样仅限 `Inner/Semi`，要么像 Trino 那样先锚定保留侧再单向派生补空侧）；
 4. **`canConsume(scanNode, targetExpr, rfType)`**：评估底表连接器支持度、分区分桶裁剪潜力以及函数求值开销；
 5. **`validateGraph(producers, consumers)`**：剪除没有任何消费者落点的孤儿 Producer，并静态断言不存在“Build 子树消费自身产出过滤器”的环形依赖。

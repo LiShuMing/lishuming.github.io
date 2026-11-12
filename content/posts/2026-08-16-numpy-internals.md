@@ -44,7 +44,7 @@ print(a.shape)    # (3, 4)
 print(a.strides)  # (32, 8)
 ```
 
-在物理内存里，根本不存在什么“行”和“列”，只有从 `0` 到 `11` 紧挨着排成一排的 `96` 个字节。`ndarray` 之所以能把它当成 `(3, 4)` 矩阵来索引，靠的是元数据里的字节步长 `strides = (32, 8)`：沿第 0 维（向下跨一行）需要跳过 4 个元素即 `32` 字节；沿第 1 维（向右跨一列）只需跨过 1 个元素即 `8` 字节。任意多维逻辑下标 $(i_0, i_1, \dots, i_{d-1})$ 对应的物理字节偏移，全部归结为一条纯整数乘加公式：
+在物理内存里，根本不存在什么“行”和“列”，只有从 `0` 到 `11` 紧挨着排成一排的 `96` 个字节。`ndarray` 之所以能把它当成 `(3, 4)` 矩阵来索引，靠的是元数据里的字节步长 `strides = (32, 8)`：沿第 0 维（向下跨一行）需要跳过 4 个元素即 `32` 字节；沿第 1 维（向右跨一列）只需跨过 1 个元素即 `8` 字节。任意多维逻辑下标 \((i_0, i_1, \dots, i_{d-1})\) 对应的物理字节偏移，全部归结为一条纯整数乘加公式：
 
 $$
 \text{byte\_offset}(i_0, \dots, i_{d-1}) = \text{offset} + \sum_{k=0}^{d-1} i_k \times \text{strides}[k]
@@ -126,9 +126,9 @@ BLAS 按数据维度与复用率将基础线性代数划分为三个层级：
 
 | BLAS 层级 | 代表运算与 NumPy 入口 | 浮点运算量 | 内存读写量级 | 硬件瓶颈特征 |
 | --- | --- | ---: | ---: | --- |
-| **Level 1** | 向量内积 / 加权和：`np.dot(x, y)` | $O(n)$ | $O(n)$ | 算术强度极低，完全卡在**内存带宽**与函数调用开销 |
-| **Level 2** | 矩阵-向量乘：`A @ x`（`gemv`） | $O(n^2)$ | $O(n^2)$ | 矩阵元素仅用一次即丢弃，多数规模下仍受**访存带宽**制约 |
-| **Level 3** | 矩阵-矩阵乘：`A @ B`（`gemm`） | $O(n^3)$ | $O(n^2)$ | 数据复用率随规模线性抬升，靠**分块打包（Cache Blocking & Packing）**逼近峰值算力 |
+| **Level 1** | 向量内积 / 加权和：`np.dot(x, y)` | \(O(n)\) | \(O(n)\) | 算术强度极低，完全卡在**内存带宽**与函数调用开销 |
+| **Level 2** | 矩阵-向量乘：`A @ x`（`gemv`） | \(O(n^2)\) | \(O(n^2)\) | 矩阵元素仅用一次即丢弃，多数规模下仍受**访存带宽**制约 |
+| **Level 3** | 矩阵-矩阵乘：`A @ B`（`gemm`） | \(O(n^3)\) | \(O(n^2)\) | 数据复用率随规模线性抬升，靠**分块打包（Cache Blocking & Packing）**逼近峰值算力 |
 
 ```python
 x = np.arange(4, dtype=np.float64)
@@ -145,13 +145,13 @@ C = np.matmul(A, B)   # BLAS Level 3: GEMM
 
 ### 2. LAPACK 矩阵分解：解方程永远优先写 `solve(A, b)` 而非 `inv(A) @ b`
 
-建立在 BLAS Level 3 分块内核之上的 LAPACK，专门负责完整的数值矩阵分解。例如求解线性方程组 $Ax = b$：
+建立在 BLAS Level 3 分块内核之上的 LAPACK，专门负责完整的数值矩阵分解。例如求解线性方程组 \(Ax = b\)：
 
 ```python
 solution = np.linalg.solve(A, np.array([1.0, 0.0], dtype=np.float64))
 ```
 
-对于双精度一般方阵，`np.linalg.solve` 底层走的是 LAPACK `dgesv` 例程（首字母前缀 `s / d / c / z` 分别对应 `float32 / float64 / complex64 / complex128`）：先用带部分主元选择的 LU 分解将矩阵拆为 $PA = LU$，再依次快速回代求解下三角系统 $Ly = Pb$ 与上三角系统 $Ux = y$。相比先显式求逆 `np.linalg.inv(A)` 再右乘 `b`，直接调用 `solve` 不仅减少了约三分之二的浮点工作量与临时矩阵分配，还能避免病态矩阵显式求逆带来的灾难性舍入误差放大。
+对于双精度一般方阵，`np.linalg.solve` 底层走的是 LAPACK `dgesv` 例程（首字母前缀 `s / d / c / z` 分别对应 `float32 / float64 / complex64 / complex128`）：先用带部分主元选择的 LU 分解将矩阵拆为 \(PA = LU\)，再依次快速回代求解下三角系统 \(Ly = Pb\) 与上三角系统 \(Ux = y\)。相比先显式求逆 `np.linalg.inv(A)` 再右乘 `b`，直接调用 `solve` 不仅减少了约三分之二的浮点工作量与临时矩阵分配，还能避免病态矩阵显式求逆带来的灾难性舍入误差放大。
 
 | NumPy 线性代数接口 | 底层核心数学路径 | 对应 LAPACK 例程家族 |
 | --- | --- | --- |
@@ -185,7 +185,7 @@ solution = np.linalg.solve(A, np.array([1.0, 0.0], dtype=np.float64))
 
 平时核查内存体积，第一反应永远是看 `arr.nbytes == arr.size * arr.itemsize`；同时在 NumPy 2.x 环境下，标量与数组的混合类型提升规则已按 [NEP 50](https://numpy.org/neps/nep-0050-scalar-promotion.html) 收紧，工程接口务必显式声明 `dtype`。
 
-利用 `view(dtype)` 在不改动任何底层字节的前提下重解释数据类型，可以写出非常漂亮的旋转位置编码（RoPE）。RoPE 将特征向量的相邻两维 $(x_{2m}, x_{2m+1})$ 视作二维平面向量旋转角度 $p \cdot \theta_m$，映射到复平面上恰好就是复数乘法 $(x_{2m} + i x_{2m+1}) e^{i p \theta_m}$：
+利用 `view(dtype)` 在不改动任何底层字节的前提下重解释数据类型，可以写出非常漂亮的旋转位置编码（RoPE）。RoPE 将特征向量的相邻两维 \((x_{2m}, x_{2m+1})\) 视作二维平面向量旋转角度 \(p \cdot \theta_m\)，映射到复平面上恰好就是复数乘法 \((x_{2m} + i x_{2m+1}) e^{i p \theta_m}\)：
 
 ```python
 def apply_rotary_emb_complex(x: np.ndarray, base: float = 10000.0) -> np.ndarray:
@@ -223,9 +223,9 @@ def apply_rotary_emb_complex(x: np.ndarray, base: float = 10000.0) -> np.ndarray
 
 日常做数组变换和计算时，牢记下面四组高频模式的成本差异，能避开绝大多数隐性性能退化：
 
-1. **严防循环内 `concatenate` 的平方级复杂度陷阱**：`reshape`、`transpose`、`swapaxes`、`ravel` 都会优先尝试返回视图，而 `flatten`、`concatenate`、`stack`、`tile`、`repeat`、`pad` **永远分配新内存并复制数据**。如果在 `for` 循环里每步调用 `arr = np.concatenate([arr, new_row])`，历史数据会被一遍遍搬进新家，总拷贝量从 $O(N)$ 恶化为 $O(N^2)$。正确做法是先用 `np.empty` 按最大容量预分配一整块数组，再用切片 `buf[pos:pos+step] = new_row` 原地写入——这正是下文 KV Cache 的标准写法。
+1. **严防循环内 `concatenate` 的平方级复杂度陷阱**：`reshape`、`transpose`、`swapaxes`、`ravel` 都会优先尝试返回视图，而 `flatten`、`concatenate`、`stack`、`tile`、`repeat`、`pad` **永远分配新内存并复制数据**。如果在 `for` 循环里每步调用 `arr = np.concatenate([arr, new_row])`，历史数据会被一遍遍搬进新家，总拷贝量从 \(O(N)\) 恶化为 \(O(N^2)\)。正确做法是先用 `np.empty` 按最大容量预分配一整块数组，再用切片 `buf[pos:pos+step] = new_row` 原地写入——这正是下文 KV Cache 的标准写法。
 2. **善用 `out=` 复用缓冲与数值稳定函数**：逐元素数学函数支持传入目标缓冲（如 `np.exp(scores, out=scores)`），省掉中间临时数组分配；计算微小量对数与指数差时优先调用 `np.log1p(x)` 与 `np.expm1(x)` 抑制有效数字相消；校验浮点相等永远用 `np.allclose(actual, expected, rtol=1e-5, atol=1e-7)` 替代裸 `==`。
-3. **Top-K 选择不必全量排序**：只需要找出得分最高的前 $k$ 个词元下标时，`np.argsort` 会付出完整的 $O(N \log N)$ 排序成本，而 `np.argpartition(scores, -k)[-k:]` 基于快速选择算法只需 $O(N)$ 平均时间即可把最大的 $k$ 项归拢到末尾。
+3. **Top-K 选择不必全量排序**：只需要找出得分最高的前 \(k\) 个词元下标时，`np.argsort` 会付出完整的 \(O(N \log N)\) 排序成本，而 `np.argpartition(scores, -k)[-k:]` 基于快速选择算法只需 \(O(N)\) 平均时间即可把最大的 \(k\) 项归拢到末尾。
 4. **独立可复现随机流与张量缩并**：新代码一律使用局部实例 `rng = np.random.default_rng(42)` 取代污染全局状态的 `np.random.seed`，多进程数据加载可通过 [`rng.spawn(4)`](https://numpy.org/doc/stable/reference/random/generated/numpy.random.Generator.spawn.html) 派生统计独立的子流；复杂多维缩并可用 `np.einsum("bhsd,bhtd->bhst", q, k)` 清晰表达下标语义，但在性能敏感路径上仍需对比显式 `transpose + matmul` 是否能更直接地命中底层 BLAS `GEMM` 快路径。
 
 ---
@@ -236,7 +236,7 @@ NumPy 在现代 AI 与科学计算工程里最不可替代的角色，就是充�
 
 ### 1. 一维泊松方程中心差分求解：看清稠密与稀疏的复杂度边界
 
-求解经典边值问题 $-u''(x) = f(x)$（边界条件 $u(0) = u(1) = 0$）。取解析真值 $u(x) = \sin(\pi x)$，右端源项即为 $f(x) = \pi^2 \sin(\pi x)$。在 $[0, 1]$ 区间等距划分 $N$ 段（步长 $h = 1/N$），代入二阶中心差分近似 $u''(x_i) \approx (u_{i-1} - 2u_i + u_{i+1}) / h^2$，内部 $N-1$ 个网格点便化为一个对称正定三对角线性方程组：
+求解经典边值问题 \(-u''(x) = f(x)\)（边界条件 \(u(0) = u(1) = 0\)）。取解析真值 \(u(x) = \sin(\pi x)\)，右端源项即为 \(f(x) = \pi^2 \sin(\pi x)\)。在 \([0, 1]\) 区间等距划分 \(N\) 段（步长 \(h = 1/N\)），代入二阶中心差分近似 \(u''(x_i) \approx (u_{i-1} - 2u_i + u_{i+1}) / h^2\)，内部 \(N-1\) 个网格点便化为一个对称正定三对角线性方程组：
 
 ```python
 import numpy as np
@@ -262,7 +262,7 @@ max_error = np.max(np.abs(u_numerical - np.sin(np.pi * x)))
 print(f"N={N}, L_inf error={max_error:.3e}")
 ```
 
-只要把 `N` 从 `100` 翻倍到 `200`，就能亲眼看到最大误差缩减为原来的四分之一，干净利落地验证二阶收敛率。同时，这段二十行的原型也一眼暴露了稠密数组模型的规模天花板：`np.diag` 把绝大多数为零的元素全存成了 `float64`，占用 $O(N^2)$ 内存，通用 LU 分解耗时 $O(N^3)$；一旦网格加密到十万级，就该保持公式不变，无缝切入 `scipy.sparse.diags` 与三对角专用 $O(N)$ 追赶法求解器——**用 NumPy 稠密原型锁死数学正确性，再交给 SciPy 专业数据结构兑现渐近复杂度**。
+只要把 `N` 从 `100` 翻倍到 `200`，就能亲眼看到最大误差缩减为原来的四分之一，干净利落地验证二阶收敛率。同时，这段二十行的原型也一眼暴露了稠密数组模型的规模天花板：`np.diag` 把绝大多数为零的元素全存成了 `float64`，占用 \(O(N^2)\) 内存，通用 LU 分解耗时 \(O(N^3)\)；一旦网格加密到十万级，就该保持公式不变，无缝切入 `scipy.sparse.diags` 与三对角专用 \(O(N)\) 追赶法求解器——**用 NumPy 稠密原型锁死数学正确性，再交给 SciPy 专业数据结构兑现渐近复杂度**。
 
 ### 2. 手写单层 Transformer Decoder：把 RoPE、因果掩码与 KV Cache 钉在代码上
 
@@ -274,11 +274,11 @@ $$
 
 其中 [RMSNorm](https://arxiv.org/abs/1910.07467) 省去了均值中心化，仅按最后一维均方根重缩放；位置信息通过前文介绍的复数视图 [RoPE](https://arxiv.org/abs/2104.09864) 注入 `Q` 和 `K`；门控前馈网络采用 [SwiGLU](https://arxiv.org/abs/2002.05202)。推理过程中最关键的状态管理在于 **`KVCache`**：
 
-| 推理阶段 | 当前输入长度 $S$ | 缓存累计总长 $T$ | 注意力分数 $QK^T$ 形状 | 硬件负载特征与算子形态 |
+| 推理阶段 | 当前输入长度 \(S\) | 缓存累计总长 \(T\) | 注意力分数 \(QK^T\) 形状 | 硬件负载特征与算子形态 |
 | --- | ---: | ---: | ---: | --- |
-| **Prefill（首轮提示词）** | $S = 5$ | $T = 5$ | `(B, H, 5, 5)`（需上三角 `-inf` 遮罩） | 多 Token 矩阵乘，贴近 BLAS Level 3 计算密集型 |
-| **Decode Step 1** | $S = 1$ | $T = 6$ | `(B, H, 1, 6)`（单查询读全部历史） | 省去历史 K/V 重算，但退化为带宽受限的瘦长矩阵乘 |
-| **Decode Step 2** | $S = 1$ | $T = 7$ | `(B, H, 1, 7)`（切片追加，零历史搬运） | KV 显存占用按 $2 \times L \times B \times H_{kv} \times T \times HD \times \text{itemsize}$ 线性增长 |
+| **Prefill（首轮提示词）** | \(S = 5\) | \(T = 5\) | `(B, H, 5, 5)`（需上三角 `-inf` 遮罩） | 多 Token 矩阵乘，贴近 BLAS Level 3 计算密集型 |
+| **Decode Step 1** | \(S = 1\) | \(T = 6\) | `(B, H, 1, 6)`（单查询读全部历史） | 省去历史 K/V 重算，但退化为带宽受限的瘦长矩阵乘 |
+| **Decode Step 2** | \(S = 1\) | \(T = 7\) | `(B, H, 1, 7)`（切片追加，零历史搬运） | KV 显存占用按 \(2 \times L \times B \times H_{kv} \times T \times HD \times \text{itemsize}\) 线性增长 |
 
 下面用不到 180 行纯 NumPy 代码把整层推理与增量 KV 缓存完整跑通：
 
@@ -435,7 +435,7 @@ for step in range(3):
 | 数组/张量生态 | 在 `ndarray` 模型之上新增的核心能力 | 打破或改写的底层执行契约 |
 | --- | --- | --- |
 | **pandas** | 行列标签索引（`Index`）、异构表格列、原生缺失值与时间序列窗口 | `a + b` **先按标签对齐再运算**（而非纯按位置广播）；`to_numpy()` 遇异构列或缺失值常触发复制 |
-| **SciPy** | 稀疏矩阵存储（CSR/CSC/DIA）、数值优化、信号滤波与科学求解器 | 稀疏数组只存非零值与坐标索引，不再支持任意 $O(1)$ 步长切片或自由 `reshape` |
+| **SciPy** | 稀疏矩阵存储（CSR/CSC/DIA）、数值优化、信号滤波与科学求解器 | 稀疏数组只存非零值与坐标索引，不再支持任意 \(O(1)\) 步长切片或自由 `reshape` |
 | **PyTorch** | GPU/加速器设备管理、动态自动微分图（Autograd）、神经网络与分布式通信 | `Tensor` 绑定 `device` 与梯度历史；`tensor.view()` 遇非连续布局会**直接报错**而非像 `reshape` 自动复制 |
 | **JAX** | `jit` 编译融合、`grad`、`vmap` 批量化变换与 XLA 多设备并行 | 数组**严格不可变（Immutable）**；要求编译期静态形状（`nonzero`/`unique` 需定长约束），执行默认异步分派 |
 | **CuPy** | 驻留 NVIDIA 显存的 GPU 数组、内联 CUDA 内核与高度兼容的算子接口 | 跨 PCIe 总线传输与异步流同步成为头号性能变量；裸指针内核不自动解析非连续 `strides` |

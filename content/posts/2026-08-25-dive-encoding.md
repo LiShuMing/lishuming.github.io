@@ -97,7 +97,7 @@ PVLDB 2020 提出的 **[FSST（Fast Static Symbol Table）](https://vldb.org/pvl
 
 ### 2.5 业务浮点与稀疏位集：Gorilla / Chimp / ALP 与 Roaring Bitmap
 
-长期以来，IEEE-754 双精度浮点数（`double`）都是列式压缩的硬骨头。像 `19.99`、`20.05` 这样在十进制下极其规整的业务金额，转换成二进制科学计数法后尾数末尾全是无限循环截断比特，直接套整数差分毫无规律。时序数据库早期普遍采用 Facebook Gorilla 或 EDBT/PVLDB 后续改进的 **[Chimp](https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf) / Patas**，对相邻浮点数做按位异或（`XOR`），只编码非零有效尾数区间。而 SIGMOD 2024 的 **[ALP（Adaptive Lossless floating-Point Compression）](https://github.com/cwida/ALP)** 戳破了窗户纸：既然真实世界里绝大多数浮点数原本就是十进制小数，只需在块内自适应探测最佳的 $10^e$ 缩放因子将其无损乘回精确整数（极少数无法精确还原的二进制浮点走异常补丁通道），瞬间就能无缝复用前面超高速的 FOR + FastLanes SIMD 位打包管线！
+长期以来，IEEE-754 双精度浮点数（`double`）都是列式压缩的硬骨头。像 `19.99`、`20.05` 这样在十进制下极其规整的业务金额，转换成二进制科学计数法后尾数末尾全是无限循环截断比特，直接套整数差分毫无规律。时序数据库早期普遍采用 Facebook Gorilla 或 EDBT/PVLDB 后续改进的 **[Chimp](https://www.vldb.org/pvldb/vol15/p3058-liakos.pdf) / Patas**，对相邻浮点数做按位异或（`XOR`），只编码非零有效尾数区间。而 SIGMOD 2024 的 **[ALP（Adaptive Lossless floating-Point Compression）](https://github.com/cwida/ALP)** 戳破了窗户纸：既然真实世界里绝大多数浮点数原本就是十进制小数，只需在块内自适应探测最佳的 \(10^e\) 缩放因子将其无损乘回精确整数（极少数无法精确还原的二进制浮点走异常补丁通道），瞬间就能无缝复用前面超高速的 FOR + FastLanes SIMD 位打包管线！
 
 与数值列并肩作战的还有贯通索引与执行层的 **[Roaring Bitmap](https://roaringbitmap.org/)**。无论是扫描过滤产出的存活行号集合（Selection Set）、倒排索引行号表还是稀疏空值掩码，纯位图在极稀疏时浪费空间，纯整数数组在稠密时又慢又占内存。Roaring 将 32 位整数按高 16 位分桶（每桶覆盖 `65,536` 个值），在桶内根据基数动态切换三种物理容器：少于 4,096 个元素用有序 `uint16 Array`，稠密区间用固定 8 KiB 的 `64-bit Bitmap`，连续大段命中则用 `Run` 游程容器。多条件 `AND / OR` 过滤直接退化为两个容器在 AVX2 寄存器里的位交并运算，算完再将存活行号精准喂给下游列读取器。
 
