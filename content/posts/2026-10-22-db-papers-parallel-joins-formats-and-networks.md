@@ -4,7 +4,6 @@ slug: "db-papers-parallel-joins-formats-and-networks"
 date: 2026-10-22T13:00:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
 description: "从跨 NUMA 插槽带宽塌缩、2MiB 大页 TLB 抖动、星型连接基数估错、列存解码墙到微秒级 RDMA 网络协议税，深度拆解 Morsel 驱动并行、硬件感知主存哈希连接、LIP 前瞻过滤、开放列存内嵌执行与高速网络数据库重设计。"
-draft: false
 toc: true
 math: true
 categories: ["数据库"]

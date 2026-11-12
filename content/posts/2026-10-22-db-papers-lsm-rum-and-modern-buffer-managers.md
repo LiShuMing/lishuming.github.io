@@ -4,7 +4,6 @@ slug: "db-papers-lsm-rum-and-modern-buffer-managers"
 date: 2026-10-22T13:10:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
 description: "从五分钟法则三十年硬件经济学与 RUM 放大率猜想出发，系统拆解 LSM-Tree 异位写演进谱系（经典滚动合并、Leveling/Tiering 综述、Fractal Tree、SuRF 前缀过滤、Bourbon 学习索引、CaaS-LSM 近存卸载）以及现代 NVMe 页式缓冲管理革命（LeanStore 指针混洗到 Umbra 变长页零页回收）。"
-draft: false
 toc: true
 math: true
 categories: ["数据库"]

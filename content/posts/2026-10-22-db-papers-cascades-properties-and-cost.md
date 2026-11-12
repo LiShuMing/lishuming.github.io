@@ -4,7 +4,6 @@ date: 2026-10-22T12:10:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
 slug: "db-papers-cascades-properties-and-cost"
 description: "从组合爆炸搜索、物理属性传递非合流反例与简化 I/O 代价公式的 4 倍误判出发，系统精读 Volcano 与 Cascades 搜索框架、Shared-Nothing 零通信并行优化、SQL 三值外连接函数依赖、有限状态自动机顺序推理、SCOPE 并行分区属性格以及即席 Join 真实磁盘缓冲代价模型。"
-draft: false
 toc: true
 math: true
 categories: ["数据库"]

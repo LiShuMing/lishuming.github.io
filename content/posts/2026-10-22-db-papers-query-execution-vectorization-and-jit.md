@@ -3,7 +3,6 @@ title: "【Paper】查询执行范式演进精读：从 Volcano 迭代器、Mone
 slug: "db-papers-query-execution-vectorization-and-jit"
 date: 2026-10-22T12:50:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
-draft: false
 toc: true
 math: true
 categories: ["数据库"]

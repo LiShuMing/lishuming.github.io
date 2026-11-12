@@ -4,7 +4,6 @@ date: 2026-10-22T12:20:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
 slug: "db-papers-outerjoin-and-subquery-unnesting"
 description: "从外连接非结合律反例与 COUNT(*)=0 关联子查询陷阱出发，系统拆解 Rosenthal 带标签空值代数、IBM EEL 静态冲突与补偿、Dayal 广义外连接聚合、R* 分布式求值协议、Kiessling 空域复审，直至 HyPer 依赖连接任意去相关与全谱系连接算子。"
-draft: false
 toc: true
 math: true
 categories: ["数据库"]

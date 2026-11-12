@@ -4,7 +4,6 @@ date: 2026-10-22T12:30:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
 slug: "db-papers-histograms-synopses-and-sketches"
 description: "从 B ≪ N 的有损压缩下界与均匀行采样在 COUNT(DISTINCT) 上的百倍失真反例出发，系统拆解直方图五维谱系与串行主化最优性、四大摘要统一误差契约、FM/PCSA 随机平均位图、Count-Min Sketch 单侧碰撞上界及 Gibbons 协调去重采样。"
-draft: false
 toc: true
 math: true
 categories: ["数据库"]

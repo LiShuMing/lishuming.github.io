@@ -4,7 +4,6 @@ date: 2026-10-22T12:00:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
 slug: "db-papers-relational-model-and-architecture"
 description: "从导航式物理指针耦合的工程困境出发，串联 Codd 1970 关系模型与 RM/T 语义扩展、INGRES QUEL 与 SEQUEL 查询语言分野、C. J. Date 对 SQL 多重集与三值逻辑的等价性批判、Postgres 可扩展内核复盘，直至现代关系数据库进程、执行、缓冲与 ARIES WAL 全局架构边界。"
-draft: false
 toc: true
 math: true
 categories: ["数据库"]

@@ -2,7 +2,6 @@
 title: "【Paper】事务隔离、千核并发与分布式存储精读：Adya 隔离模型、Abyss、Percolator、Megastore、HLC、PACELC 与 Anna"
 date: 2026-10-22T13:20:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
-draft: false
 slug: "db-papers-isolation-concurrency-and-distributed-transactions"
 description: "从跨核缓存一致性抖动与跨洲广域网光速延迟两条物理约束出发，串联精读 Adya 广义隔离级别、千核并发控制评估、Percolator 跨行快照事务、Megastore 实体组 Paxos、混合逻辑时钟 HLC、PACELC 定理与 Anna 无协调格存储。"
 categories: ["数据库"]

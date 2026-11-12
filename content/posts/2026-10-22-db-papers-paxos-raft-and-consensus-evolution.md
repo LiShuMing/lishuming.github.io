@@ -2,7 +2,6 @@
 title: "【Paper】分布式共识协议演进精读：Paxos 泛化与 Quorum 弱化、Generalized Consensus、Raft 证明边界与 Ark 工程实践"
 date: 2026-10-22T13:30:00+08:00
 lastmod: 2026-11-12T00:00:00+08:00
-draft: false
 slug: "db-papers-paxos-raft-and-consensus-evolution"
 description: "从 FLP 不可能定理与异步网络脑裂防线出发，串联精读 Heidi Howard 非对称 Quorum 与 Paxos 泛化、单次写寄存器统一共识与无主可交换命令、Raft 强领导者与 Figure 8 幽灵回滚反例、Ongaro 博士论文成员变更与线性化读边界，以及 MongoDB 前身 Ark 的拉式复制确认栅栏。"
 categories: ["数据库"]
