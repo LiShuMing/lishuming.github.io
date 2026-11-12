@@ -12,9 +12,6 @@
     <time class="listing-date" datetime="{{ .Date.Format "2006-01-02" }}">{{ .Date.Format "2006-01-02" }}</time>
     <div class="listing-body">
       <a class="listing-title" href="{{ .RelPermalink }}" title="{{ .Title }}">{{ .Title }}</a>
-      {{- with .Description }}
-      <p class="listing-summary">{{ . }}</p>
-      {{- end }}
     </div>
   </li>
 {{ end }}
