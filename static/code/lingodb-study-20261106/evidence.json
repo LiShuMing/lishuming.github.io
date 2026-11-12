@@ -1,0 +1,74 @@
+{
+  "source_head": "fab813e87b9461ca041cf2943d6b03e1f4d1d386",
+  "parallelism": 4,
+  "default_subop_opt": "ReuseLocal,Specialize,PullGatherUp,Compression",
+  "variant_subop_opt": "ReuseLocal,PullGatherUp,Compression",
+  "query": "demo.sql",
+  "expected_rows": [
+    [
+      1,
+      150,
+      4
+    ],
+    [
+      2,
+      28,
+      1
+    ]
+  ],
+  "runs": {
+    "default_snapshot": {
+      "observed_exit_code": 0,
+      "log": "run.log",
+      "result_rows": [
+        [
+          1,
+          150,
+          4
+        ],
+        [
+          2,
+          28,
+          1
+        ]
+      ],
+      "expected_result_matches": true,
+      "status": "success"
+    },
+    "default_without_snapshot": {
+      "observed_exit_code": 0,
+      "log": "without-snapshots.log",
+      "result_rows": [
+        [
+          1,
+          150,
+          4
+        ],
+        [
+          2,
+          28,
+          1
+        ]
+      ],
+      "expected_result_matches": true,
+      "status": "success"
+    },
+    "without_specialize_snapshot": {
+      "observed_exit_code": 1,
+      "log": "without-specialize/run.log",
+      "result_rows": [],
+      "expected_result_matches": false,
+      "status": "llvm_lowering_failed"
+    },
+    "without_specialize_without_snapshot": {
+      "observed_exit_code": 1,
+      "log": "without-specialize/without-snapshots.log",
+      "result_rows": [],
+      "expected_result_matches": false,
+      "status": "llvm_lowering_failed"
+    }
+  },
+  "default_snapshot_count": 56,
+  "scope": "Tiny VALUES query only; no performance comparison, full regression, or source fix performed.",
+  "llvm_ir_origin": "mlir-translate --mlir-to-llvmir snapshots/detailed-snapshot-55.mlir -o demo.before-opt.ll; before runtime LLVM optimization"
+}

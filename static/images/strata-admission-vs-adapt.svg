@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="700" viewBox="0 0 1120 700" role="img"
+     aria-label="Strata：准入与替换发生在两个时刻">
+<title>Strata：准入与替换发生在两个时刻</title>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+</defs>
+<rect width="1120" height="700" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328" text-anchor="start" data-max-w="1040" data-label="title">Strata：准入与替换发生在两个时刻</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="subtitle">蓝色是每个 token 都走的准入路径，橙色是每 4 个解码轮次一次的批量替换</text>
+<rect x="40" y="96" width="1040" height="250" rx="12" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="122" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="1000" data-label="band label '① 准入：每个路由项执行一次，不换出'">① 准入：每个路由项执行一次，不换出</text>
+<rect x="64" y="146" width="320" height="96" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="79" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="290" data-label="card title 'admit(layer, expert)'">admit(layer, expert)</text>
+<text x="79" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="290" data-label="card line '已常驻 → 返回原槽位；否则取 next_free_++'">已常驻 → 返回原槽位；否则取 next_free_++</text>
+<text x="79" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="290" data-label="card line '槽位耗尽 → kNotResident'">槽位耗尽 → kNotResident</text>
+<rect x="500" y="130" width="300" height="86" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="515" y="153" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="270" data-label="card title '有空槽位'">有空槽位</text>
+<text x="515" y="172" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="270" data-label="card line '专家整体装入'">专家整体装入</text>
+<text x="515" y="190" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="270" data-label="card line '本次路由在 GPU 计算'">本次路由在 GPU 计算</text>
+<rect x="500" y="242" width="300" height="86" rx="9" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.4"/>
+<text x="515" y="265" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="270" data-label="card title '槽位耗尽'">槽位耗尽</text>
+<text x="515" y="284" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="270" data-label="card line 'kNotResident，不是错误路径'">kNotResident，不是错误路径</text>
+<text x="515" y="302" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#b03a3a" text-anchor="start" data-max-w="270" data-label="card line '落 CPU 专家池，读权重受内存带宽约束'">落 CPU 专家池，读权重受内存带宽约束</text>
+<polyline points="386,176 496,170" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="386,216 496,280" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="396" y="162" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11" font-weight="normal" fill="#3c6e9e" text-anchor="start">有空位</text>
+<text x="396" y="252" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="11" font-weight="normal" fill="#3c6e9e" text-anchor="start">满</text>
+<rect x="40" y="386" width="1040" height="200" rx="12" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.2"/>
+<text x="60" y="412" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="1000" data-label="band label '② 替换：每 adapt_every = 4 个解码轮次执行一次'">② 替换：每 adapt_every = 4 个解码轮次执行一次</text>
+<rect x="64" y="434" width="300" height="100" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="79" y="457" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="270" data-label="card title '累计 usage'">累计 usage</text>
+<text x="79" y="476" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="270" data-label="card line '每个路由项 +1，常驻者同样计数'">每个路由项 +1，常驻者同样计数</text>
+<text x="79" y="494" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="270" data-label="card line '24,576 个 float，约 96 KiB'">24,576 个 float，约 96 KiB</text>
+<rect x="430" y="434" width="310" height="100" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="445" y="457" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="280" data-label="card title '排序与筛选'">排序与筛选</text>
+<text x="445" y="476" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="280" data-label="card line '候选：未常驻且 usage ≥ 2.0'">候选：未常驻且 usage ≥ 2.0</text>
+<text x="445" y="494" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="280" data-label="card line '牺牲者：常驻者中 usage 最低'">牺牲者：常驻者中 usage 最低</text>
+<rect x="806" y="434" width="250" height="100" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="821" y="457" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="220" data-label="card title '门槛与配额'">门槛与配额</text>
+<text x="821" y="476" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="220" data-label="card line '增益 ≥ 1.5 才交换'">增益 ≥ 1.5 才交换</text>
+<text x="821" y="494" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="220" data-label="card line '每轮 ≤ 96 次；轮末 usage ×= 0.7'">每轮 ≤ 96 次；轮末 usage ×= 0.7</text>
+<polyline points="366,484 426,484" fill="none" stroke="#a06018" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="742,484 802,484" fill="none" stroke="#a06018" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<line x1="40" y1="640" x2="1080" y2="640" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="666" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 1">常量取默认值：adapt_every=4、adapt_decay=0.7、adapt_min_gain=1.5、adapt_swaps=96（generate.cpp:765-801）。</text>
+<text x="40" y="690" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 2">半衰期 ln 0.5 / ln 0.7 ≈ 1.9 轮，是算术推论，不是源码里的测量。</text>
+</svg>

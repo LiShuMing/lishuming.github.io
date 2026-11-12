@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="700" viewBox="0 0 1120 700" role="img"
+     aria-label="vLLM：块的生命周期与前缀断点">
+<title>vLLM：块的生命周期与前缀断点</title>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+  <marker id="arrow-b03a2e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#b03a2e"/>
+  </marker>
+  <marker id="arrow-777777" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#777777"/>
+  </marker>
+</defs>
+<rect width="1120" height="700" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328" text-anchor="start" data-max-w="1040" data-label="title">vLLM：块的生命周期与前缀断点</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="subtitle">蓝色是块的状态转移，红色是失败路径；灰色块仍在缓存中，只是本请求不可达</text>
+<rect x="40" y="96" width="1040" height="200" rx="12" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="122" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="1000" data-label="band label '① 释放与失效分开：淘汰是分配路径的副产物'">① 释放与失效分开：淘汰是分配路径的副产物</text>
+<rect x="64" y="146" width="206" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="79" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="176" data-label="card title '解码中'">解码中</text>
+<text x="79" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="176" data-label="card line '引用计数 &gt; 0'">引用计数 &gt; 0</text>
+<text x="79" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="176" data-label="card line '前缀哈希存在'">前缀哈希存在</text>
+<rect x="330" y="146" width="206" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="345" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="176" data-label="card title '请求结束'">请求结束</text>
+<text x="345" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="176" data-label="card line '最后一个引用释放'">最后一个引用释放</text>
+<text x="345" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="176" data-label="card line '块进入空闲队列'">块进入空闲队列</text>
+<rect x="596" y="146" width="206" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="611" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="176" data-label="card title '空闲队列'">空闲队列</text>
+<text x="611" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="176" data-label="card line '哈希项仍保留'">哈希项仍保留</text>
+<text x="611" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="176" data-label="card line '后续请求仍可命中'">后续请求仍可命中</text>
+<rect x="862" y="146" width="206" height="100" rx="9" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.4"/>
+<text x="877" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="176" data-label="card title '再次分配'">再次分配</text>
+<text x="877" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="176" data-label="card line 'get_new_blocks 取块'">get_new_blocks 取块</text>
+<text x="877" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#b03a3a" text-anchor="start" data-max-w="176" data-label="card line '此时才清哈希项'">此时才清哈希项</text>
+<polyline points="270,196 326,196" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="536,196 592,196" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="802,196 858,196" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="326" width="1040" height="220" rx="12" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.2"/>
+<text x="60" y="352" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="1000" data-label="band label '② 前缀链：第一块缺失后，后续块对这条请求不可见'">② 前缀链：第一块缺失后，后续块对这条请求不可见</text>
+<rect x="64" y="386" width="180" height="74" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="79" y="409" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="150" data-label="card title 'B0 命中'">B0 命中</text>
+<text x="79" y="428" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="150" data-label="card line '前缀起点'">前缀起点</text>
+<rect x="300" y="386" width="180" height="74" rx="9" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.4"/>
+<text x="315" y="409" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="150" data-label="card title 'B1 缺失'">B1 缺失</text>
+<text x="315" y="428" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="150" data-label="card line '需要重算'">需要重算</text>
+<rect x="536" y="386" width="180" height="74" rx="9" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.4"/>
+<text x="551" y="409" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#5b6570" text-anchor="start" data-max-w="150" data-label="card title 'B2 在缓存'">B2 在缓存</text>
+<text x="551" y="428" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="150" data-label="card line '本请求不可达'">本请求不可达</text>
+<rect x="772" y="386" width="180" height="74" rx="9" fill="#f7f8fa" stroke="#c9d1d9" stroke-width="1.4"/>
+<text x="787" y="409" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#5b6570" text-anchor="start" data-max-w="150" data-label="card title 'B3 在缓存'">B3 在缓存</text>
+<text x="787" y="428" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="150" data-label="card line '本请求不可达'">本请求不可达</text>
+<polyline points="244,423 296,423" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="480,423 532,423" fill="none" stroke="#b03a2e" stroke-width="1.7" stroke-linejoin="round" stroke-dasharray="4 3" marker-end="url(#arrow-b03a2e)"/>
+<polyline points="716,423 768,423" fill="none" stroke="#777777" stroke-width="1.7" stroke-linejoin="round" stroke-dasharray="4 3" marker-end="url(#arrow-777777)"/>
+<line x1="40" y1="640" x2="1080" y2="640" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="666" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 1">B2、B3 仍是缓存中的有效块，只是这条请求用不到；查找从 B0 逐块进行，第一块 miss 即 break（single_type_kv_cache_manager.py:800-807）。</text>
+<text x="40" y="690" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 2">队列顺序：无哈希块前插（LIFO，保 GPU 局部性），有哈希块后插（FIFO，近似 LRU）（block_pool.py:774-805）。</text>
+</svg>

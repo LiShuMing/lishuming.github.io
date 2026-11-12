@@ -1,5 +1,7 @@
 # Blog Writing Guidelines
 
+> **Mandatory Repository Security & Commit Identity Policy**: Always read and strictly enforce [RULES.md](RULES.md) before any Git commit, amend, history rewrite, or push.
+
 ## Core Philosophy: First Principles & Lucid Prose
 
 Technical articles on this blog are written for curious engineers who want to truly understand *why* a system, algorithm, or bug behaves the way it does — not to read a defensive audit report or a directory listing.
