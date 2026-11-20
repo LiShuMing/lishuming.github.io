@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 620" width="1040" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">Spark BSP、Gluten/Velox 列式卸载与 StarRocks MPP 流水线执行架构对比</title>
+  <desc id="desc">三泳道对比原生 Spark 行存与 Stage 屏障、Gluten+Velox Substrait 子树卸载与混合 Shuffle、以及 StarRocks 全内存 Pipeline 与零额外 Stage Runtime Filter。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .lane { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .lane-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .lane-badge { font-family: "JetBrains Mono", Menlo, Consolas, monospace; font-size: 11px; font-weight: 600; }
+      .card-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.5; rx: 8; }
+      .card-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; rx: 8; }
+      .card-emerald { fill: #ecfdf5; stroke: #059669; stroke-width: 1.5; rx: 8; }
+      .card-rose { fill: #fff1f2; stroke: #e11d48; stroke-width: 1.5; rx: 8; stroke-dasharray: 5 3; }
+      .card-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.5; rx: 8; }
+      .node-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.5px; font-weight: 700; fill: #1e293b; }
+      .node-sub { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 11px; fill: #475569; }
+      .edge { stroke: #64748b; stroke-width: 1.8; fill: none; }
+      .edge-accent { stroke: #059669; stroke-width: 2; fill: none; }
+      .edge-warn { stroke: #e11d48; stroke-width: 1.6; stroke-dasharray: 4 3; fill: none; }
+      .edge-label { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; fill: #334155; font-weight: 600; }
+      .note { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11px; fill: #64748b; }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arrow-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#e11d48"/>
+    </marker>
+  </defs>
+
+  <rect width="1040" height="620" class="bg"/>
+
+  <!-- Lane 1: Native Spark BSP -->
+  <rect x="24" y="20" width="992" height="172" class="lane"/>
+  <text x="44" y="48" class="lane-title">1. 原生 Apache Spark（BSP 分时调度 + Tungsten 行存编译执行）</text>
+  <text x="996" y="48" text-anchor="end" class="lane-badge" fill="#d97706">Task/Stage 级局部重算 · 高磁盘/LLC 开销</text>
+
+  <rect x="44" y="68" width="205" height="72" class="card-amber"/>
+  <text x="146" y="94" text-anchor="middle" class="node-title">Catalyst + CodeGen</text>
+  <text x="146" y="113" text-anchor="middle" class="node-sub">Janino 融合逐行循环</text>
+  <text x="146" y="129" text-anchor="middle" class="node-sub">UnsafeRow 8B 固定槽位</text>
+
+  <rect x="304" y="68" width="215" height="72" class="card-amber"/>
+  <text x="411" y="94" text-anchor="middle" class="node-title">UnsafeShuffleWriter</text>
+  <text x="411" y="113" text-anchor="middle" class="node-sub">8B 指针基数排序 + 本地落盘</text>
+  <text x="411" y="129" text-anchor="middle" class="node-sub">Stage 硬屏障（AQE 采样点）</text>
+
+  <rect x="574" y="68" width="195" height="72" class="card-rose"/>
+  <text x="671" y="94" text-anchor="middle" class="node-title">Subquery RuntimeFilter</text>
+  <text x="671" y="113" text-anchor="middle" class="node-sub">额外 1–2 个 SinglePartition</text>
+  <text x="671" y="129" text-anchor="middle" class="node-sub">聚合 Stage 强阻塞大表扫描</text>
+
+  <rect x="818" y="68" width="178" height="72" class="card-amber"/>
+  <text x="907" y="94" text-anchor="middle" class="node-title">Reduce Stage 拉取</text>
+  <text x="907" y="113" text-anchor="middle" class="node-sub">M×R 随机小块 Fetch</text>
+  <text x="907" y="129" text-anchor="middle" class="node-sub">FetchFailed 触发父级补跑</text>
+
+  <line x1="249" y1="104" x2="302" y2="104" class="edge" marker-end="url(#arrow)"/>
+  <line x1="519" y1="104" x2="572" y2="104" class="edge-warn" marker-end="url(#arrow-red)"/>
+  <line x1="769" y1="104" x2="816" y2="104" class="edge" marker-end="url(#arrow)"/>
+  <text x="545" y="168" text-anchor="middle" class="note">痛点：宽表探测触发 200+ 周期 LLC Miss 停顿；超 64KB 字节码退化解释执行；INDETERMINATE 血缘遇 FetchFailed 引发全图回滚</text>
+
+  <!-- Lane 2: Spark + Gluten + Velox -->
+  <rect x="24" y="212" width="992" height="188" class="lane"/>
+  <text x="44" y="240" class="lane-title">2. Spark + Apache Gluten + Velox（外层 BSP 容错骨架 + Stage 内 C++ 列式流水线）</text>
+  <text x="996" y="240" text-anchor="end" class="lane-badge" fill="#2563eb">Substrait 卸载 · JNI 统一内存仲裁</text>
+
+  <rect x="44" y="260" width="190" height="78" class="card-blue"/>
+  <text x="139" y="286" text-anchor="middle" class="node-title">Gluten 校验与改写</text>
+  <text x="139" y="305" text-anchor="middle" class="node-sub">连续子树转 Substrait IR</text>
+  <text x="139" y="322" text-anchor="middle" class="node-sub">对齐 Spark 非 ANSI 语义</text>
+
+  <rect x="284" y="260" width="225" height="78" class="card-blue"/>
+  <text x="396" y="286" text-anchor="middle" class="node-title">Velox Driver 列式执行</text>
+  <text x="396" y="305" text-anchor="middle" class="node-sub">Flat/Dict/LazyVector + SIMD</text>
+  <text x="396" y="322" text-anchor="middle" class="node-sub">Join/Agg 内置 RowContainer</text>
+
+  <rect x="558" y="260" width="195" height="78" class="card-rose"/>
+  <text x="655" y="286" text-anchor="middle" class="node-title">Fallback 与内存协同</text>
+  <text x="655" y="305" text-anchor="middle" class="node-sub">不支持算子插 Col2Row/Row2Col</text>
+  <text x="655" y="322" text-anchor="middle" class="node-sub">SharedArbitrator 联动 Spill</text>
+
+  <rect x="802" y="260" width="194" height="78" class="card-purple"/>
+  <text x="899" y="286" text-anchor="middle" class="node-title">自适应混合 Shuffle</text>
+  <text x="899" y="305" text-anchor="middle" class="node-sub">窄表走 Columnar Split/RSS</text>
+  <text x="899" y="322" text-anchor="middle" class="node-sub">大 R×C 宽表退回 CompactRow</text>
+
+  <line x1="234" y1="299" x2="282" y2="299" class="edge" marker-end="url(#arrow)"/>
+  <line x1="509" y1="299" x2="556" y2="299" class="edge-warn" marker-end="url(#arrow-red)"/>
+  <line x1="753" y1="299" x2="800" y2="299" class="edge" marker-end="url(#arrow)"/>
+  <text x="520" y="372" text-anchor="middle" class="note">权衡：消除 JVM GC 与行存带宽浪费；但需严防算子碎片回退引发 JNI 转置放大，并规避万级分区×百列下的列式缓冲区矩阵 OOM</text>
+
+  <!-- Lane 3: StarRocks MPP Pipeline -->
+  <rect x="24" y="420" width="992" height="180" class="lane"/>
+  <text x="44" y="448" class="lane-title">3. StarRocks（Cascades 全功能 CBO + 全内存协作式 MPP Pipeline）</text>
+  <text x="996" y="448" text-anchor="end" class="lane-badge" fill="#059669">Gang 同时启动 · 亚秒级交互响应</text>
+
+  <rect x="44" y="468" width="205" height="76" class="card-emerald"/>
+  <text x="146" y="494" text-anchor="middle" class="node-title">FE Cascades CBO</text>
+  <text x="146" y="513" text-anchor="middle" class="node-sub">Memo 全局等价搜索 + 直方图</text>
+  <text x="146" y="529" text-anchor="middle" class="node-sub">Colocate / Bucket / MV 改写</text>
+
+  <rect x="304" y="468" width="225" height="76" class="card-emerald"/>
+  <text x="416" y="494" text-anchor="middle" class="node-title">BE PipelineDriver 引擎</text>
+  <text x="416" y="513" text-anchor="middle" class="node-sub">核数绑定线程池 + 状态机挂起</text>
+  <text x="416" y="529" text-anchor="middle" class="node-sub">异步 I/O 解耦与零拷贝列块</text>
+
+  <rect x="584" y="468" width="195" height="76" class="card-emerald"/>
+  <text x="681" y="494" text-anchor="middle" class="node-title">顺手捎带 RuntimeFilter</text>
+  <text x="681" y="513" text-anchor="middle" class="node-sub">HashJoinBuild 零额外 Stage</text>
+  <text x="681" y="529" text-anchor="middle" class="node-sub">异步直推 Scan + 超时放行</text>
+
+  <rect x="828" y="468" width="168" height="76" class="card-emerald"/>
+  <text x="912" y="494" text-anchor="middle" class="node-title">Brpc 内存 Exchange</text>
+  <text x="912" y="513" text-anchor="middle" class="node-sub">无落盘流式推送 + 反压</text>
+  <text x="912" y="529" text-anchor="middle" class="node-sub">LIMIT 达标毫秒级全局短路</text>
+
+  <line x1="249" y1="506" x2="302" y2="506" class="edge-accent" marker-end="url(#arrow-green)"/>
+  <line x1="529" y1="506" x2="582" y2="506" class="edge-accent" marker-end="url(#arrow-green)"/>
+  <line x1="779" y1="506" x2="826" y2="506" class="edge-accent" marker-end="url(#arrow-green)"/>
+  <path d="M 681 468 C 681 446, 416 446, 416 466" class="edge-accent" stroke-dasharray="5 3" marker-end="url(#arrow-green)"/>
+  <text x="550" y="456" text-anchor="middle" class="edge-label" fill="#059669">In / MinMax / BloomFilter 下推裁剪</text>
+  <text x="520" y="576" text-anchor="middle" class="note">边界：全链路内存管道要求上下游实例同时就位，默认以整条 Query 为失败重试粒度；超长 ETL 需配合算子级 Spill 兜底</text>
+</svg>

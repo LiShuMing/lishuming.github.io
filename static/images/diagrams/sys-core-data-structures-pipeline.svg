@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 560" width="1080" height="560" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">数据库与系统内核中的八大核心数据结构协同执行流水线</title>
+  <desc id="desc">展示一条复杂 SQL 查询从解析过滤、存储索引定位、Buffer Pool 页面缓存、列存位图过滤、动态概率过滤、无锁队列调度到最终算子排序与外排落盘的完整硬件与数据结构协同链路。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #2563eb; }
+      .box-p0 { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-p1 { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-p2 { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .box-hw { fill: #fffbeb; stroke: #d97706; stroke-width: 1.5; rx: 6; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-tag-p0 { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .t-tag-p1 { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .t-tag-p2 { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; fill: #0f172a; }
+      .flow-blue { stroke: #2563eb; stroke-width: 2; fill: none; }
+      .flow-green { stroke: #059669; stroke-width: 1.8; stroke-dasharray: 5 3; fill: none; }
+    </style>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="560" class="bg"/>
+
+  <!-- Top Container: Storage & Index Layer -->
+  <rect x="20" y="16" width="1040" height="236" class="panel"/>
+  <text x="40" y="42" class="p-title">第一层：存储引擎、索引裁剪与缓存淘汰底座（Storage, Indexing &amp; Buffer Pool）</text>
+  <text x="1040" y="42" text-anchor="end" class="p-sub">目标：最小化随机 I/O 放大、消灭指针追逐 LLC Miss 与高并发读锁争用</text>
+
+  <!-- Node 1: B+ Tree / LSM Tree -->
+  <rect x="38" y="60" width="230" height="168" class="box-p1"/>
+  <text x="52" y="82" class="t-tag-p1">[P1] B+ Tree / LSM Tree</text>
+  <text x="52" y="102" class="t-h">1. 存储索引与并发控制</text>
+  <text x="52" y="124" class="t-s">• RUM 权衡: B+ 原地写 vs LSM 追加</text>
+  <text x="52" y="143" class="t-s">• 并发: B-link 右兄弟 / OLC 乐观版本</text>
+  <text x="52" y="162" class="t-s">• Compaction: Leveled vs Tiered</text>
+  <text x="52" y="181" class="t-s">• 大 Value: WiscKey/BlobDB KV 分离</text>
+  <text x="52" y="204" class="t-m" fill="#047857">读路径 0 原子写 (Zero-Write OLC)</text>
+
+  <!-- Node 2: Binary Search -->
+  <rect x="296" y="60" width="232" height="168" class="box-p0"/>
+  <text x="310" y="82" class="t-tag-p0">[P0] Binary Search &amp; Invariants</text>
+  <text x="310" y="102" class="t-h">2. 索引二分与谓词下推裁剪</text>
+  <text x="310" y="124" class="t-s">• 半开区间 [L, R) 单调谓词不变量</text>
+  <text x="310" y="143" class="t-s">• Branchless CMOV + __builtin_prefetch</text>
+  <text x="310" y="162" class="t-s">• Eytzinger BFS 布局与页内 SIMD</text>
+  <text x="310" y="181" class="t-s">• ZoneMap 跨类型取整与 NaN/-0.0 序</text>
+  <text x="310" y="204" class="t-m" fill="#1d4ed8">寻首块: first block where max &gt;= L</text>
+
+  <!-- Node 3: Cache Structures -->
+  <rect x="556" y="60" width="236" height="168" class="box-p0"/>
+  <text x="570" y="82" class="t-tag-p0">[P0] Cache Structures</text>
+  <text x="570" y="102" class="t-h">3. Buffer Pool 与抗污染淘汰</text>
+  <text x="570" y="124" class="t-s">• 侵入式链表 + 开放寻址索引 (0 malloc)</text>
+  <text x="570" y="143" class="t-s">• 读锁消减: 分片 / HyperClock 原子位</text>
+  <text x="570" y="162" class="t-s">• 抗扫描: 2Q / W-TinyLFU (4-bit CMS)</text>
+  <text x="570" y="181" class="t-s">• 约束淘汰: PinCount 与 Radix 叶到根</text>
+  <text x="570" y="204" class="t-m" fill="#1d4ed8">Evictable: ref == 0 &amp;&amp; leaf</text>
+
+  <!-- Node 4: Bitmap -->
+  <rect x="820" y="60" width="222" height="168" class="box-p1"/>
+  <text x="834" y="82" class="t-tag-p1">[P1] Bitmap &amp; Succinct</text>
+  <text x="834" y="102" class="t-h">4. 倒排位图与列存选择向量</text>
+  <text x="834" y="124" class="t-s">• Roaring 高 16 位分桶 + 三态容器</text>
+  <text x="834" y="143" class="t-s">• Array (&lt;=4096) / Bitmap (8KB) / Run</text>
+  <text x="834" y="162" class="t-s">• 位图转下标: tzcnt + blsr 无分支提取</text>
+  <text x="834" y="181" class="t-s">• Poppy 两级索引实现 O(1) Rank/Select</text>
+  <text x="834" y="204" class="t-m" fill="#047857">word &amp;= (word - 1) 跳 0 提取</text>
+
+  <line x1="268" y1="144" x2="294" y2="144" class="flow-blue" marker-end="url(#arr-blue)"/>
+  <line x1="528" y1="144" x2="554" y2="144" class="flow-blue" marker-end="url(#arr-blue)"/>
+  <line x1="792" y1="144" x2="818" y2="144" class="flow-blue" marker-end="url(#arr-blue)"/>
+
+  <!-- Bottom Container: Vectorized Execution & Scheduling Layer -->
+  <rect x="20" y="272" width="1040" height="270" class="panel"/>
+  <text x="40" y="298" class="p-title">第二层：向量化算子执行、概率动态过滤与多核 Pipeline 调度（Execution &amp; Runtime）</text>
+  <text x="1040" y="298" text-anchor="end" class="p-sub">目标：榨干 SIMD 车道、避免伪共享（False Sharing）与分支预测冲刷</text>
+
+  <!-- Node 5: String Matching -->
+  <rect x="38" y="316" width="230" height="168" class="box-p2"/>
+  <text x="52" y="338" class="t-tag-p2">[P2] String Matching</text>
+  <text x="52" y="358" class="t-h">5. SIMD 文本过滤与多模式</text>
+  <text x="52" y="380" class="t-s">• 弃用纯 KMP: 规避逐字节条件跳转</text>
+  <text x="52" y="399" class="t-s">• Rare-Pair 首尾双字符 AVX2 预过滤</text>
+  <text x="52" y="418" class="t-s">• Z-Algorithm Z-Box 线性 LCP 窗口</text>
+  <text x="52" y="437" class="t-s">• AC 自动机: DFA 补全消除 fail 回跳</text>
+  <text x="52" y="460" class="t-m" fill="#6d28d9">Double-Array Trie 紧凑状态表</text>
+
+  <!-- Node 6: Probabilistic Structures -->
+  <rect x="296" y="316" width="232" height="168" class="box-p1"/>
+  <text x="310" y="338" class="t-tag-p1">[P1] Probabilistic Sketches</text>
+  <text x="310" y="358" class="t-h">6. Join Runtime Filter 与 NDV</text>
+  <text x="310" y="380" class="t-s">• Blocked Bloom: 单 64B 缓存行 SIMD</text>
+  <text x="310" y="399" class="t-s">• 静态只读表: Xor / Ribbon 省 30% 内存</text>
+  <text x="310" y="418" class="t-s">• 自适应熔断: Build 过大或过滤率&lt;10%</text>
+  <text x="310" y="437" class="t-s">• HLL: 6-bit 桶调和平均 + 小基数 LC</text>
+  <text x="310" y="460" class="t-m" fill="#047857">Runtime Filter 动态下推至 Scan</text>
+
+  <!-- Node 7: Concurrent Queue -->
+  <rect x="556" y="316" width="236" height="168" class="box-p0"/>
+  <text x="570" y="338" class="t-tag-p0">[P0] Concurrent Queue</text>
+  <text x="570" y="358" class="t-h">7. 无锁队列与 Work-Stealing</text>
+  <text x="570" y="380" class="t-s">• SPSC Shadow Index 省跨核 load</text>
+  <text x="570" y="399" class="t-s">• Vyukov MPMC: 槽位 sequence_ 同步</text>
+  <text x="570" y="418" class="t-s">• alignas(64) 隔离控制头与相邻槽位</text>
+  <text x="570" y="437" class="t-s">• Chase-Lev: 本地 LIFO + 窃取 FIFO</text>
+  <text x="570" y="460" class="t-m" fill="#1d4ed8">EventCount 两阶段等待防丢唤醒</text>
+
+  <!-- Node 8: Sorting -->
+  <rect x="820" y="316" width="222" height="168" class="box-p0"/>
+  <text x="834" y="338" class="t-tag-p0">[P0] Sorting &amp; External Sort</text>
+  <text x="834" y="358" class="t-h">8. 排序算子与外部归并落盘</text>
+  <text x="834" y="380" class="t-s">• PDQSort: BlockQuicksort 无分支分区</text>
+  <text x="834" y="399" class="t-s">• 符号位/IEEE754 翻转 + LSD/MSD Radix</text>
+  <text x="834" y="418" class="t-s">• 多列编码: Normalized Prefix Key</text>
+  <text x="834" y="437" class="t-s">• 外排 K 路: 败者树 log2(K) + 预读预测</text>
+  <text x="834" y="460" class="t-m" fill="#1d4ed8">64B Write-Combining 防 dTLB 抖动</text>
+
+  <line x1="268" y1="400" x2="294" y2="400" class="flow-blue" marker-end="url(#arr-blue)"/>
+  <line x1="528" y1="400" x2="554" y2="400" class="flow-blue" marker-end="url(#arr-blue)"/>
+  <line x1="792" y1="400" x2="818" y2="400" class="flow-blue" marker-end="url(#arr-blue)"/>
+
+  <!-- Feedback Loop: Runtime Filter pushdown from Join (6) to ZoneMap/Scan (2 & 4) -->
+  <path d="M 412 316 L 412 248 L 412 230" class="flow-green" marker-end="url(#arr-green)"/>
+  <text x="420" y="264" class="t-m" fill="#047857">Join Build 生成 Min-Max / Blocked Bloom 异步下推裁剪 Scan</text>
+
+  <!-- Bottom Summary Bar -->
+  <rect x="38" y="496" width="1004" height="34" class="box-hw"/>
+  <text x="540" y="517" text-anchor="middle" class="t-h" fill="#92400e">贯穿八大专题的三大底层第一性标尺：① 每次操作触发几次 L3 Cache / dTLB Miss？ ② 内层循环有无不可预测的条件分支？ ③ 共享缓存行上有无原子写风暴？</text>
+</svg>

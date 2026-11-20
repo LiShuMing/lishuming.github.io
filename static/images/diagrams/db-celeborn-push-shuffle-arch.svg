@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 580" width="1040" height="580" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">原生 Spark 按 Map 聚合拉取与 Apache Celeborn 按 Partition 追加推送对比</title>
+  <desc id="desc">上半部分展示原生 Spark ESS 单文件含全部分区导致的 M×R 随机小读；下半部分展示 Celeborn 控制面与数据面解耦、PushMergedData、8MB Chunk 顺序写、流水线双副本与动态 Soft Split。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .panel-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .tag-red { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #e11d48; }
+      .tag-green { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #059669; }
+      .box-map { fill: #eff6ff; stroke: #3b82f6; stroke-width: 1.4; rx: 6; }
+      .box-file { fill: #fffbeb; stroke: #d97706; stroke-width: 1.4; rx: 6; }
+      .box-ctrl { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.5; rx: 8; }
+      .box-worker { fill: #ecfdf5; stroke: #059669; stroke-width: 1.5; rx: 8; }
+      .box-rep { fill: #f0fdf4; stroke: #10b981; stroke-width: 1.4; stroke-dasharray: 5 3; rx: 8; }
+      .seg-p0 { fill: #dbeafe; stroke: #2563eb; stroke-width: 1; }
+      .seg-other { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1; }
+      .txt-b { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12px; font-weight: 700; fill: #1e293b; }
+      .txt-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; fill: #475569; }
+      .txt-mono { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; fill: #1e293b; }
+      .line-bad { stroke: #e11d48; stroke-width: 1.5; stroke-dasharray: 4 3; fill: none; }
+      .line-good { stroke: #059669; stroke-width: 2; fill: none; }
+      .line-ctrl { stroke: #7c3aed; stroke-width: 1.5; stroke-dasharray: 5 3; fill: none; }
+    </style>
+    <marker id="arr-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#e11d48"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-purple" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect width="1040" height="580" class="bg"/>
+
+  <!-- Top Panel: Spark Native ESS -->
+  <rect x="24" y="18" width="992" height="196" class="panel"/>
+  <text x="44" y="44" class="panel-title">A. 原生 Spark SortShuffle + ESS：按 Mapper 组织本地文件（单文件内把 P0..PR-1 排在一起）</text>
+  <text x="996" y="44" text-anchor="end" class="tag-red">M×R 次随机磁盘 lseek · 单副本耦合本地盘</text>
+
+  <!-- Map 0 File -->
+  <rect x="48" y="62" width="380" height="38" class="box-file"/>
+  <text x="58" y="85" class="txt-mono">Map 0 (.data):</text>
+  <rect x="160" y="68" width="60" height="26" class="seg-p0"/>
+  <text x="190" y="85" text-anchor="middle" class="txt-mono">P0 50K</text>
+  <rect x="224" y="68" width="60" height="26" class="seg-other"/>
+  <text x="254" y="85" text-anchor="middle" class="txt-mono">P1 50K</text>
+  <rect x="288" y="68" width="128" height="26" class="seg-other"/>
+  <text x="352" y="85" text-anchor="middle" class="txt-mono">... P999 50K</text>
+
+  <!-- Map 1 File -->
+  <rect x="48" y="110" width="380" height="38" class="box-file"/>
+  <text x="58" y="133" class="txt-mono">Map 1 (.data):</text>
+  <rect x="160" y="116" width="60" height="26" class="seg-p0"/>
+  <text x="190" y="133" text-anchor="middle" class="txt-mono">P0 50K</text>
+  <rect x="224" y="116" width="60" height="26" class="seg-other"/>
+  <text x="254" y="133" text-anchor="middle" class="txt-mono">P1 50K</text>
+  <rect x="288" y="116" width="128" height="26" class="seg-other"/>
+  <text x="352" y="133" text-anchor="middle" class="txt-mono">... P999 50K</text>
+
+  <!-- Map M-1 File -->
+  <rect x="48" y="158" width="380" height="38" class="box-file"/>
+  <text x="58" y="181" class="txt-mono">Map 999(.data):</text>
+  <rect x="160" y="164" width="60" height="26" class="seg-p0"/>
+  <text x="190" y="181" text-anchor="middle" class="txt-mono">P0 50K</text>
+  <rect x="224" y="164" width="60" height="26" class="seg-other"/>
+  <text x="254" y="181" text-anchor="middle" class="txt-mono">P1 50K</text>
+  <rect x="288" y="164" width="128" height="26" class="seg-other"/>
+  <text x="352" y="181" text-anchor="middle" class="txt-mono">... P999 50K</text>
+
+  <!-- Reduce 0 pulling small slices -->
+  <rect x="690" y="96" width="296" height="72" class="box-map"/>
+  <text x="838" y="124" text-anchor="middle" class="txt-b">Reduce Task 0（读取完整 P0）</text>
+  <text x="838" y="143" text-anchor="middle" class="txt-s">跨网络向 1000 台 Map 宿主机各抠 50KB</text>
+  <text x="838" y="159" text-anchor="middle" class="txt-s">污染 OS PageCache，任意机器坏盘触发 FetchFailed</text>
+
+  <path d="M 220 81 C 460 81, 520 118, 688 122" class="line-bad" marker-end="url(#arr-red)"/>
+  <path d="M 220 129 C 460 129, 520 132, 688 132" class="line-bad" marker-end="url(#arr-red)"/>
+  <path d="M 220 177 C 460 177, 520 146, 688 142" class="line-bad" marker-end="url(#arr-red)"/>
+  <text x="545" y="102" text-anchor="middle" class="txt-s" fill="#e11d48">100 万次随机小 I/O 与碎包 RPC</text>
+
+  <!-- Bottom Panel: Apache Celeborn -->
+  <rect x="24" y="232" width="992" height="330" class="panel"/>
+  <text x="44" y="258" class="panel-title">B. Apache Celeborn：Push-based 按 Partition 远端追加写 + 8MB Chunk 零拷贝与 Soft Split</text>
+  <text x="996" y="258" text-anchor="end" class="tag-green">顺序大块 I/O · 双副本 Revive 零 Stage 重算</text>
+
+  <!-- Control Plane -->
+  <rect x="48" y="276" width="250" height="68" class="box-ctrl"/>
+  <text x="173" y="300" text-anchor="middle" class="txt-b">LifecycleManager（Driver 内置）</text>
+  <text x="173" y="318" text-anchor="middle" class="txt-s">维护 PartitionLocation(epoch) 映射</text>
+  <text x="173" y="334" text-anchor="middle" class="txt-s">协调 Master (Ratis) 处理 Split / Revive</text>
+
+  <!-- ShuffleClient Map Side -->
+  <rect x="48" y="378" width="250" height="156" class="box-map"/>
+  <text x="173" y="404" text-anchor="middle" class="txt-b">ShuffleClient（Executor 单例）</text>
+  <text x="173" y="425" text-anchor="middle" class="txt-s">• HashBased / SortBased 双模缓冲</text>
+  <text x="173" y="445" text-anchor="middle" class="txt-s">• PushMergedData 合包发往同 Worker</text>
+  <text x="173" y="465" text-anchor="middle" class="txt-s">• Gluten 列式 RowVector 直推免转行</text>
+  <text x="173" y="485" text-anchor="middle" class="txt-s">• maxBytesInFlight + AIMD 拥塞限速</text>
+  <text x="173" y="512" text-anchor="middle" class="txt-mono" fill="#2563eb">BatchHeader(mapId,attempt,batch)</text>
+
+  <!-- Primary Worker -->
+  <rect x="386" y="284" width="330" height="162" class="box-worker"/>
+  <text x="551" y="310" text-anchor="middle" class="txt-b">Primary Worker：ReducePartition 文件</text>
+  <text x="551" y="329" text-anchor="middle" class="txt-s">聚齐所有 Map 推来的 P0 数据，顺序追加写盘</text>
+  <rect x="406" y="342" width="290" height="30" rx="4" fill="#ffffff" stroke="#059669"/>
+  <text x="551" y="361" text-anchor="middle" class="txt-mono">[Chunk 0: 8MB] [Chunk 1: 8MB] ... (epoch=0)</text>
+  <text x="551" y="392" text-anchor="middle" class="txt-s">• MemoryManager 85%/95%/70% 三级反压水位</text>
+  <text x="551" y="411" text-anchor="middle" class="txt-s">• 超 1GB 返回 SOFT_SPLIT 切新 epoch 免疫倾斜</text>
+  <text x="551" y="430" text-anchor="middle" class="txt-s">• 分层存储：Memory → SSD/HDD → S3/HDFS</text>
+
+  <!-- Replica Worker -->
+  <rect x="386" y="466" width="330" height="76" class="box-rep"/>
+  <text x="551" y="492" text-anchor="middle" class="txt-b">Replica Worker（或 Split 新节点 epoch=1）</text>
+  <text x="551" y="511" text-anchor="middle" class="txt-s">Primary 内部流水线异步复制副本；主节点故障时</text>
+  <text x="551" y="528" text-anchor="middle" class="txt-s">写端 Revive 切流、读端无缝切副本，消灭 FetchFailed</text>
+
+  <!-- Reduce Reader -->
+  <rect x="786" y="336" width="208" height="148" class="box-map"/>
+  <text x="890" y="364" text-anchor="middle" class="txt-b">Reduce 端流式顺序读取</text>
+  <text x="890" y="387" text-anchor="middle" class="txt-s">• ChunkFetchRequest 顺序拉取</text>
+  <text x="890" y="407" text-anchor="middle" class="txt-s">• Netty FileRegion (sendfile)</text>
+  <text x="890" y="427" text-anchor="middle" class="txt-s">• RoaringBitmap 幂等过滤重试块</text>
+  <text x="890" y="447" text-anchor="middle" class="txt-s">• AQE 倾斜按 Chunk 偏移切分</text>
+  <text x="890" y="467" text-anchor="middle" class="txt-s">  免除 FileSorter 读放大</text>
+
+  <!-- Connections -->
+  <line x1="173" y1="344" x2="173" y2="376" class="line-ctrl" marker-end="url(#arr-purple)"/>
+  <path d="M 298 310 L 384 310" class="line-ctrl" marker-end="url(#arr-purple)"/>
+  <text x="341" y="302" text-anchor="middle" class="txt-s" fill="#7c3aed">Reserve/Split</text>
+
+  <path d="M 298 432 L 384 375" class="line-good" marker-end="url(#arr-green)"/>
+  <text x="340" y="425" text-anchor="middle" class="txt-s" fill="#059669">PushMerged</text>
+
+  <line x1="551" y1="446" x2="551" y2="464" class="line-good" stroke-dasharray="4 3" marker-end="url(#arr-green)"/>
+  <line x1="716" y1="380" x2="784" y2="395" class="line-good" marker-end="url(#arr-green)"/>
+  <text x="750" y="373" text-anchor="middle" class="txt-s" fill="#059669">8MB Chunk</text>
+</svg>

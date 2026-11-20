@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 540" width="1040" height="540" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">教科书式标准库 LRU 与生产级 C++ 侵入式无锁缓存的物理布局对比</title>
+  <desc id="desc">上半部分展示 std::unordered_map 加 std::list 造成的 6 倍内存膨胀与单次 get 触发 5 次串行 LLC Miss；下半部分展示 RocksDB/CacheLib/Dragonfly 风格的 SIMD 扁平索引、侵入式连续槽位、2MB 大页 Slab 与无锁 Clock 位标记。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .badge-red { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #e11d48; }
+      .badge-green { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #059669; }
+      .node-bad { fill: #fff1f2; stroke: #e11d48; stroke-width: 1.4; rx: 6; }
+      .node-heap { fill: #fffbeb; stroke: #d97706; stroke-width: 1.4; rx: 6; }
+      .node-good { fill: #ecfdf5; stroke: #059669; stroke-width: 1.5; rx: 7; }
+      .node-simd { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; rx: 7; }
+      .node-slab { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.5; rx: 7; }
+      .t-b { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12px; font-weight: 700; fill: #1e293b; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; fill: #475569; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; fill: #0f172a; }
+      .hop-red { stroke: #e11d48; stroke-width: 1.7; stroke-dasharray: 4 3; fill: none; }
+      .hop-green { stroke: #059669; stroke-width: 2; fill: none; }
+    </style>
+    <marker id="a-red" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#e11d48"/>
+    </marker>
+    <marker id="a-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect width="1040" height="540" class="bg"/>
+
+  <!-- Panel A: Textbook std::unordered_map + std::list -->
+  <rect x="24" y="18" width="992" height="224" class="panel"/>
+  <text x="44" y="45" class="p-title">A. 教科书方案（std::unordered_map + std::list）：碎片化堆节点与串行指针追逐</text>
+  <text x="996" y="45" text-anchor="end" class="badge-red">16B 数据耗 ~104B 内存 · 单次 get 触发 4–5 次 LLC Miss + 互斥写锁</text>
+
+  <rect x="44" y="74" width="148" height="82" class="node-heap"/>
+  <text x="118" y="96" text-anchor="middle" class="t-b">Bucket* 桶数组</text>
+  <text x="118" y="116" text-anchor="middle" class="t-m">[h % N] -&gt; Node*</text>
+  <text x="118" y="136" text-anchor="middle" class="t-s" fill="#e11d48">① Miss #1 (~80ns)</text>
+
+  <rect x="244" y="68" width="206" height="94" class="node-bad"/>
+  <text x="347" y="90" text-anchor="middle" class="t-b">堆块 1: _Hash_node (~48B)</text>
+  <text x="347" y="110" text-anchor="middle" class="t-m">malloc_hdr | next* (8B)</text>
+  <text x="347" y="128" text-anchor="middle" class="t-m">Key (8B)   | list_it* (8B)</text>
+  <text x="347" y="148" text-anchor="middle" class="t-s" fill="#e11d48">② Miss #2 (单独 new)</text>
+
+  <rect x="504" y="68" width="218" height="94" class="node-bad"/>
+  <text x="613" y="90" text-anchor="middle" class="t-b">堆块 2: _List_node (~48B)</text>
+  <text x="613" y="110" text-anchor="middle" class="t-m">prev* (8B) | next* (8B)</text>
+  <text x="613" y="128" text-anchor="middle" class="t-m">Key副本(8B)| Value (8B)</text>
+  <text x="613" y="148" text-anchor="middle" class="t-s" fill="#e11d48">③ Miss #3 (Key 被迫存两遍)</text>
+
+  <rect x="776" y="68" width="220" height="94" class="node-heap"/>
+  <text x="886" y="90" text-anchor="middle" class="t-b">相邻节点 prev / next</text>
+  <text x="886" y="110" text-anchor="middle" class="t-s">splice 挪到队头需改 4–6 个指针</text>
+  <text x="886" y="128" text-anchor="middle" class="t-m">prev-&gt;next = next ...</text>
+  <text x="886" y="148" text-anchor="middle" class="t-s" fill="#e11d48">④⑤ Miss #4/#5 + 全局写锁争用</text>
+
+  <line x1="192" y1="115" x2="242" y2="115" class="hop-red" marker-end="url(#a-red)"/>
+  <line x1="450" y1="115" x2="502" y2="115" class="hop-red" marker-end="url(#a-red)"/>
+  <line x1="722" y1="115" x2="774" y2="115" class="hop-red" marker-end="url(#a-red)"/>
+
+  <text x="520" y="196" text-anchor="middle" class="t-s">致命伤：每次插入/淘汰调 2 次 new/delete 制造 dTLB 页表碎片；100% 纯读流量也因移动链表退化为互斥写，多核缓存行剧烈乒乓</text>
+  <text x="520" y="218" text-anchor="middle" class="t-m" fill="#64748b">MLP (内存级并行度) = 1，CPU 乱序窗口被串行指针依赖彻底锁死，单次命中延迟高达 350–500ns</text>
+
+  <!-- Panel B: Production C++ Intrusive + SIMD Flat + HugePage Slab + Clock -->
+  <rect x="24" y="260" width="992" height="262" class="panel"/>
+  <text x="44" y="287" class="p-title">B. 生产级 C++ 引擎（RocksDB HyperClock / Meta CacheLib / Dragonfly 思路）</text>
+  <text x="996" y="287" text-anchor="end" class="badge-green">64 分片 / Shared-Nothing · 0 malloc · 读路径 100% 无锁</text>
+
+  <!-- Step 1: SIMD Flat Table -->
+  <rect x="44" y="314" width="268" height="128" class="node-simd"/>
+  <text x="178" y="338" text-anchor="middle" class="t-b">1. SIMD 开放寻址索引 (Swiss / Dash)</text>
+  <rect x="60" y="350" width="236" height="26" rx="4" fill="#ffffff" stroke="#2563eb"/>
+  <text x="178" y="367" text-anchor="middle" class="t-m">[H2: 1B×16 控制字节] _mm_cmpeq_epi8</text>
+  <text x="178" y="394" text-anchor="middle" class="t-s">• 单条 64B 缓存行并行探测 16 个槽位</text>
+  <text x="178" y="413" text-anchor="middle" class="t-s">• 存 4B uint32 槽位下标替代 8B 裸指针</text>
+  <text x="178" y="431" text-anchor="middle" class="t-s">• 彻底消灭 _Hash_node 链式节点分配</text>
+
+  <!-- Step 2: Intrusive Slab Slot -->
+  <rect x="366" y="314" width="336" height="128" class="node-good"/>
+  <text x="534" y="338" text-anchor="middle" class="t-b">2. 侵入式单块紧凑条目 (2MB 大页 Slab 池)</text>
+  <rect x="382" y="350" width="304" height="28" rx="4" fill="#ffffff" stroke="#059669"/>
+  <text x="534" y="368" text-anchor="middle" class="t-m">prev_idx|next_idx|refs|clock_bit|Key|Value</text>
+  <text x="534" y="394" text-anchor="middle" class="t-s">• Key 仅存 1 份，Header 与内联 KV 同处一处缓存行</text>
+  <text x="534" y="413" text-anchor="middle" class="t-s">• 2MB HugePages 扩大 TLB 覆盖 512 倍，零堆碎片</text>
+  <text x="534" y="431" text-anchor="middle" class="t-s">• 容量满时原地覆写同规格槽位，0 次系统 free</text>
+
+  <!-- Step 3: Lock-free Clock / Sieve -->
+  <rect x="756" y="314" width="240" height="128" class="node-slab"/>
+  <text x="876" y="338" text-anchor="middle" class="t-b">3. 无锁 Clock / Sieve 替代改链表</text>
+  <text x="876" y="362" text-anchor="middle" class="t-m" fill="#7c3aed">if (!clock_bit) clock_bit = 1;</text>
+  <text x="876" y="385" text-anchor="middle" class="t-s">• 读命中绝不拆装 prev/next 指针</text>
+  <text x="876" y="404" text-anchor="middle" class="t-s">• Test-and-Set 避免热点缓存行写风暴</text>
+  <text x="876" y="423" text-anchor="middle" class="t-s">• 仅在容量驱逐时顺时针扫描清零回收</text>
+
+  <line x1="312" y1="378" x2="364" y2="378" class="hop-green" marker-end="url(#a-green)"/>
+  <line x1="702" y1="378" x2="754" y2="378" class="hop-green" marker-end="url(#a-green)"/>
+
+  <rect x="44" y="458" width="952" height="46" rx="6" fill="#f1f5f9" stroke="#cbd5e1"/>
+  <text x="520" y="478" text-anchor="middle" class="t-b">进阶至大模型前缀缓存（RadixAttention / Tair KVCM）：侵入式钩子与基数树拓扑融合</text>
+  <text x="520" y="496" text-anchor="middle" class="t-s">仅将 ref_count == 0 且 children_count == 0 的叶子块挂入侵入式驱逐队列，保护共享 System Prompt 根节点不被误杀</text>
+</svg>

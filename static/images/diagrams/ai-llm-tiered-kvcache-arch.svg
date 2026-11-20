@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 580" width="1040" height="580" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">大模型推理分层 KV Cache 池化与控制面/数据面解耦架构</title>
+  <desc id="desc">展示以 Tair KVCache (KVCM)、Mooncake、SGLang HiCache 与 NVIDIA Dynamo/NIXL 为代表的 G1-G4 分级存储、前缀树匹配、两阶段写入与 GPUDirect RDMA 零拷贝直注链路。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .box-ctrl { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 10; }
+      .box-compute { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 10; }
+      .box-pool { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 10; }
+      .sub-white { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.3; rx: 7; }
+      .sub-green { fill: #ffffff; stroke: #10b981; stroke-width: 1.4; rx: 7; }
+      .sub-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.4; rx: 7; }
+      .title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .h2 { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12.5px; font-weight: 700; fill: #1e293b; }
+      .p { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11px; fill: #475569; }
+      .mono { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.5px; fill: #0f172a; font-weight: 600; }
+      .ctrl-line { stroke: #7c3aed; stroke-width: 1.6; stroke-dasharray: 5 3; fill: none; }
+      .rdma-line { stroke: #059669; stroke-width: 2.4; fill: none; }
+    </style>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect width="1040" height="580" class="bg"/>
+
+  <!-- Top Control Plane -->
+  <rect x="24" y="20" width="992" height="146" class="box-ctrl"/>
+  <text x="44" y="48" class="title" fill="#5b21b6">全局语义路由与元数据控制面（Tair KVCM / NVIDIA Dynamo KV-Aware Router）</text>
+
+  <rect x="44" y="64" width="296" height="84" class="sub-white"/>
+  <text x="192" y="86" text-anchor="middle" class="h2">1. 注意力感知索引与路由</text>
+  <text x="192" y="106" text-anchor="middle" class="p">• 最长公共前缀匹配 (Radix / Block Hash)</text>
+  <text x="192" y="124" text-anchor="middle" class="p">• 兼容滑窗 (SWA) 与 Mamba 混合注意力</text>
+  <text x="192" y="140" text-anchor="middle" class="p">• 结合各级命中成本智能路由推理实例</text>
+
+  <rect x="364" y="64" width="312" height="84" class="sub-white"/>
+  <text x="520" y="86" text-anchor="middle" class="h2">2. 两阶段写入协议 (Two-Phase Writes)</text>
+  <text x="520" y="106" text-anchor="middle" class="mono" fill="#7c3aed">Phase 1: Reserve -&gt; Phase 2: Write &amp; Confirm</text>
+  <text x="520" y="124" text-anchor="middle" class="p">• 仅 Confirm 后的完整张量块对全局读可见</text>
+  <text x="520" y="140" text-anchor="middle" class="p">• ReportEvent 增量同步本地缓存水位快照</text>
+
+  <rect x="700" y="64" width="296" height="84" class="sub-white"/>
+  <text x="848" y="86" text-anchor="middle" class="h2">3. 多租户配额与异步回收</text>
+  <text x="848" y="106" text-anchor="middle" class="p">• Instance Group 租户级容量隔离</text>
+  <text x="848" y="124" text-anchor="middle" class="p">• Group LRU / 成比例后台异步降级驱逐</text>
+  <text x="848" y="140" text-anchor="middle" class="p">• 绝不阻塞前台 Prefill / Decode 关键路径</text>
+
+  <!-- Middle Compute Layer (P/D Disaggregation) -->
+  <rect x="24" y="202" width="992" height="162" class="box-compute"/>
+  <text x="44" y="230" class="title" fill="#1d4ed8">计算执行面：P/D 分离推理集群与本地分层缓存（vLLM / SGLang HiCache / Connector）</text>
+
+  <rect x="44" y="246" width="296" height="98" class="sub-white"/>
+  <text x="192" y="268" text-anchor="middle" class="h2">Prefill 实例群（计算密集型）</text>
+  <text x="192" y="288" text-anchor="middle" class="p">• 命中远端前缀块：逐层异步预取进 G1 HBM</text>
+  <text x="192" y="306" text-anchor="middle" class="p">• 仅增量计算未命中新 Token，TTFT 降 80%+</text>
+  <text x="192" y="324" text-anchor="middle" class="p">• 算完异步刷入共享 KV 池移交 Decode 节点</text>
+
+  <rect x="364" y="246" width="312" height="98" class="sub-amber"/>
+  <text x="520" y="268" text-anchor="middle" class="h2">G1 GPU HBM ↔ G2 Host Pinned DRAM</text>
+  <text x="520" y="288" text-anchor="middle" class="p">• PagedAttention / RadixTree 页块管理</text>
+  <text x="520" y="306" text-anchor="middle" class="p">• 锁页内存池 + 多网卡拓扑感知传输引擎</text>
+  <text x="520" y="324" text-anchor="middle" class="mono" fill="#d97706">Mooncake Transfer Engine / NVIDIA NIXL</text>
+
+  <rect x="700" y="246" width="296" height="98" class="sub-white"/>
+  <text x="848" y="268" text-anchor="middle" class="h2">Decode 实例群（显存带宽密集型）</text>
+  <text x="848" y="288" text-anchor="middle" class="p">• 经 GPUDirect RDMA 零拷贝拉取完整上下文 KV</text>
+  <text x="848" y="306" text-anchor="middle" class="p">• 绕过主机内核 TCP 与 CPU memcpy 开销</text>
+  <text x="848" y="324" text-anchor="middle" class="p">• 稳定保障高并发生成阶段 TPOT 延迟 SLA</text>
+
+  <!-- Bottom Storage Pool (G3 / G3.5 / G4) -->
+  <rect x="24" y="402" width="992" height="156" class="box-pool"/>
+  <text x="44" y="430" class="title" fill="#047857">存算分离高速数据面：G3–G4 多级池化存储底座（以存代算突破显存墙）</text>
+
+  <rect x="44" y="446" width="306" height="92" class="sub-green"/>
+  <text x="197" y="468" text-anchor="middle" class="h2">G3 / G3.5 分布式高速内存与 NVMe 池</text>
+  <text x="197" y="488" text-anchor="middle" class="p">Tair KVCacheStore / Mooncake Store / 3FS</text>
+  <text x="197" y="506" text-anchor="middle" class="p">• 聚拢集群富余 DRAM 与高速 NVMe SSD</text>
+  <text x="197" y="524" text-anchor="middle" class="p">• 200/400GbE RoCEv2 / InfiniBand RDMA 直通</text>
+
+  <rect x="374" y="446" width="302" height="92" class="sub-green"/>
+  <text x="525" y="468" text-anchor="middle" class="h2">带宽受限场景张量编码（LMCache）</text>
+  <text x="525" y="488" text-anchor="middle" class="p">• CacheGen 按层敏感度自适应量化流编码</text>
+  <text x="525" y="506" text-anchor="middle" class="p">• 支持跨实例与非严格句首位置块重用</text>
+  <text x="525" y="524" text-anchor="middle" class="p">• 在窄网络链路上用轻量解压换数倍吞吐</text>
+
+  <rect x="700" y="446" width="296" height="92" class="sub-white"/>
+  <text x="848" y="468" text-anchor="middle" class="h2">G4 温冷持久化层 + 语义短路层</text>
+  <text x="848" y="488" text-anchor="middle" class="p">• 超长周期 Agent 归档记忆落对象存储</text>
+  <text x="848" y="506" text-anchor="middle" class="p">• 前置 TairVector (HNSW) 语义缓存拦截高频同义问</text>
+  <text x="848" y="524" text-anchor="middle" class="p">• SCM 持久内存实现低成本亚毫秒级大内存驻留</text>
+
+  <!-- Cross-plane arrows -->
+  <line x1="192" y1="166" x2="192" y2="200" class="ctrl-line" marker-end="url(#arr-p)"/>
+  <line x1="520" y1="166" x2="520" y2="200" class="ctrl-line" marker-end="url(#arr-p)"/>
+  <line x1="848" y1="166" x2="848" y2="200" class="ctrl-line" marker-end="url(#arr-p)"/>
+  <text x="355" y="188" text-anchor="middle" class="p" fill="#6d28d9">1. 元数据寻址 / Reserve-Confirm 信令（控制面不碰大张量）</text>
+
+  <line x1="240" y1="364" x2="240" y2="400" class="rdma-line" marker-end="url(#arr-g)"/>
+  <line x1="520" y1="400" x2="520" y2="366" class="rdma-line" marker-end="url(#arr-g)"/>
+  <line x1="800" y1="400" x2="800" y2="366" class="rdma-line" marker-end="url(#arr-g)"/>
+  <text x="520" y="388" text-anchor="middle" class="mono" fill="#059669">2. GPUDirect RDMA / GDS 零拷贝高速张量通道</text>
+</svg>

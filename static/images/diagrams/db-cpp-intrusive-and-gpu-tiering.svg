@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 560" width="1040" height="560" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">向量化引擎 C++ 侵入式内存底座与 CPU-GPU 三级异构流水线映射</title>
+  <desc id="desc">左侧对比 std::shared_ptr 双指针外部控制块与 intrusive_ptr 单块连续 Buffer 布局；右侧展示 CPU SIMD 小批缓存驻留到 GPU SIMT 大批合并访存及 RMM-Pinned-NVMe 三级分级管理。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .card { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .sec-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .box-warn { fill: #fff1f2; stroke: #e11d48; stroke-width: 1.4; rx: 6; }
+      .box-ok { fill: #ecfdf5; stroke: #059669; stroke-width: 1.5; rx: 6; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.5; rx: 7; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.5; rx: 7; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.5; rx: 7; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12px; font-weight: 700; fill: #1e293b; }
+      .t-p { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; fill: #475569; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.5px; fill: #0f172a; }
+      .arr-gray { stroke: #64748b; stroke-width: 1.6; fill: none; }
+      .arr-green { stroke: #059669; stroke-width: 1.8; fill: none; }
+      .arr-blue { stroke: #2563eb; stroke-width: 1.8; fill: none; }
+    </style>
+    <marker id="m-gray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748b"/>
+    </marker>
+    <marker id="m-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="m-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect width="1040" height="560" class="bg"/>
+
+  <!-- Left Half: C++ Smart Pointer & Buffer Memory Layout -->
+  <rect x="20" y="20" width="485" height="520" class="card"/>
+  <text x="40" y="48" class="sec-title">1. 数据面内存句柄：std::shared_ptr vs. intrusive_ptr</text>
+
+  <!-- shared_ptr -->
+  <rect x="38" y="68" width="448" height="178" rx="8" fill="#f8fafc" stroke="#e2e8f0"/>
+  <text x="52" y="90" class="t-h" fill="#e11d48">A. std::shared_ptr&lt;Buffer&gt;（非侵入式：16B 胖指针 + 外部控制块）</text>
+
+  <rect x="52" y="108" width="132" height="62" class="box-warn"/>
+  <text x="118" y="130" text-anchor="middle" class="t-m">T* ptr (8B)</text>
+  <text x="118" y="152" text-anchor="middle" class="t-m">Ctrl* blk (8B)</text>
+
+  <rect x="226" y="102" width="124" height="74" class="box-warn"/>
+  <text x="288" y="122" text-anchor="middle" class="t-m">ControlBlock</text>
+  <text x="288" y="140" text-anchor="middle" class="t-p">vptr + Deleter</text>
+  <text x="288" y="156" text-anchor="middle" class="t-p">strong + weak_cnt</text>
+
+  <rect x="378" y="108" width="94" height="62" class="box-blue"/>
+  <text x="425" y="134" text-anchor="middle" class="t-m">Buffer</text>
+  <text x="425" y="152" text-anchor="middle" class="t-p">Pool 内存块</text>
+
+  <path d="M 184 126 C 240 86, 330 86, 376 122" class="arr-gray" marker-end="url(#m-gray)"/>
+  <line x1="184" y1="150" x2="224" y2="150" class="arr-gray" marker-end="url(#m-gray)"/>
+  <text x="52" y="198" class="t-p">• Placement new 分配变长尾部时无法用 make_shared，被迫额外 new 控制块</text>
+  <text x="52" y="216" class="t-p">• 16B 非平凡拷贝无法走单个寄存器传参；归零后控制块销毁，无法原地复活</text>
+  <text x="52" y="234" class="t-p">• 64B Cache Line 仅容 4 个列句柄，且强制附带无用的 weak_count 原子开销</text>
+
+  <!-- intrusive_ptr -->
+  <rect x="38" y="264" width="448" height="256" rx="8" fill="#f8fafc" stroke="#cbd5e1"/>
+  <text x="52" y="288" class="t-h" fill="#059669">B. intrusive_ptr&lt;velox::Buffer&gt;（侵入式：8B 单指针 + 单块连续池分配）</text>
+
+  <rect x="52" y="312" width="114" height="46" class="box-ok"/>
+  <text x="109" y="340" text-anchor="middle" class="t-m">T* ptr (8B)</text>
+
+  <rect x="206" y="302" width="264" height="72" class="box-ok"/>
+  <text x="338" y="323" text-anchor="middle" class="t-m">MemoryPool 单次切分连续块 (alignas 64)</text>
+  <rect x="216" y="333" width="108" height="30" rx="4" fill="#ffffff" stroke="#059669"/>
+  <text x="270" y="352" text-anchor="middle" class="t-m">Header(ref_cnt_)</text>
+  <rect x="330" y="333" width="130" height="30" rx="4" fill="#dcfce7" stroke="#059669"/>
+  <text x="395" y="352" text-anchor="middle" class="t-m">Payload 变长列数据</text>
+
+  <line x1="166" y1="335" x2="204" y2="335" class="arr-green" marker-end="url(#m-green)"/>
+  <text x="52" y="402" class="t-p">• 0 次全局堆分配：Header 与变长数据区在同一次 Arena / Pool 分配中完成</text>
+  <text x="52" y="422" class="t-p">• Cache Line 密度翻倍（64B 装 8 个句柄），支持从裸指针 this 安全零成本包装</text>
+  <text x="52" y="442" class="t-p">• 归零原地复用：release 钩子直接把块挂回 FreeList，下次置 ref_cnt_=1 复活</text>
+  <text x="52" y="462" class="t-p">• 配合不可变 Slice View（data + offset + length），跨算子切分全程零 memcpy</text>
+  <text x="52" y="492" class="t-m" fill="#059669">外层算子虚函数 (4096行/次) + 内层 TypeSwitch 模板特化保 L1i Cache</text>
+
+  <!-- Right Half: CPU-to-GPU SIMT & 3-Tier Memory Pipeline -->
+  <rect x="520" y="20" width="500" height="520" class="card"/>
+  <text x="540" y="48" class="sec-title">2. CPU 列式内核 → GPU SIMT 与三级显存分级（Sirius / RMM）</text>
+
+  <!-- CPU vs GPU Batch Mapping -->
+  <rect x="538" y="68" width="218" height="122" class="box-blue"/>
+  <text x="647" y="92" text-anchor="middle" class="t-h">CPU SIMD 向量化（Velox/SR）</text>
+  <text x="647" y="112" text-anchor="middle" class="t-p">• Batch = 1024~4096 行驻留 L1/L2</text>
+  <text x="647" y="131" text-anchor="middle" class="t-p">• SelectivityVector 位图延迟物化</text>
+  <text x="647" y="150" text-anchor="middle" class="t-p">• RowContainer + 软件预取藏 DRAM</text>
+  <text x="647" y="169" text-anchor="middle" class="t-m" fill="#2563eb">DDR5 ~200-400 GB/s</text>
+
+  <rect x="784" y="68" width="218" height="122" class="box-purple"/>
+  <text x="893" y="92" text-anchor="middle" class="t-h">GPU SIMT 锁步执行（libcudf）</text>
+  <text x="893" y="112" text-anchor="middle" class="t-p">• Batch = 10万~百万行喂饱 SM</text>
+  <text x="893" y="131" text-anchor="middle" class="t-p">• Warp 32线程 128B 合并访存列存</text>
+  <text x="893" y="150" text-anchor="middle" class="t-p">• Bitmask + PrefixSum 紧凑重排</text>
+  <text x="893" y="169" text-anchor="middle" class="t-m" fill="#7c3aed">HBM ~2,000-3,350 GB/s</text>
+
+  <line x1="756" y1="129" x2="782" y2="129" class="arr-blue" marker-end="url(#m-blue)"/>
+
+  <!-- 3-Tier Memory Hierarchy -->
+  <rect x="538" y="212" width="464" height="92" class="box-ok"/>
+  <text x="770" y="236" text-anchor="middle" class="t-h">Tier 1: GPU HBM 显存池（RMM cuda_async_memory_resource）</text>
+  <text x="770" y="256" text-anchor="middle" class="t-p">禁用同步 cudaMalloc；绑定 CUDA Stream 流序异步复用，Substrait 整棵子树驻留</text>
+  <text x="770" y="276" text-anchor="middle" class="t-p">多卡间走 NVLink P2P DMA 洗牌；压缩页直传由 nvCOMP 在卡上并行解压</text>
+
+  <rect x="538" y="332" width="464" height="92" class="box-amber"/>
+  <text x="770" y="356" text-anchor="middle" class="t-h">Tier 2: NUMA-Local Host Pinned Memory（cudaMallocHost 锁页内存）</text>
+  <text x="770" y="376" text-anchor="middle" class="t-p">消除可换页内存的驱动隐式 Staging 拷贝；严格绑定同路 CPU Socket 避开跨 UPI 降速</text>
+  <text x="770" y="396" text-anchor="middle" class="t-p">Multi-Stream 三缓冲重叠：Stream1 H2D ∥ Stream2 Kernel ∥ Stream3 D2H</text>
+
+  <rect x="538" y="452" width="464" height="68" class="box-blue"/>
+  <text x="770" y="476" text-anchor="middle" class="t-h">Tier 3: 本地 NVMe 溢出池 / GPUDirect Storage (cuFile)</text>
+  <text x="770" y="498" text-anchor="middle" class="t-p">超显存+主机配额时异步落盘兜底；GDS 支持绕过 OS PageCache 直通显存 DMA</text>
+
+  <line x1="720" y1="304" x2="720" y2="330" class="arr-green" marker-end="url(#m-green)"/>
+  <line x1="820" y1="330" x2="820" y2="304" class="arr-green" marker-end="url(#m-green)"/>
+  <text x="770" y="321" text-anchor="middle" class="t-m" fill="#d97706">PCIe Gen4/5</text>
+
+  <line x1="770" y1="424" x2="770" y2="450" class="arr-blue" marker-end="url(#m-blue)"/>
+</svg>
