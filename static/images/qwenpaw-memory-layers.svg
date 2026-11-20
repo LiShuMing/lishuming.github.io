@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="800" viewBox="0 0 1120 800" role="img"
+     aria-label="QwenPaw 的三层记忆：三种粒度，三个写入者">
+<title>QwenPaw 的三层记忆：三种粒度，三个写入者</title>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+</defs>
+<rect width="1120" height="800" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328" text-anchor="start" data-max-w="1040" data-label="title">QwenPaw 的三层记忆：三种粒度，三个写入者</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="subtitle">蓝色是当前上下文，绿色是逐字历史，橙色是蒸馏后的知识库；三条路径不互为副本</text>
+<rect x="40" y="96" width="1040" height="200" rx="12" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="122" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="1000" data-label="band label '① 工作窗口：token 有限，先保证当前轮完整'">① 工作窗口：token 有限，先保证当前轮完整</text>
+<rect x="64" y="146" width="290" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="79" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="260" data-label="card title '轮次进入窗口'">轮次进入窗口</text>
+<text x="79" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line '用户消息、工具调用与结果'">用户消息、工具调用与结果</text>
+<text x="79" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line '容量由模型上下文决定'">容量由模型上下文决定</text>
+<rect x="410" y="146" width="290" height="100" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="425" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="260" data-label="card title '写穿（write-through）'">写穿（write-through）</text>
+<text x="425" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line 'on_save：每轮原文落盘'">on_save：每轮原文落盘</text>
+<text x="425" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line '这一步不做摘要'">这一步不做摘要</text>
+<rect x="756" y="146" width="280" height="100" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="771" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="250" data-label="card title '超过阈值后压缩'">超过阈值后压缩</text>
+<text x="771" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="250" data-label="card line '保留尾部 + 续接摘要'">保留尾部 + 续接摘要</text>
+<text x="771" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="250" data-label="card line '中段折进驱逐索引'">中段折进驱逐索引</text>
+<polyline points="358,196 406,196" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="360" y="186" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="10" font-weight="normal" fill="#3c6e9e" text-anchor="start">每轮</text>
+<polyline points="704,196 752,196" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<text x="706" y="186" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="10" font-weight="normal" fill="#3c6e9e" text-anchor="start">超阈值</text>
+<rect x="40" y="326" width="1040" height="200" rx="12" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.2"/>
+<text x="60" y="352" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="1000" data-label="band label '② history.db：逐字历史，默认保留 30 天'">② history.db：逐字历史，默认保留 30 天</text>
+<rect x="64" y="376" width="290" height="100" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="79" y="399" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="260" data-label="card title 'conversation_history'">conversation_history</text>
+<text x="79" y="418" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line 'SQLite 单库'">SQLite 单库</text>
+<text x="79" y="436" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line '原文与工具输出都在'">原文与工具输出都在</text>
+<rect x="410" y="376" width="290" height="100" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="425" y="399" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="260" data-label="card title '两条召回路径'">两条召回路径</text>
+<text x="425" y="418" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line 'recall_history：参数化 SQL'">recall_history：参数化 SQL</text>
+<text x="425" y="436" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line 'recall_history_python：模型写 Python'">recall_history_python：模型写 Python</text>
+<rect x="756" y="376" width="280" height="100" rx="9" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.4"/>
+<text x="771" y="399" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="250" data-label="card title '沙箱边界不同'">沙箱边界不同</text>
+<text x="771" y="418" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="250" data-label="card line '前者进程内、无沙箱'">前者进程内、无沙箱</text>
+<text x="771" y="436" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="250" data-label="card line '后者必须沙箱，否则拒绝'">后者必须沙箱，否则拒绝</text>
+<polyline points="358,426 406,426" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="704,426 752,426" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="556" width="1040" height="130" rx="12" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.2"/>
+<text x="60" y="582" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="1000" data-label="band label '③ ReMe：只索引蒸馏后的 Markdown，不索引原始对话'">③ ReMe：只索引蒸馏后的 Markdown，不索引原始对话</text>
+<rect x="64" y="600" width="450" height="72" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="79" y="623" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="420" data-label="card title 'daily / digest 两类 .md'">daily / digest 两类 .md</text>
+<text x="79" y="642" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="420" data-label="card line '记忆整理任务写入'">记忆整理任务写入</text>
+<text x="79" y="660" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="420" data-label="card line '索引随文件更新'">索引随文件更新</text>
+<rect x="570" y="600" width="460" height="72" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="585" y="623" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="430" data-label="card title '每个用户轮次检索一次'">每个用户轮次检索一次</text>
+<text x="585" y="642" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="430" data-label="card line 'auto_memory_search → 临时注入'">auto_memory_search → 临时注入</text>
+<text x="585" y="660" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="430" data-label="card line '同一轮后续调用复用缓存'">同一轮后续调用复用缓存</text>
+<polyline points="518,636 566,636" fill="none" stroke="#a06018" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<line x1="40" y1="730" x2="1080" y2="730" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="756" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 1">30 天是 history_retention_days 的默认值；设为 0 表示永久保留（config.py:1288-1297）。</text>
+<text x="40" y="780" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 2">ReMe 的 watch_dirs 只有 daily_dir 与 digest_dir，后缀只有 md（reme_config.py:57-62）。</text>
+</svg>

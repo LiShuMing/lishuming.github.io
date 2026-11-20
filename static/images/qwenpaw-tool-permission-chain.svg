@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="820" viewBox="0 0 1120 820" role="img"
+     aria-label="一次工具调用经过的四道关卡">
+<title>一次工具调用经过的四道关卡</title>
+<defs>
+  <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a949e"/>
+  </marker>
+  <marker id="arrow-b03a2e" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+    <path d="M 0 0 L 10 5 L 0 10 z" fill="#b03a2e"/>
+  </marker>
+</defs>
+<rect width="1120" height="820" fill="#ffffff"/>
+<text x="40" y="46" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="23" font-weight="bold" fill="#1f2328" text-anchor="start" data-max-w="1040" data-label="title">一次工具调用经过的四道关卡</text>
+<text x="40" y="72" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="13" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="subtitle">蓝色是判定，红色是拒绝，橙色是执行；沙箱是默认执行环境，不是不可绕过的边界</text>
+<rect x="40" y="96" width="1040" height="200" rx="12" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.2"/>
+<text x="60" y="122" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="1000" data-label="band label '① 判定：默认 AUTO，受保护工具走完整规则集'">① 判定：默认 AUTO，受保护工具走完整规则集</text>
+<rect x="64" y="146" width="240" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="79" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="210" data-label="card title '工具调用'">工具调用</text>
+<text x="79" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="210" data-label="card line 'shell / 文件 / 浏览器 / MCP'">shell / 文件 / 浏览器 / MCP</text>
+<rect x="348" y="146" width="260" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="363" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="230" data-label="card title '执行级别'">执行级别</text>
+<text x="363" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="230" data-label="card line '默认 AUTO'">默认 AUTO</text>
+<text x="363" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="230" data-label="card line 'STRICT / SMART / JEV / OFF'">STRICT / SMART / JEV / OFF</text>
+<rect x="652" y="146" width="384" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="667" y="169" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="354" data-label="card title '四个 guardian'">四个 guardian</text>
+<text x="667" y="188" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="354" data-label="card line 'SharedSafety / FilePath'">SharedSafety / FilePath</text>
+<text x="667" y="206" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="354" data-label="card line 'RuleBased / ShellEvasion'">RuleBased / ShellEvasion</text>
+<polyline points="308,196 344,196" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="612,196 648,196" fill="none" stroke="#3c6e9e" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="326" width="1040" height="200" rx="12" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.2"/>
+<text x="60" y="352" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="1000" data-label="band label '② 处置：自动拒绝只覆盖灾难命令，其余进入审批'">② 处置：自动拒绝只覆盖灾难命令，其余进入审批</text>
+<rect x="64" y="376" width="210" height="100" rx="9" fill="#f2f6fb" stroke="#cbd8e8" stroke-width="1.4"/>
+<text x="79" y="399" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#3c6e9e" text-anchor="start" data-max-w="180" data-label="card title 'guardian 发现'">guardian 发现</text>
+<text x="79" y="418" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="180" data-label="card line '有 findings 才进入处置'">有 findings 才进入处置</text>
+<rect x="330" y="360" width="330" height="76" rx="9" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.4"/>
+<text x="345" y="383" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="300" data-label="card title '命中自动拒绝规则 → DENY'">命中自动拒绝规则 → DENY</text>
+<text x="345" y="402" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="300" data-label="card line '默认只覆盖灾难命令规则'">默认只覆盖灾难命令规则</text>
+<text x="345" y="420" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="300" data-label="card line 'wipe / mkfs / dd'">wipe / mkfs / dd</text>
+<rect x="330" y="446" width="330" height="80" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="345" y="469" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="300" data-label="card title '其他发现 → 审批'">其他发现 → 审批</text>
+<text x="345" y="488" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="300" data-label="card line 'SMART：低风险直接放行'">SMART：低风险直接放行</text>
+<text x="345" y="506" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="300" data-label="card line 'AUTO：请求用户审批'">AUTO：请求用户审批</text>
+<rect x="716" y="376" width="320" height="100" rx="9" fill="#f4f9f2" stroke="#cfe0c8" stroke-width="1.4"/>
+<text x="731" y="399" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#4d8a58" text-anchor="start" data-max-w="290" data-label="card title '审批结果'">审批结果</text>
+<text x="731" y="418" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="290" data-label="card line 'ALLOW → 执行'">ALLOW → 执行</text>
+<text x="731" y="436" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="290" data-label="card line 'DENY → 返回拒绝'">DENY → 返回拒绝</text>
+<polyline points="274,416 326,398" fill="none" stroke="#b03a2e" stroke-width="1.7" stroke-linejoin="round" stroke-dasharray="4 3" marker-end="url(#arrow-b03a2e)"/>
+<polyline points="274,436 326,486" fill="none" stroke="#a06018" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="660,486 708,442" fill="none" stroke="#a06018" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<rect x="40" y="556" width="1040" height="160" rx="12" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.2"/>
+<text x="60" y="582" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.5" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="1000" data-label="band label '③ 执行：沙箱默认关闭，批准后可在宿主机重试'">③ 执行：沙箱默认关闭，批准后可在宿主机重试</text>
+<rect x="64" y="606" width="290" height="90" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="79" y="629" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="260" data-label="card title 'PolicyGuardedTool'">PolicyGuardedTool</text>
+<text x="79" y="648" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line '有 governor 时使用'">有 governor 时使用</text>
+<text x="79" y="666" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line '否则走 GuardedFunctionTool'">否则走 GuardedFunctionTool</text>
+<rect x="400" y="606" width="290" height="90" rx="9" fill="#fbf7f0" stroke="#e6d3b8" stroke-width="1.4"/>
+<text x="415" y="629" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b07a35" text-anchor="start" data-max-w="260" data-label="card title '沙箱执行'">沙箱执行</text>
+<text x="415" y="648" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line 'sandbox_enabled 默认 False'">sandbox_enabled 默认 False</text>
+<text x="415" y="666" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="260" data-label="card line 'Linux 优先 Bubblewrap'">Linux 优先 Bubblewrap</text>
+<rect x="736" y="606" width="300" height="90" rx="9" fill="#fdf6f6" stroke="#e5c6c6" stroke-width="1.4"/>
+<text x="751" y="629" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="14.2" font-weight="600" fill="#b03a3a" text-anchor="start" data-max-w="270" data-label="card title 'DENIED → 审批'">DENIED → 审批</text>
+<text x="751" y="648" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="270" data-label="card line '批准后去掉 sandbox_config'">批准后去掉 sandbox_config</text>
+<text x="751" y="666" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="270" data-label="card line '在宿主机重试'">在宿主机重试</text>
+<polyline points="358,651 396,651" fill="none" stroke="#a06018" stroke-width="1.7" stroke-linejoin="round" marker-end="url(#arrow)"/>
+<polyline points="694,651 732,651" fill="none" stroke="#b03a2e" stroke-width="1.7" stroke-linejoin="round" stroke-dasharray="4 3" marker-end="url(#arrow-b03a2e)"/>
+<line x1="40" y1="750" x2="1080" y2="750" stroke="#d7dde3" stroke-width="1"/>
+<text x="40" y="776" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 1">File Guard 是常驻 guardian 之一，默认只覆盖工作区 .secret 与用户目录的 .qwenpaw.secret / .copaw.secret；Skill Scanner 在技能落盘前扫描，默认 warn 不阻断。</text>
+<text x="40" y="800" font-family="'Noto Sans SC','Source Han Sans SC','PingFang SC','Microsoft YaHei',sans-serif" font-size="12" font-weight="normal" fill="#5b6570" text-anchor="start" data-max-w="1040" data-label="footer line 2">所有默认值取自 5d4f8fd；配置行号见正文。图中省略 JEV 的决策模型预检。</text>
+</svg>
