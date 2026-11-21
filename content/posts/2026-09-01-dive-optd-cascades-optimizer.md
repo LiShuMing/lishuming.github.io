@@ -18,7 +18,7 @@ toc: true
 math: true
 ---
 
-> 本系列第 3/4 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}}) · [下一篇]({{< relref "2026-09-01-dive-starrocks-optimizer.md" >}})
+> 本系列第 2/3 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-09-02-dive-calcite-cost-and-traits.md" >}}) · [下一篇]({{< relref "2026-09-01-dive-starrocks-optimizer.md" >}})
 
 如果让你从零写一个查询优化器（Query Optimizer），最符合直觉的做法是什么？大概是拿到语法解析器吐出的逻辑计划树，写十几条自顶向下的树改写函数：遇到过滤条件就往下推，遇到两表连接就把小表换到左边，最后把每个逻辑节点逐个替换成物理算子。
 

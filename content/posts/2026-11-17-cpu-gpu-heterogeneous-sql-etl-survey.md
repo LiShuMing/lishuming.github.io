@@ -2,7 +2,7 @@
 title: "CPU/GPU 异构计算中的 SQL/ETL 加速陷阱、算子设计与调度抉择"
 slug: "cpu-gpu-heterogeneous-sql-etl-survey"
 date: 2026-11-17T22:30:00+08:00
-lastmod: 2026-11-17T22:30:00+08:00
+lastmod: 2026-11-21T00:00:00+08:00
 categories:
   - 数据库
   - 异构计算
@@ -13,14 +13,15 @@ tags:
   - DuckDB
   - 执行引擎
   - 调度与优化
-description: "从第一性原理拆解为什么 SQL/ETL 上 GPU 往往跑不过 CPU，深入剖析 RAPIDS cuDF（libcudf）、Sirius 与自研 GPU 算子如何加速 Hash Join 与 GroupBy Aggregate，以及混合引擎如何在 CPU 与 GPU 之间做调度与回退决策。"
+description: "从第一性原理拆解为什么 SQL/ETL 上 GPU 往往跑不过 CPU，打通 CPU SIMD 到 GPU SIMT 映射、RMM 流序显存池、锁页内存与 NUMA 亲和、Hash Join/GroupBy 算子设计，以及混合引擎调度与商业云数仓 TCO 账本。"
 draft: false
 toc: true
+math: true
 ---
 
 把一套 SQL 或 ETL 流水线从 CPU 搬到 GPU，直觉上应该快上一个数量级：现代数据中心 GPU 拥有数 TB/s 的 HBM 显存带宽（如 H100/GH200 约 3 TB/s）和上万个 CUDA 核心，而多核服务器 CPU 的 DDR5 内存带宽通常在 200–400 GB/s 量级。但在实际工程中，许多团队把 Pandas、Spark 或 DuckDB 的任务接入 GPU 后，却经常发现端到端耗时几乎没有下降，甚至比纯 CPU 更慢。
 
-要理解这个反直觉现象，不能只看 GPU Kernel 自身的峰值算力，而必须把**算术强度（Arithmetic Intensity）、PCIe 数据搬运成本、SIMT 执行模型与异构调度边界**放在同一笔账里算清楚。
+要理解这个反直觉现象，不能只看 GPU Kernel 自身的峰值算力，而必须把**算术强度（Arithmetic Intensity）、PCIe 数据搬运成本、SIMT 执行模型、异构内存底座与调度边界**放在同一笔账里算清楚。
 
 ---
 
@@ -56,7 +57,7 @@ GROUP BY dept;
 | 陷阱类型 | 底层硬件/执行约束 | 典型症状 |
 | :--- | :--- | :--- |
 | **小数据集与启动延迟** | CUDA Kernel 启动延迟约 5–20 μs；RMM 内存池初始化、Python/JVM 到 Arrow/C++ 的桥接开销不可忽略 | 几万到几百万行的数据在 CPU 上全在 L2/L3 Cache 内完成；GPU 大量线程束（Warp）处于空转状态 |
-| **变长字符串与嵌套类型** | GPU 采用 SIMT（单指令多线程）模型，要求同一 Warp 内 32 个线程执行相同路径、连续访存 | 正则匹配、长短不一的 `VARCHAR` 拼接、`List`/`Struct` 嵌套列引发严重的**线程束分化（Warp Divergence）**与非合并访存 |
+| **变长字符串与嵌套类型** | GPU 采用 SIMT（单指令多线程）模型，要求同一 Warp 内 32 个线程执行相同路径、连续访存 | 正则匹配、长短不一的 `VARCHAR` 拼接、`List`/`Struct` 嵌套列引发严重的**线程束分化**（Warp Divergence）与非合并访存 |
 | **数据倾斜与原子争用** | 多个线程并发更新同一聚合桶时，必须依赖全局显存上的 `atomicAdd` / `atomicCAS` | 低基数（Low Cardinality）或严重倾斜的 `GROUP BY` 键导致大量线程在同一个显存地址上排队串行化 |
 | **CPU↔GPU 频繁横跳** | 算子覆盖率不足或显存 OOM 触发回退（Fallback），导致中间表在 Host 与 Device 之间反复拷贝 | 一次查询包含 1 个不支持的 UDF，前 3 个算子在 GPU 省了 5 ms，回退拷贝赔掉 50 ms |
 
@@ -64,45 +65,53 @@ GROUP BY dept;
 
 ---
 
-## 二、cuDF、Sirius 与自研算子是如何实现 GPU 加速的？
+## 二、cuDF、Sirius 与自研算子是如何打通 GPU 加速底座的？
 
-既然搬运很贵、线程分化很致命，真正能跑赢 CPU 的 GPU 分析引擎（以 RAPIDS `libcudf`、UW-Madison 与 NVIDIA 联合推出的 `Sirius`，以及各类自研 CUDA/Triton 算子为代表）必须围绕**“减少搬运、对齐访存、融合内核、控制显存”**四件事做到底。
+既然搬运很贵、线程分化很致命，真正能跑赢 CPU 的 GPU 分析引擎（以 RAPIDS `libcudf`、UW-Madison 与 NVIDIA 联合推出的 `Sirius`，以及各类自研 CUDA/Triton 算子为代表）必须围绕**减少搬运、CPU SIMD → GPU SIMT 对齐映射、内核融合与流序分级显存管理**四件事做到底。
 
-### 2.1 显存驻留与零拷贝直通（Residency & GPUDirect）
+### 2.1 显存驻留、压缩态直传与多流时间轴重叠
 
-要把 HBM 的带宽红利兑现出来，核心前提是**让整个计算管线尽可能驻留在显存中（GPU-Resident）**，而不是每算完一个算子就拷回 Host：
+面对 PCIe Gen4/Gen5 单向 `25–50 GB/s` 与 GPU 片上 HBM `2,000–3,350 GB/s` 之间近百倍的带宽鸿沟，把 HBM 红利兑现出来的核心前提是**让整棵计算管线尽可能驻留在显存中（GPU-Resident）**，并在数据进出总线时用三项技术把传输税彻底折叠掉：
 
-- **管道级驻留**：从 `Scan -> Filter -> Join -> Aggregate -> Sort` 全部在 Device 内存指针上接力，只有最终结果集（往往经过过滤和聚合后缩小了几个数量级）才回传给 Host。
-- **I/O 绕过 CPU**：利用 **GPUDirect Storage (GDS)** 让 NVMe SSD 通过 DMA 直接将数据送入显存，配合 **nvCOMP** 在 GPU 上直接完成 Parquet/ORC 的 Snappy/ZSTD/LZ4 并行解压，避免 CPU 解压后再走 PCIe 搬运。
-- **统一内存架构的物理红利**：在 NVIDIA Grace Hopper（GH200）等通过 **NVLink-C2C** 互联的平台上，CPU 与 GPU 共享高达 900 GB/s 的一致性互联带宽，显著削弱了传统 PCIe 的传输墙。
+- **管道级驻留**：从 `Scan -> Filter -> Join -> Aggregate -> Sort` 全部在 Device 内存指针上接力（例如通过 **Substrait** 一次性卸载整棵连续子计划），只有经过过滤和聚合后缩小了数个数量级的最终结果集才回传给 Host。
+- **压缩页直传 + GPU 原位解压（GPUDirect + `nvCOMP`）**：扫 Parquet 或 ORC 表时，绝不在 CPU 上先把 ZSTD / Snappy / LZ4 数据解压膨胀 4 倍再去挤狭窄的 PCIe 总线，而是直接把紧凑压缩字节流原样通过 DMA——或经由 **GPUDirect Storage（`cuFile`）** 绕过操作系统 Page Cache 从 NVMe 直注显存——送上 GPU，再利用 `nvCOMP` 在卡上以数百 GB/s 并行解压，相当于将物理 PCIe 的有效带宽凭空拓宽 3 到 5 倍。
+- **Multi-Stream 三缓冲时间轴重叠**：将大表切分为适中的流式分块（如 `32–64 MB`），开辟多条独立 `cudaStream_t` 队列：当 `Stream 1` 正通过 DMA 引擎搬运第 $i+1$ 批输入（H2D）时，SM 计算核心在 `Stream 2` 上全速处理第 $i$ 批算子，反向拷贝通道同时在 `Stream 3` 上回传第 $i-1$ 批收敛结果（D2H），让总线搬运被计算窗口自然吞没。
+- **统一内存架构的物理红利**：在 NVIDIA Grace Hopper（GH200）或 Grace Blackwell（GB200）等通过 **NVLink-C2C** 互联的平台上，CPU 与 GPU 共享高达 900 GB/s 的一致性互联带宽，显著削弱了传统 PCIe 的传输墙。
 
-### 2.2 面向 SIMT 的列式内存布局（Apache Arrow / libcudf）
+### 2.2 从 CPU SIMD 到 GPU SIMT：列式布局与算子映射
 
-GPU 极度排斥行存（Row-oriented）的跨步访存。如果一行有 64 字节，一个 Warp 的 32 个线程同时读取同一列，行存会导致 32 次分散的缓存行加载；而采用与 **Apache Arrow** 兼容的**列式内存布局**后，同一列的 32 个连续 `int32` 恰好落在连续的 128 字节内，硬件可以一次完成**合并访存（Coalesced Memory Access）**：
+熟悉 StarRocks、DuckDB 或 Velox 列式向量化内核的工程师再去读 **Sirius** 或 **`libcudf`** 时会发现：**GPU 分析引擎并不是推翻重来的外星物种，而是把 CPU 列式向量化的核心机制沿着硬件并发度放大了一千倍后的自然延伸。** 抓住硬件微架构的四个核心差异，就能把熟悉的 CPU 算子精准映射到 GPU 上：
 
-- **定长列**：连续的值数组 + 独立的位图（Validity Bitmask，表示 `NULL`）。
-- **变长字符串列**：拆分为定长的 `offsets` 偏移数组（`int32`/`int64`）与紧凑拼接的 `chars` 字节缓冲区，避免在显存里存放指针数组。
+| 内核设计维度 | CPU 向量化内核（StarRocks / DuckDB / Velox） | GPU SIMT 内核（Sirius / `libcudf`） | 跨越硬件边界的底层原因 |
+| :--- | :--- | :--- | :--- |
+| **最佳批次规模（Batch Size）** | **`1,024 ~ 4,096` 行**（几十 KB 至几百 KB） | **`100,000 ~ 数百万` 行**（数十 MB 至数百 MB） | CPU 靠小批次常驻 **L1/L2 Cache** 保低延迟；GPU 靠海量活跃线程束切换掩盖 400+ 周期的 HBM 显存延迟 |
+| **数据并行单元** | 单核 **SIMD 寄存器**（一条 AVX-512 指令算 16 个 `int32`） | **Warp 锁步执行**（32 个硬件线程锁步同跑一条指令） | 列存（SoA）在两端都是刚需：CPU 喂满连续向量寄存器，GPU 实现 `128B` 合并访存 |
+| **过滤与条件裁剪（Filter）** | 维护 `SelectivityVector` 有效位图/下标延迟物化 | **无分支算位图 → 并行前缀和 → 流紧缩重排** | 规避 GPU **Warp 分支发散（Divergence）**，并保持后续算子的连续合并访存 |
+| **哈希探测（Hash Join）** | `RowContainer` 紧凑行 + `__builtin_prefetch` 批量预取 | `cuco` 开放寻址 + **Cooperative Groups 协同探测** | CPU 靠软件预取榨取有限 MLP；GPU 靠数万并发在途请求喂饱 `2–3 TB/s` HBM 带宽 |
+
+这四个映射里，最核心的两条硬件铁律是**合并访存**（Coalesced Memory Access）与**前缀和流紧缩**（Stream Compaction）：
+
+- **为什么列式布局（Apache Arrow / `libcudf`）在 GPU 上不可替代？** 同一个 Warp 的 32 个线程在同一拍发出内存读取指令。采用与 Apache Arrow 兼容的列存布局（定长列为连续值数组 + 独立 `Validity Bitmask`；变长字符串列拆分为定长 `offsets` 偏移数组 + 紧凑拼接的 `chars` 字节区，杜绝显存指针数组）后，32 个连续 `int32` 恰好落在对齐的 **128 字节** 区间内，显存控制器合并为 **1 次硬件内存事务**即可全员交付；倘若换成 `128 字节` 宽的行存（AoS），32 个线程跨步挑字段会被撕裂为 **32 次独立内存事务**，有效 HBM 吞吐当场暴跌至三十二分之一。这也是 Arrow / DuckDB / Velox 列存只需传递裸指针就能与 GPU 零格式转换对接的原因。
+- **为什么过滤算子要放弃稀疏下标视图，改用三步流紧缩？** CPU 引擎处理 `WHERE a > 10` 时喜欢给存活行套一层 `SelectionVector` 继续往下传；但在 GPU 上，如果让 Warp 内 32 个线程直接进 `if (cond)` 分支，锁步硬件会把真假路径串行各跑一遍，稀疏跳跃下标还会毁掉下游的合并访存。因此 GPU 引擎普遍采用无分支两阶段流紧缩（Two-Pass Stream Compaction）：第一步用极简 Kernel 并行算出全列 `0/1` 布尔掩码；第二步调用 `CUB::DeviceScan` 跑一遍**并行前缀和**（Parallel Prefix Sum）精确算出每个存活元素在新数组里的连续偏移并一次性分配输出显存；第三步并行拷贝输出紧凑新列——用充裕的顺序显存带宽，换取下游算子零分支发散的满速运行。
 
 ### 2.3 并行原语与算子融合（CUB / cuCollections + NVRTC JIT）
 
-在工程实现上，无论是 `libcudf` 还是基于它的 `Sirius`，都不会从零手写所有底层并发原语，而是构建在 NVIDIA CUDA-X 原语生态之上：
+在工程实现上，无论是 `libcudf` 还是基于它的 `Sirius`，都构建在 NVIDIA CUDA-X 并行原语与动态代码生成生态之上：
 
-1. **基础并行原语（CUB / Thrust）**：
-   - `DeviceRadixSort`：基数排序，纯访存驱动且无比较分支，是 GPU 上最快的排序原语。
-   - `DeviceScan`（前缀和）：GPU 算子通常无法像 CPU 那样一边过滤一边 `std::vector::push_back`，因此普遍采用**两阶段输出分配（Two-Pass）**——第一遍统计每个线程命中的行数，通过前缀和算出全局偏移量并一次性分配输出显存，第二遍并行写入。
-2. **内核融合与即时编译（Kernel Fusion & JIT）**：
-   - 如果一个复杂表达式 `WHERE (a + b) * c > 10 AND d < 5` 拆成 4 个独立 Kernel 执行，中间结果必须反复写回 HBM 再读出，白白浪费 3–4 倍显存带宽。
-   - `libcudf` 通过 **NVRTC（NVIDIA Runtime Compilation）** 与 AST 表达式求值器将多个逐元素算子（Filter + Project）动态编译融合为单个 CUDA Kernel，让中间值全程留在寄存器（Register）内；自研算子则常借助 CUDA C++ 模板融合或 OpenAI Triton / PTX 代码生成来消除中间物化。
+1. **基础并行原语（CUB / Thrust）**：除了上文流紧缩依赖的 `CUB::DeviceScan`，排序核心依赖 `CUB::DeviceRadixSort`——纯访存驱动、无比较分支，是 GPU 上吞吐最高的排序原语；哈希连接则依托 `cuCollections`（`cuco`）并发容器。
+2. **内核融合与即时编译（Kernel Fusion & JIT）**：如果一个复杂表达式 `WHERE (a + b) * c > 10 AND d < 5` 拆成 4 个独立 Kernel 执行，中间结果必须反复写回 HBM 再读出，白白浪费 3–4 倍显存带宽。`libcudf` 通过 **NVRTC（NVIDIA Runtime Compilation）** 与 AST 表达式求值器将多个逐元素算子（Filter + Project）动态编译融合为单个 CUDA Kernel，让中间值全程留在寄存器内；自研算子则常借助 CUDA C++ 模板融合或 OpenAI Triton / PTX 代码生成来消除中间物化。
 
-### 2.4 显存池化与三级溢出管理（RMM & Sirius）
+### 2.4 跨异构边界的内存底座：RMM 流序池、锁页内存与 NUMA 亲和
 
-原生的 `cudaMalloc` / `cudaFree` 会触发全局设备同步，在高频分配临时缓冲区的 SQL 引擎中会直接拖垮并发。因此 `libcudf` 强制使用 **RMM（RAPIDS Memory Manager）** 维护设备端异步内存池（如 `cuda_async_memory_resource` / `pool_memory_resource`）。
+算子跑通之后，真正的系统硬仗往往打在“显存不够装”和“跨总线拷贝太慢”这两道关卡上。以 **Sirius**（CIDR 2026）结合 **RAPIDS Memory Manager（RMM）** 及分层框架 `cucascade` 的工程实践为例，一套抗压的异构内存底座必须扣紧三个硬件环扣（对应 CPU 侧的分配器与 `intrusive_ptr` 底座设计，可参见 [资深 C++ 与计算引擎内核底座]({{< relref "2026-11-19-cpp-systems-core-data-structures-and-kernel-design.md" >}})）：
 
-而在显存容量受限（通常几十 GB）的问题上，**Sirius**（CIDR 2026）在 `libcudf` 与 RMM 之上进一步构建了**三级分层内存管理器（Tiered Memory Management）**：
-
-1. **GPU Tier**：高速 HBM 显存池，存放活跃计算分块。
-2. **Host Tier**：NUMA 本地的锁页主机内存（Pinned Host Memory），作为显存饱和时的降级缓冲池，避免直接崩溃。
-3. **Disk Tier**：磁盘溢出池（`idisk_io_backend`），作为最后的 Spill 兜底。
+1. **禁用原生 `cudaMalloc`，切入 RMM 流序异步显存池**：
+   原生的 `cudaMalloc` 与 `cudaFree` 是**重量级设备同步操作**——每次调用不仅耗时数百微秒，还会隐式卡停当前 GPU 上所有并发 Stream 流水线。对于每秒分配释放上千次临时列缓冲区的 SQL 引擎，直接调原生接口等于自杀。因此 `libcudf` 与 Sirius 必须通过 RMM 在启动时划出大块显存池，并借助基于 CUDA Stream-ordered 分配器的 **`rmm::mr::cuda_async_memory_resource`**（或 `pool_memory_resource`）将分配与释放绑定到具体的 `cudaStream_t` 上——前一个 Kernel 尚未跑完时，后续逻辑就能把它的显存块异步排入同一条流的释放队列，紧接着的算子在同一流上零同步锁、零等待地无缝复用物理显存。
+2. **三级溢出（Spill）与锁页主机内存（Pinned Memory）铁律**：
+   面对动辄数百 GB 的离线宽表关联，Sirius 在 RMM 之上构建了 **GPU Tier（高速 HBM）→ Host Tier（主机大内存降级池）→ Disk Tier（`idisk_io_backend` 本地 NVMe 兜底）** 三级内存管理器。在 `GPU HBM <-> Host RAM` 溢写通道上，主机缓冲池**必须显式使用锁页内存（Pinned Memory / `cudaMallocHost`）**：
+   C++ 普通 `malloc`/`new` 分配的是操作系统可随时换出的可换页内存（Pageable Memory），GPU 硬件 DMA 引擎要求物理地址绝对锁定不变，根本无法直接对其发起 DMA！一旦传入普通堆指针调用 `cudaMemcpyAsync`，CUDA 驱动不得不在幕后偷偷申请一块临时锁页 Staging Buffer，**动用宝贵的 CPU 核心先用 `memcpy` 把数据拷进锁页区**再通知 GPU DMA 拉取——这不仅让 PCIe 实际吞吐直接腰斩、白烧 CPU 周期，还会把异步拷贝在主机端退化成同步阻塞。
+3. **双路服务器下的 PCIe Root Complex 与 NUMA 亲和性**：
+   在一台双路 CPU 插多张 GPU 的服务器上，`GPU 0` 物理挂载在 `CPU Socket 0` 的 PCIe 根复合体下，`GPU 1` 挂载在 `Socket 1` 下。如果 `GPU 0` 溢写时拿到的是分配在 `Socket 1` 远端内存控制器上的锁页内存，每一次 H2D / D2H 传输都必须横穿两颗 CPU 之间的互联总线（Intel UPI 或 AMD Infinity Fabric），延迟陡增且挤占另一路 CPU 带宽。因此，Sirius 在初始化 Host Tier 时会严格按拓扑为每张 GPU 绑定其所属本地 **NUMA 节点**的锁页内存池；在多卡协同洗牌时则优先走卡间高速 **NVLink P2P DMA**，彻底绕开主机内存。
 
 ---
 
@@ -138,7 +147,7 @@ GPU 上的 `GROUP BY` 聚合主要有两条技术路线，各自对应截然不�
 | **适用与退化边界** | 适合中等基数、数值型聚合；**低基数或重度倾斜时因原子争用严重退化** | 适合高基数、**嵌套/变长复杂类型**（如 `List`/`Struct`）、或需要有序输出（如窗口函数、`NUNIQUE`）的场景 |
 
 **原子争用的工程解法（基数悖论与分级预聚合）**：
-在直觉上，分组越少（基数越低），聚合似乎应该越快；但在 GPU Hash-Based GroupBy 中却常出现**“基数悖论”**——当几千万行数据全部映射到 10 个分组时，成千上万个线程会同时向全局显存里的那 10 个地址发起 `atomicAdd`，硬件原子单元被迫将并发请求串行化，吞吐断崖式下跌。
+在直觉上，分组越少（基数越低），聚合似乎应该越快；但在 GPU Hash-Based GroupBy 中却常出现“**基数悖论**”——当几千万行数据全部映射到 10 个分组时，成千上万个线程会同时向全局显存里的那 10 个地址发起 `atomicAdd`，硬件原子单元被迫将并发请求串行化，吞吐断崖式下跌。
 
 为此，`libcudf` 与自研 GPU 算子普遍采用**三级归约（Block/Warp-Local Pre-aggregation）**：
 1. **Warp 级归约**：利用 `__shfl_down_sync` 洗牌指令在寄存器内合并同一 Warp 中相同 Key 的增量。
@@ -153,7 +162,7 @@ GPU 上的 `GROUP BY` 聚合主要有两条技术路线，各自对应截然不�
 
 ### 4.1 透明代理与试错回退：`cudf.pandas`
 
-`cudf.pandas` 的目标是让用户“零代码改动”加速现有 Pandas 脚本。它的调度逻辑建立在**动态代理对象（Proxy Object）**之上：
+`cudf.pandas` 的目标是让用户“零代码改动”加速现有 Pandas 脚本。它的调度逻辑建立在**动态代理对象**（Proxy Object）之上：
 
 - **GPU-First Fast Path**：所有 `DataFrame` / `Series` 都被代理对象包装。每次方法调用时，优先在 GPU 上尝试调用 `cuDF` 实现；如果底层数据还在 CPU，则透明执行 H2D 拷贝。
 - **异常捕获与回退（Slow Path）**：一旦遇到 `cuDF` 尚未支持的 API、参数签名差异或触发 GPU OOM，代理层捕获异常，将状态同步回 Host（D2H），并在标准 `pandas` 上重放执行。
@@ -193,7 +202,7 @@ $$T_{\text{gpu}} = T_{\text{H2D}} + T_{\text{launch}} + T_{\text{kernel}} + T_{\
 在实际调度器设计中，可以收敛为四条硬约束：
 
 1. **规模与驻留阈值（Amortization Guard）**：单次调用数据量过小（例如低于数百万行或几十 MB）且无法在后续多个算子中继续复用显存驻留状态时，直接留给 CPU，避免 PCIe 和 Kernel 启动开销反噬。
-2. **管线级切分优于算子级微调度（Pipeline-Level Offloading）**：尽量以连续的 Pipeline（甚至整个 Stage）为单位做 CPU/GPU 划分，绝不为了一个孤立的算子频繁跨越 `Host <-> Device` 边界。
+2. **管线级切分优于算子级微调度（Pipeline-Level Offloading）**：尽量以连续的 Pipeline（甚至整个 Stage）为单位做 CPU/GPU 划分，杜绝单算子“乒乓回退（Ping-Pong Fallback）”——一旦边界插入的 `D2H + H2D` 往返时间与 `5–20 μs` Kernel 启动开销吞噬了加速红利，就果断将整段子计划完整保留在 CPU 向量化管道内原地执行。
 3. **算子与数据类型亲和性（Affinity Routing）**：定长数值型的大表 Scan、等值 Hash Join、高基数 GroupBy、全局 Radix Sort 优先分配给 GPU；重度依赖复杂正则表达式、非结构化 JSON 解析、高分支 UDF 或极小批量的运算直接路由给 CPU。
 4. **显存水位与倾斜熔断（Headroom & Skew Guard）**：调度前结合统计信息估算 Hash Table 膨胀系数与输出基数；当预估显存接近阈值或检测到极端低基数/高倾斜键时，主动切换至 Sort-Based 路径、触发分级 Spill，或直接回退至 CPU 执行，保证系统稳定性不被单条慢查询拖垮。
 
@@ -203,7 +212,7 @@ $$T_{\text{gpu}} = T_{\text{H2D}} + T_{\text{launch}} + T_{\text{kernel}} + T_{\
 
 既然 GPU 在特定算子上有数倍乃至十倍的吞吐优势，为什么当我们审视 **Snowflake、Databricks、Google BigQuery** 这三大现代商业云数仓（Cloud Data Warehouse / Lakehouse）时，它们的核心 SQL 引擎却几乎清一色地运行在通用 CPU 集群上？
 
-答案并不在于云厂商写不出 CUDA 算子，而在于一旦把视角从“单机算子微基准测试（Micro-benchmark）”拉升到“多租户云数仓的总拥有成本（TCO）”，GPU 会撞上三道残酷的经济墙。
+答案并不在于云厂商写不出 CUDA 算子，而在于一旦把视角从单机算子微基准测试（Micro-benchmark）拉升到多租户云数仓的总拥有成本（TCO），GPU 会撞上三道残酷的经济墙。
 
 ### 5.1 云原生数仓的三道经济墙：对象存储 I/O、内存单价与潮汐空转
 
@@ -237,22 +246,22 @@ $$T_{\text{gpu}} = T_{\text{H2D}} + T_{\text{launch}} + T_{\text{kernel}} + T_{\
 
 早期研究往往假设“整个数据集已经装在 GPU 显存里”，重点解决如何消除算子间物化与 SIMT 分支分化：
 
-- **Crystal（Shanbhag et al., SIGMOD 2020）**：从第一性原理建模对比了 CPU 与 GPU 的微架构，明确指出 GPU 跑 OLAP 的瓶颈几乎完全在于**显存带宽而非算力**。Crystal 提出了 **Tile-based（分块）执行模型**，不再按算子全列读写 HBM，而是以 Thread Block 为单位将数据切片加载进片上 Shared Memory 和寄存器，在片上一次性跑完整个查询管线（Filter -> Probe -> Aggregate）。
-- **DogQC（Funke & Teubner, VLDB 2020）与 HetExchange（Chrysogelos et al., VLDB 2019）**：DogQC 针对非均匀数据过滤与 Join 展开后引发的严重 Warp 分化，在 JIT 编译生成的 CUDA 管线中插入基于共享内存的动态负载均衡器（Divergence Buffer）；HetExchange 则在 EPFL 的 JIT 引擎中设计了统一的异构交换算子，让同一个流水线能够同时调度多核 CPU 与多块 GPU 并行跑批。
+- **Crystal**（Shanbhag et al., SIGMOD 2020）：从第一性原理建模对比了 CPU 与 GPU 的微架构，明确指出 GPU 跑 OLAP 的瓶颈几乎完全在于**显存带宽而非算力**。Crystal 提出了 **Tile-based（分块）执行模型**，不再按算子全列读写 HBM，而是以 Thread Block 为单位将数据切片加载进片上 Shared Memory 和寄存器，在片上一次性跑完整个查询管线（Filter -> Probe -> Aggregate）。
+- **DogQC**（Funke & Teubner, VLDB 2020）与 **HetExchange**（Chrysogelos et al., VLDB 2019）：DogQC 针对非均匀数据过滤与 Join 展开后引发的严重 Warp 分化，在 JIT 编译生成的 CUDA 管线中插入基于共享内存的动态负载均衡器（Divergence Buffer）；HetExchange 则在 EPFL 的 JIT 引擎中设计了统一的异构交换算子，让同一个流水线能够同时调度多核 CPU 与多块 GPU 并行跑批。
 
 ### 6.2 第二代（打破 PCIe 与显存容量墙，2020–2024）：快互联、SSD 直通与借用张量核
 
 当审视点回到“真实数据库远大于显存容量”时，研究重心转向了硬件拓扑突破与新型计算单元借用：
 
-- **高速互联下的核外执行（Lutz et al., *"Pump Up the Volume"*, SIGMOD 2020）**：针对“数据溢出显存后 GPU 必输 CPU”的传统定论，该工作在具备 **NVLink 2.0**（双向高带宽一致性互联）的平台上重新设计了核外（Out-of-Core）无分区 Hash Join，证明当主机内存到显存的通道足够宽时，哪怕大表放在主机内存流式喂给 GPU，依然能比 PCIe 3.0 快 18 倍、比多核 CPU 快 7.3 倍。
-- **SSD 直通与语义缓存（GOLAP, SIGMOD 2023；Mordred, PVLDB）**：**GOLAP** 提出 *GPU-in-data-path* 架构，通过 GPUDirect 让压缩列块从 NVMe SSD 阵列直接流式打入显存，在扫描同时由 GPU 内核实时解压并做谓词裁剪；**Mordred** 则在 CPU-GPU 混合引擎中引入语义感知缓存（Semantic-aware Caching）与分片级协同执行，用细粒度流水掩盖 PCIe 传输。
-- **向 AI 硬件借算力（TCUDB, SIGMOD 2022）**：现代 GPU 芯片面积与算力的大头都给了服务于深度学习的 **Tensor Core Units（TCU）**，而传统 SQL 只能用旁边的普通 CUDA 核心。TCUDB 将关系型自然连接（Natural Join）与分组聚合重写为稀疏/稠密矩阵乘法（GEMM），强行唤醒闲置的 Tensor Core 来跑关系代数。
+- **高速互联下的核外执行**（Lutz et al., *"Pump Up the Volume"*, SIGMOD 2020）：针对“数据溢出显存后 GPU 必输 CPU”的传统定论，该工作在具备 **NVLink 2.0**（双向高带宽一致性互联）的平台上重新设计了核外（Out-of-Core）无分区 Hash Join，证明当主机内存到显存的通道足够宽时，哪怕大表放在主机内存流式喂给 GPU，依然能比 PCIe 3.0 快 18 倍、比多核 CPU 快 7.3 倍。
+- **SSD 直通与语义缓存**（GOLAP, SIGMOD 2023；Mordred, PVLDB）：**GOLAP** 提出 *GPU-in-data-path* 架构，通过 GPUDirect 让压缩列块从 NVMe SSD 阵列直接流式打入显存，在扫描同时由 GPU 内核实时解压并做谓词裁剪；**Mordred** 则在 CPU-GPU 混合引擎中引入语义感知缓存（Semantic-aware Caching）与分片级协同执行，用细粒度流水掩盖 PCIe 传输。
+- **向 AI 硬件借算力**（TCUDB, SIGMOD 2022）：现代 GPU 芯片面积与算力的大头都给了服务于深度学习的 **Tensor Core Units（TCU）**，而传统 SQL 只能用旁边的普通 CUDA 核心。TCUDB 将关系型自然连接（Natural Join）与分组聚合重写为稀疏/稠密矩阵乘法（GEMM），强行唤醒闲置的 Tensor Core 来跑关系代数。
 
 ### 6.3 第三代（可组合引擎与单位成本对决，2025–2026）：Sirius 与 Maximus 的反思
 
-到了最近两年，学术界终于直面工业界最关心的问题：**“不改现有数据库代码怎么接 GPU？”** 以及 **“算上云主机差价，到底省不省钱？”**
+到了最近两年，学术界终于直面工业界最关心的问题：“不改现有数据库代码怎么接 GPU？”以及“算上云主机差价，到底省不省钱？”
 
-- **Maximus（PVLDB）与 Sirius（CIDR 2026）**：以 **Sirius** 为代表的新一代研究放弃了从头造一个封闭 GPU 数据库的做法，通过 **Substrait** 挂载到 DuckDB 等成熟系统之后，在评测方法论上做了一个关键纠偏——不再只比绝对延时，而是按**公有云相同每小时租金（Normalized Cost / `$/Query`）**对比。研究发现，只要规避掉频繁回退并利用三级内存管理跑通中大型分析查询（如 TPC-H SF100），1 块中端数据中心 GPU（如 L4 / A10G / A100）在单查询耗时上的缩减幅度，足以抵消其相比同等租金 CPU 节点的单价劣势。
+- **Maximus**（PVLDB）与 **Sirius**（CIDR 2026）：以 **Sirius** 为代表的新一代研究放弃了从头造一个封闭 GPU 数据库的做法，通过 **Substrait** 挂载到 DuckDB 等成熟系统之后，在评测方法论上做了一个关键纠偏——不再只比绝对延时，而是按**公有云相同每小时租金**（Normalized Cost / `$/Query`）对比。研究发现，只要规避掉频繁回退并利用三级内存管理跑通中大型分析查询（如 TPC-H SF100），1 块中端数据中心 GPU（如 L4 / A10G / A100）在单查询耗时上的缩减幅度，足以抵消其相比同等租金 CPU 节点的单价劣势。
 
 ---
 
@@ -260,7 +269,7 @@ $$T_{\text{gpu}} = T_{\text{H2D}} + T_{\text{launch}} + T_{\text{kernel}} + T_{\
 
 回到最核心的工程决策问题：**今天硬件（尤其是高端 GPU 和 HBM）这么贵，我们在设计或演进数据系统时，到底该如何看待 GPU 与数据库的融合？**
 
-这里给出一个明确的判断框架：**在通用数仓里“用 GPU 全面替代 CPU”是一个伪命题；但在特定数据链路与新一代硬件拓扑下，“按需局部融合”正在从赔钱货变成高 ROI 利器。**
+这里给出一个明确的判断框架：**在通用数仓里用 GPU 全面替代 CPU 是一个伪命题；但在特定数据链路与新一代硬件拓扑下，按需局部融合正在从赔钱货变成高 ROI 利器。**
 
 ### 7.1 为什么说“全面替代”是伪命题，而“三个交汇点”是真需求？
 
@@ -292,14 +301,14 @@ $$T_{\text{gpu}} = T_{\text{H2D}} + T_{\text{launch}} + T_{\text{kernel}} + T_{\
 | **最容易踩的坑** | 超大规模数值 Join/Sort 受限于 DDR5 带宽上限 | 热路径回退引发 PCIe 乒乓与试错税；常驻挂载 GPU 账单贵 | 继承 CPU 代价模型导致计划次优；长尾函数仍需回退 CPU |
 | **最佳甜蜜点** | 通用云数仓、日常 BI 报表、重字符串/JSON 清洗、脉冲负载 | 已有重度 Pandas/Spark 特征工程管线，与下游 GPU 训练同域 | 大规模数值型重算 Stage 卸载、AI-Data 同域预处理、紧耦合硬件 |
 
-归根结底，GPU 不是一块“插上就能降本增效”的通用数据库加速卡，而是一台**高吞吐、高租金、高启动门槛、且极度依赖显存局部性的流式协处理器**。认清 PCIe 与云存储 I/O 的物理边界，放弃“全面替代 CPU”的执念，在 **AI-Data 同域管线** 与 **弹性重算子卸载** 上用好 `libcudf` 与 `Sirius` 这类可组合底座，才是硬件昂贵时代最清醒的架构选择。
+归根结底，GPU 不是一块“插上就能降本增效”的通用数据库加速卡，而是一台**高吞吐、高租金、高启动门槛、且极度依赖显存局部性的流式协处理器**。认清 PCIe 与云存储 I/O 的物理边界，放弃全面替代 CPU 的执念，在 **AI-Data 同域管线** 与 **弹性重算子卸载** 上用好 `libcudf` 与 `Sirius` 这类可组合底座，才是硬件昂贵时代最清醒的架构选择。
 
 ---
 
 > **参考资料与调研基线**
-> - **工业界架构与云数仓实践**：Databricks *Photon: A Fast Query Engine for Lakehouse Systems* (SIGMOD 2022) · Snowflake Virtual Warehouses & Snowpark Container Services (SPCS) 架构文档 · Google BigQuery Dremel & Vertex AI 联邦推理架构 · NVIDIA RAPIDS (`libcudf`, `cuCollections`, `cudf.pandas`, `spark-rapids`, `cudf-polars`) 官方技术文档。
+> - **工业界架构与底层显存生态**：Databricks *Photon: A Fast Query Engine for Lakehouse Systems* (SIGMOD 2022) · Snowflake Virtual Warehouses & Snowpark Container Services (SPCS) 架构文档 · Google BigQuery Dremel & Vertex AI 联邦推理架构 · NVIDIA RAPIDS（`libcudf` `cudf::column_view` / `apply_boolean_mask`、**RMM** `rmm::mr::cuda_async_memory_resource`、`cuCollections` `cuco::static_multimap`、`nvCOMP` / GPUDirect Storage `cuFile`、`cudf.pandas`、`spark-rapids`、`cudf-polars`）官方技术文档。
 > - **学术界代表性论文**：
->   - **Sirius**: *Rethinking Analytical Processing in the GPU Era* ([CIDR 2026](https://www.cidrdb.org/cidr2026/papers/p12-yogatama.pdf))
+>   - **Sirius**: *Rethinking Analytical Processing in the GPU Era* ([CIDR 2026](https://www.cidrdb.org/cidr2026/papers/p12-yogatama.pdf)) 及 `sirius-db/sirius`（Substrait 子计划拦截与基于 `cucascade` 的 GPU / NUMA-Local Pinned Host / Disk 三级内存管理）
 >   - **Crystal**: Shanbhag et al., *A Study of the Fundamental Performance Characteristics of GPUs and CPUs for Database Analytics* (SIGMOD 2020)
 >   - **NVLink Out-of-Core Join**: Lutz et al., *Pump Up the Volume: Processing Large Data on GPUs with Fast Interconnects* (SIGMOD 2020)
 >   - **HetExchange & DogQC**: Chrysogelos et al., *HetExchange: Encapsulating Heterogeneous CPU-GPU Parallelism in JIT Compiled Engines* (VLDB 2019) · Funke & Teubner, *Data-Parallel Query Processing on Non-Uniform Data* (VLDB 2020)

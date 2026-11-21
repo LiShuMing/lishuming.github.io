@@ -76,7 +76,7 @@ math: true
 
 ### 2.1 侵入式容器合一（Intrusive Containers）：一次分配，零冗余键
 
-第一刀直接砍向标准库容器的“外部包装节点”。所谓**侵入式设计**（与前文 [向量化引擎的 C++ 内存底座]({{< relref "2026-11-18-vectorized-engine-cpp-memory-and-gpu-mapping.md" >}}) 中剖析的 `intrusive_ptr` 一脉相承），就是把哈希冲突链钩子、LRU 前后驱钩子、引用计数与业务键值全部熔铸进**同一个紧凑连续的结构体**里：
+第一刀直接砍向标准库容器的“外部包装节点”。所谓**侵入式设计**（与前文 [资深 C++ 与计算引擎内核底座]({{< relref "2026-11-19-cpp-systems-core-data-structures-and-kernel-design.md" >}}) 中剖析的 `intrusive_ptr` 一脉相承），就是把哈希冲突链钩子、LRU 前后驱钩子、引用计数与业务键值全部熔铸进**同一个紧凑连续的结构体**里：
 
 ```cpp
 // 生产级单块紧凑缓存条目（RocksDB LRUHandle / Meta CacheLib Item 思路）
@@ -104,7 +104,7 @@ struct alignas(8) CacheEntry {
 
 ### 2.3 `2MB` 大页 Slab 内存池与原地覆写复用
 
-第三刀接管底层内存分配。仿照 **Meta CacheLib** 的 Slab Allocator，引擎在启动时直接申请按 **`2 MB` HugePages（大页）**对齐的大块连续虚拟内存——单此一步就把 CPU TLB 的地址覆盖半径扩大了 **512 倍**，将大内存随机查找下的 `dTLB Miss` 压近于零。
+第三刀接管底层内存分配。仿照 **Meta CacheLib** 的 Slab Allocator，引擎在启动时直接申请按 **`2 MB` HugePages**（大页）对齐的大块连续虚拟内存——单此一步就把 CPU TLB 的地址覆盖半径扩大了 **512 倍**，将大内存随机查找下的 `dTLB Miss` 压近于零。
 
 大页内部按固定规格梯度（如 `64B, 96B, 128B, 256B ...`）切分为 Slab Class。当某个规格池满载需要淘汰旧条目时，根本不调用任何释放函数，而是直接摘下该规格队尾的冷槽位，把新写入的键值原地 `memcpy` 覆盖进去，全生命周期外部内存碎片率严格为零。
 

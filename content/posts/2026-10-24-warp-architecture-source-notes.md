@@ -1,8 +1,10 @@
 ---
-title: "【源码】Warp：终端、UI 与 Agent 如何共享状态"
+title: "【源码与实践】Warp：终端与 Agent 架构剖析，以及原生直连百炼改造"
 slug: "warp-architecture-source-notes"
 date: 2026-10-24T00:00:00+08:00
-lastmod: 2026-10-24T00:00:00+08:00
+lastmod: 2026-11-21T00:00:00+08:00
+aliases:
+  - "/2026/10/24/warp-bailian-native-direct-poc/"
 categories:
   - AI Engineering
 tags:
@@ -11,7 +13,10 @@ tags:
   - Terminal
   - Agent
   - Source Code
-description: "从现代终端与 AI Agent 的三个核心矛盾出发，拆解 Warp 的双前端分工、Entity/Handle 状态归属、PTY 到命令 Block 的解析链路，以及原生 Agent 协议与本地直连的改造边界。"
+  - Bailian
+  - DeepSeek
+  - SSE
+description: "从现代终端与原生 AI Agent 的架构矛盾出发，拆解 Warp 的双前端分工、Entity/Handle 状态归属、PTY 到 Block 解析链路与云端代理机制，并通过请求截流、百炼 SSE 协议翻译和独立会话驱动，在 macOS Metal GUI 上实测跑通 deepseek-v4.1-flash 原生多轮流式直连。"
 draft: false
 toc: true
 math: false
@@ -19,13 +24,13 @@ math: false
 
 传统的终端模拟器（比如 xterm 或 iTerm2）建立在一个极其克制的抽象之上：子进程往伪终端（Pseudo Terminal，PTY）里吐出一串字节流和 ANSI 转义序列，终端负责把字符画到二维网格上。画完之后，终端本身并不知道哪几行属于上一次 `cargo test` 的报错、当时的工作目录在哪里、退出码是多少。
 
-如果你想在这个传统字符网格旁边硬塞一个原生的 AI Agent，最朴素的做法是“抓取屏幕上的文字拼进 Prompt，调完大模型接口再把返回的字符串画到侧边栏”。但只要动手写下去，马上就会撞上三堵墙：
+如果想在这个传统字符网格旁边硬塞一个原生的 AI Agent，最朴素的做法是“抓取屏幕上的文字拼进 Prompt，调完大模型接口再把返回的字符串画到侧边栏”。但只要动手写下去，马上就会撞上三堵墙：
 
 1. **终端输出缺乏结构边界**：仅凭屏幕上出现了 `$` 或 `#` 去猜命令起止，一旦遇到自定义提示符、并发交错输出或者 `vim`、`htop` 这类全屏程序，上下文切分就会彻底乱套。
 2. **高频异步 I/O 与多视图渲染抢状态**：一边是 PTY 每秒涌入几万字节的编译日志，另一边是网络流式推送的模型回复，外加窗口分屏、历史列表乃至桌面 GPU 与无头终端两套前端同时读写。如果异步回调直接去改界面组件，或者在调用栈里随意嵌套加锁，不是数据撕裂就是界面卡死。
-3. **“配了自己的模型密钥”不等于“本地直连推理”**：这也是促使我翻开 [Warp](https://github.com/warpdotdev/warp) 源码的直接导火索——我在设置里填好了阿里云百炼（Alibaba Cloud Model Studio）的自定义 Endpoint 和 API Key，本以为客户端会直接把请求发往百炼，结果按下回车后，依然可能被 Warp 自己的 `Out of credits` 拦在门外。
+3. **“配了自己的模型密钥”不等于“本地直连推理”**：这也是促使我翻开 [Warp](https://github.com/warpdotdev/warp) 源码的直接导火索——往设置里填好阿里云百炼（Alibaba Cloud Model Studio）的自定义 Endpoint 和 API Key 后，不仅默认选中的 `qwen3.8-max` 在日常快问快答里偏慢，而且哪怕百炼账户里额度充足，在原生输入框按下回车时，依然可能被 Warp 弹出的 `Out of credits` 拦在门外。
 
-为什么填了自己的 API Key 还会受制于官方额度？终端里的字节流到底怎样变成可引用的命令块（Block）？如果我们想绕开云端中转、复用 Warp 原生输入框和流式界面直连自己的大模型，刀该切在哪一层？本篇先顺着终端和 Agent 两条数据流把 Warp 的骨架拆清楚；具体的百炼直连改造、Metal 编译踩坑与实机验证则记录在[下一篇实践笔记]({{< ref "2026-10-24-warp-bailian-native-direct-poc.md" >}})里。
+为什么用自己的 API Key 还会受制于官方额度？终端里的原始字节流到底怎样变成可引用的命令块（Block）？如果我们想绕开云端中转、固定接入百炼 Token Plan 上的 `deepseek-v4.1-flash`，同时完整保留 Warp 原生的输入框、多轮对话卡片和流式 Markdown 渲染，刀该切在客户端的哪一层？
 
 ---
 
@@ -37,7 +42,7 @@ math: false
 
 *箭头表示主要依赖或数据流向。左下方的 `TerminalServer` 是管理本机 PTY 生命周期的子进程；右下方的 Warp 云端服务则承载 `/ai/multi-agent` 编排协议，两者职责完全正交。*
 
-先看顶层的两个前端。桌面图形版位于 `app/`，基于自研的 WarpUI 框架做像素级布局和 GPU 渲染（在 macOS 上依赖完整的 Metal 着色器工具链）；而无头终端版位于 `crates/warp_tui/`（基础组件在 `crates/warpui_core/src/elements/tui/`），直接画在字符网格上并消费终端输入事件。虽然开源桌面入口 [`app/src/bin/oss.rs::main`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/bin/oss.rs#L10) 和 TUI 入口最终都汇入 [`app/src/lib.rs::run`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/lib.rs#L780) 所在的库，共用底层的 `App`、实体句柄（Entity / Handle）、动作派发和核心业务模型，但两者的布局计算、绘制管线与输入事件转换是各自独立实现的——跑通了 TUI 单元测试，依然要用真实的 Metal 构建去验证桌面窗口的渲染和鼠标交互。顺带一提，`oss.rs` 里的 `OSS` 只是构建渠道标识，入口初始化时照样会装配默认的服务端地址，具体功能是否联网完全取决于下游模块。
+先看顶层的两个前端。桌面图形版位于 `app/`，基于自研的 WarpUI 框架做像素级布局和 GPU 渲染（在 macOS 上依赖完整的 Metal 着色器工具链）；而无头终端版位于 `crates/warp_tui/`（基础组件在 `crates/warpui_core/src/elements/tui/`），直接画在字符网格上并消费终端输入事件。虽然开源桌面入口 [`app/src/bin/oss.rs::main`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/bin/oss.rs#L10) 和 TUI 入口（`run_tui`）最终都汇入 [`app/src/lib.rs::run`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/lib.rs#L780) 所在的库，共用底层的 `App`、实体句柄（Entity / Handle）、动作派发和核心业务模型，但两者的布局计算、绘制管线与输入事件转换是各自独立实现的——跑通了 TUI 单元测试，依然要用真实的 Metal 构建去验证桌面窗口的渲染和鼠标交互。顺带一提，`oss.rs` 里的 `OSS` 只是构建渠道标识，入口初始化时照样会装配默认的服务端地址，具体功能是否联网完全取决于下游模块。
 
 再看底层的两种“Server”。翻源码时看到 [`local_tty/server/mod.rs`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_terminal/src/local_tty/server/mod.rs#L113) 里的 `TerminalServer`，很容易误以为它跟远程服务有关。实际上，它是一个纯本机运行的守护子进程，专门负责创建和托管本地 PTY 的生命周期，并通过 Unix Domain Socket 把控制消息与底层文件描述符（File Descriptor）移交给主程序。一旦主程序拿到了 PTY 文件描述符，后续海量的终端字节读写就直接在主程序与 PTY 之间完成，不需要每敲一个字符都去绕一趟子进程转发。
 
@@ -55,7 +60,7 @@ math: false
 
 这套状态共享机制还决定了改代码时的一条铁律——**严防跨层重入死锁**。以核心的 `TerminalModel` 为例，它内部受互斥锁保护，而视图渲染和事件分发又经常需要间接读取终端状态。如果上层调用栈已经拿住了 `TerminalModel` 的锁，调进某个辅助函数后又试图二次 `.lock()`，整个图形界面就会当场冻死。因此在终端相关模块里，显式把已锁定的引用往下传、尽量压缩持锁区间，远比每个小函数各自去抢锁安全得多。
 
-往下细分，客户端里的核心状态其实分属三个独立的层级：
+往下细分，客户端里的核心状态分属三个独立的层级：
 
 - **工作区（Workspace）**：管窗口、标签页（Tab）与分屏布局；
 - **终端会话（Terminal Session）**：管具体的 Shell 进程、PTY 通道与命令输出块；
@@ -77,29 +82,29 @@ math: false
 
 第一个问题是**高吞吐输出与界面响应的平衡**。打开 [`EventLoop::pty_read`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_terminal/src/local_tty/event_loop.rs#L201) 可以看到，当后台读取线程从 PTY 拿到一批字节后，会获取终端状态锁并调用 `state.parser.parse_bytes(...)`（底层在 [`model/ansi/mod.rs`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_terminal/src/model/ansi/mod.rs) 中用 `Processor` 包装 VTE 解析器，由 `Performer` 将控制序列转译为 `crates/warp_terminal/src/model/grid/` 上的网格变更，并把需要回传给终端的控制响应塞入写队列）。试想，如果跑一句 `cat huge.log` 吐出几百兆日志，`pty_read` 死死抱住状态锁一直解析到文件末尾，主线程就根本拿不到锁去画界面。所以 `pty_read` 专门做了定量分批处理：消化一定字节后主动让出锁，并在产生可见变更时向前端发唤醒事件，让渲染帧得以插空执行。
 
-第二个问题是**命令边界的精确识别**。Warp 并不是靠正则去屏幕文本里猜哪里是提示符，而是通过 Shell 集成脚本，在命令即将执行、刚刚结束等生命周期节点主动注入设备控制字符串（Device Control String，DCS）转义序列，由解析侧的 [`dcs_hooks.rs`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_terminal/src/model/ansi/dcs_hooks.rs) 捕获并通知上层 `app/src/terminal/model/`。有了这套带外信号，客户端就能准确切分出每次执行的命令文本、标准输出、当前工作目录与退出状态，组装成结构化的 Block（反过来，如果连上一台没装 Shell 集成的裸远端机器，或者切进全屏 TUI 程序，能拿到的元数据自然也会随之退化）。
+第二个问题是**命令边界的精确识别**。Warp 并不是靠正则去屏幕文本里猜哪里是提示符，而是通过 Shell 集成脚本，在命令即将执行、刚刚结束等生命周期节点主动注入设备控制字符串（Device Control String，DCS）转义序列，由解析侧的 [`dcs_hooks.rs`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_terminal/src/model/ansi/dcs_hooks.rs) 捕获并通知上层 `app/src/terminal/model/`（维护 `TerminalModel`、`Session` 与 `BlockList`）。有了这套带外信号，客户端就能准确切分出每次执行的命令文本、标准输出、当前工作目录与退出状态，组装成结构化的 Block（反过来，如果连上一台没装 Shell 集成的裸远端机器，或者切进全屏 TUI 程序，能拿到的元数据自然也会随之退化）。
 
 这也道出了 Warp 与经典的 `iTerm2 + tmux` 工作流在根子上的分野：`tmux` 把会话持久化和分屏复用留在了终端字节流协议内部，跟远端服务器脚本配合得天衣无缝；而 Warp 选择把命令块、富文本输入框和 AI 上下文全部提升到客户端的应用状态层——当你点中一段编译失败的 Block 继续追问 Agent 时，传过去的是天然带边界的结构化对象，而不是从字符网格里生抠出来的一段纯文本。
 
 ---
 
-## 四、Agent 路径：为什么配了自定义密钥还会走 Warp 云端？
+## 四、Agent 路径：为什么配了自定义密钥还会撞上 `Out of credits`？
 
-现在我们可以解开文章开头的那个谜团了：在原生 Agent 输入框敲下回车，请求究竟去了哪里？
+现在我们可以解开文章开头的谜团：在原生 Agent 输入框敲下回车，请求究竟去了哪里？配额门禁又卡在哪一层？
 
-顺着 [`Input::input_enter`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/terminal/input.rs#L13924) 往下追，输入先经过模式判定、额度与可用性预检，再走 `submit_ai_query_with_routing` 进入 `submit_ai_query_local`（注意：函数名里的 `local` 指的是“当前客户端本地分屏路由”，用来区别共享会话转发，跟本地跑大模型毫无关系）。接着，`BlocklistAIController` 把用户输入封装成 `AIAgentInput`，按当前选中项、权限与脱敏规则收集引用的命令块、工作目录或附件，并构造 `RequestInput` 与 `RequestParams` 快照，把这一轮的模型标识、任务上下文和自定义提供商配置冻结下来。
+先看配置层。Warp 的模型身份本身分成了四层：内部引用的 Endpoint 配置 ID、关联底层能力的 `config_key`、实际发给模型服务商的 `slug`，以及界面上展示的别名（Alias）。当 `get_active_base_model` 和 `get_preferred_base_model` 解析当前该用哪个模型时，还要综合当前分屏（Pane）的局部选择、Profile 默认值和回退策略——光改了 Profile 默认模型，已经打开的分屏未必会跟着切换。与此同时，[`ApiKeyManager`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/ai/src/api_keys.rs) 把 Endpoint 元数据存在普通设置里，把敏感密钥存进 macOS 钥匙串（Keychain），等到发请求时再拼装成 `custom_model_providers`（排查时甚至能看到部分旧的可用性检查还在读历史遗留的 `ApiKeys.custom_endpoints`，而新注册逻辑已经迁到了另一套结构里）。
 
-真正的分水岭出现在下一步——[`generate_multi_agent_output`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/agent/api/impl.rs#L16)：
+但比配置结构更致命的，是从敲下回车到屏幕出字这条完整的跨网络调用链：
 
-1. 客户端把 Prompt、任务历史、可用工具清单，**连同你在设置里配好的自定义 Endpoint 地址与 API Key（`custom_model_providers`）一起**，打包进 `warp_multi_agent_api::Request`（Protobuf 结构）；
-2. 随后交给 [`warp_multi_agent_client`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_multi_agent_client/src/lib.rs#L48)，附带 Warp 账号鉴权令牌，统一 POST 到 **Warp 云端服务端的 `/ai/multi-agent` 接口**；
-3. 云端完成多智能体编排、提示词组织与上游模型调用后，再把结果编码成 Warp 私有的响应事件流推回客户端。
+![Warp 原生 Agent 从输入到流式展示的调用链](/assets/images/warp-source-notes/native-request-flow.svg)
 
-真相一目了然：原生的“自定义 Endpoint”在架构上属于**服务端托管转发（Cloud-orchestrated BYOK）**，而不是客户端本机直连。正因为整条链路依然穿过客户端的额度预检门禁（`AIRequestUsageModel`）和云端的 `/ai/multi-agent` 编排层，哪怕你自己的百炼账户里额度充足，只要撞上客户端或服务端的配额策略，请求照样会被 `Out of credits` 拦下来。
+*图中涵盖输入快照、异步流回调与视图重绘构成的完整闭环，箭头代表数据与事件流向，并非单一同步调用栈。*
 
-### 事件契约：流式回复如何点亮原生界面？
+沿着图中的编号往下走，每一段都在回答“额度拦截和协议绑定发生在哪”：
 
-既然 `/ai/multi-agent` 返回的不是 OpenAI 兼容接口那种简单的 `choices[].delta.content` JSON，客户端是怎么把回复渲染出来的？追进响应消费链路就能看到一套非常干净的分层：
+1. **发包前的客户端门禁与请求快照（步骤 1～3）**：用户在输入框敲下回车，[`Input::input_enter`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/terminal/input.rs#L13924) 识别出 Agent 模式后，经 `submit_ai_query_with_routing` 路由进 `submit_ai_query_local`（注意：函数名里的 `local` 指的是“当前客户端本地分屏路由”，用来区别共享会话转发，跟本地跑大模型毫无关系）。**在任何网络请求发出之前**，`AIRequestUsageModel` 和 `PromptAlert` 就会先做一轮可用性与配额预检——这意味着单靠客户端本地的账户配额状态，就足以提前拦下提交。通过预检后，新会话与存量会话汇入 `BlocklistAIController::send_query`，由 `input_for_query` 和 `input_context_for_request` 封装 `AIAgentInput`（按当前选中项、权限与脱敏规则收集引用的命令块、工作目录或附件），再通过 `RequestInput` 与 `send_request_input` 冻结出一份不可变的 `RequestParams` 快照（防止等待网络响应期间用户修改界面设置污染当前轮次），同时拉起 `ResponseStream`。
+2. **发往 Warp 云端的私有编排协议（步骤 4～5）**：真正的分水岭出现在 [`generate_multi_agent_output`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/agent/api/impl.rs#L16)——它把冻结的快照打包成 Protobuf 格式的 `warp_multi_agent_api::Request`，里面不仅有 Prompt、任务历史和可用工具声明，**还把你在设置里配好的自定义 Endpoint 地址与密钥（`custom_model_providers`）一并装了进去**。紧接着，[`warp_multi_agent_client`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_multi_agent_client/src/lib.rs#L48) 附带 Warp 账号鉴权令牌，统一 POST 到 **Warp 云端服务的 `/ai/multi-agent` 接口**。云端完成多智能体编排与上游模型调用后，再把结果编码成 Warp 私有事件流推回客户端。
+3. **服务端事件解码与 `ClientActions` 状态驱动（步骤 6～8）**：云端返回的虽然也是服务端发送事件（Server-Sent Events，SSE）流，但载荷经过了 Base64 URL-safe 与 Protobuf 编码，解出来的是 `ResponseEvent`，跟 OpenAI 兼容接口的 `choices[].delta.content` 完全是两码事。消费链路分层非常干净：
 
 ```text
 ResponseStream（消费 SSE，经 Base64 与 Protobuf 解码出 ResponseEvent）
@@ -112,19 +117,30 @@ ResponseStream（消费 SSE，经 Base64 与 Protobuf 解码出 ResponseEvent）
     → AIBlock::render（驱动原生 Markdown 流式视图重绘）
 ```
 
-这段链路里最值得标星号的设计，就是**模型层与视图层之间的 `ClientActions` 事件契约**。`AIBlock::render` 根本不关心网络那头连的是 Warp 官方云端还是别的什么服务；它只认 `AIConversation` 里的状态变更。只要我们在本地新写一个轻量 HTTP 客户端，直连百炼拿到标准的服务端发送事件（Server-Sent Events，SSE）文本增量，再当场把它们翻译成符合顺序和 ID 约束的 `AddMessagesToTask`、`AppendToMessageContent` 与完成事件喂给 `ResponseStream`，整套原生的输入框、代码高亮、流式滚动和多轮追问界面就能原封不动地跑起来！
+真相至此一目了然：原生的“自定义 Endpoint”在架构上属于**服务端托管转发（Cloud-orchestrated BYOK）**，而不是客户端本机直连。只要整条链路依然穿过客户端的额度预检门禁和云端 `/ai/multi-agent` 编排层，哪怕你自己的百炼账户里额度充足，撞上官方配额策略依然会触发 `Out of credits`。
 
-### 工具调用为什么会让复杂度陡增？
+但这条链路也暴露了一个极其宝贵的解耦点——**模型层与视图层之间的 `ClientActions` 事件契约**。`AIBlock::render` 根本不关心网络那头连的是 Warp 官方云端还是别的什么服务，它只认 `AIConversation` 里的状态变更。只要我们在本地写一个轻量 HTTP 客户端，直连百炼拿到标准 SSE 文本增量，再当场翻译成符合顺序和 ID 约束的 `AddMessagesToTask`、`AppendToMessageContent` 与完成事件喂给 `ResponseStream`，整套原生的输入框、代码高亮、流式滚动和多轮追问界面就能原封不动地跑起来。
 
-当然，完整的终端 Agent 不只是聊聊天。在原版闭环里，如果服务端返回的 `ClientActions` 包含执行 Shell 命令或读写文件的动作，就会交由 `action_model.rs`、`action_model/execute.rs` 排队、弹出用户审批确认并在本地执行，最后通过 Controller 的 `send_follow_up_for_conversation` 把执行结果编码成下一轮输入发回服务端。
+不过，如果连本地工具调用一起接管，复杂度就会陡增。在原版闭环里，当 `ClientActions` 包含执行 Shell 命令或读写文件的动作时，会交由 `action_model.rs`、`action_model/execute.rs` 中的 `try_to_execute_action` 排队、弹出用户审批并在本地执行，再由 `send_follow_up_for_conversation` 把执行结果编码成下一轮输入发回服务端。也就是说，`ClientActions` 同时承载了纯 UI 级别的消息追加与带副作用的工具调用。如果在客户端直连的第一步就把工具循环也搬进来，就必须立刻接手工具 Schema 维护、权限弹窗对接、中断时子进程清理以及断流防重放等一整套编排状态机。因此，首期只复用消息类 `ClientActions` 跑通纯文本多轮直连，是验证原生 UI 解耦最干净的切口。
 
-也就是说，`ClientActions` 既承载了纯 UI 级别的消息创建与文本追加，也承载了带副作用的本地工具调用。如果我们一上来就想把工具循环也改成客户端直连，就得在本地接手工具 Schema 维护、权限弹窗对接、中断时子进程清理、以及断流重试时的防重复执行等一整套编排逻辑。反过来，先只复用消息类的 `ClientActions` 跑通纯文本直连，就能用最小的改动验证原生 UI 解耦的可行性。
+对照下面这八个源码锚点，可以跳过数千行 Controller 代码直接顺完整条 Agent 调用链：
+
+| 阶段 | 关键函数 | 源码定位 |
+| --- | --- | --- |
+| 输入与路由 | `input_enter`、`submit_ai_query_with_routing`、`submit_ai_query_local` | [input.rs:13924](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/terminal/input.rs#L13924)、[4598](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/terminal/input.rs#L4598)、[15057](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/terminal/input.rs#L15057) |
+| 模型解析 | `get_active_base_model`、`get_preferred_base_model` | [llms.rs:908](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/llms.rs#L908) |
+| 凭据序列化 | `custom_model_providers_for_request` | [api_keys.rs:1125](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/ai/src/api_keys.rs#L1125) |
+| 发送快照准备 | `send_query`、`send_request_input` | [controller.rs:775](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/blocklist/controller.rs#L775)、[3047](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/blocklist/controller.rs#L3047) |
+| 请求构造与发送 | 两层 `generate_multi_agent_output` | [api/impl.rs:16](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/agent/api/impl.rs#L16)、[client/lib.rs:48](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/crates/warp_multi_agent_client/src/lib.rs#L48) |
+| 异步流生命周期 | `ResponseStream::new`、`spawn_request`、`spawn_generate` | [response_stream.rs:374](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/blocklist/controller/response_stream.rs#L374) |
+| 事件写入历史 | `apply_response_event`、`apply_client_actions`、`apply_client_action` | [controller.rs:3616](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/blocklist/controller.rs#L3616)、[history_model.rs:2044](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/blocklist/history_model.rs#L2044)、[conversation.rs:2875](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/agent/conversation.rs#L2875) |
+| 界面渲染与工具回传 | `AIBlock::render`、`send_follow_up_for_conversation` | [view_impl.rs:873](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/blocklist/block/view_impl.rs#L873)、[controller.rs:2155](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/blocklist/controller.rs#L2155) |
 
 ---
 
-## 五、第三方接入的四条路线与存储、账户边界
+## 五、第三方接入的四条路线与 `ConversationDriver` 边界
 
-平时大家聊“在 Warp 里接第三方模型或外部 Agent”，其实往往把四种改造深度完全不同的方案混在了一起。把它们放到同一张架构切面图上对比，各自的代价就一清二楚了：
+平时聊“在 Warp 里接第三方模型或外部 Agent”，往往把四种改造深度完全不同的方案混在了一起。把它们放到同一张架构切面图上对比，各自的取舍就一清二楚了：
 
 | 接入方式 | 复用了 Warp 的哪一层 | 需要适配或重写的环节 | 运行边界 |
 | --- | --- | --- | --- |
@@ -133,39 +149,209 @@ ResponseStream（消费 SSE，经 Base64 与 Protobuf 解码出 ResponseEvent）
 | **通过外部 Harness（如 ACP）接入** | 部分原生消息结构与 `AIBlock` 展示组件 | 会话生命周期、事件映射、工具归属与同步裁剪 | 仓库虽有 ACP 转换层，但关联模块仍带有绑定云端会话与上传记录的逻辑 |
 | **客户端原生推理直连（本次百炼 PoC）** | 原生输入框、多轮文本历史与流式渲染 UI | 新增 HTTP/SSE 客户端、事件翻译器与独立会话驱动 | 客户端直接请求百炼接口；首期仅支持纯文本内存会话，暂不含工具与持久化 |
 
-Warp 源码里其实专门抽出了一个枚举来刻画不同接入方式的行为边界——[`ConversationDriver`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/agent/conversation_driver.rs#L5)。它用一组明确的行为谓词回答六个问题：谁掌控轮次生命周期？谁在本地执行工具？是否从消息流重建输入？是否向云端上报任务状态？界面是否只读？会话是否落盘持久化？
+Warp 源码里专门抽出了一个枚举来刻画不同接入方式的行为边界——[`ConversationDriver`](https://github.com/warpdotdev/warp/blob/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1/app/src/ai/agent/conversation_driver.rs#L5)。它用六项明确的行为谓词界定一套会话的权责：谁掌控轮次生命周期？谁在本地执行工具？是否从消息流重建输入？是否向云端上报任务状态？界面是否只读？会话是否落盘持久化？
 
 千万别小看这六个开关。举个例子，`ExternalHarness` 虽然自己驱动事件和工具，但默认仍可能触发任务状态上报或本地持久化；如果做直连改造时图省事借用了一个看似相近的现有枚举，本地随手生成的任务 ID 就可能被拿去请求云端同步接口，或者在重启恢复时撞上云端 `conversation_token` 校验报错。
 
-这也引出了最后两道横切边界——**本地存储**与**账号门禁**：
+这还牵出最后两道横切边界——**本地存储**与**账号门禁**：
 
 - **持久化与云同步各自独立**：`crates/persistence/` 下的 SQLite（Diesel Schema 与 Migrations）管本地落盘，`app/src/drive/`、`app/src/auth/` 与 GraphQL 模块管云端资产与账户同步。直连会话既然没有云端颁发的 `conversation_token`，最稳妥的起步策略就是给它单独定义一个 `DirectBailian` 驱动，明确关闭云端状态上报和重启恢复，让会话先纯粹驻留在内存里（代价是退出应用后直连历史清空，但彻底杜绝了脏 ID 污染数据库）。
-- **推理直连不等于整个客户端免登录离线化**：GUI 启动时的引导流程，以及原生 Agent 面板是否可用（如 `Settings → Agents → Warp Agent` 总开关），依然受账户登录态与基础设置控制。把推理 HTTP 请求切到百炼，解决的是“谁来跑大模型、扣谁的 Token”，客户端自身的账号入口门禁仍在原位。
+- **推理直连不等于整个客户端免登录离线化**：GUI 启动时的引导流程，以及原生 Agent 面板是否可用（如 **Settings → Agents → Warp Agent** 总开关），依然受账户登录态与基础设置控制。把推理 HTTP 请求切到百炼，解决的是“谁来跑大模型、扣谁的 Token”，客户端自身的账号入口门禁仍在原位。
 
 ---
 
-## 六、源码走读地图
+## 六、原生直连百炼 PoC：截流、SSE 协议翻译与驱动隔离
 
-如果你也想基于 Warp 源码修改模型路由、接入内部网关，或者单纯想读懂一个大型 Rust GUI 终端是怎么组织的，顺着下面这张“问题驱动”的导航表往下跳，比按字母顺序翻目录高效得多：
+既然前两条路要么绕不开 `/ai/multi-agent` 云端中转，要么放弃了 Warp 原生对话卡片，最直接的动手方案就是在 `generate_multi_agent_output` 即将构造云端请求的前一刻劈开一条本地直连分支：固定对接百炼 Token Plan 上的 `deepseek-v4.1-flash`，把返回的流式增量翻译成原生 `ResponseEvent`，让原生 UI 在纯文本多轮对话范围内完全脱离官方推理中转独立运转。
 
-| 想搞清楚的问题 | 关键目录或文件 | 核心入口类型 / 函数 |
+![百炼直连分支与原生 UI 事件适配](/assets/images/warp-source-notes/direct-bailian-flow.svg)
+
+整套直连改造由三个紧耦合的环节组成：**请求快照截流**、**SSE 协议与事件状态机翻译**，以及**独立会话驱动隔离**。
+
+### 1. 显式进程开关与请求前截流
+
+新增的 `app/src/ai/direct_bailian.rs` 负责管理进程级开关与凭据快照。只有启动环境中显式设置了 `WARP_DIRECT_BAILIAN=1` 时，直连模式才会激活，确保日常默认路径毫发无损。构造请求快照时，`DirectBailianRequest::snapshot` 优先读取进程环境变量 `LLM_API_KEY`；若未设置，则回退查找当前构建渠道 `ApiKeyManager` 中 URL 匹配百炼 Token Plan 的配置项，并将快照冻结进本轮的 `RequestParams`。
+
+当执行流走到 `api/impl.rs::generate_multi_agent_output` 时，代码在拼装 Protobuf 请求和获取 Warp 云端令牌**之前**先检查这份快照：
+
+- 只放行不带引用块、文件或图片附件的纯文本 `UserQuery`（如果用户开启了输入脱敏策略，照常先跑一遍客户端既有的脱敏函数）；
+- 即使外层 Controller 自动收集了终端输出或环境上下文，直连分支也不会把这些额外载荷透传给百炼；
+- 一旦遇到不支持的输入类型，或者试图在旧的云端会话上混用直连模式，直接返回明确错误，绝不悄悄回退去调 Warp 官方模型。
+
+### 2. 独立客户端：从百炼 SSE 字节流到 `AppendToMessageContent`
+
+新增的独立 Crate `crates/warp_bailian_client/` 承担了全部 HTTP 通信、SSE 分片解析与 Warp 事件翻译工作。请求侧直接对齐百炼的 OpenAI 兼容接口（接口规范与模型开通条件见[百炼 DeepSeek API 文档](https://help.aliyun.com/zh/model-studio/deepseek-api)）：
+
+```text
+POST https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions
+model: deepseek-v4.1-flash
+stream: true
+stream_options.include_usage: true
+enable_thinking: false
+max_tokens: 2048
+tools: 不发送
+```
+
+组装请求体时，`request_body` 会扫描当前单一任务里已有的 `UserQuery` 和 `AgentOutput`，还原成标准的 `user` / `assistant` 消息数组（自动剥离模型标记等内部元数据，若检测到多任务或含工具历史则拒绝发送），再前置一条说明纯文本助手边界的 `system` 提示词。这样第二轮提问就能自然带上第一轮的上下文。网络层设置了 120 秒超时并严禁 HTTP 重定向；遇到非 200 响应时只向上报告状态码而不拼接原始响应正文，同时为 `Config` 手写脱敏版 `Debug` 实现，防止密钥或敏感报错意外落入日志。
+
+响应侧则需要按字节流严谨处理百炼 SSE 细节（参见[官方流式输出说明](https://help.aliyun.com/zh/model-studio/stream)）：增量正文位于 `choices[].delta.content`，开启 `include_usage` 后末尾统计帧的 `choices` 可能为空数组，整条流以 `[DONE]` 收尾。解析器在字节缓冲区上妥善处理了跨 TCP 分片的 UTF-8 多字节字符、`LF` / `CRLF` 换行、多行 `data:` 拼接与注释行，并给单个事件加上 1 MiB 体积上限。
+
+拿到增量文本只是第一步，真正的巧思在于由本地适配层把多轮消息角色映射、SSE 增量切片还原、未授权 `tool_calls` 拦截与原生 `ResponseEvent` 重建串成严格保序的时序闭环：
+
+![Warp 百炼直连中的流式协议与状态动作翻译时序](/images/diagrams/app-warp-stream-translation.svg)
+
+对照时序图里的三个阶段，适配层在每个流状态节点都必须守住对应的状态机不变量：
+
+| 百炼流状态 | 翻译出的 Warp 原生事件 | 必须维持的状态机不变量 |
 | --- | --- | --- |
-| 开源构建与双前端从哪启动 | `app/src/bin/oss.rs`、`app/src/lib.rs` | `main`、`run`、`run_tui` |
-| 谁持有全局模型与视图实体 | `crates/warpui_core/src/core/app.rs` | `AppContext`、`add_model`、`add_view` |
-| 本地 PTY 怎样创建与分批读取 | `crates/warp_terminal/src/local_tty/` | `TerminalServer`、`EventLoop::pty_read` |
-| 原始字节流怎样解析成终端操作 | `crates/warp_terminal/src/model/ansi/` | `Processor`、`Performer`、`dcs_hooks.rs` |
-| 命令 Block 与终端会话如何关联 | `app/src/terminal/model/` | `TerminalModel`、`Session`、`BlockList` |
-| 敲下回车怎样变成一轮 Agent 请求 | `app/src/terminal/input.rs`、`app/src/ai/blocklist/controller.rs` | `input_enter`、`send_query`、`send_request_input` |
-| 模型选择与自定义密钥如何装配 | `app/src/ai/llms.rs`、`crates/ai/src/api_keys.rs` | `get_active_base_model`、`ApiKeyManager` |
-| 默认请求打包后发往哪里 | `app/src/ai/agent/api/impl.rs`、`crates/warp_multi_agent_client/src/lib.rs` | 两处 `generate_multi_agent_output` |
-| 流式事件怎样一步步改写对话历史 | `app/src/ai/blocklist/history_model.rs`、`app/src/ai/agent/conversation.rs` | `apply_client_actions`、`apply_client_action` |
-| 状态更新后由谁渲染成界面气泡 | `app/src/ai/blocklist/block/view_impl.rs` | `AIBlock::render` |
-| 工具动作怎样审批、执行与回传 | `app/src/ai/blocklist/action_model/`、Controller | `try_to_execute_action`、`send_follow_up_for_conversation` |
-| 不同后端怎样约束会话生命周期 | `app/src/ai/agent/conversation_driver.rs` | `ConversationDriver` 及其行为谓词 |
-| 本地历史按什么条件落盘与恢复 | `crates/persistence/` | Diesel Schema、Migrations 与调用侧恢复判据 |
+| HTTP 200 且响应头为事件流 | `Init` | 生成本地唯一的 `request_id`，绝不伪造云端 `conversation_token` |
+| 首包准备落位 | 按需发 `CreateTask`，紧接 `AddMessagesToTask` | 回显本轮用户消息并预先建好空的助手消息槽位，锁定 `message_id` |
+| 收到 `choices[].delta.content` | `AppendToMessageContent` | `FieldMask` 精确指向 `agent_output.text`，复用同一个 `task_id` 与 `message_id` |
+| 收到正常 `stop` 且读到 `[DONE]` | `Finished(Done)` | 只有停止原因与流结束标记双双齐全，才算本轮成功闭合 |
+| 触发 `length` 截断、工具调用或提前断流 | 错误事件 | 拒绝把半截回复当成功；关闭自动重试，防止已上屏的半截文字被重复刷一遍 |
 
-摸清了这条“输入快照 → 传输协议 → `ClientActions` → `AIHistoryModel` → `AIBlock`”的主干，下一步的动手方案就水到渠成了：在 `generate_multi_agent_output` 构造云端请求之前劈开一条本地直连分支，用百炼的 `deepseek-v4.1-flash` 跑通纯文本流式对话。具体的协议翻译细节、macOS Metal 工具链构建排障以及 GUI 实测过程，请看下一篇[《Warp 原生直连百炼：从请求链路到 GUI 验证》]({{< ref "2026-10-24-warp-bailian-native-direct-poc.md" >}})。
+核心的增量追加翻译浓缩在下面几行 Rust 代码里：
+
+```rust
+yield client_actions(vec![Action::AppendToMessageContent(AppendToMessageContent {
+    task_id: task_id.clone(),
+    message: Some(message(message_id.clone(), MessageKind::AgentOutput(AgentOutput { text }))),
+    mask: Some(prost_types::FieldMask { paths: vec!["agent_output.text".to_owned()] }),
+})]);
+```
+
+正是因为每次 yield 都带着恒定的 `message_id` 和指向 `agent_output.text` 的 `FieldMask`，上游的 `AIHistoryModel` 才知道“把这几个新字接在刚才那条助手气泡末尾”，`AIBlock::render` 也才能像对待官方云端流一样实时拉长 Markdown 视图。此外，当底层流被上层丢弃（Drop）时，HTTP 连接会随之立即中止。
+
+### 3. `ConversationDriver::DirectBailian`：切断不匹配的云端副作用
+
+结合前一节梳理的 `ConversationDriver` 边界，我们在 `conversation_driver.rs` 中新增了 `ConversationDriver::DirectBailian`，将六项会话行为谓词逐一定死：
+
+| 会话行为谓词 | PoC 设定 | 这样设计的工程原因 |
+| --- | --- | --- |
+| 掌控本轮生命周期 | **是** | 由本机直连流全权负责发起、流式推进与中止收尾 |
+| 本机执行工具调用 | **否** | 首期锁定纯文本范围，不开放命令与文件副作用 |
+| 从消息流重建输入 | **否** | 直接沿用当前本地输入快照组装请求 |
+| 上报任务状态 | **否** | 本地生成的任务 ID 在 Warp 云端并不存在，禁止向后台同步 |
+| 界面只读模式 | **否** | 保持底部原生输入框可用，支持同会话连续多轮追问 |
+| 本地落盘持久化 | **否** | 暂不写入 SQLite，避开云端恢复协议冲突（代价是退出进程后 PoC 会话即清空） |
+
+围绕这个新驱动，`conversation.rs` 不再为它分配服务端身份，`local_agent_task_sync_model.rs` 跳过后台状态上报，Controller 禁止将它与旧会话或共享会话转发混用，`ResponseStream` 也关掉了针对云端断流的自动重连恢复；同时，`request_usage_model.rs` 和 `prompt_alert.rs` 在 `WARP_DIRECT_BAILIAN=1` 模式下放行了客户端本地的官方额度拦截，并在 `llms.rs` 里把界面模型标签固定显示为 `deepseek-v4.1-flash · 百炼直连 PoC`，一眼就能确认当前走的是直连路由。
+
+至于前面提到的账号入口门禁，首期刻意保持了原状：实测发现，如果启动 GUI 时完全跳过账号登录，整个 AI 菜单会处于置灰禁用状态；即使正常登录，也需要去 **Settings → Agents → Warp Agent** 打开总开关（对应 `settings/ai.rs::is_any_ai_enabled` 与引导状态检查）。也就是说，这次手术精准切开了“模型推理与额度计费路径”，尚未去拆整个桌面产品的账号体系。
 
 ---
 
-> **源码基线说明**：本文源码链接与模块路径固定在 [`warpdotdev/warp`](https://github.com/warpdotdev/warp/tree/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1) 上游提交 `1e6c3ae`（源码阅读与本机验证日期为 2026-10-24）。仓库涵盖客户端 GUI、TUI 与共享 Rust Crates，不包含 Warp 闭源云端 `/ai/multi-agent` 服务端实现；文中提及的百炼客户端直连属于基于该快照的本地实验分支改动。
+## 七、从代码到可运行的 macOS GUI：凭据传递、Metal 工具链与终端防护
+
+源码逻辑写通之后，真正要在 macOS 上弹出一个能交互的 GPU 渲染窗口，还接连跨过了三道环境与构建关卡。
+
+### 1. 把远端开发机的凭据安全送进本地 GUI 进程
+
+我的百炼密钥原本放在一台远端 SSH 开发机（别名 `dev1`）的 `~/.env` 里。远端 Shell 的环境变量显然不会自动飘到本机桌面进程里；在本地随便开个终端敲 `export` 也影响不到已经运行的 GUI；更何况已安装的商业版 `Warp.app` 与源码编译的 `WarpOss.app` 拥有不同的应用身份和钥匙串命名空间，商业版配过的 Keychain 条目未必能被开源渠道直接读取。
+
+为此，本地脚本 `script/run-bailian` 提供了清晰的启动入口：当传入 `--from-dev1` 时，父进程通过 SSH 仅提取远端的 `LLM_API_KEY` 单一变量值到内存，随即注入即将拉起的 `warp-oss` 子进程环境，全程不落盘、不写配置文件、也不顺手导入其他无关变量（若密钥就在本机环境或开源渠道可解析的 Keychain 里，直接省掉 `--from-dev1` 即可）：
+
+```sh
+# 使用当前终端环境中的 LLM_API_KEY（或 OSS 渠道 Keychain），直接启动已构建好的应用包
+./script/run-bailian --no-build
+
+# 从远端 SSH 主机 dev1 按需读取密钥并启动已构建好的 GUI（复现时需替换为自己的 SSH 别名）
+./script/run-bailian --no-build --from-dev1
+```
+
+这里的 `--no-build` 会通过 `cargo metadata` 定位已打包好的 macOS Debug 应用目录并直接拉起里面的 `warp-oss` 可执行文件，既省去重复编译签名，又保证每次运行的是同一份已核验二进制（脚本另提供 `--smoke` 参数用于跑独立的命令行真机连通性测试）。
+
+### 2. 拆掉“空 Metal 库”假象，把锁定编译与打包签名解耦
+
+本机编译环境为 Apple M4 Pro（24 GiB 内存，macOS 15.5）。起初机器上只装了 Command Line Tools，顺着仓库已有的 `WARP_LOCAL_SKIP_METAL` 环境变量虽然能跑过 `cargo check`，但翻看构建脚本就知道：**那个开关只是往产物里塞了一个空的占位 `.metallib` 来骗过类型检查，真要打开 GPU 窗口非崩不可。**
+
+结合 macOS 15.5 的版本兼容矩阵（见 [Apple Xcode 系统要求](https://developer.apple.com/xcode/system-requirements)），我安装了 Xcode 16.4 并配齐 Metal `32023.620` 工具链，配合仓库锁定的 Rust `1.92.0` 与 `cargo-bundle` `0.11.0` 重新构建。注意，切回真机构建前必须先清掉 `warpui` 之前留下的空着色器缓存，并显式清除 `WARP_LOCAL_SKIP_METAL`：
+
+```sh
+# 清除此前跳过 Metal 类型检查时留下的空着色器构建缓存
+cargo clean -p warpui
+
+env -u WARP_LOCAL_SKIP_METAL \
+  RUSTUP_TOOLCHAIN=1.92.0 CARGO_BUILD_JOBS=6 FRAMEWORK_OVERRIDE=dev \
+  cargo build -p warp --bin warp-oss --features gui --locked
+```
+
+重编完成后，构建目录生成了 `31,233` 字节的真实 Metal 着色器库，并核实已完整嵌入最终可执行文件。
+
+接下来的应用打包又遇到了 `cargo-bundle 0.11.0` 不认识 `--locked` 参数的问题。解决办法是把“锁定依赖编译”和“目录封装签名”拆成前后两步：上面已经用 `--locked` 编出了确定性的二进制，打包阶段直接挂上 `CARGO_BUNDLE_SKIP_BUILD=1` 跳过二次编译；同时加上 `--dont-open`、`GENERATE_SCHEMA=false` 和 `SKIP_SETTINGS_SCHEMA=1`，防止打包脚本中途拉起尚未报备的新二进制去生成配置文件：
+
+```sh
+RUSTUP_TOOLCHAIN=1.92.0 CARGO_BUNDLE_SKIP_BUILD=1 \
+  WARP_BIN_NAME=warp-oss WARP_CHANNEL=oss FEATURES=gui \
+  GENERATE_SCHEMA=false SKIP_SETTINGS_SCHEMA=1 \
+  ./script/macos/run --dont-open
+```
+
+由于 `cargo-bundle` 初次打出的 DMG 早于外层脚本后续的资源拷贝、`Info.plist` 修正与 ad-hoc 签名，等全部后处理跑完后再重新压制最终镜像并用 `hdiutil verify` 校验。最终生成的 arm64 `WarpOss.app` 顺利通过 `codesign --verify --deep --strict` 检查，主可执行文件 SHA-256 固定为：
+
+```text
+51fa14d5a63c9a9a4e838e5a3f0a46cd16f0240456810606643b17e867499e4d
+```
+
+### 3. 企业终端防护拦截带来的验证顺序调整
+
+在打包期间还有一个很真实的排障插曲：早期我写了一个独立的会话驱动测试二进制，一运行就异常退出。第一反应以为是 ad-hoc 签名没签好，直到桌面弹出了明确的企业终端安全防护拦截提示，才意识到是未报备的新增可执行文件触发了系统的执行管控。
+
+确认原因后，我立刻停掉了那个临时测试程序并清理掉产物，没有尝试绕过或关闭企业安全策略，而是把验证流程调整为：**先在编译期跑完单元测试、静态检查与固定产物的完整打包，拿着上面那串确定的二进制哈希按正常流程提交报备；等审批放行后，全程只用 `--no-build` 运行同一份已报备的 `WarpOss.app`。** 把“编译通过”“签名合法”和“安全策略放行”三件事分清，少走了很多弯路。
+
+---
+
+## 八、分层验证、GUI 实测与补丁复现
+
+为了确保每一层改动都有扎实证据，验证从底向上分成了五层推进：
+
+| 验证层级 | 实跑结果 | 覆盖的验证边界 |
+| --- | --- | --- |
+| `warp_bailian_client` 单元测试 | `cargo nextest run -p warp_bailian_client` 15 项全绿 | 跨分片 UTF-8、CRLF、多行 `data:`、1 MiB 上限、空 `choices` 统计帧、停机带正文、拒接工具调用、截断报错、401 不重试、缺 Key 拦截及 `Init/Add/Append/Finished` 全链路翻译 |
+| 静态代码检查 | 客户端严格 Clippy 通过；主应用定向检查通过 | 新增客户端零告警（主应用检查时仅针对基线遗留的 `unnecessary_unwrap` 局部放宽，未触碰无关源码） |
+| 命令行真机连通（Smoke） | 两轮真实请求返回 `OK` 并准确回忆数字 `42` | 证实 HTTP/TLS、鉴权与 SSE 解析器对百炼线上接口真实可用（两次短请求观测首字延迟约 `1.21` 秒与 `0.84` 秒） |
+| GUI 锁定编译与打包校验 | Rust `1.92.0` + 真实 Metal + 严格签名与镜像校验通过 | 确认 arm64 `WarpOss.app` 携带真实 GPU 着色器且包结构完整 |
+| 原生 GUI 多轮流式交互 | 同会话两轮记忆与流式增量渲染实测通过 | 在已报备的同一哈希二进制上完成端到端桌面交互闭环 |
+
+*注：早期单元测试与命令行 Smoke 在安全拦截提示前基于本机 Rust `1.94.1` 跑通，随后切回工作区锁定的 Rust `1.92.0` 完成兼容性对齐与完整 GUI 构建；独立驱动测试程序因上述终端管控未执行，留待后续补跑。*
+
+报备放行后，通过 `./script/run-bailian --no-build --from-dev1` 拉起 `WarpOss.app`（核对启动前后主程序 SHA-256 完全一致），登录账号并开启 Warp Agent 开关，在新建的原生 Agent 面板里进行了两轮连续测试：
+
+1. **第一轮写入上下文**：在原生输入框发送 `请记住测试代号“青竹-7319”。只回复：已记住。`，界面干净地返回 `已记住。`。
+2. **第二轮检验多轮记忆与增量流式渲染**：不再提示代号，直接要求模型回忆刚才的测试代号，并接着生成 20 条带编号的终端使用技巧。模型第一句便准确报出 `青竹-7319`，随后一条接一条向下滚动生成列表。
+
+为了确认界面是真正的逐块增量渲染、而不是等全文收完才一次性刷屏，我在第二轮生成中途截取了画面：当时列表正停在尚未写完的第 17 条，底部清晰显示着 `Warping...` 动画与停止按钮；稍等片刻后，第 20 条补齐并切换为完成态。与此同时，以约 `0.25` 秒为间隔对 GUI 主进程做了 30 秒的 TCP 连接采样，其中两个采样点准确命中了百炼 Token Plan 域名解析出的 IPv6 地址与 `443` 端口（伴随客户端自身原有的常规后台连接），两轮对话全程未再触发 `Out of credits` 拦截。
+
+### 改动清单与补丁复现
+
+本次 PoC 涉及的全部源码文件与各自守住的边界汇总如下（随附补丁已包含全部实现、15 项客户端测试与启动脚本，不含任何密钥或个人环境数据）：
+
+| 文件 / 模块 | 本次改动内容 | 后续扩展需守住的不变量 |
+| --- | --- | --- |
+| `Cargo.toml`、`Cargo.lock`、`app/Cargo.toml` | 注册 `warp_bailian_client` 工作区成员与依赖 | 保持 `--locked` 确定性构建可复现 |
+| `app/src/ai/direct_bailian.rs`、`mod.rs` | 实现 `WARP_DIRECT_BAILIAN=1` 开关与凭据快照 | 未开启时零侵入默认路径，`Debug` 输出严禁泄露密钥 |
+| `agent/api.rs`、`agent/api/impl.rs` | `RequestParams` 携带直连快照，在云端序列化前分流 | 直连报错直接终止本轮，绝不隐式回退至 Warp 云端 |
+| `crates/warp_bailian_client/` | 封装百炼 HTTP 请求、字节级 SSE 解析与 `ClientActions` 翻译 | 维持 `task_id` / `message_id` 稳定，仅在 `stop` + `[DONE]` 时标记成功 |
+| `conversation_driver.rs`、`conversation.rs` | 新增 `DirectBailian` 驱动，剥离服务端会话身份与落盘 | 本地生成的 ID 绝不冒充云端 `conversation_token` |
+| `controller.rs`、`response_stream.rs` | 约束会话接续边界、透传取消信号、关闭云端断流重放 | 禁止与旧云端会话混用，防止半截流重放产生重复文本 |
+| `local_agent_task_sync_model.rs` | 按 `ConversationDriver` 谓词跳过后台状态上报 | 无云端身份的本地会话不触发同步请求 |
+| `request_usage_model.rs`、`prompt_alert.rs` | 在显式直连模式下绕开客户端本地配额弹窗拦截 | 仅放行本地 UI 配额预检，不影响百炼侧真实鉴权与计费 |
+| `llms.rs` | 将直连模式下的有效模型显示为 `deepseek-v4.1-flash · 百炼直连 PoC` | 界面诚实反映固定模型路由，避免下拉框产生虚假切换预期 |
+| `script/run-bailian` | 封装环境变量 / SSH 凭据注入、Smoke 测试与 `--no-build` 启动 | `--no-build` 直接运行已核验产物，不触发重编译改写签名 |
+
+如果想在本地检出同一份源码快照体验或继续改造，下载[本地 PoC 补丁](/assets/code/warp-bailian-direct-poc.patch)后按下面三步即可应用：
+
+```sh
+git checkout 1e6c3ae
+git apply --check /path/to/warp-bailian-direct-poc.patch
+git apply /path/to/warp-bailian-direct-poc.patch
+```
+
+站在“原生纯文本流式直连已跑通”的台阶上往后看，后续演进路线也很清晰：
+
+- **近期加固（纯文本闭环内）**：实机补测点击 GUI 停止按钮时的 HTTP 连接即时中断表现，覆盖 `401` / `429`、中途断网、超长上下文截断等异常交互，补跑会话驱动测试，再把写死的 `deepseek-v4.1-flash` 提取成可由模型下拉框动态切换的配置列表。
+- **深水区演进（走向完整本地 Agent）**：一旦跨出纯文本问答，就需要依次接管三块硬骨头——设计 OpenAI `tools` Schema 到 Warp 本地动作审批与 `send_follow_up_for_conversation` 的多轮工具闭环；在 SQLite 中为本地直连会话设计独立的持久化与重启恢复协议；以及全面梳理账户登录门禁与云同步开关，评估真正的离线解耦成本。在此之前，遇到需要改文件、跑命令或长周期恢复的重度任务，在 Warp 终端分屏里直接跑成熟的 CLI 工具，依然是最务实的互补方案。
+
+---
+
+> **源码与实验基线说明**：本文源码链接与模块路径固定在 [`warpdotdev/warp`](https://github.com/warpdotdev/warp/tree/1e6c3ae465d6a925a9b97ae03877aaadd159b8f1) 上游提交 `1e6c3ae`（源码阅读与实机验证日期为 2026-10-24）；仓库涵盖客户端 GUI、TUI 与共享 Rust Crates，不包含 Warp 闭源云端 `/ai/multi-agent` 服务端实现。百炼原生直连改动见本地补丁 [`warp-bailian-direct-poc.patch`](/assets/code/warp-bailian-direct-poc.patch)，本机编译与实测环境为 Apple M4 Pro（24 GiB 内存，macOS 15.5）、Xcode 16.4、Metal `32023.620`、Rust `1.92.0` 与 `cargo-bundle` `0.11.0`。

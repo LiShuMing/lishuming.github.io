@@ -18,7 +18,7 @@ toc: true
 math: true
 ---
 
-> 本系列第 4/4 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
+> 本系列第 3/3 篇 · 优化器 / Cascades · [上一篇]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) · 相关：[DOP 三次决策]({{< relref "2026-09-12-dive-dop.md" >}})
 
 在[上一篇剖析 optd]({{< relref "2026-09-01-dive-optd-cascades-optimizer.md" >}}) 的结尾，我们撞上了一道横亘在教学原型与分布式生产内核之间的分水岭：单机原型里每个等价类（`Group`）只需要记住唯一一个最便宜的物理子计划（`Winner`）；可一旦放进多机并行的 MPP 引擎，**“谁是最便宜的子计划”这个问题本身就不再有唯一答案**。
 

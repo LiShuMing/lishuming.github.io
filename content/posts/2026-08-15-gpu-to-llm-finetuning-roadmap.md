@@ -60,8 +60,8 @@ toc: true
 第一阶段完全不碰 GPU，专心消除张量形状（Shape）和链式法则上的模糊感。
 
 > **当前进度：已完成。**
-> - **理论底座**：[《深入 NumPy：从 ndarray 内存模型到科学计算与张量生态》]({{< relref "2026-08-16-numpy-internals.md" >}}) 已完整拆解连续缓冲区、字节步长（`strides`）、零步长广播、`ufunc` 向量化以及底层 BLAS/LAPACK 分派机制。
-> - **动手验收**：[《NumPy 项目实践：从向量化到手写两层 MLP 与反向传播》]({{< relref "2026-08-16-numpy-mlp-practice.md" >}}) 已交付可在浏览器直接运行的交互式 Notebook，完成了双月牙非线性分类、平移不变稳定 Softmax、手写 `backward`、中心有限差分梯度检查（最大绝对误差 `1.51e-11`）及单变量学习率对照。
+> - **理论底座**：[《从 NumPy 内存模型、手写两层 MLP 到 CuPy/CUDA 设备边界与异步计时》]({{< relref "2026-08-16-numpy-internals.md" >}})第一部分已完整拆解连续缓冲区、字节步长（`strides`）、零步长广播、`ufunc` 向量化以及底层 BLAS/LAPACK 分派机制。
+> - **动手验收**：同一长文[第二部分（手写两层 MLP 与反向传播）]({{< relref "2026-08-16-numpy-internals.md" >}})已交付可在浏览器直接运行的交互式 Notebook，完成了双月牙非线性分类、平移不变稳定 Softmax、手写 `backward`、中心有限差分梯度检查（最大绝对误差 `1.51e-11`）及单变量学习率对照。
 
 三周的具体推进节奏按“内存布局 → 损失函数数值稳定性 → 完整两层网络”展开：第 1 周每次写矩阵运算前先在纸上推导输入输出形状，并用纯 Python 循环对比 NumPy 向量化计算欧氏距离的调度开销；第 2 周实现线性层、ReLU、减去行最大值的稳定 Softmax 与交叉熵，观察不同学习率下的收敛、震荡与溢出；第 3 周把 `forward → loss → backward → update` 串成闭环，逐个核对参数与梯度的维度契合关系。只有亲手写过一遍 `ForwardCache`，后面看框架显存占用时才会真正明白前向激活为什么不能随手丢掉。
 
@@ -78,7 +78,7 @@ toc: true
 这一阶段直面三个核心问题：GPU 什么时候真快、什么时候反而更慢，以及 16GB 显存究竟是怎么被一步步吃光的。
 
 > **前置实验进度：已完成。**
-> - [《从 NumPy 到 CUDA：用 CuPy 验证设备边界、线程索引与异步计时》]({{< relref "2026-10-28-cupy-cuda-device-boundaries-and-timing.md" >}}) 已在本机跑通最小闭环并附逐行中文注释 Notebook，用 `3×4` 跨总线搬运反例、`10,003` 元素非整除 `RawKernel` 尾部越界守卫以及 `CUDA Event` 硬件卡点，把 CPU 同步直觉平稳过渡到了 GPU 异步流模型。
+> - [《从 NumPy 内存模型、手写两层 MLP 到 CuPy/CUDA 设备边界与异步计时》第三部分（CuPy/CUDA 设备边界与异步计时）]({{< relref "2026-08-16-numpy-internals.md" >}})已在本机跑通最小闭环并附逐行中文注释 Notebook，用 `3×4` 跨总线搬运反例、`10,003` 元素非整除 `RawKernel` 尾部越界守卫以及 `CUDA Event` 硬件卡点，把 CPU 同步直觉平稳过渡到了 GPU 异步流模型。
 
 在此基础上继续向 PyTorch 训练剖析推进：第 1 周对比 CPU 与 CUDA 在不同矩阵规模下的乘法耗时，强制执行预热（Warmup）并在计时边界调用 `torch.cuda.synchronize()`，同时对比“一万次小矩阵发射”与“单次合并大矩阵计算”，直观量化核函数发射开销（Launch Overhead）。第 2 周在 16GB 显存上逐步拉高 `batch_size` 与序列长度，开启混合精度、梯度累积（Gradient Accumulation）与激活重计算（Activation Checkpointing），记录每项开关省下的显存字节与付出的重算耗时。第 3 周借助 `torch.profiler` 定位数据加载、前向、反向与参数更新各段占比，调优 `num_workers` 与锁页内存（`pin_memory`）。
 

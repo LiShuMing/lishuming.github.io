@@ -19,7 +19,7 @@ toc: true
 math: true
 ---
 
-> 本系列第 1/3 篇 · 论文雷达 · [下一篇]({{< relref "2026-08-09-sigmod-2026-industry-papers.md" >}}) · 对照阅读：[Umbra 研究路线]({{< relref "2026-09-04-dive-umbra.md" >}}) · [现代硬件]({{< relref "2026-08-09-modern-database-hardware.md" >}}) · [经典论文精读]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})
+> 本系列第 1/3 篇 · 论文雷达 · [下一篇]({{< relref "2026-08-09-sigmod-2026-industry-papers.md" >}}) · 对照阅读：[Umbra 研究路线]({{< relref "2026-09-04-dive-umbra.md" >}}) · [现代硬件]({{< relref "2026-11-19-hardware-evolution-and-database-programming-paradigms.md" >}}) · [经典论文精读]({{< relref "2026-08-23-database-paper-reading-notes.md" >}})
 
 过去十几年里，分析型数据库内核最核心的军备竞赛是**让单个算子每秒吞掉更多元组**——列式内存布局、SIMD 向量化批处理、基于 LLVM 的查询编译（JIT），把单核 CPU 的指令流水线越压越满。
 
