@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 650" width="1080" height="650" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">执行引擎内存所有权模型：COW Column 状态机、三大生产暗礁与竞品分层对照</title>
+  <desc id="desc">上半部分展示 StarRocks COW Column 的四类智能指针与 try_mutate 状态流转；中间展示 ChunkPtr 双层共享、生命周期 UAF 与组合列子列别名三类真实生产缺陷；底部对比 ClickHouse、Velox、Arrow/DataFusion 与 DuckDB 的内存所有权取舍。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.8px; font-weight: 600; fill: #475569; }
+      .box-slate { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.6px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 11px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.3px; fill: #0f172a; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .flow-s { stroke: #475569; stroke-width: 1.8; fill: none; }
+      .flow-g { stroke: #059669; stroke-width: 1.8; fill: none; }
+      .flow-b { stroke: #2563eb; stroke-width: 1.8; fill: none; }
+      .flow-r { stroke: #dc2626; stroke-width: 1.8; fill: none; stroke-dasharray: 5 3; }
+    </style>
+    <marker id="arr-s" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="650" class="bg"/>
+
+  <!-- Top Panel: COW Ownership State Machine -->
+  <rect x="20" y="16" width="1040" height="202" class="panel"/>
+  <text x="38" y="40" class="p-title">一、COW Column 所有权状态机（StarRocks cow.h / ClickHouse COW 范式）</text>
+  <text x="1042" y="40" text-anchor="end" class="p-sub">编译期约束共享边界 + 运行期原子引用计数 _use_count 分流</text>
+
+  <!-- MutPtr -->
+  <rect x="38" y="56" width="212" height="142" class="box-green"/>
+  <text x="52" y="76" class="tag-g">EXCLUSIVE · 可变独占态</text>
+  <text x="52" y="96" class="t-h">MutablePtr (MutPtr&lt;T&gt;)</text>
+  <text x="52" y="116" class="t-m">• 拷贝构造 = delete</text>
+  <text x="52" y="133" class="t-m">• 仅允许 std::move 移交</text>
+  <text x="52" y="150" class="t-s">可调用非 const 原地修改方法</text>
+  <text x="52" y="168" class="t-s">保证单一所有权（理论上 ref=1）</text>
+  <text x="52" y="186" class="t-m">create() 初始产物</text>
+
+  <!-- Move to ImmutPtr arrow -->
+  <path d="M 250 104 L 318 104" class="flow-b" marker-end="url(#arr-b)"/>
+  <text x="284" y="96" text-anchor="middle" class="tag-b">std::move</text>
+  <text x="284" y="120" text-anchor="middle" class="t-s">冻结发布</text>
+
+  <!-- ImmutPtr -->
+  <rect x="324" y="56" width="224" height="142" class="box-blue"/>
+  <text x="338" y="76" class="tag-b">SHARED · 只读共享态</text>
+  <text x="338" y="96" class="t-h">Ptr (ImmutPtr&lt;const T&gt;)</text>
+  <text x="338" y="116" class="t-m">• 允许拷贝，_use_count++</text>
+  <text x="338" y="133" class="t-m">• 仅可调用 const 方法</text>
+  <text x="338" y="150" class="t-s">跨算子、广播、CTE 零拷贝共享</text>
+  <text x="338" y="168" class="t-s">禁止从左值 MutPtr 直接拷贝</text>
+  <text x="338" y="186" class="t-m">子列嵌套用 ChameleonPtr 包装</text>
+
+  <!-- try_mutate decision -->
+  <path d="M 548 124 L 604 124" class="flow-s" marker-end="url(#arr-s)"/>
+  <text x="576" y="114" text-anchor="middle" class="t-m">mutate()</text>
+
+  <rect x="610" y="76" width="166" height="96" class="box-purple"/>
+  <text x="693" y="98" text-anchor="middle" class="tag-p">TRY_MUTATE 分流器</text>
+  <text x="693" y="120" text-anchor="middle" class="t-m">ref = _use_count.load()</text>
+  <text x="693" y="140" text-anchor="middle" class="t-s">检查壳层引用计数</text>
+  <text x="693" y="158" text-anchor="middle" class="t-s">+ mutate_each_subcolumn()</text>
+
+  <!-- Two outcomes -->
+  <path d="M 776 100 L 826 86" class="flow-g" marker-end="url(#arr-g)"/>
+  <rect x="832" y="56" width="210" height="64" class="box-green"/>
+  <text x="844" y="74" class="tag-g">ref == 1 · 零拷贝原地复用</text>
+  <text x="844" y="92" class="t-m">as_mutable_ptr() 影子迁移</text>
+  <text x="844" y="109" class="t-s">4096×100B 字符串：~1.2 µs</text>
+
+  <path d="M 776 148 L 826 164" class="flow-r" marker-end="url(#arr-r)"/>
+  <rect x="832" y="132" width="210" height="66" class="box-amber"/>
+  <text x="844" y="150" class="tag-a">ref &gt; 1 · 触发深拷贝隔离</text>
+  <text x="844" y="168" class="t-m">derived()-&gt;clone() 新建缓冲</text>
+  <text x="844" y="185" class="t-s">4096×100B 字符串：~225 µs</text>
+
+  <!-- Middle Panel: 3 Production Traps in StarRocks -->
+  <rect x="20" y="232" width="1040" height="206" class="panel"/>
+  <text x="38" y="256" class="p-title">二、把 COW 事后嫁接到存量可变引擎的三座真实暗礁（StarRocks 生产复盘）</text>
+  <text x="1042" y="256" text-anchor="end" class="p-sub">为什么 #73480 最终将 enable_cow_optimization 默认回退为 false</text>
+
+  <!-- Trap 1 -->
+  <rect x="38" y="272" width="320" height="150" class="box-red"/>
+  <text x="52" y="292" class="tag-r">暗礁 1 · 双层引用计数失明 (#66805)</text>
+  <text x="52" y="313" class="t-h">ChunkPtr 共享，但内层 Column ref=1</text>
+  <text x="52" y="334" class="t-m">shared_ptr&lt;Chunk&gt; (ref=2) ─┬─ 消费者 A</text>
+  <text x="52" y="350" class="t-m">  └─ ColumnPtr (ref=1!)    └─ 消费者 B</text>
+  <text x="52" y="372" class="t-s">单查 Column::_use_count 误判为独占，</text>
+  <text x="52" y="389" class="t-s">消费者 A 原地改写直接污染消费者 B。</text>
+  <text x="52" y="408" class="t-m">根因：容器层与列层未统一所有权契约</text>
+
+  <!-- Trap 2 -->
+  <rect x="380" y="272" width="320" height="150" class="box-red"/>
+  <text x="394" y="292" class="tag-r">暗礁 2 · 析构与裸指针 UAF (#67314)</text>
+  <text x="394" y="313" class="t-h">mutate 替换壳层后旧子列指针悬空</text>
+  <text x="394" y="334" class="t-m">auto mut = Column::mutate(std::move(c));</text>
+  <text x="394" y="350" class="t-m">return const_col-&gt;data()-&gt;as_mutable_ptr();</text>
+  <text x="394" y="372" class="t-s">局部包装列析构或 chunk-&gt;update_column</text>
+  <text x="394" y="389" class="t-s">顶替旧 NullableColumn 时，旧裸指针失效。</text>
+  <text x="394" y="408" class="t-m">根因：逃生舱 as_mutable_raw_ptr 绕过护栏</text>
+
+  <!-- Trap 3 -->
+  <rect x="722" y="272" width="320" height="150" class="box-red"/>
+  <text x="736" y="292" class="tag-r">暗礁 3 · 复合列子列跨列别名 (#73480)</text>
+  <text x="736" y="313" class="t-h">map_keys(c2) 借用 MapColumn 子列</text>
+  <text x="736" y="334" class="t-m">Chunk: [ c2: Map(_keys, _vals, _offs),</text>
+  <text x="736" y="350" class="t-m">         mp: Array(_keys*, _offs*) ]</text>
+  <text x="736" y="372" class="t-s">外层 Map/Array 壳 ref=1，内层子列 ref=2；</text>
+  <text x="736" y="389" class="t-s">过滤或变异未递归深查即原地改写引发崩溃。</text>
+  <text x="736" y="408" class="t-m">复现：test_map_function_cow</text>
+
+  <!-- Bottom Panel: 4 Industry Ownership Paradigms -->
+  <rect x="20" y="452" width="1040" height="182" class="panel"/>
+  <text x="38" y="476" class="p-title">三、主流计算引擎内存所有权的四条技术路线对比</text>
+  <text x="1042" y="476" text-anchor="end" class="p-sub">决定拷贝开销与安全性的根本变量：共享粒度 × 可变时机</text>
+
+  <rect x="38" y="492" width="240" height="126" class="box-blue"/>
+  <text x="50" y="511" class="tag-b">路线 1 · 对象级 COW</text>
+  <text x="50" y="530" class="t-h">ClickHouse / Doris / StarRocks</text>
+  <text x="50" y="550" class="t-s">粒度：IColumn / Column 对象</text>
+  <text x="50" y="567" class="t-s">核心：Block 强制不可变，写前</text>
+  <text x="50" y="583" class="t-s">显式 mutate()；需全链路自律，</text>
+  <text x="50" y="599" class="t-s">不能混用可变逃生舱。</text>
+
+  <rect x="292" y="492" width="240" height="126" class="box-green"/>
+  <text x="304" y="511" class="tag-g">路线 2 · Buffer 级 COW</text>
+  <text x="304" y="530" class="t-h">Meta Velox</text>
+  <text x="304" y="550" class="t-s">粒度：AlignedBuffer (BufferPtr)</text>
+  <text x="304" y="567" class="t-s">核心：Vector 壳轻量重组，写前</text>
+  <text x="304" y="583" class="t-s">查 buffer-&gt;isUnique()；天然覆盖</text>
+  <text x="304" y="599" class="t-s">嵌套/字典/切片底层内存共享。</text>
+
+  <rect x="546" y="492" width="240" height="126" class="box-purple"/>
+  <text x="558" y="511" class="tag-p">路线 3 · 绝对不可变 + 切片</text>
+  <text x="558" y="530" class="t-h">Apache Arrow / DataFusion / Trino</text>
+  <text x="558" y="550" class="t-s">粒度：只读 Buffer / Block + Offset</text>
+  <text x="558" y="567" class="t-s">核心：永不原地改写；靠零拷贝</text>
+  <text x="558" y="583" class="t-s">Slice 与位图掩码传递，彻底根绝</text>
+  <text x="558" y="599" class="t-s">别名写坏，换取较高内存分配率。</text>
+
+  <rect x="800" y="492" width="242" height="126" class="box-amber"/>
+  <text x="812" y="511" class="tag-a">路线 4 · 算子独占 + 选择向量</text>
+  <text x="812" y="530" class="t-h">DuckDB / Umbra / Photon</text>
+  <text x="812" y="550" class="t-s">粒度：Pipeline 局部 DataChunk</text>
+  <text x="812" y="567" class="t-s">核心：Vector::Reference 显式借用</text>
+  <text x="812" y="583" class="t-s">+ SelectionVector 延迟物化，减少</text>
+  <text x="812" y="599" class="t-s">跨线程原子计数，压榨 L1/L2 缓存。</text>
+</svg>

@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 620" width="1120" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">现代数据引擎应对突发大 Query 与高并发混合负载的四道纵深防线</title>
+  <desc id="desc">展示从准入预测与全局队列、执行期细粒度资源仲裁、离群大查询旁路卸载到不对称 AutoScaling 与优雅回收的四层资源治理闭环。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .l1 { fill: #ffffff; stroke: #2563eb; stroke-width: 1.6; rx: 10; }
+      .l2 { fill: #ffffff; stroke: #059669; stroke-width: 1.6; rx: 10; }
+      .l3 { fill: #ffffff; stroke: #d97706; stroke-width: 1.6; rx: 10; }
+      .l4 { fill: #ffffff; stroke: #7c3aed; stroke-width: 1.6; rx: 10; }
+      .hdr-b { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #1d4ed8; }
+      .hdr-g { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #047857; }
+      .hdr-o { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #b45309; }
+      .hdr-p { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #6d28d9; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.6px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 600; fill: #0f172a; }
+      .card-b { fill: #eff6ff; stroke: #60a5fa; stroke-width: 1.2; rx: 7; }
+      .card-g { fill: #ecfdf5; stroke: #34d399; stroke-width: 1.2; rx: 7; }
+      .card-o { fill: #fffbeb; stroke: #fbbf24; stroke-width: 1.2; rx: 7; }
+      .card-p { fill: #f5f3ff; stroke: #a78bfa; stroke-width: 1.2; rx: 7; }
+      .arr-b { stroke: #2563eb; stroke-width: 1.7; fill: none; }
+      .arr-g { stroke: #059669; stroke-width: 1.7; fill: none; }
+      .arr-o { stroke: #d97706; stroke-width: 1.7; stroke-dasharray: 5 3; fill: none; }
+      .arr-p { stroke: #7c3aed; stroke-width: 1.7; stroke-dasharray: 5 3; fill: none; }
+      .badge { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1; rx: 5; }
+    </style>
+    <marker id="mb" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="mg" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="mo" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706"/>
+    </marker>
+    <marker id="mp" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="620" class="bg"/>
+
+  <!-- Layer 1: Admission & Global Queue -->
+  <rect x="20" y="16" width="1080" height="148" class="l1"/>
+  <text x="38" y="40" class="hdr-b">第一道防线：事前预测与全局强一致准入（防惊群效应、防队头阻塞）</text>
+
+  <rect x="38" y="52" width="318" height="98" class="card-b"/>
+  <text x="52" y="72" class="t-h">1. 混合负载预测与轻重分流</text>
+  <text x="52" y="90" class="t-m">CBO 静态估算 + 历史画像 / ML (IWM)</text>
+  <text x="52" y="109" class="t-s">• 识别 10ms 点查 vs 10TB 扫描大查</text>
+  <text x="52" y="126" class="t-s">• 超高 QPS 短查走 Fast-path / 本地批预借</text>
+  <text x="52" y="142" class="t-s">• 规避单点 Leader RPC 瓶颈与 RTT 抖动</text>
+
+  <path d="M 356 101 L 392 101" class="arr-b" marker-end="url(#mb)"/>
+
+  <rect x="398" y="52" width="336" height="98" class="card-b"/>
+  <text x="412" y="72" class="t-h">2. 全局权威队列（SlotManager / Cohort）</text>
+  <text x="412" y="90" class="t-m">LogicalSlot + Pending Queue + 租约防泄漏</text>
+  <text x="412" y="109" class="t-s">• 唯一权威状态消除多 FE 视图割裂与惊群</text>
+  <text x="412" y="126" class="t-s">• 唤醒算法：SWRR（租户公平）+ SJF/Aging</text>
+  <text x="412" y="142" class="t-s">• 软状态切主快速收敛 + 滑动时间窗累计配额</text>
+
+  <path d="M 734 101 L 770 101" class="arr-b" marker-end="url(#mb)"/>
+
+  <rect x="776" y="52" width="306" height="98" class="card-b"/>
+  <text x="790" y="72" class="t-h">3. 异常大查门禁与权威水位输出</text>
+  <text x="790" y="90" class="t-m">Big Query Threshold + Metrics Source</text>
+  <text x="790" y="109" class="t-s">• 超扫描行数/超预测内存触发拦截或旁路路由</text>
+  <text x="790" y="126" class="t-s">• 向扩缩容输出干净信号：Pending Depth / Wait</text>
+  <text x="790" y="142" class="t-s">• 叠加后端实时 MemUsedPct 熔断防估偏</text>
+
+  <!-- Connectors Down -->
+  <path d="M 380 164 L 380 194" class="arr-g" marker-end="url(#mg)"/>
+  <text x="392" y="184" class="t-s" fill="#047857">常规与重查询放行进入主计算池</text>
+
+  <path d="M 928 164 L 928 194" class="arr-o" marker-end="url(#mo)"/>
+  <text x="742" y="184" class="t-s" fill="#b45309">离群大查旁路分流 →</text>
+
+  <!-- Layer 2 (Left) & Layer 3 (Right) -->
+  <rect x="20" y="198" width="714" height="194" class="l2"/>
+  <text x="38" y="222" class="hdr-g">第二道防线：执行期细粒度仲裁与降级（兜底估偏，把 OOM 转化为大查平滑降速）</text>
+
+  <rect x="38" y="236" width="218" height="140" class="card-g"/>
+  <text x="50" y="256" class="t-h">CPU / I/O 树形权重仲裁</text>
+  <text x="50" y="274" class="t-m">ClickHouse Workload Tree</text>
+  <text x="50" y="294" class="t-s">• CREATE RESOURCE 管线程与盘</text>
+  <text x="50" y="311" class="t-s">• Max-Min Fair + 优先级抢占</text>
+  <text x="50" y="328" class="t-s">• 大查吃满闲置核，小查一到</text>
+  <text x="60" y="344" class="t-s">立即稳拿 80% 权重保 P99</text>
+  <text x="50" y="365" class="t-m">StarRocks Hard CPU Limit</text>
+
+  <rect x="268" y="236" width="222" height="140" class="card-g"/>
+  <text x="280" y="256" class="t-h">动态内存抢占与 Spill 兜底</text>
+  <text x="280" y="274" class="t-m">Velox Arbitrator / CH Overcommit</text>
+  <text x="280" y="294" class="t-s">• 高优查缺内存 → 主动触发大查</text>
+  <text x="290" y="310" class="t-s">Hash/Agg/Sort Spill Reclaim</text>
+  <text x="280" y="328" class="t-s">• 极端过载按优先级牺牲最大</text>
+  <text x="290" y="344" class="t-s">低优查询，绝不误杀无辜小查</text>
+  <text x="280" y="365" class="t-m">StarRocks Operator/Load Spill</text>
+
+  <rect x="502" y="236" width="216" height="140" class="card-g"/>
+  <text x="514" y="256" class="t-h">无损 Slot 抢占与状态解耦</text>
+  <text x="514" y="274" class="t-m">BigQuery Dremel Fair Share</text>
+  <text x="514" y="294" class="t-s">• Shuffle 落独立持久内存层</text>
+  <text x="514" y="311" class="t-s">• 空闲期大查免费借 Idle Slots</text>
+  <text x="514" y="328" class="t-s">• 属主小查唤醒 → 毫秒级收回</text>
+  <text x="524" y="344" class="t-s">大查平滑降并发，绝不失败重跑</text>
+  <text x="514" y="365" class="t-m">Fluid Per-Stage Rebalance</text>
+
+  <!-- Layer 3: Outlier Offloading -->
+  <rect x="750" y="198" width="350" height="194" class="l3"/>
+  <text x="768" y="222" class="hdr-o">第三道防线：离群大查旁路卸载</text>
+
+  <rect x="768" y="236" width="314" height="140" class="card-o"/>
+  <text x="782" y="256" class="t-h">不拉高主仓规格，算完即还的弹性外挂</text>
+  <text x="782" y="276" class="t-m">• Snowflake QAS（Gen2 默认开启）</text>
+  <text x="794" y="293" class="t-s">将重扫描/DML 切片卸载至共享 Serverless 池</text>
+  <text x="782" y="314" class="t-m">• ClickHouse Cloud On-Demand Compute</text>
+  <text x="794" y="331" class="t-s">为突发超大 ad-hoc 临时租借额外 Worker 节点</text>
+  <text x="782" y="352" class="t-m">• 独立 Big-Query CNGroup / Warehouse</text>
+  <text x="794" y="368" class="t-s">彻底隔离主仓热缓存与高并发低延迟队列</text>
+
+  <!-- Layer 4: Asymmetric AutoScaling Loop -->
+  <rect x="20" y="424" width="1080" height="178" class="l4"/>
+  <text x="38" y="448" class="hdr-p">第四道防线：队列驱动的不对称 AutoScaling 闭环（解耦并发扩容与单查扩容、压低冷启动、安全无损缩容）</text>
+
+  <rect x="38" y="462" width="244" height="124" class="card-p"/>
+  <text x="50" y="482" class="t-h">1. 多信号与双窗口决策</text>
+  <text x="50" y="500" class="t-m">Queue Wait + Two-Window</text>
+  <text x="50" y="519" class="t-s">• 主信号看排队等待而非滞后 CPU</text>
+  <text x="50" y="536" class="t-s">• 短窗口快扩（15–30s 响应）</text>
+  <text x="50" y="553" class="t-s">• 双窗口+Cooldown 稳缩防抖</text>
+  <text x="50" y="570" class="t-s">• 叠加定时预扩应对可预测早高峰</text>
+
+  <path d="M 282 524 L 310 524" class="arr-p" marker-end="url(#mp)"/>
+
+  <rect x="316" y="462" width="244" height="124" class="card-p"/>
+  <text x="328" y="482" class="t-h">2. 物理形态按负载解耦</text>
+  <text x="328" y="500" class="t-m">Scale-out 副本 vs Scale-up</text>
+  <text x="328" y="519" class="t-s">• 高并发 BI：加独立 CNGroup 副本</text>
+  <text x="338" y="535" class="t-s">闭环执行，消除 Shuffle 扇出爆炸</text>
+  <text x="328" y="553" class="t-s">• 重型 ETL：单组增节点扩内存池</text>
+  <text x="328" y="570" class="t-s">• 终局：Adaptive 自适应路由池</text>
+
+  <path d="M 560 524 L 588 524" class="arr-p" marker-end="url(#mp)"/>
+
+  <rect x="594" y="462" width="236" height="124" class="card-p"/>
+  <text x="606" y="482" class="t-h">3. 冷启动与缓存击穿防护</text>
+  <text x="606" y="500" class="t-m">Warm Pool + Slow Start</text>
+  <text x="606" y="519" class="t-s">• 热池预留压低起仓至 2–6 秒</text>
+  <text x="606" y="536" class="t-s">• 一致性哈希最小化缓存失效面</text>
+  <text x="606" y="553" class="t-s">• 新节点 10%→50%→100% 渐进放量</text>
+  <text x="606" y="570" class="t-s">• 避免空盘直接打爆对象存储 QPS</text>
+
+  <path d="M 830 524 L 858 524" class="arr-p" marker-end="url(#mp)"/>
+
+  <rect x="864" y="462" width="218" height="124" class="card-p"/>
+  <text x="876" y="482" class="t-h">4. 优雅缩容（Graceful Drain）</text>
+  <text x="876" y="500" class="t-m">Draining → 摘流 → 排空 → 回收</text>
+  <text x="876" y="519" class="t-s">• Leader 停止向目标组派新 Slot</text>
+  <text x="876" y="536" class="t-s">• 等待在途 Fragment 自然完结</text>
+  <text x="876" y="553" class="t-s">• 配最大 Drain 超时防僵尸查锁死</text>
+  <text x="876" y="570" class="t-s">• 活跃归零后归还 Warm Pool/销毁</text>
+
+  <!-- Feedback Loop Arrow from Layer 1 Metrics down to Layer 4 -->
+  <path d="M 1082 101 L 1110 101 L 1110 410 L 160 410 L 160 456" class="arr-p" marker-end="url(#mp)"/>
+  <rect x="400" y="399" width="320" height="20" class="badge"/>
+  <text x="560" y="413" text-anchor="middle" class="t-m" fill="#6d28d9">全局 Queue Depth / Wait Time / Spill 率驱动闭环</text>
+</svg>

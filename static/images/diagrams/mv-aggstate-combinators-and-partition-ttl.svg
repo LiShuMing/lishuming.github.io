@@ -1,0 +1,137 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" width="1080" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">AggState 聚合状态组合代数，以及多列分区、Iceberg 分区变换与表达式 TTL 治理</title>
+  <desc id="desc">上半部分展示 StarRocks PR #62122 与 ClickHouse 体系下的四大 AggState Combinator（_state/_combine/_union/_merge）在写入、嵌套 MV 与查询改写中的流转；下半部分展示多列分区（PR #52577）、Iceberg Transform 单调性边界与表达式 TTL（PR #53488）在嵌套级联下的防误删机制。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.6px; font-weight: 600; fill: #475569; }
+      .box-slate { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 10.9px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.1px; fill: #0f172a; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .flow-g { stroke: #059669; stroke-width: 1.8; fill: none; }
+      .flow-b { stroke: #2563eb; stroke-width: 1.8; fill: none; }
+      .flow-p { stroke: #7c3aed; stroke-width: 1.8; fill: none; }
+    </style>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="620" class="bg"/>
+
+  <!-- Top Section: AggState Combinators -->
+  <rect x="20" y="16" width="1040" height="278" class="panel"/>
+  <text x="38" y="40" class="p-title">一、AggState 聚合状态组合代数：如何让 AVG / PERCENTILE / MAX_BY 彻底支持增量与上卷？</text>
+  <text x="1042" y="40" text-anchor="end" class="p-sub">StarRocks PR #62122 (agg_state_combine.h) × ClickHouse -State / -Merge 范式</text>
+
+  <!-- Raw input -->
+  <rect x="38" y="58" width="170" height="146" class="box-slate"/>
+  <text x="50" y="78" class="tag-b">BASE TABLE 原始行</text>
+  <text x="50" y="99" class="t-h">非可加聚合输入</text>
+  <text x="50" y="120" class="t-m">avg(latency)</text>
+  <text x="50" y="137" class="t-m">percentile_approx</text>
+  <text x="50" y="154" class="t-m">max_by(val, ts)</text>
+  <text x="50" y="171" class="t-m">hll_union_agg</text>
+  <text x="50" y="191" class="t-s">存终态标量无法二次合并</text>
+
+  <!-- Arrow to Combine -->
+  <path d="M 208 112 L 254 112" class="flow-g" marker-end="url(#arr-g)"/>
+  <text x="231" y="102" text-anchor="middle" class="tag-g">一步聚合</text>
+
+  <!-- Combine (PR #62122) -->
+  <rect x="260" y="58" width="232" height="146" class="box-green"/>
+  <text x="274" y="78" class="tag-g">1. {fn}_combine(x) · PR #62122</text>
+  <text x="274" y="99" class="t-h">MV1 物化写入（消除逐行装箱）</text>
+  <text x="274" y="120" class="t-m">arg_types → intermediate_type</text>
+  <text x="274" y="140" class="t-s">等价于 fn_union(fn_state(x))，但</text>
+  <text x="274" y="156" class="t-s">直接在 AggState 原地 update()，</text>
+  <text x="274" y="172" class="t-s">省去逐行构造临时状态与堆分配</text>
+  <text x="274" y="191" class="t-m">例：avg_combine(latency) 存 (sum,cnt)</text>
+
+  <!-- Arrow to Union -->
+  <path d="M 492 112 L 538 112" class="flow-p" marker-end="url(#arr-p)"/>
+  <text x="515" y="102" text-anchor="middle" class="tag-p">嵌套 MV</text>
+
+  <!-- Union -->
+  <rect x="544" y="58" width="224" height="146" class="box-purple"/>
+  <text x="558" y="78" class="tag-p">2. {fn}_union(state)</text>
+  <text x="558" y="99" class="t-h">MV1 → MV2 跨层上卷保态</text>
+  <text x="558" y="120" class="t-m">state → state (保持可合并)</text>
+  <text x="558" y="140" class="t-s">按小时 MV1 上卷到按天 MV2，</text>
+  <text x="558" y="156" class="t-s">仅合并内部状态而不 finalize，</text>
+  <text x="558" y="172" class="t-s">下游 MV3 仍可继续无损上卷</text>
+  <text x="558" y="191" class="t-m">依赖 AggStateDesc 参数不丢失</text>
+
+  <!-- Arrow to Merge -->
+  <path d="M 768 112 L 814 112" class="flow-b" marker-end="url(#arr-b)"/>
+  <text x="791" y="102" text-anchor="middle" class="tag-b">透明改写</text>
+
+  <!-- Merge -->
+  <rect x="820" y="58" width="222" height="146" class="box-blue"/>
+  <text x="834" y="78" class="tag-b">3. {fn}_merge(state)</text>
+  <text x="834" y="99" class="t-h">用户查询命中 MV 自动终结</text>
+  <text x="834" y="120" class="t-m">state → final return_type</text>
+  <text x="834" y="140" class="t-s">用户仍写标准 AVG(latency)；</text>
+  <text x="834" y="156" class="t-s">CBO 自动改写为 avg_merge(col)</text>
+  <text x="834" y="172" class="t-s">即便 GROUP BY 完全一致，也强制</text>
+  <text x="834" y="188" class="t-s">isRollup=true 以触发 finalize()</text>
+
+  <!-- Bottom note inside Top panel -->
+  <rect x="38" y="218" width="1004" height="62" class="box-amber"/>
+  <text x="52" y="238" class="tag-a">工程深水区警示（源码真实 Bug 复盘）</text>
+  <text x="52" y="256" class="t-s">1. 辅助常量参数保真（#83385）：max_n / min_n / percentile_approx 合并状态时必须在 AggStateDesc 完整保留 n 与 compression 参数；</text>
+  <text x="52" y="272" class="t-s">2. 生命周期与内存泄漏（#81054）：Combinator 批量销毁时必须向下透传 destroy() 释放被包装的内层聚合状态，并做好跨版本序列化兼容。</text>
+
+  <!-- Bottom Section: Multi-Column Partition, Iceberg Transform & Expression TTL -->
+  <rect x="20" y="310" width="1040" height="294" class="panel"/>
+  <text x="38" y="334" class="p-title">二、湖仓分区治理：多列分区（#52577）、Iceberg 分区变换与表达式 TTL（#53488）</text>
+  <text x="1042" y="334" text-anchor="end" class="p-sub">精确 PCT 刷新与改写前提：建立基表分区 → MV 分区的可证明映射</text>
+
+  <!-- Left: Multi-Col + Iceberg Transform -->
+  <rect x="38" y="352" width="496" height="236" class="box-blue"/>
+  <text x="52" y="372" class="tag-b">1. 多列分区与 ICEBERG 分区变换单调性边界</text>
+  <text x="52" y="393" class="t-h">基表分区 → MV 分区的 1:1 / N:1 精确追踪（PCT）</text>
+  <text x="52" y="415" class="t-m">✓ 保序单调变换（支持局部刷新与局部 Union 改写）：</text>
+  <text x="52" y="433" class="t-s">  • 多列组合：Base(dt, region) → MV(date_trunc('month', dt), region)</text>
+  <text x="52" y="450" class="t-s">  • Iceberg Hidden Partition：hour(ts) / day(ts) / month(ts) / year(ts)</text>
+  <text x="52" y="467" class="t-s">  • 证明 1 个 MV 分区严格对应基表连续子区间，单天变更只刷对应月分区</text>
+  <text x="52" y="492" class="t-m">✗ 非单调 / 哈希变换（无法局部区间映射）：</text>
+  <text x="52" y="510" class="t-s">  • Iceberg bucket(user_id, 16) 若 MV 未保留同阶 bucket 列，则无法定位</text>
+  <text x="52" y="527" class="t-s">    受影响分区，必须降级为全量刷新或交由行级 IVM（TVR）接管</text>
+  <text x="52" y="555" class="t-m">关键模块：MVPartitionExprResolver / IcebergPartitionUtils /</text>
+  <text x="52" y="571" class="t-m">          MVTimelinessListPartitionArbiter</text>
+
+  <!-- Right: Expression TTL -->
+  <rect x="548" y="352" width="494" height="236" class="box-green"/>
+  <text x="562" y="372" class="tag-g">2. 表达式 TTL（partition_retention_condition）与嵌套防误删</text>
+  <text x="562" y="393" class="t-h">为什么固定 partition_ttl_number 在多列分区下彻底失效？</text>
+  <text x="562" y="415" class="t-s">• 多列分区 (dt, region) 每天产生 50 个分区，ttl_number=30 连 1 天都保不住</text>
+  <text x="562" y="434" class="t-m">• 表达式 TTL：dt &gt;= current_date() - INTERVAL 30 DAY AND region != 'test'</text>
+  <text x="562" y="453" class="t-s">• 复用优化器 PartitionColPredicateEvaluator 精准求值淘汰分区</text>
+  <rect x="562" y="468" width="466" height="106" fill="#ffffff" stroke="#fca5a5" stroke-width="1.3" rx="6"/>
+  <text x="574" y="488" class="tag-r">嵌套 MV 级联护栏：MV1（保留 7 天）→ MV2（保留 365 天）</text>
+  <text x="574" y="508" class="t-s">若 MV1 因 TTL 自动淘汰第 8 天分区，下游 MV2 刷新时若盲目同步删除，</text>
+  <text x="574" y="524" class="t-s">会把 365 天历史年报全部清空！必须将 TTL 归档与基表真删语义分离，</text>
+  <text x="574" y="540" class="t-s">同时通过 excluded_trigger_tables / 仅刷新保留窗口内分区守住历史资产。</text>
+  <text x="574" y="561" class="t-m">源码：PartitionSelector.getExpiredPartitionsByRetentionCondition()</text>
+</svg>

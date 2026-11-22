@@ -1,0 +1,156 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 600" width="1120" height="600" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">非结构化数据入湖仓的架构演进：控制面与数据面分离及四级物理分层</title>
+  <desc id="desc">对比朴素内联或裸路径方案、第一代 Object Table 表级映射、以及第二代一等公民 BlobRef 控制面与数据面分离架构，并展示 Inline、Packed、Dedicated 与 External 四级物理分层布局。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.4; rx: 10; }
+      .panel-hi { fill: #ffffff; stroke: #2563eb; stroke-width: 1.8; rx: 10; }
+      .hdr-gray { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #334155; }
+      .hdr-blue { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #1d4ed8; }
+      .hdr-green { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; font-weight: 700; fill: #047857; }
+      .sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.5px; fill: #475569; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.8px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.2px; font-weight: 600; fill: #0f172a; }
+      .t-err { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; font-weight: 600; fill: #b91c1c; }
+      .t-ok { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; font-weight: 600; fill: #047857; }
+      .card-err { fill: #fef2f2; stroke: #ef4444; stroke-width: 1.2; rx: 7; }
+      .card-warn { fill: #fffbeb; stroke: #d97706; stroke-width: 1.3; rx: 7; }
+      .card-ctrl { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.4; rx: 7; }
+      .card-data { fill: #ecfdf5; stroke: #059669; stroke-width: 1.4; rx: 7; }
+      .card-purp { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.3; rx: 7; }
+      .pill { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1; rx: 5; }
+      .dash-sep { stroke: #94a3b8; stroke-width: 1.4; stroke-dasharray: 6 4; }
+      .arrow { stroke: #475569; stroke-width: 1.5; fill: none; }
+      .arrow-blue { stroke: #2563eb; stroke-width: 1.6; fill: none; }
+      .arrow-green { stroke: #059669; stroke-width: 1.6; fill: none; }
+    </style>
+    <marker id="arr-gray" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arr-blue" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="600" class="bg"/>
+
+  <!-- Stage 0: Naive approaches -->
+  <rect x="20" y="18" width="520" height="176" class="panel"/>
+  <text x="36" y="42" class="hdr-gray">演进起点：两种朴素方案为何在 LLM 时代同时撞墙？</text>
+
+  <rect x="36" y="56" width="236" height="122" class="card-err"/>
+  <text x="48" y="76" class="t-h">方案 A：大对象直接内联列存</text>
+  <text x="48" y="94" class="t-m">BINARY / BYTES 写入 Parquet</text>
+  <text x="48" y="114" class="t-err">✗ RowGroup 膨胀，字典与压缩崩溃</text>
+  <text x="48" y="132" class="t-err">✗ 改标量触发巨量 Compaction 写放大</text>
+  <text x="48" y="150" class="t-err">✗ 传统 Shuffle 搬运 GB 级字节 OOM</text>
+  <text x="48" y="168" class="t-err">✗ 数仓单行硬上限（16–100 MB）</text>
+
+  <rect x="288" y="56" width="236" height="122" class="card-err"/>
+  <text x="300" y="76" class="t-h">方案 B：表里只存裸 URI 字符串</text>
+  <text x="300" y="94" class="t-m">'s3://bucket/video_01.mp4'</text>
+  <text x="300" y="114" class="t-err">✗ 外部覆写/删除 → 悬空引用与脏读</text>
+  <text x="300" y="132" class="t-err">✗ 表级 RLS 与对象桶 IAM 权限割裂</text>
+  <text x="300" y="150" class="t-err">✗ 优化器失明：看不到文件大小与类型</text>
+  <text x="300" y="168" class="t-err">✗ 按行数切分导致严重长尾倾斜</text>
+
+  <!-- Arrow from Stage 0 to Gen 1 -->
+  <path d="M 540 106 L 574 106" class="arrow" marker-end="url(#arr-gray)"/>
+
+  <!-- Stage 1: Gen 1 Object Table -->
+  <rect x="580" y="18" width="520" height="176" class="panel"/>
+  <text x="596" y="42" class="hdr-gray">第一代：表级映射（Object Table / Directory Table / Volume）</text>
+
+  <rect x="596" y="56" width="236" height="122" class="card-warn"/>
+  <text x="608" y="76" class="t-h">目录元数据映射为只读表</text>
+  <text x="608" y="94" class="t-m">uri | size | etag | mtime | mime</text>
+  <text x="608" y="115" class="t-ok">✓ 缓存目录元信息，告别慢 List</text>
+  <text x="608" y="133" class="t-ok">✓ 支持元数据谓词下推与大小切分</text>
+  <text x="608" y="151" class="t-ok">✓ 统一 Catalog 授权访问外部桶</text>
+  <text x="608" y="169" class="sub">BigQuery ObjTable / MaxCompute / Snowflake Dir</text>
+
+  <rect x="848" y="56" width="236" height="122" class="card-err"/>
+  <text x="860" y="76" class="t-h">表级抽象的天然天花板</text>
+  <text x="860" y="96" class="t-err">✗ 引用上下文绑定在“整张表”上</text>
+  <text x="860" y="116" class="t-err">✗ 与业务结构化表 JOIN / CTAS 后</text>
+  <text x="872" y="132" class="t-err">文件句柄与访问权限即丢失</text>
+  <text x="860" y="152" class="t-err">✗ 难以在一行内共存多个多模态列</text>
+  <text x="872" y="168" class="t-s">（如主图 + 详情 PDF + 语音录音）</text>
+
+  <!-- Arrow down to Gen 2 -->
+  <path d="M 840 194 L 840 222" class="arrow-blue" marker-end="url(#arr-blue)"/>
+  <text x="852" y="213" class="t-h" fill="#1d4ed8">升级为列级一等引用类型</text>
+
+  <!-- Bottom Large Panel: Gen 2 Control/Data Plane Separation -->
+  <rect x="20" y="228" width="1080" height="354" class="panel-hi"/>
+  <text x="38" y="254" class="hdr-blue">第二代：一等公民 BlobRef / FILE / ObjectRef —— 控制面与数据面彻底分离</text>
+  <text x="1082" y="254" text-anchor="end" class="sub">BigQuery ObjectRef · Snowflake FILE · Lance Blob v2 · Paimon BLOB · Iceberg v4 FILE</text>
+
+  <!-- Control Plane Zone -->
+  <rect x="38" y="268" width="1044" height="114" class="card-ctrl"/>
+  <text x="54" y="290" class="hdr-blue">控制面（Control Plane / 表内列存与查询流转）：紧致、可事务、可优化、零大字节拷贝</text>
+
+  <rect x="54" y="302" width="406" height="68" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="66" y="321" class="t-h">标准列存主表（Parquet / Lance / Delta / Paimon）</text>
+  <text x="66" y="340" class="t-m">doc_id | tenant_id | updated_at | blob_ref (64–200 B)</text>
+  <text x="66" y="358" class="t-s">标量列保持高压缩与 ZoneMap 索引；Projection Pruning 直接跳过 Blob</text>
+
+  <rect x="478" y="302" width="322" height="68" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="490" y="321" class="t-h">BlobRef 描述符结构体（随 JOIN / CTAS 自由携带）</text>
+  <text x="490" y="340" class="t-m">{ uri, offset, length, version/etag,</text>
+  <text x="490" y="357" class="t-m">  mime_type, storage_mode, authorizer }</text>
+
+  <rect x="818" y="302" width="248" height="68" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="830" y="321" class="t-h">统一治理与运行时凭据签发</text>
+  <text x="830" y="340" class="t-s">RLS / CLS 行列级权限随行传递</text>
+  <text x="830" y="358" class="t-s">Credential Vending / Scoped URL</text>
+
+  <!-- Separator Line between Control and Data Plane -->
+  <line x1="38" y1="402" x2="1082" y2="402" class="dash-sep"/>
+  <rect x="382" y="390" width="356" height="24" class="pill"/>
+  <text x="560" y="406" text-anchor="middle" class="t-h">仅在下游真正消费字节时惰性解引用（Late Materialization）</text>
+
+  <!-- Vertical Connectors to 4 storage tiers -->
+  <path d="M 162 382 L 162 426" class="arrow-green" marker-end="url(#arr-green)"/>
+  <path d="M 426 382 L 426 426" class="arrow-green" marker-end="url(#arr-green)"/>
+  <path d="M 690 382 L 690 426" class="arrow-green" marker-end="url(#arr-green)"/>
+  <path d="M 954 382 L 954 426" class="arrow-green" marker-end="url(#arr-green)"/>
+
+  <!-- Data Plane Zone: 4-tier storage -->
+  <rect x="38" y="430" width="1044" height="136" class="card-data"/>
+  <text x="54" y="452" class="hdr-green">数据面（Data Plane / 尺寸感知的四级物理分层存储）：消灭小文件 IOPS 爆炸与大文件扫描污染</text>
+
+  <!-- Tier 1: Inline -->
+  <rect x="54" y="464" width="238" height="90" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="66" y="483" class="t-h">1. Inline 内联存储</text>
+  <text x="66" y="500" class="t-m">目标：极小载荷（&lt; 64 KiB）</text>
+  <text x="66" y="518" class="t-s">直接嵌入主数据页，避免为几 KB</text>
+  <text x="66" y="534" class="t-s">缩略图或短文本发额外对象存储 GET</text>
+
+  <!-- Tier 2: Packed -->
+  <rect x="308" y="464" width="246" height="90" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="320" y="483" class="t-h">2. Packed 打包侧车（.blob）</text>
+  <text x="320" y="500" class="t-m">目标：中小对象（64 KiB – 数 MB）</text>
+  <text x="320" y="518" class="t-s">多行拼装进共享 .blob 侧车文件；</text>
+  <text x="320" y="534" class="t-s">消灭小文件风暴，支持 Range 合并读</text>
+
+  <!-- Tier 3: Dedicated -->
+  <rect x="570" y="464" width="246" height="90" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="582" y="483" class="t-h">3. Dedicated 独立托管大文件</text>
+  <text x="582" y="500" class="t-m">目标：巨型载荷（数 MB – 百 GB）</text>
+  <text x="582" y="518" class="t-s">独立 _blobs/{uuid}.blob 托管；</text>
+  <text x="582" y="534" class="t-s">随表快照提交与 Compaction GC</text>
+
+  <!-- Tier 4: External / View -->
+  <rect x="832" y="464" width="234" height="90" class="card-purp"/>
+  <text x="844" y="483" class="t-h">4. External 外部 / 跨表视图</text>
+  <text x="844" y="500" class="t-m">目标：存量桶资产 / 派生子表</text>
+  <text x="844" y="518" class="t-s">零拷贝外部 URI+Version 指针或</text>
+  <text x="844" y="534" class="t-s">Paimon Blob View 跨表只读引用</text>
+</svg>

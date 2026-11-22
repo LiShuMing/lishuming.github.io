@@ -1,8 +1,10 @@
 ---
-title: "SQL 与 LLM 算子融合架构调研：七大核心算子矩阵与端到端 AI 数据管线实现"
-slug: "sql-llm-operator-fusion-and-seven-stage-ai-data-pipeline"
+title: "当 SQL 引擎遇上大模型：从黑盒 UDF 到语义融合内核的架构推演"
+slug: "sql-llm-fused-engine-architecture"
+aliases:
+  - "/2026/11/22/sql-llm-operator-fusion-and-seven-stage-ai-data-pipeline/"
 date: 2026-11-22T12:20:00+08:00
-lastmod: 2026-11-22T12:20:00+08:00
+lastmod: 2026-11-22T15:42:00+08:00
 categories:
   - AI 基础设施
   - 数据库
@@ -10,266 +12,229 @@ tags:
   - SQL
   - LLM
   - 语义算子
+  - 查询优化器
   - 多模态
-  - MinHash
-  - KMeans
   - 向量检索
+  - KV Cache
   - Data Infra
-description: "围绕现代 AI 数据处理平台的七大核心算子矩阵（AI 数据访问、解析脱敏、MinHash、KMeans、Pairwise、向量检索、模型加工），系统调研 SQL 与 LLM 算子融合的优化原理，拆解端到端物理执行链路实现、业界三种落地栈对比与关键工程护栏。"
+description: "从千万级非结构化文档清洗与知识入库的真实瓶颈出发，沿着“类型与逻辑代数 → 语义代价优化与 PrefixLocality 物理属性 → 异构异步执行与推理协同 → 开放表格式增量闭环”的推演路径，拆解 SQL 引擎与 LLM 运行时深度融合的内核设计。"
 draft: false
 toc: true
+math: true
 ---
 
-把一套现代 **AI 数据处理平台（AI Data Infra / Multimodal Lakehouse）** 从原始非结构化接入到高质量模型语料与知识资产产出的全链路拆开，几乎所有生产级管线最终都会收敛到七项核心算子能力：
+假设你手里有 1,000 万份企业合同 PDF、扫描票据和原始业务日志，散落在对象存储的不同目录里。业务方提了一个在今天再普通不过的需求：把它们清洗成一份干净、无重复、不含敏感隐私（PII）、抽取出关键条款与风险等级的知识库，并且能同时支撑关键字与高维向量混合检索；之后每周新增几万份文件时，整套结果还要能低成本增量更新。
 
-1. **AI 数据访问（Multimodal Data Access）**
-2. **解析脱敏（Parsing & PII Redaction）**
-3. **MinHash（词面模糊去重）**
-4. **KMeans（高维向量聚类）**
-5. **Pairwise（成对比对与偏好构造）**
-6. **向量检索（Vector Search / ANN）**
-7. **模型加工能力（Model Processing / Batch Inference）**
-
-这七项能力在逻辑上是一条极其流畅的价值漏斗，但在物理执行层却横跨了**四种截然冲突的计算世界**：异步对象存储流式 I/O（Stage 1–2）、关系/图 Shuffle 迭代（Stage 3–4）、稠密 GPU 矩阵乘法与近邻索引（Stage 4–6），以及有状态 GPU 连续批处理推理（Stage 7）。
-
-如果像过去那样用七套独立工具硬拼（Python 拉 S3 → Unstructured 解析 → Spark 跑 MinHash → FAISS 脚本跑 KMeans → 自写循环跑 Pairwise → 导进 Milvus → 拉 vLLM 脚本批推理），团队会付出惨重的 **7 次跨系统序列化、多份存储拷贝、血缘断裂与零跨算子优化代价**；可如果直接把它们当作黑盒 Python UDF 塞进传统 SQL 引擎，优化器又完全变成瞎子，GPU 空等 I/O、内存频频 OOM、LLM Token 账单直接失控。
-
-**如何把 SQL 的声明式优化能力与 LLM/AI 算子深度融合，用统一逻辑计划优雅驱动这七阶段异构链路？** 下面结合 2025–2026 学术界前沿与工业界落地架构，给出完整的实现蓝图。
+如果按过去最顺手的工程习惯去搭这套系统，大多数团队都会先后走过两条弯路——而这两条弯路撞上的墙，恰好把下一代 **SQL × LLM 融合引擎** 必须长成的样子逼了出来。
 
 ---
 
-## 一、SQL 与 LLM 算子融合的四条核心设计原则
+## 一、两条朴素路线的尽头：为什么“胶水拼接”与“黑盒 UDF”都会撞墙？
 
-过去两年（SIGMOD / VLDB / CIDR 2025–2026），以 **LOTUS**、**Palimpzest（Abacus）**、**DocETL** 及关系表前缀缓存重排算法（如 **SOLO**）为代表的学术前沿，与 Snowflake Cortex、Databricks AI Functions、BigQuery、Daft 等工业系统不约而同地收敛到了四条融合原则：
+第一种做法是**按工序拼装独立工具**：写 Python 脚本从对象存储拉文件，交给文档解析库转成文本，落盘后再起 Spark 作业做词面去重，把向量抽出来丢进独立脚本跑聚类和成对比对，随后导入外部向量库，最后再起一批 Worker 调 vLLM 做结构化抽取。
 
-### 1.1 语义关系代数一等公民化（打破黑盒 UDF）
-传统 SQL 优化器看不懂 `python_udf(text)` 里面干了什么，只能老老实实逐行执行。算子融合的第一步，是把高频 AI 能力提升为优化器可感知的**声明式语义算子**（如 `AI_PARSE_DOCUMENT`、`AI_FILTER` / `sem_filter`、`AI_EXTRACT`、`AI_JOIN` / `sem_join`、`AI_RERANK`、`VECTOR_SEARCH`）。优化器不再只记录行数和字节数，而是显式建模每个算子的三个新维度：**单行 Token/算力代价（Cost）、预估过滤选择率（Selectivity）以及语义精度预算（Accuracy Budget）**。
+管线跑在小样本上似乎一切正常，一旦数据量拉到千万级，四堵物理墙会同时压下来：
+1. **跨系统序列化与反复落盘**：每跨过一道工具边界，整批数据就要经历一次编码、网络搬运和对象存储落盘，I/O 与序列化成本很快盖过有效计算；
+2. **非结构化内存放大**：一份 20 MB 的扫描 PDF 在解码、渲染和切块后，内存中很容易膨胀到 300–400 MB，只要上游拉取速度和下游处理速度失配，Worker 瞬间 OOM；
+3. **推理缓存被彻底打碎**：上游按存储分片乱序吐数据，共享同一长模板或同一主题背景的文档被拆散到不同批次、不同 GPU 节点，推理引擎的 Prefix KV-Cache 命中率跌至谷底，大量算力白烧在重复 Prefill 上；
+4. **长作业容错成本失控**：GPU Spot 节点一旦被抢占，传统脚本或血缘重算机制会把几小时烧掉的 LLM Token 账单推倒重来。
 
-### 1.2 逻辑层优化：谓词重排、多任务融合与代理模型级联
-一旦优化器看懂了语义算子，就能自动施展远超手写脚本的全局降本改写：
-- **跨模态谓词重排（Predicate Pushdown & Reordering）**：结构化列裁剪、文件大小/MIME 过滤、正则脱敏、BM25 关键词与 MinHash 去重永远被自动推到 Embedding 和 LLM 算子之前执行，严禁拿未过滤的脏数据去喂 GPU。
-- **多语义算子融合（Prompt Coalescing）**：当查询对同一篇长文档既做 `AI_CLASSIFY`（分类）又做 `AI_EXTRACT`（字段抽取）和 `AI_FILTER`（质检）时，优化器自动将其合并为单次结构化输出 Prompt，避免把同一篇 10K Token 文档重复 Prefill 三次。
-- **代理模型级联（Proxy Model Cascades，LOTUS / Palimpzest 范式）**：优化器自动用极低成本的 Proxy（如 Embedding 相似度或小参数分类器）先扫全表，将高置信度通过/拒绝的 85%–90% 样本直接放行或拦截，**仅将置信度落在灰色区间的 10% 难例路由给昂贵的旗舰大模型**，并在小样本校验集上给出统计学精度保证。
+为了消灭跨系统胶水，团队往往迅速转向第二种做法：**把解析、去重、向量化和模型调用全部包成 Python UDF，塞进现有的分布式 SQL 引擎里一锅端**。
 
-### 1.3 物理层优化：KV-Cache 前缀感知的关系重排（Prefix-Cache-Aware Reordering）
-批量跑 LLM 加工时，最大的算力与延迟瓶颈往往在 **Prefill 阶段**。关系表天然包含大量重复前缀（相同的 System Prompt、相同的文档上下文、相同的品类/知识背景），但按原始存储顺序逐行发送请求会彻底打碎 vLLM/SGLang 的 **RadixAttention / Prefix KV-Cache** 局部性。
+表面上看，入口统一成了 SQL；可一到真实生产查询，优化器立刻变成“瞎子”。在传统关系数据库眼里，每个黑盒 UDF 都只是一段不透明的函数调用——它看不见 `file_path` 背后到底指着 10 KB 的纯文本还是 2 GB 的视频，看不见一次正则表达式只需 5 微秒、而一次 70B 大模型抽取要花 300 毫秒且按 Token 计费，也看不见相邻两个 UDF 其实都在反复读同一篇 10K Token 的长文档。结果引擎既不敢把廉价过滤提前、也做不了批处理重排，GPU 一边空等 I/O，一边为大量本该被挡在门外的脏数据支付昂贵算力。
 
-最新的融合执行引擎（以及 SOLO 等前沿算法）在将批数据发往推理服务之前，会利用 SQL 的排序/分组算子**按共享前缀字段对行和列做物理重排聚类**，让共享同一上下文前缀的请求紧挨着路由到同一个 GPU Worker 实例，直接将批量 Prefill 吞吐拉高数倍。
-
-### 1.4 执行层优化：异构多池解耦与零延迟流式背压
-绝对不能让 CPU 的网络解码线程和 GPU 的矩阵推理线程绑在同一个同步阻塞循环里。现代融合内核（如 Daft Swordfish、Ray Data）将物理执行彻底拆为隔离的运行池：**异步对象存储 I/O 池 → SIMD/多核 CPU 解析池 → 独立常驻 GPU Continuous Batching 推理池**，相邻算子间用容量受限通道传递微批并逐跳施加**流式背压（Backpressure）**，彻底消除多模态解码内存膨胀导致的 OOM。
+走到这里，真正的核心问题才浮出水面：**传统数据库面对千变万化的业务需求，从来不是靠堆砌专用工具或黑盒函数，而是靠极少数正交的内核原语（数据表示 → 代数算子 → 代价优化 → 物理执行 → 事务存储），让系统自己把声明式意图编译成高效计划。** 如果沿着同一条数据库内核的演进思路反推，要让 SQL 引擎真正“看懂”并原生驾驭多模态与大模型负载，每一层究竟缺了哪块拼图？
 
 ---
 
-## 二、七大核心算子矩阵的端到端物理实现拆解
+## 二、第一块拼图：让引擎先“看见”大对象与语义计算
 
-围绕上面四条融合原则，我们沿着数据流转顺序，逐一拆解这七项能力在现代 SQL + AI 融合引擎中的**声明式接口、底层物理实现与核心工程护栏**：
+要让优化器睁开眼睛，第一步不是在 SQL 里堆语法糖，而是补齐**数据表示**与**逻辑代数**两处最基础的盲区：先让引擎理解“非结构化大对象”，再把看似五花八门的 AI 处理步骤压缩成极少数可优化的关系算子。
 
-### Stage 1：AI 数据访问（Multimodal Data Access）
-- **声明式接口**：在表模型中引入一等公民的 `Object Table`、`FILE(MediaType)`、`Image`、`Tensor` 与 `Blob` 类型，使外部 S3/OSS 上亿级非结构化文件拥有版本化的结构化元数据视图（`uri`, `size`, `etag`, `last_modified`）。
-- **底层物理实现**：
-  - **元数据与 Blob 分离存储**：采用 **Lance** 或 **Paimon Blob / Iceberg + 外部对象引用**，常规标量列紧致列存以支持毫秒级元数据谓词下推，百 MB 级视频/音频大对象仅在表内保存轻量的字节偏移引用（Lazy Reference），直到下游算子真正消费时才按需拉取。
-  - **高吞吐异步 I/O**：在独立异步 I/O 线程池中实施 **Range Coalescing（小区间合并读，如 ≤ 1 MiB 合并减少 HTTP 请求数）** 与大文件并发分片预取，并支持网络闪断后的 HTTP `Range` 自动续传。
-- **核心护栏**：通过元数据按文件字节数做**加权均衡分片**（防止单个 2 GB 视频文件塞进同一个分区制造长尾慢节点），并对上游下载并发施加上限背压。
+### 2.1 用惰性 `BlobRef` 打破“内联炸列存、裸路径丢治理”的死结
 
-### Stage 2：解析脱敏（Parsing & PII Redaction）
-- **声明式接口**：通过内置表值/标量算子（如 `AI_PARSE_DOCUMENT(file_col, mode => 'LAYOUT')`）或向量化批处理原语（`apply_chunk` / `map_batches`）表达。
-- **底层物理实现**：
-  - **绕开 Python GIL 的多模态解码**：纯图像缩放、文本切块与 WARC 解析下沉至 Rust/C++ 原生算子；复杂 PDF 版面还原（OCR / 表格识别）与音视频 ASR 路由至独立进程池或轻型 GPU 推理池，进程间经 **POSIX 共享内存 + Apache Arrow IPC** 零拷贝交换批次，避免 Socket 整块拷贝与 GIL 锁死。
-  - **两级分级脱敏漏斗**：第一级在 C++/Rust SIMD 层用确定性 DFA 正则与字典以微秒级速度拦截 80% 显式敏感格式（手机号、身份证、邮箱、API Key、内网 IP）；第二级仅将高风险文本块批送给轻量 NER 模型（如 Presidio / 量化小尺寸 BERT）识别上下文隐式隐私（姓名、住址、病历信息），执行确定性假名化（Pseudonymization）或掩码，并在元数据列留存脱敏审计标记。
-- **核心护栏**：PDF/图像解码瞬时内存放大可达 **10×–20×**，必须把微批行数调小并配合严格有界队列背压，防止解析阶段击穿 Worker 内存。
+面对几十 MB 的 PDF、音频或视频，数据库一直卡在两难之间：如果直接当成 `BINARY` 列内联塞进 Parquet 或数仓数据页，常规标量列的压缩比、缓存行局部性与扫描吞吐会瞬间崩盘；可如果表里只留一串裸 URI 字符串（`'s3://bucket/a.pdf'`），SQL 就彻底失去了版本快照、行级权限控制，优化器更不知道这条路径背后藏着多大的文件。
 
-### Stage 3：MinHash（PB 级词面模糊去重）
-- **声明式接口**：以内置列式函数生成签名（`MINHASH_SIGNATURE(text, num_perm => 128, ngram => 5)`），下游接声明式去重算子或分布式图连通分量步骤。
-- **底层物理实现**：
-  - **零神经网络的高吞吐签名**：采用 Portable SIMD（如 8 路向量化梅森素数哈希）或 GPU（RAPIDS cuDF / NeMo Curator）并行计算文档签名，每篇文档压缩为仅 **512 字节**指纹，彻底扛住百亿文档、PB 级语料的第一层粗筛。
-  - **LSH 分桶与星型建边**：将签名切分为 `b` 个 Band、`r` 行并按 Band Key 做 Hash Shuffle 分桶；**严禁桶内 `O(k²)` 两两建边**，而是统一以桶内最小 `doc_id` 为中心构建 **`O(k)` 星型树边**，随后经 **交替大星-小星（Alternating Large-Star / Small-Star）分布式 WCC** 收敛连通分量。
-- **核心护栏**：强制设置**热点大桶熔断阈值**（拦截全网通用免责声明或乱码模板导致的超级节点雪崩）与 **Jaccard 精确复核**（剔除 LSH 假阳性），按多维质量分（质量分类器 + 长度 + 新鲜度）选出唯一 Survivor，并落盘 `(cluster_id, duplicate_id, survivor_id)` 血缘映射表。
+破局点在于把大对象指针提升为类型系统里的一等公民——**惰性大对象引用类型 `BlobRef`**（工业界对应的落地形态包括 BigQuery `ObjectRef`、Snowflake `FILE`、Lance `Blob v2` 与 Apache Paimon `.blob`）。主表列存页里只紧致存放 `(uri, offset, length, etag, mime_type)` 等几十字节的轻量描述符和常规标量列，原始字节流则通过物理分流独立存放、保持惰性。
 
-### Stage 4：KMeans（高维向量聚类）
-- **声明式接口**：通过 SQL ML 扩展（`CREATE MODEL ... OPTIONS(model_type='KMEANS', num_clusters=50000)`）或 DataFrame 原语（`sem_cluster_by`）触发。
-- **底层物理实现**：
-  - **向量归一化与 GPU 加速**：在前置模型加工产出稠密 Embedding 后，先执行 L2 归一化（使内积严格等价于余弦相似度）；随后将采样集或全量分片送入 **FAISS GPU / RAPIDS cuML** 执行分布式 Mini-Batch KMeans 训练质心（Centroids），再将质心广播回计算节点并发计算每条文档的 `(cluster_id, dist_to_centroid)`。
-  - **一鱼三吃**：聚出的 `cluster_id` 同时服务于三大下游——作为 Stage 5 **SemDeDup 语义去重的分区键**、作为 **D4/FineWeb-2 式多样性分层采样（Stratified Sampling）的配比依据**，以及直接作为 Stage 6 **IVF 倒排向量索引的底层聚类中心**。
-- **核心护栏**：针对高维空间极易出现的“空簇”与“超级大簇”，工程上需启用 **Balanced KMeans（带容量约束的平衡聚类）** 或对超大规模簇执行二次递归分裂，保证每个簇的规模控制在数千至数万条的可控区间内。
+这一步看似只是多了一个类型，带来的连锁反应却直接改写了扫描层（`TableScan`）：
+1. **元数据谓词零代价下推**：像 `WHERE size_bytes BETWEEN 1024 AND 52428800 AND updated_at >= ...` 这样的条件，在列存扫描阶段就靠 ZoneMap 和分区裁剪把绝大部分无效文件直接拦掉，连一次对象存储 GET 请求都不用发；
+2. **字节加权分片与延迟物化**：只要后续算子没触碰文件内容，字节流就永远不被加载；一旦真正消费 `BlobRef`，调度器依据描述符里的 `length` 按**字节总量**而非行数切分 Split（避免单个 2 GB 视频把某个 Worker 拖成慢节点），底层的异步对象 I/O 池再自动执行 **Range Coalescing**（合并小于 1 MiB 的相邻碎区间以减少 HTTP 往返）与分片预取。
 
-### Stage 5：Pairwise（成对比对、语义连接与偏好构造）
-- **声明式接口**：簇内分区自连接（`PARTITION BY cluster_id`）、语义连接（`SELECT * FROM news SEM_JOIN risks ON ...`），或偏好对构造算子（`AI_RANK_PAIR(prompt, resp_a, resp_b)`）。
-- **底层物理实现**：Pairwise 天然带有 `O(N²)` 组合爆炸基因，在融合引擎内部必须经由**三层物理剪枝**压回近线性复杂度：
-  1. **Blocking 分区隔离**：所有比对严格限定在同一 KMeans `cluster_id`、同一 LSH 桶或同一结构化键（如 `category`、`prompt_id`）分区内完成，避免全表笛卡尔积。
-  2. **簇内 GPU GEMM 暴力矩乘替代双层循环**：对于 SemDeDup 簇内精确余弦相似度计算，把簇内 `m` 条归一化 `d` 维向量拼成矩阵 `E (m × d)`，直接在 GPU 上跑一次 FP16/BF16 **矩阵乘法 `E · E^T`**（借助 FAISS `GpuIndexFlatIP` 或 cuBLAS），毫秒级扫出上三角相似度矩阵并按阈值标记冗余样本（通常保留距质心最近或最远的代表样本）。
-  3. **灰区精判与偏好裁判（LLM-as-a-Judge）**：对于跨表实体消歧的模糊边界（如余弦距离落在 `0.05–0.15`）或 RLHF/DPO 同一 Prompt 下的多模型回复对 `(y_w, y_l)`，通过受控批处理路由给 LLM 裁判输出结构化胜负标签与理由。
-- **核心护栏**：严格限制单簇最大元素数 `m_max`（超限先分裂或降级为 ANN Top-K 召回），防止 `m × m` 临时相似度矩阵打爆单卡显存。
+### 2.2 把纷繁的 AI 工序抽象为四类正交关系算子
 
-### Stage 6：向量检索（Vector Search / ANN + 混合检索）
-- **声明式接口**：在 SQL 中直接以表函数或排序原语暴露——如 `VECTOR_SEARCH(TABLE base, 'emb', TABLE query, 'emb', top_k => 10)`，并与 `BM25_SCORE` 通过 **RRF（倒数排名融合）** 在单条查询计划中联合执行。
-- **底层物理实现**：
-  - **索引分层选型与量化压缩**：内存充裕且追求亚 10 ms 在线召回用 **HNSW**；十亿级离线批量语义自连接与低内存成本优先用 **IVF-PQ / ScaNN / DiskANN**，配合 **SQ8 / PQ / Binary（二值量化）+ 原始向量重打分（Oversample + Rerank）** 将索引内存压低 4×–32×。
-  - **结构化谓词与向量检索联合优化**：当查询附带 `WHERE tenant_id = 'acme' AND updated_at > ...` 时，SQL 优化器根据过滤选择率动态切换 **Pre-filtering（选择率低时先走倒排/B-Tree 裁剪再暴力算距离）** 与 **Iterative Filtering / Post-filtering（选择率高时边遍历 ANN 图边校验位图掩码）**，避免传统外挂向量库“先查 Top-10 再过滤结果全空”的经典事故。
-- **核心护栏**：将向量索引与关系表纳入同一事务与行级权限（RLS）边界，确保文档删除或权限变更实时生效，彻底消灭外部向量库异步同步造成的 RAG 越权与“幽灵数据”。
+解决了“数据怎么进表”，紧接着面对的第二个诱惑是：既然 AI 数据管线里既有 PDF 解析、敏感词脱敏，又有 MinHash 模糊去重、KMeans 向量聚类、成对语义比对、向量混合检索和 LLM 抽取，是不是该给每种算法都在内核里造一套独立阶段？
 
-### Stage 7：模型加工能力（Model Processing / Batch LLM Inference）
-- **声明式接口**：统一的 AI Functions 家族——`AI_EMBED`（向量化）、`AI_CLASSIFY`（分类/质检）、`AI_EXTRACT`（结构化抽取）、`AI_FILTER`（语义过滤）、`AI_GENERATE` / `llm.generate`（摘要、翻译、CoT 合成）。
-- **底层物理实现**：
-  - **计算与推理池物理分离**：SQL/DataFrame Worker 仅负责拼装 Prompt、做前缀聚簇排序与限流背压；真正的模型前向计算全部交给常驻 GPU 池上的 **Continuous Batching 推理引擎（vLLM / SGLang）**，彻底消除逐条调用的 GPU 空转。
-  - **受限解码保障关系 Schema 稳定性**：通过 **JSON Schema / Regex / CFG 语法有限状态机（Guided Decoding）** 在 Token 采样层强约束输出格式，让 LLM 的非结构化文本输出 100% 合法地直接映射为下游 SQL 的 `STRUCT` / `ARRAY` 强类型列，无需脆弱的正则后解析。
-  - **长耗时 GPU 作业的 Key 级断点续跑**：批跑百万级文档的 LLM 推理往往耗时数小时，一旦 Spot/抢占式 GPU 节点回收，传统血缘重算会烧光预算。物理层必须引入基于对象存储的 **Key 级幂等 Checkpoint**（如 Daft `daft-checkpoint`），重启时自动 Anti-Join 跳过已落盘主键。
+答案是否定的。业务算法会年年翻新，今天加一项版权检测，明天换一种聚类变体，如果把算法名写死在引擎骨架里，内核很快就会僵化。跳出具体算法名，从**数据形态与计算复杂度**切入，这堆看似迥异的操作其实全部收敛到四类正交的关系代数扩展算子，且每个算子都向优化器暴露统一的**六元组契约**（输入/输出强类型 Arrow Schema、算力域、单行 Cost、预估 Selectivity、语义精度约束）：
 
----
+1. **异步语义变换与过滤：`AsyncMap` / `SemProject` / `SemFilter`**
+   不管是 PDF 版面解析、SIMD 正则 + 轻量 NER 两级脱敏、Embedding 编码，还是大模型分类与字段抽取（`AI_CLASSIFY`、`AI_EXTRACT`、`AI_FILTER`），在逻辑计划眼里都是同一回事——把输入列异步映射成受 Schema 约束的输出列。唯一差异在于后端绑定的物理执行内核不同（Rust 原生算子、独立解码进程池、本地 GPU 模型或远端 vLLM 服务）。
+2. **语义分区：`SemanticPartition`**
+   传统分布式 SQL 靠 `HashPartition(key)` 把精确等值的数据路由到同一节点；到了非精确语义世界，MinHash 的 LSH Band 和 KMeans 的聚类质心干的其实是同一件事——**给每行打上语义分区键 `bucket_id` / `cluster_id`**，把全局 \(O(N^2)\) 的语义比较锁死在局部簇内。更妙的是，KMeans 产出的质心与簇归属能够“一鱼三吃”：下游同时复用它做簇内去重 Blocking、多样性分层采样（如 FineWeb-2 / D4 策略），以及直接充当 IVF 向量索引的底层倒排桶。
+3. **近似相似度连接：`SimilarityJoin`**
+   离线的大规模成对语义比对（SemDeDup 去重、实体消歧、RLHF 偏好对构造）与在线的高维向量检索（ANN Top-K），表面上分属离线批处理与在线查询两个世界，在关系代数里却是同一个算子：前者是表与自己的自连接，后者是 Query 表与 Base 表的索引连接。一旦在代数层统一，优化器就能像在 `Hash Join` 与 `Index Nested-Loop Join` 之间选型一样自主拍板：
+   - 面对离线大表自连接，先借 `SemanticPartition` 做 Blocking（并靠 Balanced KMeans 或单簇上限 `m_max` 拦截超级热点簇），再在簇内把 \(m\) 条 L2 归一化向量拼成矩阵 \(E \in \mathbb{R}^{m \times d}\)，用单次 GPU FP16/BF16 矩乘 \(E \cdot E^T\) 替代双层循环，仅把落入模糊灰区的候选对送给 LLM 裁判；
+   - 面对带结构化过滤（如 `tenant_id`、时间窗口）的在线召回，则根据过滤选择率在 **Pre-filtering**（低选择率先走倒排/B-Tree 再精确算距离）与 **Iterative Filtering**（高选择率边遍历 HNSW/DiskANN/IVF-PQ 图边验位图掩码）之间动态切换，并与 `BM25` 通过 RRF（倒数排名融合）在同一执行计划内合流。
+4. **语义归约与迭代不动点：`SemAgg` / `IterativeFixpoint`**
+   MinHash 分桶后需要把跨桶重复文档合并成连通分量——为避免单个大桶内 \(O(k^2)\) 建边爆炸，通常以桶内最小 `doc_id` 构造 \(O(k)\) 星型边，再跑交替大星-小星 WCC；这在关系代数里就是标准的迭代不动点算子。而面对超长上下文的跨行语义汇总（如 Snowflake `AI_AGG`），则是带窗口预算与 Tree-Reduce 分治归约的 `SemAgg`。
 
-## 三、端到端融合链路蓝图：一条声明式管线如何映射到异构物理层？
-
-将上述七项能力串成一条真实的“多模态文档清洗 → 两级去重 → 知识抽取 → 向量入库”生产流水线，在理想化的 SQL + 语义算子融合引擎中，上层代码可以收敛得非常干净：
+有了 `BlobRef` 和这四类算子，开篇那个需要七八套脚本硬拼的企业合同知识库构建任务，就能收束成一条完全声明式、且对优化器透明的 SQL：
 
 ```sql
--- 1. AI 数据访问 + 解析脱敏（Object Table 元数据裁剪 + 惰性流式解析 + 分级脱敏）
-WITH parsed_clean AS (
+WITH raw_docs AS (
   SELECT
-    obj.doc_id,
-    obj.tenant_id,
-    PII_REDACT(AI_PARSE_DOCUMENT(obj.file_ref, mode => 'LAYOUT')) AS clean_text
-  FROM lakehouse.raw_pdfs_object_table AS obj
-  WHERE obj.size_bytes BETWEEN 1024 AND 52428800   -- 谓词下推：先按字节过滤异常文件
-    AND obj.updated_at >= CURRENT_DATE - INTERVAL '30' DAY
+    doc_id, tenant_id, file_ref,
+    -- 统一建模为 AsyncMap：布局解析 + SIMD 正则与轻量 NER 分级脱敏
+    PII_REDACT(AI_PARSE_DOCUMENT(file_ref, mode => 'LAYOUT')) AS clean_text
+  FROM lakehouse.raw_pdfs_table
+  WHERE size_bytes BETWEEN 1024 AND 52428800
+    AND updated_at >= CURRENT_DATE - INTERVAL '30' DAY
 ),
--- 2. MinHash 词面粗去重（低成本压掉 70%+ 模板与镜像重复）
-fuzzy_deduped AS (
-  SELECT doc_id, tenant_id, clean_text
-  FROM MINHASH_DEDUP(
-    TABLE parsed_clean,
-    text_col => 'clean_text',
-    threshold => 0.8,
-    survivor_order => 'LENGTH(clean_text) DESC'
-  )
-),
--- 3. Embedding 编码 + KMeans 语义分簇（为簇内 Pairwise 与 IVF 索引打底）
-embedded_clustered AS (
+dedup_and_clustered AS (
+  -- 词面近似去重（SemanticPartition(LSH) + IterativeFixpoint WCC）
+  -- 与语义聚类（AI_EMBED + SemanticPartition(KMeans)）统一为关系算子
   SELECT
     doc_id, tenant_id, clean_text, emb,
-    KMEANS_ASSIGN(emb, model => 'corpus_kmeans_50k') AS cluster_id
+    SEMANTIC_PARTITION(emb, method => 'KMEANS', model => 'corpus_50k') AS cluster_id
   FROM (
     SELECT doc_id, tenant_id, clean_text, AI_EMBED(clean_text, model => 'bge-m3') AS emb
-    FROM fuzzy_deduped
+    FROM MINHASH_DEDUP(TABLE raw_docs, text_col => 'clean_text', threshold => 0.8)
   )
 ),
--- 4. 簇内 Pairwise 精确语义去重（SemDeDup：GPU GEMM 簇内精排，规避全局 O(N²)）
-sem_deduped AS (
+curated AS (
+  -- SimilarityJoin：簇内 GPU GEMM 精确余弦去重，规避全局 O(N^2)
   SELECT doc_id, tenant_id, clean_text, emb, cluster_id
-  FROM PAIRWISE_SEMDEDUP(
-    TABLE embedded_clustered,
-    partition_by => 'cluster_id',
-    vector_col => 'emb',
-    cosine_threshold => 0.95
+  FROM SIMILARITY_DEDUP(
+    TABLE dedup_and_clustered,
+    partition_by => 'cluster_id', vector_col => 'emb', cosine_threshold => 0.95
   )
 )
--- 5. 最终高阶模型加工：仅对层层提纯后的高价值样本调用昂贵 LLM，按前缀排序提升 KV Cache 命中
 INSERT INTO lakehouse.curated_knowledge_base
 SELECT
-  doc_id,
-  tenant_id,
-  clean_text,
-  emb,
+  doc_id, tenant_id, clean_text, emb,
+  -- 同一文档上的语义过滤与多字段抽取，交由优化器自动融合并级联代理模型
   AI_EXTRACT(
     clean_text,
     schema => 'STRUCT<summary STRING, risk_level STRING, entities ARRAY<STRING>>',
-    model  => 'qwen3-32b',
-    cascade_proxy => 'qwen3-4b'
+    quality_target => 0.95
   ) AS structured_meta
-FROM sem_deduped
--- 物理层由优化器按 cluster_id / 共享前缀聚类排序后再喂入 vLLM 连续批池
-DISTRIBUTE BY cluster_id;
+FROM curated
+WHERE AI_FILTER(clean_text, 'contains actionable compliance or contract obligations');
 ```
 
-在这段声明式管线背后，融合引擎的物理执行层会将其自动切分为**四类异构执行域**协同接力（全程通过 **Apache Arrow 零拷贝内存**与 **Lance / Iceberg 开放表格式**无缝衔接）：
+---
 
-| 管线阶段 | 实际承载的物理执行硬件与引擎域 | 关键优化与容错动作 |
-| :--- | :--- | :--- |
-| **Stage 1–2（访问 + 解析脱敏）** | 异步对象存储 I/O 池 + 多核 CPU SIMD / 独立解码进程池 | Range Coalescing 预取、有界通道流式背压、正则→NER 两级脱敏 |
-| **Stage 3（MinHash）** | SIMD CPU 或 GPU（cuDF）签名 + 分布式图 WCC | 热点桶熔断、`O(k)` 星型建边、大星-小星收敛 + 血缘表落盘 |
-| **Stage 4–5（KMeans + Pairwise）** | GPU 矩阵与向量算力池（FAISS GPU / cuML） | L2 归一化、Balanced KMeans 分簇、簇内 FP16 GEMM 精确余弦去重 |
-| **Stage 6–7（ANN 检索 + LLM 加工）** | 向量/全文混合索引核 + 常驻 GPU Continuous Batching（vLLM / SGLang） | 过滤下推 + RRF、代理模型级联、前缀重排提 KV 命中、受限解码 + Key 级 S3 Checkpoint |
+## 三、第二块拼图：成本相差五个数量级，优化器如何自动排兵布阵？
+
+逻辑计划透明之后，马上就会撞上第二个关键问题：在传统 OLAP 查询里，一次哈希探针和一次字符串正则最多相差几十倍开销；可是在上面这棵计划树里，标量过滤是微秒级，词面去重是百微秒级，而调用一次 70B 大模型是百毫秒乃至秒级，算力与美元账单横跨 **4–5 个数量级**。
+
+如果继续靠工程师靠经验手调执行顺序，哪怕换个数据集分布或者换个模型价格，最优漏斗顺序就会失效。过去两年 SIGMOD / VLDB / CIDR 的一批前沿工作（**LOTUS、Palimpzest/Abacus、DocETL、SOLO**），给出的共同解法是把经典 Cascades 优化器的三件套——**代价模型、逻辑改写规则、物理属性与强制器（Property & Enforcer）**——系统性地拓展到语义计算领域。
+
+### 3.1 从三维帕累托代价里“长出”漏斗顺序
+
+传统 CBO 只需要最小化执行时间，但包含 LLM 的查询天然存在三个相互拉扯的目标：**算力与 Token 费用（美元成本）、端到端延迟、以及语义输出质量（Precision / Recall）**。MIT 的 **Palimpzest / Abacus** 把这三者放入帕累托前沿搜索，为每个算子标定单位代价 \(C_i\) 与预估过滤选择率 \(S_i\)。
+
+一旦代价模型落地，根本不需要人为写死“先过滤元数据 → 再脱敏 → 再词面去重 → 再向量聚类 → 最后调大模型”的固定步骤。优化器只需套用经典的谓词排秩法则：
+
+\[
+\text{Rank}_i = \frac{C_i}{1 - S_i}
+\]
+
+单行代价相差数万倍的算子就会被**自动重排成一条严格单调的漏斗**——微秒级标量过滤与廉价词面去重永远冲在最前面吃掉绝大部分冗余与脏数据，昂贵的旗舰大模型永远只接触最后提纯下来的高价值行。这套顺序不再是人肉编排的业务约定，而是代价模型自动推导出的数学必然。
+
+### 3.2 三条高杠杆逻辑改写：经典 SQL 优化的语义镜像
+
+在排好执行顺序之外，优化器还能顺着同一张逻辑计划树做三类高收益的等价改写，而且每一条都能在经典数据库优化里找到精准的镜像：
+
+1. **多任务算子融合（`Prompt Coalescing`，对应传统 Projection Merging）**
+   回头看前面 SQL 的最后几行：同一篇 `clean_text` 先经过 `AI_FILTER`，紧接着又进了 `AI_EXTRACT`。如果不做融合，一篇 10K Token 的合同会被送进推理引擎做两次重复 Prefill。优化器检测到相邻语义算子共享同一输入列且无数据依赖时，自动把它们合并为单次结构化输出调用，Prefill 算力直接砍半。
+2. **代理模型级联下推（`Proxy Cascade`，对应传统 Join Runtime Bloom Filter）**
+   传统 OLAP 引擎会在昂贵的 Hash Join 前自动下推轻量 Bloom Filter 挡掉 90% 无效探针；在 **LOTUS** 与 **Palimpzest** 的范式里，语义 CBO 对昂贵的 `SemFilter` 和 `SimilarityJoin` 干的是一模一样的事——在前面自动插一层廉价代理（BM25、Embedding 余弦分或 4B 小模型），借助少量校验样本做统计学阈值校准（Importance Sampling / Conformal Calibration），把高置信度通过或拒绝的 80%–90% 样本直接放行或截断，**只把落入置信灰区的 10% 难例路由给旗舰大模型**，同时在统计意义上严格守住用户声明的 `quality_target`。
+3. **长文档分治与稳定算子自蒸馏（DocETL + 代码合成）**
+   遇到动辄上百页的超长文档、单次 Prompt 容易漏检关键条款时，优化器可自动把单个 `SemProject` 改写为 `Split → Map → Resolve/Reduce` 并附带二次反思校验（Gleaning）；反过来，对于每天定时跑的固定版式管线（如标准发票或结构化日志抽取），系统在冷启动积累足够样本后，可将行为高度稳定的 LLM 算子**自动蒸馏为确定性 Python/Regex 或轻量微调小模型**，只在监测到数据分布漂移（Drift）时才回退大模型复核。
+
+### 3.3 把 `PrefixLocality` 变成 Cascades 的第三个一等物理属性
+
+前两步省的是“不该调模型的行”和“重复调的次数”，但真正决定 GPU 算力利用率的，还有隐藏在数据顺序里的巨大红利——**KV-Cache 亲和性**。
+
+熟悉 Calcite 或 StarRocks Cascades 优化器的工程师都知道，传统物理计划搜索靠两个核心物理属性（Physical Property）驱动全局最优：**`Distribution`**（数据分布，对应的 Enforcer 是 `Exchange`）和 **`Ordering`**（排序顺序，对应的 Enforcer 是 `Sort`）。
+
+但在批量跑大模型算子时，GPU 最大的耗时往往不在逐 Token 解码，而在 **Prefill 阶段**。关系表里的行往往天然共享大量相同前缀——相同的 System Prompt、相同的合同模板、相同的知识背景文档，或是同一 KMeans 主题簇的上下文。如果按磁盘原始顺序乱序送进 vLLM 或 SGLang，**RadixAttention / Prefix KV-Cache** 的命中率会跌到接近于零。
+
+因此，融合优化器完全可以在 Cascades 框架里引入第三个一等物理属性——**`PrefixLocality(prefix_cols)`**，并配上专属 Enforcer：**`PrefixReorder`（基于列基数与属性共现构建的 Radix 重排，如 SOLO 算法）+ `StickyExchange`（按前缀哈希粘性路由）**：
+
+- 物理计划树里的 `AsyncLLMOperator` 向上游子节点声明属性需求 `Requires PrefixLocality(prompt_prefix_cols)`；
+- 优化器像权衡 `Sort` 代价与 `Merge Join` 收益一样，精确对比“CPU 做一次 Radix 重排的耗时”与“Prefill KV-Cache 命中率翻倍省下的 GPU 算力与费用”；只要净收益为正，就自动插入 `PrefixReorder`；
+- 如果上游数据恰好已经按 `cluster_id` 或 `doc_id` 聚簇分布，优化器还能像传统属性满足（Property Satisfaction）那样**零成本直接消除多余重排**。
 
 ---
 
-## 四、工业界三大云数仓（BigQuery / Snowflake / Databricks）实战拆解与落地栈对比
+## 四、第三块拼图：计划画干净了，怎么喂饱 GPU 又不爆内存？
 
-### 4.1 BigQuery、Snowflake 与 Databricks 如何把七大算子装进 SQL？
+逻辑代数和语义 CBO 把执行计划压缩到了最优，但真把这套计划拉到几百张 GPU 和 PB 级非结构化文件上跑起来，物理执行层立刻会暴露出新的矛盾：**异步对象存储下载、CPU 密集型文档解码、稠密 GPU 矩阵乘法、以及有状态的 LLM 连续批推理，是四种资源画像截然冲突的负载**。把它们混在同一个线程模型里，轻则 GPU 饥饿空转，重则内存雪崩。
 
-进入 2025–2026 年，Google BigQuery、Snowflake 与 Databricks 不再把 AI 能力当作数仓外挂，而是将上述七阶段能力拆解成**原生 SQL 算子 + 托管多模态对象层 + 弹性 GPU 后端**。把三家的原生映射摆在同一张七算子坐标系下，架构差异一目了然：
+### 4.1 单一 Arrow 零拷贝数据面 + 四类隔离执行池
 
-| 算子阶段 | Google BigQuery (2025–2026) | Snowflake Cortex AISQL (2025–2026) | Databricks Mosaic AI & Lakehouse (2025–2026) |
-| :--- | :--- | :--- | :--- |
-| **1. AI 数据访问** | `Object Table` + **`ObjectRef`** 一等引用类型（直接把 GCS 多模态文件当普通表列操作） | Stage + Directory Table + 原生 **`FILE`** 类型 | Unity Catalog Volumes + Delta Lake **`VARIANT`** / Binary 列 |
-| **2. 解析脱敏** | Document AI / Gemini 多模态解析 + Cloud DLP 脱敏集成 | **`AI_PARSE_DOCUMENT`**（保留表格/版面结构输出 JSON/Markdown）+ 原生数据分类脱敏 | **`ai_parse_document`**（输出结构化 Schema / `VARIANT`，配 `ai_prep_search`）+ **`ai_mask`**（开箱即用的 SQL 内置 PII 脱敏） |
-| **3. MinHash 粗去重** | 依赖 `bigframes` Python 下推或外部 Dataflow/Spark | 依赖 Snowpark Python / **SPCS** 容器执行 | 原生强项：Spark MLlib `MinHashLSH` + GraphFrames WCC + **Photon / Ray on Spark** |
-| **4. KMeans 聚类** | 原生 SQL **`ML.CREATE_MODEL(model_type='KMEANS')`**（BQML 唯一全 SQL 原生支持） | Snowpark ML / SPCS GPU 容器执行 | Spark MLlib / GPU Serverless 池（cuML / FAISS） |
-| **5. Pairwise 语义比对** | `VECTOR_SEARCH` 批量自连接裁剪 + `AI.IF` / `AI.SCORE` 精排 | **`AI_JOIN`**（语义连接直接写进 `JOIN ... ON`）+ **`AI_SIMILARITY`** + **`AI_FILTER`** | Delta + Vector Search 召回 + **`ai_query`** / `ai_classify` 精判 |
-| **6. 向量检索** | 基于 ScaNN 的 **`VECTOR_SEARCH`** 与混合检索表函数 **`AI.SEARCH`** | 全托管混合检索服务 **Cortex Search**（BM25 + 向量 + Dynamic Table 增量同步） | **Mosaic AI Vector Search**（基于 Delta Sync 自动增量维护向量索引） |
-| **7. 模型加工能力** | **`AI.GENERATE`** / **`AI.IF`** / **`AI.CLASSIFY`** / **`AI.EMBED`**（联邦直连 Vertex AI Gemini） | **`AI_COMPLETE`** / **`AI_FILTER`** / **`AI_AGG`**（突破窗口限制的分组语义聚合） | **`ai_query`** / **`ai_extract`** / **`ai_classify`**（受限 JSON/Struct 输出 + Foundation Model APIs） |
+现代融合执行内核（如 Daft Swordfish 以及 Ray Data 的演进方向）给出的解法是**“数据面绝对统一，算力面彻底隔离”**：所有算子之间只传递统一的 **Apache Arrow `RecordBatch` + 惰性 `BlobRef` 句柄**（跨进程走 POSIX 共享内存 Arrow IPC 零拷贝），绝不反复序列化；但在物理调度上，把不同算子路由到四个互不干扰的执行池：
 
-从上表可以看到三家极具代表性的战略分叉：
-- **Google BigQuery 押注“极致声明式 + `ObjectRef` 与 BQML 原生闭环”**：依托 Dremel + Vertex AI 联邦推理，BigQuery 是唯一把 `ObjectRef`、`ML.CREATE_MODEL(KMEANS)`、`VECTOR_SEARCH`/`AI.SEARCH` 与 `AI.IF`/`AI.GENERATE` 全部收口到纯 Serverless SQL 里的云数仓，开发者几乎零集群概念；但面对超大规模自定义图迭代（MinHash WCC）与高定制 Python 多模态解码时，仍需借助 `bigframes` 或外部引擎。
-- **Snowflake 押注“Cortex AISQL 语义代数最全 + 强治理企业 RAG”**：Snowflake 把 `AI_FILTER`、`AI_JOIN`、`AI_AGG` 直接做成了类似学术界 LOTUS 的原生 SQL 语义算子（尤其是 `AI_AGG` 直接解决 `GROUP BY` 跨行聚合超出上下文窗口的痛点），再配合 `AI_PARSE_DOCUMENT` 和全托管 **Cortex Search**，极其适合强安全合规的企业知识库与 BI 融合；遇到非 SQL 覆盖的重度聚类或自定义模型，则退入 **SPCS（Snowpark Container Services）** 托管 GPU 容器。
-- **Databricks 押注“开放湖仓 + 批处理 AI Functions + 全栈可编程”**：除了开箱即用的 `ai_parse_document`、`ai_mask` 和 `ai_query`，Databricks 最大的底牌在于其底层本身就是分布式计算引擎（Spark + Photon + Lakeflow + **Ray on Spark**），因此在七阶段里的 **Stage 3（PB 级 MinHash WCC）与 Stage 4（大规模 GPU KMeans）** 上，Databricks 能比纯 SQL 数仓更平滑地承接超重型自定义分布式算法。
+| 物理执行池 | 承载的典型物理算子 | 核心并发与内存机制 |
+| --- | --- | --- |
+| **Async Object-IO Pool** | 惰性 `BlobRef` 拉取、Range Coalescing、Checkpoint 落盘 | 事件循环驱动高并发异步 HTTP，支持断线 Range 自动续传 |
+| **Native CPU SIMD Pool** | 列存扫描、SIMD 正则脱敏、MinHash 签名、`PrefixReorder`、RRF | 彻底绕开 Python GIL，用 Rust/C++ 向量化批处理吃满内存带宽 |
+| **GPU Dense Compute Pool** | 本地 Embedding、Balanced KMeans、簇内 FP16 GEMM (`E·E^T`) | 批组装满载显存算力，与有状态 KV-Cache 推理池物理隔离防显存碎片 |
+| **LLM Continuous-Batching Pool** | `AI_FILTER` / `AI_EXTRACT` / `AI_AGG` / 灰区裁判 | 常驻 vLLM / SGLang 连续批处理，输出端强制挂载 **Guided Decoding（JSON Schema / CFG 状态机）**，确保非结构化文本 100% 合法落回强类型 Arrow `STRUCT`/`ARRAY` 列 |
 
-### 4.2 当前业界的三种工程落地选型方案对比
+### 4.2 打破无状态 HTTP 黑洞：查询调度器与推理路由器的双向协同
 
-在 2026 年的真实生产环境中，没有任何单一工具能把这七项能力从 PB 级离线洗数到 10 ms 在线召回全部通吃。目前工业界成熟落地主要收敛为三种组合栈：
+目前绝大多数“SQL 调大模型”的实现，在查询引擎和 vLLM/SGLang 之间都只隔着一层无状态的 HTTP 客户端——SQL 引擎盲目按批发请求，推理集群盲目轮询调度。要让前面优化器费尽心思算出来的 `PrefixLocality` 真正变现，执行层必须在两个方向打通协同协议：
 
-| 落地栈类型 | 典型技术组合 | 对七大算子的覆盖度 | 优势与适用边界 |
-| :--- | :--- | :--- | :--- |
-| **方案 A：开放湖仓 AI-Native 栈（离线重度多模态首选）** | **Lance / Iceberg** + **Daft on Ray**（或 NeMo Curator）+ **FAISS / cuML** + **vLLM / SGLang** | **7/7 全覆盖**（离线批处理吞吐与成本比最高） | 零 JVM、原生多模态类型、严格流式背压与 Key 级断点续跑；适合基模预训练/后训练语料清洗、PB 级多模态加工。短板是不适合高并发亚秒级在线点查。 |
-| **方案 B：一体化云数仓托管栈（企业级治理首选）** | **Snowflake Cortex + SPCS** / **BigQuery + `bigframes`** / **Databricks AIR + Spark Connect** / **MaxCompute MaxFrame + Object Table** | **6/7 原生覆盖**（Stage 3/4 大规模图/聚类常借内置 Python/GPU 引擎完成） | 数据零出库、自带完整 RBAC/RLS 权限合规与 Serverless 弹性；最适合企业知识库 ETL、合同/客服 AI 富化与业务侧 AI-SQL 分析。 |
-| **方案 C：实时混合检索闭环栈（在线服务出口首选）** | **Hologres / StarRocks / Doris / PG（`pgvector`+`ParadeDB`）** + 增量 Dynamic Table + 推理网关 | 专精 **Stage 6（混合检索）+ 在线 Stage 2/5/7 拦截** | 支撑千并发毫秒级 RAG 混合召回（结构化过滤 + BM25 + ANN + RRF）、实时写入语义防重与 Agent 长期记忆服务；通常作为方案 A/B 离线提纯后的“在线服务层”。 |
+- **下行（前缀感知粘性路由）**：`AsyncLLMOperator` 不再轮询乱发微批，而是把优化器算出的前缀哈希随请求透传给推理路由层（如 SGLang Router、Mooncake 或 LMCache），确保共享同一长文档上下文的 SQL 行精准命中已经热缓存该 KV Block 的 GPU 节点。
+- **上行（拥塞反馈 + 按字节计费的有界背压）**：`AsyncLLMOperator` 采用非阻塞微批挂起，持续监听推理池的 TTFT、KV-Cache 水位与排队深度，用类 TCP AIMD 算法动态调节在途并发度；同时，相邻算子间的有界通道全部**按字节配额（而非行数）计费**——一旦上游 PDF 解码出现 10×–20× 内存膨胀或下游推理变慢，背压逐跳反压直至暂停对象存储拉取，从根源上把多模态 OOM 堵死。
+
+### 4.3 代价感知容错：让昂贵 GPU 作业免疫 Spot 抢占
+
+传统分布式 SQL 引擎的容错哲学是**血缘重算（Lineage Recomputation）**：某个 Worker 挂了，按 DAG 血缘重跑上游分区就行。这套逻辑在 CPU 批处理里几乎免费，可一旦上游算子是耗时数小时的百万行 LLM 推理，节点被抢占一次就意味着几百美元的 Token 账单付诸东流。
+
+因此，融合执行器的容错机制本身也必须是**代价感知的**：对单行 Cost 低于阈值的 CPU 算子继续沿用轻量血缘重算；对超过代价阈值的 LLM/GPU 算子，引擎自动在物理层挂载 **Row-Key 级幂等 Checkpoint Barrier**（类似 Daft `daft-checkpoint`），将已完成主键的结果异步持久化到对象存储。一旦便宜的 Spot GPU 节点被回收重启，底层自动对输入流执行 `Anti-Join` 跳过已落盘主键，上层 SQL 对此完全无感。
 
 ---
 
-## 五、学术界前沿调研（2024–2026）：语义查询优化与系统协同的五大方向
+## 五、第四块拼图：跑完之后怎么用？把离线清洗与在线检索缝回同一张表
 
-如果说工业界正在把“AI 函数塞进 SQL 语法”做扎实，那么 2024–2026 年数据库顶会（SIGMOD / VLDB / CIDR / ICML）的学术研究，则在全力攻克下一个更难的命题——**如何让优化器自动决定“用什么模型、按什么顺序、以什么物理布局执行，才能在精度达标的前提下把成本压到最低”**：
+如果故事只停在单次离线清洗跑通，生产系统很快就会冒出最后两道顽疾：第一，每周新增几万份合同时，难道要把千万级存量全量重跑一遍？第二，把结果导进外部向量库后，只要业务主表里删掉一份涉密合同、或者收回某个租户的行级权限，外部向量库如果同步延迟，RAG 检索就会立刻吐出越权的“幽灵数据”。
 
-1. **带统计学精度保障的语义代数与代理级联（LOTUS, VLDB 2025）**：
-   Stanford/Berkeley 提出的 **LOTUS** 形式化定义了 `sem_filter`、`sem_join`、`sem_agg`、`sem_topk`、`sem_dedup`、`sem_cluster_by` 等语义算子，核心突破在于**用小模型/Embedding 代理分值 + 统计学抽样校准（Importance Sampling / Conformal Calibration）**，在跳过 80%–90% 旗舰 LLM 调用的同时，严格保证最终查询结果的召回率与精确率满足用户设定的置信区间。
-2. **多目标帕累托物理计划搜索（Palimpzest / Abacus, CIDR 2025 / VLDB）**：
-   MIT 的 **Palimpzest** 及其代价优化器 **Abacus** 突破了传统数据库只优化单一“执行时间”的局限，把 **美元成本（Cost）、延迟（Latency）与输出质量（Quality）** 纳入统一三维帕累托前沿搜索——优化器不仅会在“小模型 vs 大模型”之间切换，还会自动评估是否能用 **LLM 合成的确定性 Python 代码 / 正则提取器** 替代逐行 LLM 调用。
-3. **Agentic 查询改写与长文档分解（DocETL, VLDB 2025）**：
-   UC Berkeley 的 **DocETL** 专门攻克传统 SQL 逻辑改写解决不了的“复杂非结构化长文档失效”问题：当单个 Prompt 任务过难或文档过长导致模型遗漏细节时，由优化 Agent 自动尝试 **Split（切块）→ Map → Reduce / Resolve（实体归并）** 以及 **Gleaning（二次反思校验）** 等语义等价改写计划，并在验证集上挑选准确率最高的物理管线。
-4. **KV-Cache 前缀感知的关系表重排（SOLO / Relational LLM Optimization, 2025–2026）**：
-   针对批量 SQL+LLM 场景下 Prefill 算力吃紧的问题，最新研究（如 **SOLO** 等算法）基于关系表的列基数与属性共现分布构建 **Radix Tree 拓扑**，同时重排查询输入的行顺序与 Prompt 内的列拼接顺序，把推理引擎的 **Prefix KV-Cache 命中率** 推向理论最优，在不牺牲 1% 精度的前提下成倍降低离线批量推理耗时。
-5. **多模态近似查询与分布感知语料治理（ThalamusDB / FlockMTL / SemDeDup / FineWeb-2）**：
-   - **ThalamusDB（SIGMOD 2024）**、**UQE** 与 DuckDB 生态的 **FlockMTL** 探索直接在轻量 SQL 内核中无缝执行多模态（图像/音频/文本）近似过滤与采样聚合；
-   - **SemDeDup / D4（Meta AI）** 与 **FineWeb-2 Rehydration（Hugging Face）** 则从算法层确立了 Stage 3–5 的黄金法则：**“去重不是删得越多越好”**——必须保留聚类簇规模元数据（`cluster_size`），在去除冗余的同时对高价值主题做受控回补重采样，避免破坏自然语料分布。
+要把这两道裂痕彻底缝合，存储层必须完成最后一步收口：
+
+- **一表多索引与事务一致性**：基于 **Iceberg v3 / Paimon Blob / Lance** 等多模态开放表格式，把结构化标量列、大对象 `BlobRef`、全文倒排（BM25）、高维向量索引（IVF/HNSW/DiskANN，直接复用前面 `SemanticPartition` 产出的聚类质心）以及血缘审计列（`raw_uri, pii_audit, cluster_id, survivor_id, model_ver`）全部纳入同一套表快照事务与行级权限（RLS）边界，让权限撤回与数据删除在混合检索中原子生效。
+- **管线即增量物化视图（Dynamic Table / IVM）**：整条 SQL × LLM 管线不再是周期全量重跑的离线脚本，而是声明在原始多模态表上的持续增量视图。当上游对象桶新增或删改文件时，只有 CDC 增量行穿过同一棵优化后的物理执行树，增量完成解析、脱敏、去重入簇、模型抽取与向量索引更新。
+
+顺着上面推演出的四块拼图——**类型与惰性扫描、正交代数与语义 CBO、异构执行与推理协同、统一表格式与增量闭环**——回头审视 2025–2026 年工业界最主流的五类落地栈，就能一眼看清各家真正补齐了哪几块、又在哪些地方留了取舍：
+
+| 落地栈 / 代表系统 | 类型与惰性扫描 | 正交代数与语义 CBO | 异构执行与推理协同 | 统一索引与增量闭环 | 最佳定位 |
+| --- | --- | --- | --- | --- | --- |
+| **Google BigQuery** | `Object Table` + 一等 `ObjectRef` | `ML.CREATE_MODEL(KMEANS)` + `VECTOR_SEARCH` / `AI.SEARCH` + `AI.IF` / `AI.GENERATE`（最接近全 Serverless SQL） | Dremel + Vertex AI 联邦推理；重型图/自定义解码回退 `bigframes` / Dataflow | 内置 ScaNN 向量索引 + 混合检索 | 强 Serverless SQL 一体化分析与轻中度多模态管线 |
+| **Snowflake Cortex AISQL** | Stage + 原生 `FILE` 类型 | 语义代数最接近学术界 LOTUS（`AI_PARSE_DOCUMENT`、`AI_FILTER`、`AI_JOIN`、`AI_AGG`） | 托管 Cortex 推理；超重型聚类/定制模型退入 **SPCS** 托管 GPU 容器 | **Cortex Search**（BM25+向量）+ Dynamic Table 自动增量同步 | 强安全治理的企业知识库 ETL 与 BI × AI 融合 |
+| **Databricks Mosaic AI** | Unity Catalog Volumes + Delta `VARIANT` / Binary | `ai_parse_document` / `ai_mask` / `ai_query` + Spark MLlib / GraphFrames | **Spark + Photon + Ray on Spark**，天然扛住 PB 级图 WCC 与 GPU 集群聚类 | Mosaic AI Vector Search + Lakeflow Delta Sync 增量维护 | 开放湖仓 + 超大规模自定义分布式算法与批处理 |
+| **开放湖仓 AI-Native 栈**（Lance/Iceberg + Daft on Ray + vLLM/SGLang） | Lance Blob v2 / Iceberg + 零拷贝 Arrow | DataFrame / SQL 原语 + 原生多模态算子，正快速引入前缀重排与级联优化 | **四池解耦最彻底**：Rust 原生 SIMD + 有界流式背压 + 独立 vLLM 池 + Key 级 Checkpoint | Lance 一体化标量/Blob/IVF-PQ/BM25，离线批吞吐性价比最高 | 基模预训练/后训练 PB 级语料清洗与重度多模态加工 |
+| **实时混合检索服务栈**（Hologres / StarRocks / Doris / PG） | 行列混存或列存 + 标量/向量共存 | 专精高并发 `IndexANNJoin`（Pre/Iterative-filter）+ BM25 RRF + 在线轻量拦截 | 低延迟 MPP/协程引擎 + 外联推理网关 | Dynamic Table 实时增量索引 + 完整 RLS 权限 | 千并发亚秒级 RAG 在线召回与 Agent 长期记忆服务层 |
 
 ---
 
-## 六、当下工程最佳实践与未来发展趋势（2026–2028）
+## 六、回到架构原点：落地边界与未来演进
 
-### 6.1 当下生产落地的五条最佳实践（Best Practices）
+顺着开篇那个问题一路推演到底，一套 SQL × LLM 融合引擎其实并不神秘。落地到真实工程团队时，有五条边界清晰的原则值得守住：
 
-无论选用方案 A、B 还是 C，在 2026 年把这七阶段融合管线真正跑稳、跑省钱，有五条经过大量踩坑验证的最佳实践必须守住：
+1. **只沉淀正交原语，绝不把业务工序写死进内核**：业务需求会不停演变，内核只守住 `BlobRef` 扫描、四类正交代数算子、多目标语义 CBO、四池异步执行器和统一开放表格式这几个稳定扩展点。
+2. **用字节背压与簇容量上限锁死两条 OOM 红线**：多模态链路最容易爆内存的永远是两处——文档/视频解码 20× 内存膨胀与 `SimilarityJoin` 局部 \(O(m^2)\) 展开。前者靠全链路按字节计费的有界背压治理，后者靠 `SemanticPartition` 均衡切分加 GPU 分块 GEMM 兜底。
+3. **靠“代理级联 + 前缀重排 + Key 级 Checkpoint”守住 GPU 账单**：三项叠加，通常能把千万级文档的 LLM 批处理费用压低一个数量级，同时让团队敢于大规模使用廉价 Spot GPU。
+4. **语义阈值靠评测集闭环，不靠拍脑袋**：无论是去重相似度阈值、聚类簇数还是代理级联的灰区边界，都应绑定固定 Golden Eval Set 或下游指标自动校准，并将血缘审计列随主表一起落盘。
+5. **逻辑声明统一，物理执行允许专精分工**：PB 级离线多模态语料清洗与毫秒级高并发在线 RAG 在物理架构上短期内仍会各自专精，但它们正借由 **Apache Arrow 内存格式**与 **Iceberg / Paimon / Lance 开放表格式**在逻辑层彻底合流。
 
-1. **严守“廉价优先”漏斗单调性与代理级联**：七个阶段的单行处理成本横跨 **4–5 个数量级**（元数据裁剪 < 正则脱敏 < MinHash 哈希 < Embedding/KMeans < 旗舰 LLM 推理）。严禁倒置算子顺序；凡是能用正则、BM25 或 4B/8B 小模型解决 85% 明确样本的环节，绝不让 70B+ 模型全表空转。
-2. **用流式背压与 Blocking 守住两条 OOM 红线**：全链路最容易炸内存的两个节点是 **Stage 1–2 的非结构化解码放大（20×）** 与 **Stage 5 的 Pairwise 展开（`O(m²)`）**。前者必须用有界通道背压（`channel(1)`）和字节加权分片，后者必须靠 Balanced KMeans 限制单簇规模 + GPU FP16 GEMM 分块计算。
-3. **增量维护 + Key 级幂等 Checkpoint 双保险**：针对持续新增数据的日常管线，优先用 **Dynamic Tables / Lakeflow IVM** 只对 CDC 增量行触发解析与 Embedding；针对百卡小时级的大模型离线批处理，务必在写入端采用 **Key 级三态幂等 Checkpoint**，重启自动跳过已处理主键，放心使用廉价抢占式（Spot）GPU。
-4. **评估驱动的阈值治理与一等血缘资产**：MinHash 的 Jaccard 阈值、SemDeDup 的余弦阈值、模型级联的置信度阈值绝不能拍脑袋设定，而必须由固定 **Golden Eval Set 或小尺寸代理模型（Proxy Model）** 的下游指标裁决；每阶段同步沉淀 `(raw_uri, pii_audit, minhash_cluster, kmeans_cluster, survivor_id, model_ver)` 血缘表，支撑版权审计、GDPR 删数与效果回溯。
-5. **物理分层解耦，逻辑声明统一**：不要幻想用一个单核进程吃掉“对象存储解析 + 万亿图收敛 + GPU 矩阵聚类 + vLLM 连续批推理”。真正高扩展的架构，是**在逻辑层用统一的 SQL / DataFrame 声明式 IR 与开放表格式（Arrow / Iceberg / Lance）消除心智割裂，在物理层放手让最适合的专用引擎各司其职**。
-
-### 6.2 未来 2–3 年的四大演进趋势（2026–2028）
-
-沿着当前工业界与学术界的合流轨迹，这套七阶段 AI 数据管线正在向四个方向演进：
-
-1. **从“手写 AI 函数语法糖”迈向“真正的多目标语义 CBO”**：
-   今天你在 Snowflake / BigQuery / Databricks 里写 `AI_EXTRACT` 或 `AI_FILTER`，大多还要手动指定模型名和级联参数；未来 2 年，**Palimpzest / LOTUS 式的帕累托优化器**将正式进入主流云数仓和 Daft 内核——用户只需声明“准确率 ≥ 95% 且单次作业预算 ≤ 500 美元”，优化器自动在代码规则、小模型、大模型、谓词顺序与采样策略间搜索最优物理计划。
-2. **查询引擎与推理引擎的跨层协议协同（Prefix-Aware Routing + 共享 KV 层）**：
-   目前 SQL/DataFrame 引擎与 vLLM/SGLang 之间还隔着一层无状态的 HTTP/gRPC 接口。下一代架构将打通**查询规划器与推理路由器的协同协议**——引擎在按前缀重排批次的同时，把前缀哈希提示直接传给分布式 KV Cache 路由层（如 Mooncake / LMCache / SGLang Router），确保共享同一长文档上下文的 SQL 行精准落到已缓存该 KV 块的 GPU 节点上。
-3. **多模态开放表格式合流（Iceberg v3 / Paimon Blob / Lance）**：
-   结构化列、百 MB 级非结构化 Blob、倒排全文索引（BM25）与高维向量索引（IVF/HNSW/DiskANN）正在统一收敛到同一套开放湖仓表格式与 Catalog 之下，彻底终结“元数据在湖里、文件在裸桶里、向量在外部库里”的三分裂时代。
-4. **自演化管线：“将稳定的 LLM 算子自动蒸馏为确定性代码”**：
-   对于长期周期性运行的 ETL 管线（如解析固定格式发票、提取标准化日志字段），每天重复花钱调 LLM 是巨大的浪费。结合 DocETL 与 Palimpzest 的代码合成思想，未来的 AI 数据平台将具备**在线自蒸馏能力**——先用旗舰 LLM 跑通冷启动并积累标注样本，一旦检测到数据模式稳定，系统自动合成高速确定性 Python/Regex/轻量微调小模型替换昂贵的 LLM 算子，仅在检测到数据分布漂移（Drift）时自动回退大模型复核，将长期运行成本再压低 1–2 个数量级。
+往后看两到三年，SQL 引擎与大模型融合的主线已经十分明朗：**一是**从今天仍需显式指定模型名与级联阈值，迈向只需声明“精度目标 + 预算上限”的**多目标帕累托语义 CBO**；**二是**打通查询优化器的 `PrefixLocality` 物理属性与分布式 KV-Cache 路由层（Mooncake / LMCache / SGLang Router）的**跨层协同协议**；**三是**在线**自蒸馏闭环**走向成熟——让数据库自动将模式稳定的 LLM 算子编译为高速确定性代码或小模型，仅在数据分布漂移时唤起旗舰大模型兜底，真正把大模型能力内化成关系引擎的一等基础原语。
 
 ---
 
 > **参考与调研基线**
-> - **工业界三大云数仓公开文档（2025–2026）**：Google Cloud BigQuery（`Object Table` / `ObjectRef`、`ML.CREATE_MODEL(KMEANS)`、`VECTOR_SEARCH` / `AI.SEARCH`、`AI.GENERATE` / `AI.IF`）；Snowflake Cortex AISQL（`AI_PARSE_DOCUMENT`、`AI_FILTER`、`AI_JOIN`、`AI_AGG`、`AI_SIMILARITY`、Cortex Search 与 SPCS）；Databricks Mosaic AI（`ai_parse_document`、`ai_mask`、`ai_query`、`ai_prep_search`、Mosaic AI Vector Search 与 Lakeflow）。
-> - **SQL + LLM 语义算子与优化前沿**：Patel et al., *LOTUS: Semantic Operators: A Declarative Model for AI-Based Analytics* (VLDB 2025) · Liu et al., *Palimpzest / Abacus: Optimizing AI-Powered Analytical Queries* (CIDR 2025 / VLDB) · Shankar et al., *DocETL: Agentic Query Rewriting and Evaluation for Complex Document Processing* (VLDB 2025) · *ThalamusDB* (SIGMOD 2024) · DuckDB *FlockMTL* · 关系表 Prefix-Cache 感知重排研究（*SOLO* 等 2025–2026 前沿）。
-> - **多模态去重与向量聚类管线**：Meta AI *SemDeDup* & *D4* 论文 · Hugging Face *FineWeb / FineWeb-2* 技术报告 · NVIDIA NeMo Curator & RAPIDS cuML / FAISS GPU 官方文档 · Daft + Lance 多模态湖仓架构文档。
+> - **SQL × LLM 语义算子、优化与前缀重排前沿**：Patel et al., *LOTUS: Semantic Operators: A Declarative Model for AI-Based Analytics* (VLDB 2025) · Liu et al., *Palimpzest / Abacus: Optimizing AI-Powered Analytical Queries* (CIDR 2025 / VLDB) · Shankar et al., *DocETL: Agentic Query Rewriting and Evaluation for Complex Document Processing* (VLDB 2025) · *ThalamusDB* (SIGMOD 2024) · DuckDB *FlockMTL* · 关系表 Prefix-Cache 感知重排研究（*SOLO* 等 2025–2026 前沿）。
+> - **工业界云数仓与 AI-Native 栈公开文档（2025–2026）**：Google Cloud BigQuery（`Object Table`/`ObjectRef`、BQML、`VECTOR_SEARCH`/`AI.SEARCH`、`AI.IF`/`AI.GENERATE`）；Snowflake Cortex AISQL（`FILE`、`AI_PARSE_DOCUMENT`、`AI_FILTER`/`AI_JOIN`/`AI_AGG`、Cortex Search、SPCS）；Databricks Mosaic AI（Unity Catalog Volumes、`ai_parse_document`/`ai_mask`/`ai_query`、Photon、Ray on Spark、Mosaic AI Vector Search）；Daft + Lance / Iceberg v3 / Paimon Blob 与 vLLM / SGLang / Mooncake 公开架构文档。
+> - **多模态去重与向量聚类实证**：Meta AI *SemDeDup* & *D4* · Hugging Face *FineWeb / FineWeb-2* 技术报告 · NVIDIA NeMo Curator & RAPIDS cuML / FAISS GPU 官方文档。

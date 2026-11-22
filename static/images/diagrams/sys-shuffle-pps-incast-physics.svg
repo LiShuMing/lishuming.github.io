@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 600" width="1120" height="600" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">大规模 M×N Shuffle 物理瓶颈解剖：Linux PPS 墙与交换机 TCP Incast / RoCEv2 PFC 风暴</title>
+  <desc id="desc">展示 30TB 级集群按核直连 Shuffle 如何分别撞上 Linux 协议栈与网卡 PPS 墙（带宽利用率不足 5% 却打满软中断），以及同步齐发如何打爆 ToR 交换机浅 SRAM 缓冲并触发 200ms TCP RTO 阶梯长尾或 RoCEv2 PFC 扩散风暴。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .zone-red { fill: #ffffff; stroke: #dc2626; stroke-width: 1.6; rx: 10; }
+      .zone-amber { fill: #ffffff; stroke: #d97706; stroke-width: 1.6; rx: 10; }
+      .zone-green { fill: #ffffff; stroke: #059669; stroke-width: 1.6; rx: 10; }
+      .hdr-r { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #b91c1c; }
+      .hdr-o { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #b45309; }
+      .hdr-g { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #047857; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.6px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.2px; font-weight: 600; fill: #0f172a; }
+      .t-tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .t-tag-o { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .card-r { fill: #fef2f2; stroke: #ef4444; stroke-width: 1.3; rx: 8; }
+      .card-o { fill: #fffbeb; stroke: #f59e0b; stroke-width: 1.3; rx: 8; }
+      .card-b { fill: #eff6ff; stroke: #3b82f6; stroke-width: 1.3; rx: 8; }
+      .card-g { fill: #ecfdf5; stroke: #10b981; stroke-width: 1.3; rx: 8; }
+      .card-s { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.2; rx: 8; }
+      .arr-r { stroke: #dc2626; stroke-width: 1.8; fill: none; }
+      .arr-o { stroke: #d97706; stroke-width: 1.8; fill: none; }
+    </style>
+    <marker id="m-r" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#dc2626"/>
+    </marker>
+    <marker id="m-o" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="600" class="bg"/>
+
+  <rect x="20" y="18" width="1080" height="194" class="zone-red"/>
+  <text x="38" y="42" class="hdr-r">物理病灶一：Linux 协议栈与网卡 PPS 墙（Per-Packet 固定成本吞噬全部 CPU 与包转发额度）</text>
+
+  <rect x="38" y="58" width="230" height="136" class="card-s"/>
+  <text x="52" y="79" class="t-h">1. 按并发直连切碎微包</text>
+  <text x="52" y="98" class="t-m">4,096 行 Chunk ÷ 8,192 下游</text>
+  <text x="52" y="117" class="t-s">• 每条通道均摊 &lt; 1 行</text>
+  <text x="52" y="135" class="t-s">• 有效载荷仅 64 ~ 128 B</text>
+  <text x="52" y="153" class="t-s">• 跨连接小包无法触发网卡</text>
+  <text x="52" y="170" class="t-s">  TSO / GSO / GRO 硬件卸载</text>
+
+  <path d="M 268 126 L 302 126" class="arr-r" marker-end="url(#m-r)"/>
+
+  <rect x="304" y="58" width="256" height="136" class="card-r"/>
+  <text x="318" y="79" class="t-h">2. 按“包个数”计费的内核链路</text>
+  <text x="318" y="98" class="t-m">sendmsg → sk_buff → ksoftirqd</text>
+  <text x="318" y="117" class="t-s">• RPC 封包 / 序列化 + 系统调用</text>
+  <text x="318" y="135" class="t-s">• 内核 sk_buff 分配与回收</text>
+  <text x="318" y="153" class="t-s">• L2/L3/L4 查表校验 + epoll 唤醒</text>
+  <text x="318" y="171" class="t-s">• 网卡硬件中断 + DMA 描述符环</text>
+
+  <path d="M 560 126 L 594 126" class="arr-r" marker-end="url(#m-r)"/>
+
+  <rect x="596" y="58" width="236" height="136" class="card-r"/>
+  <text x="610" y="79" class="t-h">3. 撞上 1 Mpps 天花板</text>
+  <text x="610" y="98" class="t-m">25 Gbps 网卡 / 1 Mpps 上限</text>
+  <text x="610" y="118" class="t-tag-r">10^6 × 128 B ≈ 128 MB/s</text>
+  <text x="610" y="137" class="t-s">• 网卡实际带宽利用率 &lt; 5%</text>
+  <text x="610" y="155" class="t-s">• CPU %si（软中断）与 %sys 飙红</text>
+  <text x="610" y="173" class="t-s">• 云上 ENI / vSwitch 直接限流丢包</text>
+
+  <path d="M 832 126 L 866 126" class="arr-r" marker-end="url(#m-r)"/>
+
+  <rect x="868" y="58" width="214" height="136" class="card-b"/>
+  <text x="882" y="79" class="t-h">Linux 线上诊断指纹</text>
+  <text x="882" y="99" class="t-m">sar -n DEV 1</text>
+  <text x="882" y="115" class="t-s">txpck/s 高、平均包长 ≪ 1500B</text>
+  <text x="882" y="135" class="t-m">mpstat -P ALL 1</text>
+  <text x="882" y="151" class="t-s">%si 极高，perf 热点在 tcp_sendmsg</text>
+  <text x="882" y="171" class="t-m">ethtool -S eth0</text>
+  <text x="882" y="186" class="t-s">tx/rx_dropped 或 ENI PPS 限速</text>
+
+  <rect x="20" y="228" width="1080" height="218" class="zone-amber"/>
+  <text x="38" y="252" class="hdr-o">物理病灶二：ToR 交换机浅缓冲与多对一拥塞崩溃（TCP 200ms RTO 阶梯 / RoCEv2 PFC 风暴）</text>
+
+  <rect x="38" y="268" width="214" height="160" class="card-o"/>
+  <text x="52" y="289" class="t-h">1. 同步齐发（Many-to-One）</text>
+  <text x="52" y="309" class="t-m">Sender 0..63 同序 0→N-1</text>
+  <text x="52" y="329" class="t-s">• 64 台物理机在同一微秒</text>
+  <text x="52" y="346" class="t-s">  同时向 Node 0 灌入分区 0</text>
+  <text x="52" y="366" class="t-s">• 瞬时汇聚入速率达到</text>
+  <text x="52" y="383" class="t-tag-o">64 × 25 Gbps ≫ 单口 25 Gbps</text>
+  <text x="52" y="405" class="t-s">• 形成微秒级同步微突发</text>
+
+  <path d="M 252 348 L 286 348" class="arr-o" marker-end="url(#m-o)"/>
+
+  <rect x="288" y="268" width="232" height="160" class="card-o"/>
+  <text x="302" y="289" class="t-h">2. ToR 交换机浅缓冲溢出</text>
+  <text x="302" y="309" class="t-m">Shared SRAM ≈ 几十 MB</text>
+  <text x="302" y="329" class="t-s">• 单出口队列仅数百 KB ~ 数 MB</text>
+  <text x="302" y="347" class="t-s">• 几十微秒内出端口队列打满</text>
+  <text x="302" y="368" class="t-tag-r">TCP：尾部丢包（Tail Drop）</text>
+  <text x="302" y="388" class="t-tag-o">RoCEv2：触发 PFC Pause 帧</text>
+  <text x="302" y="408" class="t-s">  若扩散则酿成 PFC Storm 队头阻塞</text>
+
+  <path d="M 520 348 L 554 348" class="arr-o" marker-end="url(#m-o)"/>
+
+  <rect x="556" y="268" width="276" height="160" class="card-r"/>
+  <text x="570" y="289" class="t-h">3. 凑不齐 3 Dup ACK → 坠入 RTO</text>
+  <text x="570" y="309" class="t-m">Linux 默认 RTO_min = 200 ms</text>
+  <text x="570" y="329" class="t-s">• 并发流过多压小 cwnd 或末尾丢包</text>
+  <text x="570" y="347" class="t-s">• 无法触发微秒级 Fast Retransmit</text>
+  <text x="570" y="367" class="t-tag-r">200ms RTO = 1,000~4,000× RTT</text>
+  <text x="570" y="387" class="t-s">• 阶段 Barrier 等最慢流重传完毕</text>
+  <text x="570" y="405" class="t-s">• 99% 节点空转，整体吞吐断崖暴跌</text>
+
+  <path d="M 832 348 L 866 348" class="arr-o" marker-end="url(#m-o)"/>
+
+  <rect x="868" y="268" width="214" height="160" class="card-b"/>
+  <text x="882" y="289" class="t-h">Incast 经典指纹</text>
+  <text x="882" y="310" class="t-tag-r">P99/P999 = 200 / 400 / 600ms</text>
+  <text x="882" y="328" class="t-s">精准卡在 200ms 整数倍阶梯</text>
+  <text x="882" y="348" class="t-m">nstat -az TcpExtTCPTimeouts</text>
+  <text x="882" y="365" class="t-s">RTO 计数与重传段突增</text>
+  <text x="882" y="385" class="t-m">ss -ti</text>
+  <text x="882" y="402" class="t-s">rto 飙升、cwnd 骤降；交换机</text>
+  <text x="882" y="418" class="t-s">出端口 buffer drop / ECN 暴涨</text>
+
+  <rect x="20" y="462" width="1080" height="120" class="zone-green"/>
+  <text x="38" y="486" class="hdr-g">联合根治闭环：一次同时拆掉“PPS 墙”与“Incast / PFC 拥塞”的三层协同防线</text>
+
+  <rect x="38" y="500" width="334" height="68" class="card-g"/>
+  <text x="52" y="520" class="t-h">应用与执行层（降扇出 + 破共振）</text>
+  <text x="52" y="538" class="t-s">• Node-level 合并攒批（64–256KB）+ BRPC 连接复用</text>
+  <text x="52" y="555" class="t-s">• 错峰发包 (i + k) % P + 接收端 Credit 背压流控</text>
+
+  <rect x="392" y="500" width="334" height="68" class="card-g"/>
+  <text x="406" y="520" class="t-h">Linux 内核与协议层（保低水位 + 砍长尾）</text>
+  <text x="406" y="538" class="t-s">• 开启 TSO/GSO/GRO + 9000B Jumbo Frame + fq Pacing</text>
+  <text x="406" y="555" class="t-s">• ECN + DCTCP 提前降速 + TLP (RFC 8985) + rto_min 5–10ms</text>
+
+  <rect x="746" y="500" width="336" height="68" class="card-g"/>
+  <text x="760" y="520" class="t-h">硬件旁路与异构拓扑（RDMA / GPU）</text>
+  <text x="760" y="538" class="t-s">• RoCEv2 + DCQCN 精细 ECN 水位，防止盲目触发 PFC</text>
+  <text x="760" y="555" class="t-s">• GPU 机内 NVLink 预聚合 + 跨机 GPUDirect RDMA 发大块</text>
+</svg>

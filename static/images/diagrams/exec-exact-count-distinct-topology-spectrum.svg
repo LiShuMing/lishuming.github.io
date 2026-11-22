@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" width="1080" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">分布式精确 COUNT(DISTINCT) 执行拓扑谱系：3/4 阶段、倾斜打散与多列 Distinct 路线对决</title>
+  <desc id="desc">上半部分对比单列精确去重在三阶段、四阶段与 Salting 打散下的 Shuffle 次数与抗倾斜能力；下半部分对比多列 COUNT(DISTINCT) 的 Expand 展开、专用 HashSet、CTE 拆分与 MarkDistinct/共享基数表四条工业路线。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.6px; font-weight: 600; fill: #475569; }
+      .box-slate { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 10.9px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.2px; fill: #0f172a; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .flow-s { stroke: #475569; stroke-width: 1.7; fill: none; }
+      .flow-b { stroke: #2563eb; stroke-width: 1.7; fill: none; }
+      .flow-g { stroke: #059669; stroke-width: 1.7; fill: none; }
+      .flow-a { stroke: #d97706; stroke-width: 1.7; fill: none; }
+    </style>
+    <marker id="arr-s" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="620" class="bg"/>
+
+  <!-- Top Section: Single Distinct 3-stage vs 4-stage vs Salting -->
+  <rect x="20" y="16" width="1040" height="316" class="panel"/>
+  <text x="38" y="40" class="p-title">一、单列精确 COUNT(DISTINCT d) GROUP BY g：网络次数与抗倾斜的三档演进</text>
+  <text x="1042" y="40" text-anchor="end" class="p-sub">核心矛盾：去重必须汇聚相同 (g, d)，但仅按 g 汇聚会撞上热点倾斜 OOM</text>
+
+  <!-- 3-Stage Column -->
+  <rect x="38" y="56" width="320" height="258" class="box-blue"/>
+  <text x="52" y="76" class="tag-b">形态 A · 三阶段聚合（1 次 Shuffle）</text>
+  <rect x="54" y="88" width="288" height="34" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="198" y="109" text-anchor="middle" class="t-m">1. Local Agg: GROUP BY (g, d)</text>
+  <path d="M 198 122 L 198 144" class="flow-b" marker-end="url(#arr-b)"/>
+  <text x="208" y="137" class="tag-b">Shuffle by (g)</text>
+  <rect x="54" y="148" width="288" height="34" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="198" y="169" text-anchor="middle" class="t-m">2. Distinct Global: 去重 (g, d)</text>
+  <path d="M 198 182 L 198 202" class="flow-b" marker-end="url(#arr-b)"/>
+  <text x="208" y="196" class="t-s">本地直连（无网络）</text>
+  <rect x="54" y="206" width="288" height="34" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="198" y="227" text-anchor="middle" class="t-m">3. Final Global: COUNT(d) BY g</text>
+  <text x="52" y="260" class="t-s">✓ 适用：g 基数高且均匀（省 1 次 Shuffle）</text>
+  <text x="52" y="278" class="t-s">✗ 死穴：g 基数低（如国家/NULL）单节点 OOM</text>
+  <text x="52" y="296" class="t-m">代表：StarRocks / Doris / Hologres 默认优先尝试</text>
+
+  <!-- 4-Stage Column -->
+  <rect x="380" y="56" width="320" height="258" class="box-green"/>
+  <text x="394" y="76" class="tag-g">形态 B · 四阶段聚合（2 次 Shuffle）</text>
+  <rect x="396" y="88" width="288" height="30" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="540" y="107" text-anchor="middle" class="t-m">1. Local Agg: GROUP BY (g, d)</text>
+  <path d="M 540 118 L 540 135" class="flow-g" marker-end="url(#arr-g)"/>
+  <text x="550" y="130" class="tag-g">Shuffle by (g, d)</text>
+  <rect x="396" y="139" width="288" height="30" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="540" y="158" text-anchor="middle" class="t-m">2. Distinct Global (g, d) → 3. Partial COUNT(g)</text>
+  <path d="M 540 169 L 540 187" class="flow-g" marker-end="url(#arr-g)"/>
+  <text x="550" y="182" class="tag-g">Shuffle by (g)（数据极小）</text>
+  <rect x="396" y="191" width="288" height="30" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="540" y="210" text-anchor="middle" class="t-m">4. Final Global: SUM(partial_cnt) BY g</text>
+  <text x="394" y="242" class="t-s">✓ 适用：g 低基数/倾斜或全局无 GROUP BY</text>
+  <text x="394" y="260" class="t-s">✓ 靠 d 的高 NDV 把热点 g 均匀打散到全集群</text>
+  <text x="394" y="278" class="t-s">✗ 代价：多 1 次轻 Shuffle；d 自身倾斜仍偏斜</text>
+  <text x="394" y="296" class="t-m">见 StarRocks SplitMultiPhaseAggRule</text>
+
+  <!-- Salting Column -->
+  <rect x="722" y="56" width="320" height="258" class="box-amber"/>
+  <text x="736" y="76" class="tag-a">形态 C · 分桶打散 / Salting（抗热键）</text>
+  <rect x="738" y="88" width="288" height="34" fill="#ffffff" stroke="#fcd34d" stroke-width="1.2" rx="6"/>
+  <text x="882" y="109" text-anchor="middle" class="t-m">派生桶列 b = murmur_hash3(d) % B</text>
+  <path d="M 882 122 L 882 144" class="flow-a" marker-end="url(#arr-a)"/>
+  <text x="892" y="137" class="tag-a">Shuffle by (g, b)</text>
+  <rect x="738" y="148" width="288" height="34" fill="#ffffff" stroke="#fcd34d" stroke-width="1.2" rx="6"/>
+  <text x="882" y="169" text-anchor="middle" class="t-m">内层：COUNT(DISTINCT d) BY (g, b)</text>
+  <path d="M 882 182 L 882 202" class="flow-a" marker-end="url(#arr-a)"/>
+  <text x="892" y="196" class="tag-a">Shuffle by (g)</text>
+  <rect x="738" y="206" width="288" height="34" fill="#ffffff" stroke="#fcd34d" stroke-width="1.2" rx="6"/>
+  <text x="882" y="227" text-anchor="middle" class="t-m">外层：SUM(bucket_cnt) BY g</text>
+  <text x="736" y="260" class="t-s">✓ 打破三阶段按 g 聚合的热点单点死局</text>
+  <text x="736" y="278" class="t-s">⚠ 若已走四阶段且 NDV(d) &gt; B，加 Salt 纯属冗余</text>
+  <text x="736" y="296" class="t-m">见 GroupByCountDistinctDataSkewEliminateRule</text>
+
+  <!-- Bottom Section: Multi-Distinct 4 Architectures -->
+  <rect x="20" y="346" width="1040" height="258" class="panel"/>
+  <text x="38" y="370" class="p-title">二、多列精确去重 COUNT(DISTINCT a), COUNT(DISTINCT b), ... 的四条工业路线对决</text>
+  <text x="1042" y="370" text-anchor="end" class="p-sub">根本权衡：网络行膨胀（k×） vs 单点内存状态 vs 多次扫描/CTE 物化</text>
+
+  <rect x="38" y="388" width="240" height="200" class="box-red"/>
+  <text x="50" y="408" class="tag-r">路线 1 · Expand / Repeat 行展开</text>
+  <text x="50" y="428" class="t-h">Spark / Hologres / Hive</text>
+  <text x="50" y="449" class="t-m">1 行 → 复制 k 行 + gid 标记</text>
+  <text x="50" y="468" class="t-s">把多 Distinct 统一折叠进一次</text>
+  <text x="50" y="484" class="t-s">Shuffle 与统一 Hash 聚合。</text>
+  <text x="50" y="505" class="t-s"><tspan font-weight="700" fill="#047857">优点：</tspan>单次扫描、计划简单</text>
+  <text x="50" y="523" class="t-s"><tspan font-weight="700" fill="#b91c1c">死穴：</tspan>30TB × k 倍 Shuffle 放大，</text>
+  <text x="50" y="539" class="t-s">k≥4 时网络与内存极易雪崩。</text>
+  <text x="50" y="564" class="t-m">适用：小中规模表 / k=2</text>
+
+  <rect x="292" y="388" width="240" height="200" class="box-blue"/>
+  <text x="304" y="408" class="tag-b">路线 2 · 专用多去重算子</text>
+  <text x="304" y="428" class="t-h">StarRocks / Doris multi_distinct</text>
+  <text x="304" y="449" class="t-m">AggState 内嵌多张 HashSet</text>
+  <text x="304" y="468" class="t-s">不复制输入行，按 g 分发后在算</text>
+  <text x="304" y="484" class="t-s">子内部为 a、b 各自维护去重集合。</text>
+  <text x="50" y="505" class="t-s"></text>
+  <text x="304" y="505" class="t-s"><tspan font-weight="700" fill="#047857">优点：</tspan>零行膨胀，单 Tablet 极快</text>
+  <text x="304" y="523" class="t-s"><tspan font-weight="700" fill="#b91c1c">死穴：</tspan>无 GROUP BY 会聚到单点，</text>
+  <text x="304" y="539" class="t-s">且中间态序列化与内存占用重。</text>
+  <text x="304" y="564" class="t-m">见 MultiDistinctByMultiFuncRewriter</text>
+
+  <rect x="546" y="388" width="240" height="200" class="box-green"/>
+  <text x="558" y="408" class="tag-g">路线 3 · CTE 拆分 + Join 合流</text>
+  <text x="558" y="428" class="t-h">StarRocks CTE / Trino SPLIT</text>
+  <text x="558" y="449" class="t-m">CTE 共享扫描 → k 路独立聚合</text>
+  <text x="558" y="468" class="t-s">每路独立享受 3/4 阶段与倾斜打散，</text>
+  <text x="558" y="484" class="t-s">末端按 GROUP BY 键 Join 拼回。</text>
+  <text x="558" y="505" class="t-s"><tspan font-weight="700" fill="#047857">优点：</tspan>零行膨胀、天然抗倾斜、</text>
+  <text x="558" y="521" class="t-s">原生支持 COUNT(DISTINCT a, b)</text>
+  <text x="558" y="539" class="t-s"><tspan font-weight="700" fill="#b91c1c">代价：</tspan>CTE 缓存 + 多路 Join 开销</text>
+  <text x="558" y="564" class="t-m">见 MultiDistinctByCTERewriter</text>
+
+  <rect x="800" y="388" width="242" height="200" class="box-purple"/>
+  <text x="812" y="408" class="tag-p">路线 4 · MarkDistinct / 共享基数表</text>
+  <text x="812" y="428" class="t-h">Trino / DuckDB / Bitmap 协同</text>
+  <text x="812" y="449" class="t-m">打标去重 / 公共输入复用哈希表</text>
+  <text x="812" y="468" class="t-s">• Trino MarkDistinct：单遍打布尔标</text>
+  <text x="812" y="484" class="t-s">• DuckDB：相同列多聚合共用一张</text>
+  <text x="812" y="500" class="t-s">  RadixPartitionedHashTable</text>
+  <text x="812" y="520" class="t-s">• 存储协同：全局字典 + Roaring</text>
+  <text x="812" y="536" class="t-s">  Bitmap（Snowflake/SR/Doris）把</text>
+  <text x="812" y="552" class="t-s">  Distinct 彻底降维成可合并位图。</text>
+  <text x="812" y="572" class="t-m">大数据集近似逃生舱：HLL++</text>
+</svg>

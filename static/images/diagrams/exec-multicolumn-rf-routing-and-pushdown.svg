@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" width="1080" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">多列全局 Runtime Filter 跨 Exchange 路由与下推边界，以及学术界 Predicate Transfer 演进</title>
+  <desc id="desc">左侧拆解多列 Shuffle Join 下全局多分区 Runtime Filter 如何携带全部 partition_by_exprs 跨过 ExchangeNode 并在 Scan 节点按复合哈希索引分区 Bloom Filter，以及为何不能下推至单列存储索引；右侧对比单列组合误放行与多表 Predicate Transfer 演进。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.6px; font-weight: 600; fill: #475569; }
+      .box-slate { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 11px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.2px; fill: #0f172a; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .flow-s { stroke: #475569; stroke-width: 1.8; fill: none; }
+      .flow-g { stroke: #059669; stroke-width: 1.8; fill: none; }
+      .flow-b { stroke: #2563eb; stroke-width: 1.8; fill: none; }
+      .flow-r { stroke: #dc2626; stroke-width: 1.8; fill: none; stroke-dasharray: 5 3; }
+      .flow-p { stroke: #7c3aed; stroke-width: 1.8; fill: none; }
+    </style>
+    <marker id="arr-s" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#dc2626"/>
+    </marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="620" class="bg"/>
+
+  <!-- Left Panel: Multi-Column Global RF End-to-End Routing -->
+  <rect x="20" y="16" width="632" height="588" class="panel"/>
+  <text x="38" y="40" class="p-title">一、多列 Shuffle Join 全局 Runtime Filter 端到端路由（StarRocks #57269）</text>
+  <text x="38" y="58" class="p-sub">SQL: fact l JOIN [SHUFFLE] dim r ON l.c0 = r.c0 AND l.c1 = r.c1</text>
+
+  <!-- Step 1: Build Instances -->
+  <rect x="38" y="74" width="596" height="84" class="box-blue"/>
+  <text x="52" y="94" class="tag-b">1. HASH JOIN BUILD 侧（按 hash(r.c0, r.c1) % N 分区构建）</text>
+  <rect x="52" y="104" width="176" height="42" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="62" y="122" class="t-m">Build Inst 0</text>
+  <text x="62" y="138" class="t-s">RF(c0)[0], RF(c1)[0]</text>
+  <rect x="246" y="104" width="176" height="42" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="256" y="122" class="t-m">Build Inst 1</text>
+  <text x="256" y="138" class="t-s">RF(c0)[1], RF(c1)[1]</text>
+  <rect x="440" y="104" width="180" height="42" fill="#ffffff" stroke="#93c5fd" stroke-width="1.2" rx="6"/>
+  <text x="450" y="122" class="t-m">Build Inst N-1</text>
+  <text x="450" y="138" class="t-s">RF(c0)[N-1], RF(c1)[N-1]</text>
+
+  <path d="M 336 158 L 336 184" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Step 2: Merge Node -->
+  <rect x="38" y="190" width="596" height="72" class="box-purple"/>
+  <text x="52" y="210" class="tag-p">2. GLOBAL MERGE NODE（Concat 拼接多分区数组而非混为一个大 Bloom Filter）</text>
+  <text x="52" y="230" class="t-m">ComposedRuntimeFilter = MinMax + _hash_partition_bf[0 .. N-1]</text>
+  <text x="52" y="248" class="t-s">保留分桶边界可大幅降低单个 SimdBlockFilter 装载率与假阳性率，同时支持 Bucket/Colocate 对齐</text>
+
+  <path d="M 336 262 L 336 290" class="flow-p" marker-end="url(#arr-p)"/>
+  <text x="350" y="281" class="tag-p">跨 ExchangeNode 广播下推（FE 校验 partitionByExprs 全为 SlotRef）</text>
+
+  <!-- Step 3: Scan Node Chunk-level evaluation -->
+  <rect x="38" y="296" width="596" height="148" class="box-green"/>
+  <text x="52" y="316" class="tag-g">3. SCAN 算子层评估（_eval_runtime_filters · Chunk 粒度）</text>
+  <text x="52" y="338" class="t-h">关键动作：必须同时读取 partition_by_exprs = [l.c0, l.c1] 计算分区桶号</text>
+  <rect x="52" y="350" width="268" height="78" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="64" y="370" class="t-m">Step A: 联合分区路由</text>
+  <text x="64" y="388" class="t-m">bucket = hash(l.c0, l.c1) % N</text>
+  <text x="64" y="406" class="t-s">缺少任一分区列都无法定位目标桶</text>
+  <text x="64" y="420" class="t-s">（支持全局分区与 Pipeline 级多分区）</text>
+
+  <path d="M 320 389 L 350 389" class="flow-g" marker-end="url(#arr-g)"/>
+
+  <rect x="356" y="350" width="264" height="78" fill="#ffffff" stroke="#6ee7b7" stroke-width="1.2" rx="6"/>
+  <text x="368" y="370" class="t-m">Step B: 靶向测试分区过滤器</text>
+  <text x="368" y="388" class="t-m">MinMax(l.c0) &amp;&amp; bf[bucket].test(l.c0)</text>
+  <text x="368" y="406" class="t-s">剔除不匹配行后再进 Exchange Shuffle，</text>
+  <text x="368" y="420" class="t-s">把昂贵的跨机网络传输前置消灭</text>
+
+  <!-- Blocked pushdown to storage -->
+  <path d="M 336 444 L 336 478" class="flow-r" marker-end="url(#arr-r)"/>
+  <text x="350" y="466" class="tag-r">禁止下推（olap_scan_prepare.cpp: num_partition_by_exprs &gt; 1）</text>
+
+  <!-- Step 4: Storage Engine Boundary -->
+  <rect x="38" y="484" width="596" height="102" class="box-red"/>
+  <text x="52" y="504" class="tag-r">4. 存储层 SegmentIterator 边界（延迟物化与单列谓词的天然冲突）</text>
+  <text x="52" y="525" class="t-h">为什么多列分区 RF 不能直接下推为存储层 ColumnPredicate？</text>
+  <text x="52" y="546" class="t-s">• 存储层按列顺序读 Page（延迟物化）：读列 l.c0 时，列 l.c1 尚未解码，无法算出 hash(l.c0, l.c1)</text>
+  <text x="52" y="564" class="t-s">• 仅单列 RF 或 Broadcast RF（无需分区哈希）可直接下推 ZoneMap / Bitset / Parquet RowGroup 剪枝</text>
+  <text x="52" y="578" class="t-m">  例外：MinMax 边界不依赖分区桶，仍可独立提取用于区间裁剪</text>
+
+  <!-- Right Panel: Conceptual Distinction & Evolution -->
+  <rect x="668" y="16" width="392" height="588" class="panel"/>
+  <text x="686" y="40" class="p-title">二、核心辨析与演进：从局部 RF 到多表传递</text>
+  <text x="686" y="58" class="p-sub">为什么“多个单列 RF”≠“复合键联合过滤”</text>
+
+  <!-- Case 1: Correlation False Positive -->
+  <rect x="686" y="74" width="356" height="162" class="box-amber"/>
+  <text x="700" y="94" class="tag-a">反例：相关列下的单列 RF 假阳性失效</text>
+  <text x="700" y="114" class="t-m">Build 侧仅有 2 行: (CN, 2026), (US, 2020)</text>
+  <text x="700" y="133" class="t-m">Probe 侧海量垃圾行: (CN, 2020)</text>
+  <text x="700" y="155" class="t-s">• 独立单列 RF：c0∈{CN,US} ✓ 且 c1∈{2026,2020} ✓</text>
+  <text x="700" y="172" class="t-s">  → 全部误放行！过滤率 = 0%</text>
+  <text x="700" y="193" class="t-s">• 复合键联合 BF：hash(c0, c1) 仅含 2 个组合</text>
+  <text x="700" y="210" class="t-s">  → (CN, 2020) 瞬间拦截，过滤率 ≈ 99%</text>
+  <text x="700" y="226" class="t-m">权衡：复合 BF 需多列同时求值，无法下推单列索引</text>
+
+  <!-- Case 2: Industry Spectrum -->
+  <rect x="686" y="252" width="356" height="166" class="box-slate"/>
+  <text x="700" y="272" class="t-h">工业界四类主流落地点</text>
+  <text x="700" y="294" class="t-s"><tspan font-weight="700" fill="#1d4ed8">Trino / Photon DFP</tspan>：推至文件/Split 级元数据剪枝</text>
+  <text x="700" y="314" class="t-s"><tspan font-weight="700" fill="#047857">StarRocks / Doris</tspan>：MinMax + SIMD Bloom + Bitset</text>
+  <text x="700" y="330" class="t-s">  + 分区数组跨 Exchange 下推与动态自适应等待</text>
+  <text x="700" y="350" class="t-s"><tspan font-weight="700" fill="#b45309">DuckDB / Velox</tspan>：紧耦合 RowGroup / VectorHasher，</text>
+  <text x="700" y="366" class="t-s">  融合 InFilter / PrefixRange / PerfectHash 剪枝</text>
+  <text x="700" y="386" class="t-s"><tspan font-weight="700" fill="#6d28d9">Snowflake / BigQuery</tspan>：Micro-Partition 多列</text>
+  <text x="700" y="402" class="t-s">  统计自动裁剪 + Serverless Shuffle 阶段动态重平衡</text>
+
+  <!-- Case 3: Academic Frontier -->
+  <rect x="686" y="434" width="356" height="152" class="box-purple"/>
+  <text x="700" y="454" class="tag-p">学术界前沿：从局部 SIP 到 RPT+（2017 → 2025）</text>
+  <text x="700" y="476" class="t-m">1. LIP (SIGMOD'17)：星型多维表 BF 级联预过滤</text>
+  <text x="700" y="496" class="t-m">2. Predicate Transfer (CIDR'24)：</text>
+  <text x="700" y="512" class="t-s">   借 Yannakakis 前向/后向两趟 Bloom 传递消解多表膨胀</text>
+  <text x="700" y="532" class="t-m">3. Robust PT / RPT+ (VLDB'25 · DuckDB 实验)：</text>
+  <text x="700" y="548" class="t-s">   非对称传递砍掉冗余 BF 构造，运行时监测选择率，</text>
+  <text x="700" y="564" class="t-s">   低收益自动熔断，兼顾最坏情况鲁棒性与极速热路径</text>
+</svg>

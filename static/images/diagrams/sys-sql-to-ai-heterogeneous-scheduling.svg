@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 540" width="1120" height="540" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">从传统 SQL 一维槽位调度到 AI 时代多维 CPU/GPU 异构调度的范式跃迁</title>
+  <desc id="desc">左右对比传统 OLAP 的一维 LogicalSlot 与同构 CNGroup 水平副本调度，以及 AI 多模态集群的多维资源向量 DRF、Gang 拓扑碎片整理、CPU/GPU 解耦独立伸缩和 Checkpoint 秒级换卡恢复。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .left { fill: #ffffff; stroke: #2563eb; stroke-width: 1.6; rx: 10; }
+      .right { fill: #ffffff; stroke: #7c3aed; stroke-width: 1.8; rx: 10; }
+      .hdr-b { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #1d4ed8; }
+      .hdr-p { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #6d28d9; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.6px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 600; fill: #0f172a; }
+      .card-b { fill: #eff6ff; stroke: #60a5fa; stroke-width: 1.2; rx: 7; }
+      .card-p { fill: #f5f3ff; stroke: #a78bfa; stroke-width: 1.2; rx: 7; }
+      .card-g { fill: #ecfdf5; stroke: #34d399; stroke-width: 1.2; rx: 7; }
+      .card-o { fill: #fffbeb; stroke: #f59e0b; stroke-width: 1.2; rx: 7; }
+      .arr { stroke: #475569; stroke-width: 1.8; fill: none; }
+      .pill { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.2; rx: 6; }
+    </style>
+    <marker id="ma" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="540" class="bg"/>
+
+  <!-- Left Panel: Traditional SQL OLAP Scheduling -->
+  <rect x="20" y="18" width="490" height="504" class="left"/>
+  <text x="38" y="46" class="hdr-b">传统 OLAP / 云数仓调度范式（同构 CPU 池）</text>
+  <text x="38" y="65" class="t-m">StarRocks V2 · Snowflake · ClickHouse · BigQuery</text>
+
+  <rect x="38" y="82" width="454" height="92" class="card-b"/>
+  <text x="52" y="102" class="t-h">1. 资源建模：一维逻辑槽位（1D Slot）</text>
+  <text x="52" y="121" class="t-s">• 节点配置同构（固定 CPU:Mem 比例），可用单一 Slot 近似</text>
+  <text x="52" y="138" class="t-s">• 核心矛盾：防止 1 个大查询堵死或打爆 1,000 个小查询</text>
+  <text x="52" y="156" class="t-m">策略：SWRR / SJF+Aging + CPU/IO 权重 + Spill 兜底</text>
+
+  <rect x="38" y="188" width="454" height="96" class="card-b"/>
+  <text x="52" y="208" class="t-h">2. 弹性单元：同构 Cluster / CNGroup 水平副本</text>
+  <text x="52" y="227" class="t-s">• 并发激增直接复制整套同构计算组，单查询在组内闭环执行</text>
+  <text x="52" y="244" class="t-s">• 离线/离群大查询卸载给共享 Serverless 池（QAS / On-Demand）</text>
+  <text x="52" y="262" class="t-m">冷启动：秒级（热池拉无状态计算进程，无几十 GB 模型权重）</text>
+
+  <rect x="38" y="298" width="454" height="96" class="card-b"/>
+  <text x="52" y="318" class="t-h">3. 流控粒度：行/批次级管道，内存相对可预测</text>
+  <text x="52" y="337" class="t-s">• 结构化标量列紧凑，单行几十到几百字节</text>
+  <text x="52" y="354" class="t-s">• 仅需防范 Join/Agg 倾斜导致的算子内存膨胀（Spill 可化解）</text>
+  <text x="52" y="372" class="t-m">准入 + 内存仲裁器即可覆盖绝大多数突发风险</text>
+
+  <rect x="38" y="408" width="454" height="96" class="card-b"/>
+  <text x="52" y="428" class="t-h">4. 缩容与容错：等待自然排空（Graceful Drain）</text>
+  <text x="52" y="447" class="t-s">• 查询多为毫秒~分钟级，摘除新流量后等存量跑完即可销毁</text>
+  <text x="52" y="464" class="t-s">• 节点偶发宕机直接重算整条查询或上游 Stage，代价可接受</text>
+  <text x="52" y="482" class="t-m">Draining 超时兜底 + 一致性哈希保热缓存</text>
+
+  <!-- Center Transition Arrows -->
+  <path d="M 510 128 L 574 128" class="arr" marker-end="url(#ma)"/>
+  <path d="M 510 236 L 574 236" class="arr" marker-end="url(#ma)"/>
+  <path d="M 510 346 L 574 346" class="arr" marker-end="url(#ma)"/>
+  <path d="M 510 456 L 574 456" class="arr" marker-end="url(#ma)"/>
+
+  <rect x="518" y="114" width="52" height="24" class="pill"/>
+  <text x="544" y="130" text-anchor="middle" class="t-m">升维</text>
+  <rect x="518" y="222" width="52" height="24" class="pill"/>
+  <text x="544" y="238" text-anchor="middle" class="t-m">解耦</text>
+  <rect x="518" y="332" width="52" height="24" class="pill"/>
+  <text x="544" y="348" text-anchor="middle" class="t-m">背压</text>
+  <rect x="518" y="442" width="52" height="24" class="pill"/>
+  <text x="544" y="458" text-anchor="middle" class="t-m">续跑</text>
+
+  <!-- Right Panel: AI Heterogeneous Scheduling -->
+  <rect x="580" y="18" width="520" height="504" class="right"/>
+  <text x="598" y="46" class="hdr-p">AI / 多模态时代异构调度范式（CPU + GPU + 拓扑）</text>
+  <text x="598" y="65" class="t-m">K8s Kueue / Volcano / Karpenter · Ray Data · Daft</text>
+
+  <rect x="598" y="82" width="484" height="92" class="card-p"/>
+  <text x="612" y="102" class="t-h">1. 多维资源向量 + DRF + 双向防饿死</text>
+  <text x="612" y="121" class="t-s">• 强耦合向量：[CPU, Mem, GPU, VRAM, NVLink/IB 拓扑]</text>
+  <text x="612" y="138" class="t-s">• 双向踩踏：既防大作业 OOM，更防碎小作业占满空隙饿死 64-GPU 大作业</text>
+  <text x="612" y="156" class="t-m">策略：Volcano DRF + Gang 原子准入 + Kueue 拓扑碎片整理抢占</text>
+
+  <rect x="598" y="188" width="484" height="96" class="card-g"/>
+  <text x="612" y="208" class="t-h">2. 异构算力池解耦独立伸缩 + 权重热池</text>
+  <text x="612" y="227" class="t-s">• CPU 解码/清洗池与 GPU 推理池彻底拆开，按积压队列与显存水位独立弹性</text>
+  <text x="612" y="244" class="t-s">• 几十 GB 大模型权重加载耗时长 → 强依赖 GPU Warm Pool + P2P/RDMA 权重缓存</text>
+  <text x="612" y="262" class="t-m">热点推理模型公共服务化（共享常驻显存 + Dynamic Batching）</text>
+
+  <rect x="598" y="298" width="484" height="96" class="card-o"/>
+  <text x="612" y="318" class="t-h">3. 按字节配额的深度流式背压（防 20× 解码爆炸）</text>
+  <text x="612" y="337" class="t-s">• 多模态 PDF/视频解码存在 10–20× 内存放大，不能按行数排队</text>
+  <text x="612" y="354" class="t-s">• Ray Data 四维算子预算 + Daft Swordfish 深度优先流式执行 + Out-of-Core Spill</text>
+  <text x="612" y="372" class="t-m">GPU TTFT / KV-Cache 水位反向驱动 AIMD 调并发</text>
+
+  <rect x="598" y="408" width="484" height="96" class="card-p"/>
+  <text x="612" y="428" class="t-h">4. 潮汐/抢占式容错：秒级换卡 + Row-Key Checkpoint</text>
+  <text x="612" y="447" class="t-s">• Spot / 混部 GPU 被回收时无法干等 10 分钟 Drain，重算 Token 成本极高</text>
+  <text x="612" y="464" class="t-s">• 昂贵 GPU 算子内置细粒度 Row-Key 异步 Checkpoint + 幂等 Anti-Join 续跑</text>
+  <text x="612" y="482" class="t-m">Karpenter ProvisioningRequest 联动队列按精准卡型秒级补齐</text>
+</svg>

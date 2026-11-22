@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 600" width="1080" height="600" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">增量计算第一性原理：Z-Set 符号权重与三类关系算子的状态账单</title>
+  <desc id="desc">展示一次行更新如何编码为带符号权重的 Z-Set 变更流，并沿着线性算子、双线性连接与非线性有状态算子分化出截然不同的内存状态与维护复杂度。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #475569; }
+      .box-slate { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 11.2px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.5px; fill: #0f172a; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .flow-s { stroke: #475569; stroke-width: 1.8; fill: none; }
+      .flow-g { stroke: #059669; stroke-width: 1.8; fill: none; }
+      .flow-b { stroke: #2563eb; stroke-width: 1.8; fill: none; }
+      .flow-a { stroke: #d97706; stroke-width: 1.8; fill: none; }
+      .flow-r { stroke: #dc2626; stroke-width: 1.8; fill: none; stroke-dasharray: 5 3; }
+    </style>
+    <marker id="arr-s" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#d97706"/>
+    </marker>
+    <marker id="arr-r" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#dc2626"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="600" class="bg"/>
+
+  <!-- Top Input Band: CDC -> Z-Set -->
+  <rect x="20" y="16" width="1040" height="114" class="panel"/>
+  <text x="38" y="40" class="p-title">输入层：把表变更统一编码为带符号多重集（Z-Set / Oriented Multiset）</text>
+  <text x="1042" y="40" text-anchor="end" class="p-sub">同一批次内 +1 / -1 自动抵消，消解更新顺序依赖</text>
+
+  <rect x="38" y="54" width="290" height="62" class="box-slate"/>
+  <text x="52" y="76" class="t-h">原始 DML / 表内 CDC 事件</text>
+  <text x="52" y="96" class="t-m">UPDATE orders SET amt=90 WHERE id=42</text>
+  <text x="52" y="110" class="t-s">旧值 100 → 新值 90；若再改回 100 则净变为 0</text>
+
+  <path d="M 328 85 L 366 85" class="flow-s" marker-end="url(#arr-s)"/>
+
+  <rect x="372" y="54" width="330" height="62" class="box-purple"/>
+  <text x="386" y="75" class="tag-p">Z-SET ABELIAN GROUP (row → weight ∈ ℤ)</text>
+  <text x="386" y="95" class="t-m">ΔA = { (42, 100) ↦ -1,  (42, 90) ↦ +1 }</text>
+  <text x="386" y="110" class="t-s">合法物化状态满足 weight ≥ 0；下溢即报错阻断</text>
+
+  <path d="M 702 85 L 740 85" class="flow-s" marker-end="url(#arr-s)"/>
+
+  <rect x="746" y="54" width="296" height="62" class="box-slate"/>
+  <text x="760" y="76" class="t-h">DBSP / TVR 微分核心问题</text>
+  <text x="760" y="95" class="t-m">Q^Δ = D ∘ Q ∘ I   (ΔV = Q(A+ΔA) ⊖ Q(A))</text>
+  <text x="760" y="110" class="t-s">不同算子是否“可微”决定状态规模与维护代价</text>
+
+  <!-- Routing arrows from top band to 3 tiers -->
+  <path d="M 200 130 L 200 156" class="flow-g" marker-end="url(#arr-g)"/>
+  <path d="M 540 130 L 540 156" class="flow-b" marker-end="url(#arr-b)"/>
+  <path d="M 880 130 L 880 156" class="flow-a" marker-end="url(#arr-a)"/>
+
+  <!-- Tier 1: Linear -->
+  <rect x="20" y="162" width="328" height="270" class="panel"/>
+  <rect x="34" y="176" width="300" height="32" rx="6" fill="#ecfdf5" stroke="#059669" stroke-width="1.2"/>
+  <text x="46" y="196" class="tag-g">TIER 1 · 线性算子 (Linear / Bag-Homomorphic)</text>
+
+  <text x="38" y="232" class="t-h">Filter (σ) / Project (π) / Union All (∪)</text>
+  <text x="38" y="254" class="t-m">Δ(σ_p(X)) = σ_p(ΔX)</text>
+  <text x="38" y="272" class="t-m">Δ(π_c(X)) = π_c(ΔX)</text>
+  <text x="38" y="290" class="t-m">Δ(X ∪ Y)  = ΔX ∪ ΔY</text>
+
+  <rect x="34" y="308" width="300" height="110" class="box-green"/>
+  <text x="48" y="328" class="t-h">状态账单：理论上零状态（Stateless）</text>
+  <text x="48" y="350" class="t-s">• 维护代价：严格 O(|Δ|)，不碰历史数据</text>
+  <text x="48" y="370" class="t-s">• 唯一前提：表达式必须确定性（禁 rand/now）</text>
+  <text x="48" y="390" class="t-s">• 工程陷阱：若像朴素图引擎那样为每个节点</text>
+  <text x="48" y="406" class="t-s">  缓存完整关系，TPC-H/DS 约 73% 是死状态</text>
+
+  <!-- Tier 2: Bilinear -->
+  <rect x="366" y="162" width="348" height="270" class="panel"/>
+  <rect x="380" y="176" width="320" height="32" rx="6" fill="#eff6ff" stroke="#2563eb" stroke-width="1.2"/>
+  <text x="392" y="196" class="tag-b">TIER 2 · 双线性算子 (Bilinear / Inner Join)</text>
+
+  <text x="384" y="232" class="t-h">Inner / Cross Join (⋈)：Δ 与 Σ 必须并存</text>
+  <text x="384" y="254" class="t-m">Δ(A ⋈ B) = (ΔA ⋈ B_old) ∪ (A_new ⋈ ΔB)</text>
+  <text x="384" y="272" class="t-m">         = ΔA⋈B_old + A_old⋈ΔB + ΔA⋈ΔB</text>
+  <text x="384" y="292" class="t-s">等价写法：optd 用 Union(B, ⊖ΔB) 构造 B_old</text>
+
+  <rect x="380" y="308" width="320" height="110" class="box-blue"/>
+  <text x="394" y="328" class="t-h">状态账单：双侧按 Join Key 建持久索引</text>
+  <text x="394" y="350" class="t-s">• 状态体积：O(|A| + |B|)（Arranged Trace）</text>
+  <text x="394" y="370" class="t-s">• 维护代价：O(|ΔA|·deg_B + |ΔB|·deg_A)</text>
+  <text x="394" y="390" class="t-s">• 翻车拐点：热点键高扇出或双侧大比例更新</text>
+  <text x="394" y="406" class="t-s">  时，增量探测代价会反超全量 Hash Join</text>
+
+  <!-- Tier 3: Nonlinear -->
+  <rect x="732" y="162" width="328" height="270" class="panel"/>
+  <rect x="746" y="176" width="300" height="32" rx="6" fill="#fffbeb" stroke="#d97706" stroke-width="1.2"/>
+  <text x="758" y="196" class="tag-a">TIER 3 · 非线性算子 (Threshold / Extrema / Rank)</text>
+
+  <text x="750" y="230" class="t-h">必须维护专用状态，按结构复杂度分层：</text>
+  <text x="750" y="252" class="t-s">1. <tspan class="t-m">SUM/COUNT/整AVG</tspan> → 可逆累加器 O(|Δ|)</text>
+  <text x="750" y="272" class="t-s">2. <tspan class="t-m">DISTINCT / Outer / Semi / Anti</tspan></text>
+  <text x="750" y="288" class="t-s">   → 过零点跃迁（Match-Count 0↔1 状态机）</text>
+  <text x="750" y="308" class="t-s">3. <tspan class="t-m">MIN / MAX</tspan> → 不可逆！需维护有序索引</text>
+  <text x="750" y="324" class="t-s">   (懒删堆 heapq / BTree ValueIndex, O(log D))</text>
+  <text x="750" y="344" class="t-s">4. <tspan class="t-m">浮点 SUM/AVG</tspan> → 舍入误差不可逆，回退重算</text>
+
+  <rect x="746" y="356" width="300" height="62" class="box-red"/>
+  <text x="760" y="376" class="tag-r">CLIFF · Sort / Limit / 全局窗口</text>
+  <text x="760" y="395" class="t-s">删除第 K 名需从全量候补补位；易退化为</text>
+  <text x="760" y="410" class="t-s">局部/全量重算（optd 原始 SQL 最大阻塞点）</text>
+
+  <!-- Bottom Summary Strip -->
+  <rect x="20" y="450" width="1040" height="132" class="panel"/>
+  <text x="38" y="476" class="p-title">一条核心工程铁律：增量不是无条件更便宜，而是“用常驻状态空间 + 增量维护代价”对赌“周期全量重算”</text>
+
+  <rect x="38" y="492" width="314" height="74" class="box-slate"/>
+  <text x="52" y="512" class="t-h">1. 正确性红线（Fail-Closed）</text>
+  <text x="52" y="532" class="t-s">任何未解析的 Δ 标记、非确定性函数、或</text>
+  <text x="52" y="548" class="t-s">NULL-aware Anti 全局依赖必须显式阻断或回退</text>
+
+  <path d="M 352 529 L 380 529" class="flow-s" marker-end="url(#arr-s)"/>
+
+  <rect x="386" y="492" width="314" height="74" class="box-slate"/>
+  <text x="400" y="512" class="t-h">2. 优化器三维账本（Cost Model）</text>
+  <text x="400" y="532" class="t-s">必须同时估算：初始构建 (Bootstrap) +</text>
+  <text x="400" y="548" class="t-s">单轮维护 (Maintenance) + 常驻状态 (State)</text>
+
+  <path d="M 700 529 L 728 529" class="flow-s" marker-end="url(#arr-s)"/>
+
+  <rect x="734" y="492" width="308" height="74" class="box-slate"/>
+  <text x="748" y="512" class="t-h">3. 全局 DAG 联动（Enzyme / Tempura）</text>
+  <text x="748" y="532" class="t-s">上游图省事走 Full Refresh 会摧毁细粒度 Δ，</text>
+  <text x="748" y="548" class="t-s">迫使整条下游物化视图链跟着全量重算</text>
+</svg>

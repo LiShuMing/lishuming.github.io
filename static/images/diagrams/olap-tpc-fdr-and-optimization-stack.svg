@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 620" width="1120" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">2026 TPC-H / TPC-DS 公开 FDR 物理密码与 OLAP 引擎全栈优化图谱</title>
+  <desc id="desc">上半部分对照 2026 年公开 TPC-DS 100TB（MaxCompute QA 2.0、Tencent DLC）与 TPC-H 3TB/30TB（Hologres 4.1 / V1.3）的硬件配比与 DDL 布局密码；下半部分展示跨越四道物理墙的五层 OLAP 全栈优化体系。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .zone-top { fill: #ffffff; stroke: #2563eb; stroke-width: 1.6; rx: 10; }
+      .zone-bot { fill: #ffffff; stroke: #059669; stroke-width: 1.6; rx: 10; }
+      .hdr-b { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #1d4ed8; }
+      .hdr-g { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 13.5px; font-weight: 700; fill: #047857; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11.8px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.4px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.1px; font-weight: 600; fill: #0f172a; }
+      .t-tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .t-tag-o { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .t-tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .t-tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .card-b { fill: #eff6ff; stroke: #3b82f6; stroke-width: 1.25; rx: 8; }
+      .card-p { fill: #f5f3ff; stroke: #8b5cf6; stroke-width: 1.25; rx: 8; }
+      .card-g { fill: #ecfdf5; stroke: #10b981; stroke-width: 1.25; rx: 8; }
+      .card-o { fill: #fffbeb; stroke: #f59e0b; stroke-width: 1.25; rx: 8; }
+      .card-s { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 1.2; rx: 8; }
+      .arr { stroke: #059669; stroke-width: 1.6; fill: none; }
+    </style>
+    <marker id="m-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="620" class="bg"/>
+
+  <!-- TOP ZONE: 2026 TPC FDR DECODING -->
+  <rect x="20" y="16" width="1080" height="252" class="zone-top"/>
+  <text x="38" y="40" class="hdr-b">一、从 2026 公开 TPC-DS / TPC-H FDR 数字反推架构密码（每条红利都对应真实的物理约束）</text>
+
+  <!-- Card 1: MaxCompute SF100000 -->
+  <rect x="38" y="54" width="252" height="198" class="card-b"/>
+  <text x="50" y="74" class="t-h">MaxCompute QA 2.0 (SF100000)</text>
+  <text x="50" y="92" class="t-tag-b">133.5M QphDS · 20.36 CNY/kQphDS</text>
+  <text x="50" y="111" class="t-m">64 Pod · 2,048 vCPU · 8 TB RAM</text>
+  <text x="50" y="128" class="t-m">16 Gbps · 1,600 CU · AliORC</text>
+  <text x="50" y="148" class="t-s">• 无 PARTITIONED BY，24 表全用</text>
+  <text x="50" y="164" class="t-s">  CLUSTERED BY + SORTED BY</text>
+  <text x="50" y="182" class="t-s">• 9 大表 1,600 桶（按 item_sk 对齐 CU）</text>
+  <text x="50" y="198" class="t-s">  桶内按 date 排序 + 15 维表 1 桶</text>
+  <text x="50" y="216" class="t-s">• 仅 8TB 内存 + 16Gbps 扛 100TB：</text>
+  <text x="50" y="232" class="t-s">  靠分桶共置砍 Shuffle + ESSD 稳 Spill</text>
+
+  <!-- Card 2: Tencent DLC SF100000 -->
+  <rect x="304" y="54" width="252" height="198" class="card-p"/>
+  <text x="316" y="74" class="t-h">Tencent DLC SuperSQL (SF100000)</text>
+  <text x="316" y="92" class="t-tag-p">653.6M QphDS · 11.04 CNY/kQphDS</text>
+  <text x="316" y="111" class="t-m">Intel Xeon 6983P-C · 4,544 核</text>
+  <text x="316" y="128" class="t-m">总价 721.5 万 CNY（现行 #1）</text>
+  <text x="316" y="148" class="t-s">• 核数约 2.2×，QphDS 跃升 4.9×</text>
+  <text x="316" y="166" class="t-s">• 单位性价比（CNY/kQphDS）进一步</text>
+  <text x="316" y="182" class="t-s">  压低近一半（11.04 vs 20.36）</text>
+  <text x="316" y="202" class="t-s">• 印证高密新一代 CPU + 高带宽</text>
+  <text x="316" y="218" class="t-s">  在 100TB 复杂雪花查询上的非线性</text>
+  <text x="316" y="234" class="t-s">  扩展与内存驻留吞吐红利</text>
+
+  <!-- Card 3: Hologres 4.1 SF3000 -->
+  <rect x="570" y="54" width="252" height="198" class="card-g"/>
+  <text x="582" y="74" class="t-h">Hologres 4.1 (TPC-H SF3000)</text>
+  <text x="582" y="92" class="t-tag-g">8.44M QphH · 390.47 CNY/kQphH</text>
+  <text x="582" y="111" class="t-m">64 Worker · 1,040 vCPU · 4.16 TB</text>
+  <text x="582" y="128" class="t-m">100 Gbps · 320 Shards · Pangu v2</text>
+  <text x="582" y="148" class="t-s">• Power 8.79M vs 8 流 Throughput</text>
+  <text x="582" y="164" class="t-s">  8.11M，几乎 1:1 无并发退化！</text>
+  <text x="582" y="182" class="t-s">• 320 Shards（每 Worker 5 Shard）</text>
+  <text x="582" y="198" class="t-s">  按 distribution_key 均匀分布</text>
+  <text x="582" y="216" class="t-s">• 内存/原始数据比仅 1.39×，表级无副本</text>
+  <text x="582" y="232" class="t-s">  冗余交由 Pangu 多副本与纠删码</text>
+
+  <!-- Card 4: Hologres V1.3 SF30000 -->
+  <rect x="836" y="54" width="246" height="198" class="card-o"/>
+  <text x="848" y="74" class="t-h">Hologres V1.3 (2022 SF30000)</text>
+  <text x="848" y="92" class="t-tag-o">27.87M QphH（历史里程碑对照）</text>
+  <text x="848" y="111" class="t-m">459 容器 · 11,000 vCPU · 88 TB</text>
+  <text x="848" y="128" class="t-m">25 Gbps · 3,456 Shards · Pangu</text>
+  <text x="848" y="148" class="t-s">• 内存/原始数据比 2.93×，热数据全驻</text>
+  <text x="848" y="164" class="t-s">  内存缓冲，规避冷盘随机读</text>
+  <text x="848" y="182" class="t-s">• 25 Gbps 窄网下靠 Table Group 共置</text>
+  <text x="848" y="198" class="t-s">  把 lineitem×orders 变成零 Shuffle</text>
+  <text x="848" y="216" class="t-s">• 对比 4.1：单核效能与内存紧凑度</text>
+  <text x="848" y="232" class="t-s">  在四年迭代中实现数倍代际跃迁</text>
+
+  <!-- BOTTOM ZONE: 5-LAYER FULL-STACK OPTIMIZATION -->
+  <rect x="20" y="284" width="1080" height="318" class="zone-bot"/>
+  <text x="38" y="308" class="hdr-g">二、贯穿 TPC-H / TPC-DS 的五层全栈优化图谱（直击 I/O 墙、Cache 墙、基数误差墙与内存悬崖）</text>
+
+  <!-- Layer 1 -->
+  <rect x="38" y="324" width="196" height="258" class="card-s"/>
+  <text x="50" y="346" class="t-h">Layer 1 · 物理布局与裁剪</text>
+  <text x="50" y="364" class="t-tag-b">先消灭 80% I/O 与 Shuffle</text>
+  <text x="50" y="388" class="t-s">• Hash Clustering / Table Group</text>
+  <text x="50" y="405" class="t-s">  Colocation（对齐 CU/Shard）</text>
+  <text x="50" y="427" class="t-s">• SORTED BY / Z-Order 多维排布</text>
+  <text x="50" y="444" class="t-s">  + AliORC/Parquet ZoneMap</text>
+  <text x="50" y="466" class="t-s">• 维度表 1 Bucket / Broadcast</text>
+  <text x="50" y="488" class="t-s">• LSM + 存算分离缓存吸收</text>
+  <text x="50" y="505" class="t-s">  RF1/RF2 实时更新与删除</text>
+  <text x="50" y="532" class="t-m">击穿：I/O 放大 + 窄网卡墙</text>
+
+  <path d="M 234 452 L 250 452" class="arr" marker-end="url(#m-g)"/>
+
+  <!-- Layer 2 -->
+  <rect x="252" y="324" width="196" height="258" class="card-b"/>
+  <text x="264" y="346" class="t-h">Layer 2 · 逻辑代数改写</text>
+  <text x="264" y="364" class="t-tag-b">消除不该发生的扫描与 Join</text>
+  <text x="264" y="388" class="t-s">• General Unnesting（BTW'15）</text>
+  <text x="264" y="405" class="t-s">  任意相关子查询机械去关联</text>
+  <text x="264" y="427" class="t-s">• Subquery → Window（Q2/Q17）</text>
+  <text x="264" y="444" class="t-s">  两遍扫描 + Join 压成单扫</text>
+  <text x="264" y="466" class="t-s">• 代价驱动 CTE Reuse（Orca）</text>
+  <text x="264" y="488" class="t-s">• Eager Agg / ROLLUP 下推</text>
+  <text x="264" y="505" class="t-s">• Ranking Window → PartitionTopN</text>
+  <text x="264" y="532" class="t-m">击穿：重复扫描 + 组合膨胀</text>
+
+  <path d="M 448 452 L 464 452" class="arr" marker-end="url(#m-g)"/>
+
+  <!-- Layer 3 -->
+  <rect x="466" y="324" width="196" height="258" class="card-g"/>
+  <text x="478" y="346" class="t-h">Layer 3 · CBO 与信息旁路</text>
+  <text x="478" y="364" class="t-tag-g">穿越基数估计不确定性迷雾</text>
+  <text x="478" y="388" class="t-s">• DPccp / DPhyp / Cascades</text>
+  <text x="478" y="405" class="t-s">  15+ 表超图 Bushy 搜索</text>
+  <text x="478" y="427" class="t-s">• SIP 革命：Blocked Bloom →</text>
+  <text x="478" y="444" class="t-s">  LIP → Predicate Transfer (RPT+)</text>
+  <text x="478" y="466" class="t-s">• Diamond Hardened Joins</text>
+  <text x="478" y="488" class="t-s">• DFP + Global/TopN RF 下推</text>
+  <text x="478" y="505" class="t-s">• AQE 动态转 Broadcast / 消倾斜</text>
+  <text x="478" y="532" class="t-m">击穿：基数误差墙 + 坏计划</text>
+
+  <path d="M 662 452 L 678 452" class="arr" marker-end="url(#m-g)"/>
+
+  <!-- Layer 4 -->
+  <rect x="680" y="324" width="196" height="258" class="card-o"/>
+  <text x="692" y="346" class="t-h">Layer 4 · 编码与微架构</text>
+  <text x="692" y="364" class="t-tag-o">把单核 IPC 与 Cache 吃到顶</text>
+  <text x="692" y="388" class="t-s">• Global Low-Card 字典（int32）</text>
+  <text x="692" y="405" class="t-s">  × German String（16B 内联）</text>
+  <text x="692" y="427" class="t-s">• 存储/执行/全局延迟物化 GLM</text>
+  <text x="692" y="444" class="t-s">• COW Column 零防御拷贝</text>
+  <text x="692" y="466" class="t-s">• Perfect/Direct Hash + Swiss</text>
+  <text x="692" y="488" class="t-s">  + Two-Level + 自适应 PreAgg</text>
+  <text x="692" y="505" class="t-s">• 向量化 SIMD 与 Flying Start</text>
+  <text x="692" y="532" class="t-m">击穿：L3 Cache 与字符串墙</text>
+
+  <path d="M 876 452 L 892 452" class="arr" marker-end="url(#m-g)"/>
+
+  <!-- Layer 5 -->
+  <rect x="894" y="324" width="188" height="258" class="card-p"/>
+  <text x="906" y="346" class="t-h">Layer 5 · 并行、Spill 与 GPU</text>
+  <text x="906" y="364" class="t-tag-p">稳住百 TB 内存与多流长尾</text>
+  <text x="906" y="388" class="t-s">• Morsel-Driven + 异步 Pipeline</text>
+  <text x="906" y="405" class="t-s">  NUMA 本地化与 Work Stealing</text>
+  <text x="906" y="427" class="t-s">• 机内 LocalExchange 保 1x 流量</text>
+  <text x="906" y="444" class="t-s">• Radix Spill（ICDE'24/VLDB'25）</text>
+  <text x="906" y="461" class="t-s">  统一内存仲裁消除性能悬崖</text>
+  <text x="906" y="483" class="t-s">• GPU 异构（Crystal/Sirius）：</text>
+  <text x="906" y="500" class="t-s">  Sub-Plan 驻留 HBM + DeviceTrait</text>
+  <text x="906" y="532" class="t-m">击穿：长尾、OOM 与 PCIe 墙</text>
+</svg>

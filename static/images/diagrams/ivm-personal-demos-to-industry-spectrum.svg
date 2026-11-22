@@ -1,0 +1,143 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" width="1080" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">从个人实验原型到云数仓与开源引擎：增量计算架构演进图谱</title>
+  <desc id="desc">对比学术界理论、optd 与 vela-dbsp 两个个人实验、三大云数仓（Snowflake、Databricks Enzyme、BigQuery）及开源 OLAP（StarRocks、Apache Doris、Databend、Feldera）在增量粒度、状态归属与优化策略上的架构坐标。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #475569; }
+      .card-demo { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.8; rx: 8; }
+      .card-acad { fill: #f1f5f9; stroke: #475569; stroke-width: 1.5; rx: 8; }
+      .card-cloud { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .card-oss { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 10.8px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; fill: #1e293b; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 9.8px; font-weight: 700; fill: #6d28d9; }
+      .tag-s { font-family: "JetBrains Mono", Menlo, monospace; font-size: 9.8px; font-weight: 700; fill: #334155; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 9.8px; font-weight: 700; fill: #1d4ed8; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 9.8px; font-weight: 700; fill: #047857; }
+      .line-link { stroke: #64748b; stroke-width: 1.6; fill: none; }
+      .line-dash { stroke: #7c3aed; stroke-width: 1.6; fill: none; stroke-dasharray: 5 3; }
+    </style>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#64748b"/>
+    </marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="620" class="bg"/>
+
+  <!-- Row 1: Academic Foundations -->
+  <rect x="20" y="16" width="1040" height="122" class="panel"/>
+  <text x="38" y="40" class="p-title">① 理论基座：五条增量计算代数与优化主线</text>
+  <text x="1042" y="40" text-anchor="end" class="p-sub">代数可微性 → 高阶微分 → 偏序时序 → 统一代价空间 → 模组化流电路</text>
+
+  <rect x="36" y="54" width="190" height="72" class="card-acad"/>
+  <text x="48" y="72" class="tag-s">CLASSIC IVM &amp; DBTOASTER</text>
+  <text x="48" y="90" class="t-h">计数算法与高阶 Delta</text>
+  <text x="48" y="106" class="t-s">对 Δ 再求 Δ 递归物化触发器</text>
+  <text x="48" y="120" class="t-s">适合高频小更新，状态易膨胀</text>
+
+  <rect x="240" y="54" width="194" height="72" class="card-acad"/>
+  <text x="252" y="72" class="tag-s">DIFFERENTIAL DATAFLOW</text>
+  <text x="252" y="90" class="t-h">偏序时间轴 + Arranged Trace</text>
+  <text x="252" y="106" class="t-s">支持递归/迭代图增量维护</text>
+  <text x="252" y="120" class="t-s">工业代表：Materialize</text>
+
+  <rect x="448" y="54" width="194" height="72" class="card-acad"/>
+  <text x="460" y="72" class="tag-s">TVR &amp; TEMPURA (VLDB '21)</text>
+  <text x="460" y="90" class="t-h">时变关系 + 统一代价优化</text>
+  <text x="460" y="106" class="t-s">把快照 Σ 与增量 Δ 放入同一</text>
+  <text x="460" y="120" class="t-s">CBO 空间，动态选全/增混合</text>
+
+  <rect x="656" y="54" width="194" height="72" class="card-acad"/>
+  <text x="668" y="72" class="tag-s">DBSP (VLDB '23 BEST PAPER)</text>
+  <text x="668" y="90" class="t-h">Z-Set 流 + 积分/微分 I·D·z⁻¹</text>
+  <text x="668" y="106" class="t-s">链式法则自动化增量编译</text>
+  <text x="668" y="120" class="t-s">工业代表：Feldera (Rust)</text>
+
+  <rect x="864" y="54" width="180" height="72" class="card-acad"/>
+  <text x="876" y="72" class="tag-s">SEMIRINGS IN IVM ('26)</text>
+  <text x="876" y="90" class="t-h">半环语义边界澄清</text>
+  <text x="876" y="106" class="t-s">严格区分集合/重数/血缘注释</text>
+  <text x="876" y="120" class="t-s">决定撤回与幂等的复杂度上界</text>
+
+  <!-- Connectors Row 1 -> Row 2 -->
+  <path d="M 545 126 L 340 162" class="line-dash" marker-end="url(#arr-p)"/>
+  <path d="M 753 126 L 780 162" class="line-dash" marker-end="url(#arr-p)"/>
+  <path d="M 753 126 L 440 162" class="line-dash" marker-end="url(#arr-p)"/>
+
+  <!-- Row 2: Two Personal Experiments (Bridge) -->
+  <rect x="20" y="164" width="1040" height="148" class="panel"/>
+  <text x="38" y="188" class="p-title">② 个人实验桥梁：从代数下推、代价搜索到算子状态与崩溃恢复的端到端解剖</text>
+  <text x="1042" y="188" text-anchor="end" class="p-sub">两条互补路线，把论文公式跑通在真实 TPC-H / TPC-DS 与 Iceberg 快照上</text>
+
+  <rect x="36" y="202" width="496" height="96" class="card-demo"/>
+  <text x="50" y="221" class="tag-p">DEMO A · optd-incremental → optd-incremental-sql (Rust / DataFusion)</text>
+  <text x="50" y="240" class="t-h">路线：Δ 下推重写 → 8 级策略表 + COW AVL 状态树 + 块级有界重放</text>
+  <text x="50" y="258" class="t-s">• 机制：MatchCount 过零点外连接、ValueIndex 极值、RankDelta、256 行内容寻址块</text>
+  <text x="50" y="274" class="t-s">• 成果与真相：relational_core 达 TPC-H 22/22 &amp; TPC-DS 99/99；暴露 73% 死关系缓存、</text>
+  <text x="50" y="290" class="t-s">  Sort/Limit 阻断原 SQL 与算子整块 Checkpoint O(|S|) 写放大等真实系统瓶颈</text>
+
+  <rect x="548" y="202" width="496" height="96" class="card-demo"/>
+  <text x="562" y="221" class="tag-p">DEMO B · vela-dbsp (Python / CascadesPlanner / Iceberg v2 / DuckDB Oracle)</text>
+  <text x="562" y="240" class="t-h">路线：Z-Set 流电路 + Cascades 三维代价寻优 + 零重放 Trace Checkpoint</text>
+  <text x="562" y="258" class="t-s">• 机制：剥离逻辑视图与物理算子，CBO 统一选 Join 顺序与聚合实现</text>
+  <text x="562" y="274" class="t-s">  (retractable_exact / retractable_extrema 懒删堆 / 浮点回退 group_rescan)</text>
+  <text x="562" y="290" class="t-s">• 验证：真实 Iceberg v2 COW 重写对拍 DuckDB；1000 行删 1 行从 999 次扫描降至 0</text>
+
+  <!-- Connectors Row 2 -> Row 3 & 4 -->
+  <path d="M 284 298 L 284 334" class="line-link" marker-end="url(#arr)"/>
+  <path d="M 796 298 L 796 334" class="line-link" marker-end="url(#arr)"/>
+
+  <!-- Row 3: Cloud Warehouses -->
+  <rect x="20" y="338" width="1040" height="128" class="panel"/>
+  <text x="38" y="362" class="p-title">③ 商业云数仓三条工业范式：把“全自动增量”框定在可控成本与语义边界内</text>
+  <text x="1042" y="362" text-anchor="end" class="p-sub">不再追求盲目 100% 增量，而是融合延迟契约、历史冻结与全局代价</text>
+
+  <rect x="36" y="376" width="326" height="78" class="card-cloud"/>
+  <text x="48" y="394" class="tag-b">SNOWFLAKE DYNAMIC TABLES</text>
+  <text x="48" y="411" class="t-h">延迟视图语义 (DVS) + 历史冻结</text>
+  <text x="48" y="427" class="t-s">• TARGET_LAG 声明新鲜度 + 内置 Change Tracking</text>
+  <text x="48" y="443" class="t-s">• FROZEN WHERE 冻结历史分区，防回填重算风暴</text>
+
+  <rect x="377" y="376" width="326" height="78" class="card-cloud"/>
+  <text x="389" y="394" class="tag-b">DATABRICKS ENZYME (SIGMOD '26)</text>
+  <text x="389" y="411" class="t-h">湖仓状态拆分 + DAG 全局代价寻优</text>
+  <text x="389" y="427" class="t-s">• 顶层视图 + Delta 辅助状态表 (AVG→SUM+CNT)</text>
+  <text x="389" y="443" class="t-s">• 沿整张 MV DAG 算总账，防止上游全量拖垮下游</text>
+
+  <rect x="718" y="376" width="326" height="78" class="card-cloud"/>
+  <text x="730" y="394" class="tag-b">GOOGLE BIGQUERY MV &amp; CONTINUOUS</text>
+  <text x="730" y="411" class="t-h">严格子集 + Smart Tuning 读时合并</text>
+  <text x="730" y="427" class="t-s">• 增量 MV 严限 SQL 子集，查询时拼装未刷新增量</text>
+  <text x="730" y="443" class="t-s">• 非增量须显式配 max_staleness；流场景独立处理</text>
+
+  <!-- Row 4: Open-Source OLAP -->
+  <rect x="20" y="480" width="1040" height="124" class="panel"/>
+  <text x="38" y="504" class="p-title">④ 开源 OLAP 阵营的演进分野：从分区级刷新迈向行级 IVM 与读时修补</text>
+  <text x="1042" y="504" text-anchor="end" class="p-sub">受限于表格式与状态存储底座，各家在“增量刷新”与“透明改写”间划出不同切口</text>
+
+  <rect x="36" y="518" width="326" height="74" class="card-oss"/>
+  <text x="48" y="536" class="tag-g">STARROCKS (PCT → TVR IVM)</text>
+  <text x="48" y="553" class="t-h">TVR 重写器 + 湖仓行级增量刷新</text>
+  <text x="48" y="569" class="t-s">• IvmRewriter + MVIVMRefreshProcessor 接 Iceberg</text>
+  <text x="48" y="584" class="t-s">• 刷新链路与透明查询改写解耦，各守边界</text>
+
+  <rect x="377" y="518" width="326" height="74" class="card-oss"/>
+  <text x="389" y="536" class="tag-g">APACHE DORIS (MTMV 三级阶梯)</text>
+  <text x="389" y="553" class="t-h">分区增量改写主力 + 行级 IVM 演进</text>
+  <text x="389" y="569" class="t-s">• 分区刷新 + UNION ALL 透明改写补偿成熟落地</text>
+  <text x="389" y="584" class="t-s">• Row Binlog → Table Stream 支撑行级 IVM 与 AUTO 降级</text>
+
+  <rect x="718" y="518" width="326" height="74" class="card-oss"/>
+  <text x="730" y="536" class="tag-g">DATABEND (FUSE 三对象分工)</text>
+  <text x="730" y="553" class="t-h">Stream CDC + MV 读时修补 + DT ELT</text>
+  <text x="730" y="569" class="t-s">• Stream 捕获变更；单表 MV 借 Hybrid Read-Fix 保鲜</text>
+  <text x="730" y="584" class="t-s">• Dynamic Table 承接多表 ELT（显式全量刷新为主）</text>
+</svg>

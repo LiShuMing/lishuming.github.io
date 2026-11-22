@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 620" width="1080" height="620" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">SPJG 物化视图透明改写全链路：结构匹配、三类补偿机制与 Union 分区新鲜度兜底</title>
+  <desc id="desc">上半部分展示从候选 MV 筛选、表关系映射、等价类与谓词蕴含到代价竞价的改写流水线；下半部分展示 Query-Delta、View-Delta(PK/FK)、Outer Join 降级与 Partition Union 补偿四类核心改写形态。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.6px; font-weight: 600; fill: #475569; }
+      .box-slate { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 10.9px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.1px; fill: #0f172a; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .flow-b { stroke: #2563eb; stroke-width: 1.7; fill: none; }
+    </style>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="620" class="bg"/>
+
+  <!-- Top Pipeline: SPJG Rewrite Engine -->
+  <rect x="20" y="16" width="1040" height="200" class="panel"/>
+  <text x="38" y="40" class="p-title">一、SPJG 透明改写六步流水线（Goldstein &amp; Larson → Calcite / StarRocks / Doris）</text>
+  <text x="1042" y="40" text-anchor="end" class="p-sub">目标：不改一行 SQL，把查询等价改写为 MV Scan + 最小补偿算子，并进入 CBO 代价竞价</text>
+
+  <!-- Step 1 -->
+  <rect x="38" y="60" width="154" height="136" class="box-slate"/>
+  <text x="48" y="80" class="tag-b">STEP 1 · 候选剪枝</text>
+  <text x="48" y="100" class="t-h">相关性 + 新鲜度</text>
+  <text x="48" y="120" class="t-s">按基表集合交集</text>
+  <text x="48" y="136" class="t-s">初筛候选 MV，</text>
+  <text x="48" y="152" class="t-s">调 TimelinessArbiter</text>
+  <text x="48" y="168" class="t-s">计算过期分区清单</text>
+  <text x="48" y="185" class="t-m">防千级 MV 爆炸</text>
+
+  <path d="M 192 128 L 210 128" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Step 2 -->
+  <rect x="214" y="60" width="154" height="136" class="box-blue"/>
+  <text x="224" y="80" class="tag-b">STEP 2 · 关系映射</text>
+  <text x="224" y="100" class="t-h">RelationMapping</text>
+  <text x="224" y="120" class="t-s">建立 Query 表与</text>
+  <text x="224" y="136" class="t-s">MV 表映射（含自</text>
+  <text x="224" y="152" class="t-s">连接排列），推导</text>
+  <text x="224" y="168" class="t-s">连接等价类 EC</text>
+  <text x="224" y="185" class="t-m">统一列血缘映射</text>
+
+  <path d="M 368 128 L 386 128" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Step 3 -->
+  <rect x="390" y="60" width="156" height="136" class="box-purple"/>
+  <text x="400" y="80" class="tag-p">STEP 3 · 谓词蕴含</text>
+  <text x="400" y="100" class="t-h">PredicateSplit</text>
+  <text x="400" y="120" class="t-s">拆为 Equal / Range</text>
+  <text x="400" y="136" class="t-s">/ Residual 三段，</text>
+  <text x="400" y="152" class="t-s">证 P_q ⇒ P_v 并</text>
+  <text x="400" y="168" class="t-s">求最小补偿谓词</text>
+  <text x="400" y="185" class="t-m">RangeSimplifier</text>
+
+  <path d="M 546 128 L 564 128" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Step 4 -->
+  <rect x="568" y="60" width="156" height="136" class="box-green"/>
+  <text x="578" y="80" class="tag-g">STEP 4 · 连接与输出</text>
+  <text x="578" y="100" class="t-h">Delta + 表达式改写</text>
+  <text x="578" y="120" class="t-s">处理多表/少表补偿</text>
+  <text x="578" y="136" class="t-s">与 Outer Join 校验，</text>
+  <text x="578" y="152" class="t-s">把 Query 投影改写</text>
+  <text x="578" y="168" class="t-s">为 MV 输出列引用</text>
+  <text x="578" y="185" class="t-m">EquationRewriter</text>
+
+  <path d="M 724 128 L 742 128" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Step 5 -->
+  <rect x="746" y="60" width="146" height="136" class="box-amber"/>
+  <text x="756" y="80" class="tag-a">STEP 5 · 聚合上卷</text>
+  <text x="756" y="100" class="t-h">Roll-up &amp; State</text>
+  <text x="756" y="120" class="t-s">若 G_q ⊂ G_v 或含</text>
+  <text x="756" y="136" class="t-s">AggState 组合列，</text>
+  <text x="756" y="152" class="t-s">生成上层二次聚合</text>
+  <text x="756" y="168" class="t-s">(sum/merge/hll)</text>
+  <text x="756" y="185" class="t-m">含 Union 后再聚合</text>
+
+  <path d="M 892 128 L 910 128" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Step 6 -->
+  <rect x="914" y="60" width="128" height="136" class="box-slate"/>
+  <text x="924" y="80" class="tag-g">STEP 6 · CBO 竞价</text>
+  <text x="924" y="100" class="t-h">Memo 择优</text>
+  <text x="924" y="120" class="t-s">改写计划装入</text>
+  <text x="924" y="136" class="t-s">Cascades Memo，</text>
+  <text x="924" y="152" class="t-s">与原计划同台算</text>
+  <text x="924" y="168" class="t-s">Cost 防止负优化</text>
+  <text x="924" y="185" class="t-m">不盲信命中 MV</text>
+
+  <!-- Bottom Section: 4 Compensation Mechanisms -->
+  <rect x="20" y="232" width="1040" height="372" class="panel"/>
+  <text x="38" y="256" class="p-title">二、决定改写覆盖率的四把核心补偿武器（从教科书到宽表/湖仓实战的分水岭）</text>
+  <text x="1042" y="256" text-anchor="end" class="p-sub">为什么简单字面匹配命中率不到 10%，而工业级 SPJG 补偿能替换整个 Druid / Kylin Cube 集群</text>
+
+  <!-- Card 1: Query-Delta -->
+  <rect x="38" y="274" width="494" height="146" class="box-blue"/>
+  <text x="52" y="294" class="tag-b">1. QUERY-DELTA 补偿（Query 表比 MV 多）</text>
+  <text x="52" y="315" class="t-m">MV = A ⋈ B     |     Query = A ⋈ B ⋈ C</text>
+  <text x="52" y="335" class="t-s">• 改写结果：<tspan font-weight="700" fill="#1d4ed8">MV ⋈ C</tspan>（只要 MV 输出了与 C 连接所需的连接键与投影列）</text>
+  <text x="52" y="354" class="t-s">• 若 MV 包含聚合，还可尝试先把 C 关联键留在 MV 分组内，或用聚合下推跨连接改写</text>
+  <text x="52" y="373" class="t-s">• 典型场景：公共订单明细 MV 关联不同业务线的实时维表 C / D</text>
+  <text x="52" y="398" class="t-m">难点：多表匹配时搜索空间随表数阶乘增长，需按表签名剪枝</text>
+
+  <!-- Card 2: View-Delta -->
+  <rect x="548" y="274" width="494" height="146" class="box-purple"/>
+  <text x="562" y="294" class="tag-p">2. VIEW-DELTA 补偿（大宽表 MV 比 Query 表多 · 替换 Cube 核心）</text>
+  <text x="562" y="315" class="t-m">MV = Fact ⋈ Dim1 ⋈ Dim2   |   Query = Fact ⋈ Dim1</text>
+  <text x="562" y="335" class="t-s">• 核心风险：多连的 Dim2 若有重复键会<tspan font-weight="700" fill="#b91c1c">膨胀行数</tspan>，若缺匹配键会<tspan font-weight="700" fill="#b91c1c">过滤丢失行</tspan></text>
+  <text x="562" y="354" class="t-s">• 合法前提：必须证明 <tspan font-weight="700" fill="#6d28d9">PK/FK 唯一性 + 外键无损连接</tspan>（或 LEFT JOIN 唯一维表）</text>
+  <text x="562" y="373" class="t-s">• 工程价值：建一张星型大宽表 MV，同时透明服务几十种不同维表组合查询</text>
+  <text x="562" y="398" class="t-m">源码线索：MaterializedViewRewriter.compensateViewDelta()</text>
+
+  <!-- Card 3: Outer Join & Predicate -->
+  <rect x="38" y="436" width="494" height="150" class="box-amber"/>
+  <text x="52" y="456" class="tag-a">3. OUTER JOIN 语义降级与等价类推导</text>
+  <text x="52" y="477" class="t-m">MV = A LEFT JOIN B   |   Query = A INNER JOIN B</text>
+  <text x="52" y="497" class="t-s">• MV 是超集：只要 MV 输出含 B 非空列（如主键 b.id），补 <tspan font-weight="700" fill="#b45309">WHERE b.id IS NOT NULL</tspan></text>
+  <text x="52" y="516" class="t-s">  即可无损降级为 INNER JOIN；反之 INNER MV 绝不可回答 LEFT Query</text>
+  <text x="52" y="535" class="t-s">• 陷阱：Outer Join 的 ON 谓词不能随意并入全局等价类（空值拒绝 Null-Rejecting 判定）</text>
+  <text x="52" y="560" class="t-m">参考：Calcite MaterializedViewRule / StarRocks JoinDerivePredicate</text>
+
+  <!-- Card 4: Partition Union Compensation -->
+  <rect x="548" y="436" width="494" height="150" class="box-green"/>
+  <text x="562" y="456" class="tag-g">4. UNION 分区补偿（新鲜度与加速兼得的终极兜底）</text>
+  <text x="562" y="477" class="t-m">Query 查近 90 天 | MV 仅近 89 天新鲜，今日分区已脏或过期</text>
+  <text x="562" y="497" class="t-s">• 改写计划：<tspan font-weight="700" fill="#047857">AGG_ROLLUP( MV[d≤89]  UNION ALL  BaseTable[d=90] )</tspan></text>
+  <text x="562" y="516" class="t-s">• 89 天历史直读预聚合 MV，仅今日增量回扫基表，端到端保证强一致实时结果</text>
+  <text x="562" y="535" class="t-s">• 后续必须重跑谓词下推与分区裁剪（MVCompensationPruneUnionRule 消去空分支）</text>
+  <text x="562" y="560" class="t-m">约束：要求聚合函数支持 Union 后二次 Roll-up（含 AggState Merge）</text>
+</svg>

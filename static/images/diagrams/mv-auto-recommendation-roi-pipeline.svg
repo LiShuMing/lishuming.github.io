@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 580" width="1080" height="580" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">云数仓物化视图自动推荐闭环：Query Log 挖掘、What-If 改写核验与云成本 ROI 背包优化</title>
+  <desc id="desc">展示 MaxCompute、BigQuery MV Recommender、Redshift AutoMV 与 AutoAdmin 共同面对的四阶段物化视图自动推荐流水线，以及为什么必须接入优化器 What-If 改写核验和云算力/存储/刷新净收益模型。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.6px; font-weight: 600; fill: #475569; }
+      .box-slate { fill: #f1f5f9; stroke: #64748b; stroke-width: 1.5; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 10.9px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.1px; fill: #0f172a; }
+      .tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .flow-b { stroke: #2563eb; stroke-width: 1.8; fill: none; }
+      .flow-g { stroke: #059669; stroke-width: 1.8; fill: none; }
+      .flow-s { stroke: #475569; stroke-width: 1.6; fill: none; stroke-dasharray: 5 3; }
+    </style>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-s" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="580" class="bg"/>
+
+  <!-- Top Band: 4-Stage Pipeline -->
+  <rect x="20" y="16" width="1040" height="252" class="panel"/>
+  <text x="38" y="40" class="p-title">一、物化视图自动推荐的四阶段闭环（MaxCompute / BigQuery Recommender / Redshift AutoMV）</text>
+  <text x="1042" y="40" text-anchor="end" class="p-sub">核心原则：推荐器必须与真实 CBO 改写器共用同一套语义与代价标尺</text>
+
+  <!-- Stage 1 -->
+  <rect x="38" y="60" width="232" height="186" class="box-slate"/>
+  <text x="50" y="80" class="tag-b">STAGE 1 · 负载挖掘与归一化</text>
+  <text x="50" y="100" class="t-h">百万级 Query Log 去噪</text>
+  <text x="50" y="121" class="t-s">• 过滤一次性 Ad-hoc 与极低开销 SQL</text>
+  <text x="50" y="139" class="t-s">• 剥离字面量、别名与谓词顺序差异</text>
+  <text x="50" y="157" class="t-s">• 抽取标准 SPJG 子图签名（Join 图</text>
+  <text x="50" y="173" class="t-s">  + 分组键 + 聚合函数 + 过滤维度）</text>
+  <text x="50" y="195" class="t-m">输入：Query 频次 f_q、扫描字节、</text>
+  <text x="50" y="211" class="t-m">      历史 CU 消耗、基表 DML 写入率</text>
+
+  <path d="M 270 153 L 292 153" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Stage 2 -->
+  <rect x="296" y="60" width="232" height="186" class="box-blue"/>
+  <text x="308" y="80" class="tag-b">STAGE 2 · 候选生成与蕴含合并</text>
+  <text x="308" y="100" class="t-h">从单条查询到“公共覆盖祖先”</text>
+  <text x="308" y="121" class="t-s">• 合并相似查询：Q1(g1,g2) 与 Q2(g1)</text>
+  <text x="308" y="137" class="t-s">  归并为一个按 (g1,g2) 聚合的候选 MV</text>
+  <text x="308" y="157" class="t-s">• 谓词求并集（dt≥D1 ∪ dt≥D2）或</text>
+  <text x="308" y="173" class="t-s">  上提为分区列以扩大跨查询覆盖面</text>
+  <text x="308" y="195" class="t-s">• 合并不可加聚合为 AggState 中间态</text>
+  <text x="308" y="216" class="t-m">避免“为每条 SQL 建一个 MV”的碎片化</text>
+
+  <path d="M 528 153 L 550 153" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Stage 3 -->
+  <rect x="554" y="60" width="240" height="186" class="box-purple"/>
+  <text x="566" y="80" class="tag-p">STAGE 3 · What-If 核验与 ROI 背包</text>
+  <text x="566" y="100" class="t-h">先用真实优化器试改写，再算净账</text>
+  <text x="566" y="121" class="t-s">• <tspan font-weight="700" fill="#6d28d9">What-If 核验</tspan>：把虚拟候选 MV 注入</text>
+  <text x="566" y="137" class="t-s">  CBO，确认真实能改写命中且 Cost 下降</text>
+  <text x="566" y="157" class="t-s">• 估算三笔账：查询节省 CU − 刷新消耗</text>
+  <text x="566" y="173" class="t-s">  CU（PCT/IVM）− 存储费用</text>
+  <text x="566" y="195" class="t-s">• 在存储与刷新预算约束下做背包/贪心</text>
+  <text x="566" y="216" class="t-m">剔除“改不中”与“刷新比查询还贵”的假候选</text>
+
+  <path d="M 794 153 L 816 153" class="flow-g" marker-end="url(#arr-g)"/>
+
+  <!-- Stage 4 -->
+  <rect x="820" y="60" width="222" height="186" class="box-green"/>
+  <text x="832" y="80" class="tag-g">STAGE 4 · 影子灰度与自愈治理</text>
+  <text x="832" y="100" class="t-h">打破“不敢建、没人管”的冷启动</text>
+  <text x="832" y="121" class="t-s">• Shadow Dry-Run：先输出收益报告</text>
+  <text x="832" y="137" class="t-s">  与可复核 DDL，支持人工审批或托管</text>
+  <text x="832" y="157" class="t-s">• 上线后持续追踪真实改写命中率与</text>
+  <text x="832" y="173" class="t-s">  刷新/查询 CU 比值</text>
+  <text x="832" y="195" class="t-s">• 负载漂移连续负 ROI → 自动停刷</text>
+  <text x="832" y="216" class="t-m">或回收僵尸 MV，防止账单失控</text>
+
+  <!-- Feedback Loop Arrow -->
+  <path d="M 931 246 L 931 262 L 154 262 L 154 246" class="flow-s" marker-end="url(#arr-s)"/>
+
+  <!-- Bottom Band: Cloud ROI Math & Platform Tradeoffs -->
+  <rect x="20" y="284" width="1040" height="280" class="panel"/>
+  <text x="38" y="308" class="p-title">二、云数仓 ROI 决策方程与推荐系统最容易踩空的三个现实陷阱</text>
+  <text x="1042" y="308" text-anchor="end" class="p-sub">NetROI(m) = Σ f_q · ΔCU(q|m) − CU_refresh(m, λ_DML) − α · Storage(m)</text>
+
+  <!-- Trap 1 -->
+  <rect x="38" y="326" width="320" height="220" class="box-amber"/>
+  <text x="52" y="346" class="tag-a">陷阱 1 · 高频写入基表上的“负 ROI 视图”</text>
+  <text x="52" y="368" class="t-h">只看查询扫描量，没算 DML 刷新账</text>
+  <text x="52" y="390" class="t-s">一张每分钟持续 Upsert 的表，若只支持</text>
+  <text x="52" y="406" class="t-s">全量或粗粒度分区刷新，每小时刷新消耗</text>
+  <text x="52" y="422" class="t-s">可能数倍于每天 20 次查询省下的算力。</text>
+  <text x="52" y="446" class="t-m">解法：把基表变更率 λ_DML 与刷新模式</text>
+  <text x="52" y="462" class="t-m">（IVM vs PCT vs Full）直接写进目标函数，</text>
+  <text x="52" y="478" class="t-m">并联动推荐合理的刷新周期 / Freshness。</text>
+  <text x="52" y="512" class="t-s"><tspan font-weight="700" fill="#b45309">经验阈值：</tspan>查询节省 &lt; 2× 刷新成本即否决</text>
+
+  <!-- Trap 2 -->
+  <rect x="380" y="326" width="320" height="220" class="box-red"/>
+  <text x="394" y="346" class="tag-r">陷阱 2 · 推荐器与改写器“两张皮”</text>
+  <text x="394" y="368" class="t-h">离线启发式推荐出来，线上 CBO 改不中</text>
+  <text x="394" y="390" class="t-s">离线 SQL 解析器觉得某张 Join 宽表能覆</text>
+  <text x="394" y="406" class="t-s">盖 50 条 SQL，真建出来后线上发现缺 PK/FK</text>
+  <text x="394" y="422" class="t-s">约束、类型隐式转换或时区函数导致改写失败。</text>
+  <text x="394" y="446" class="t-m">解法：Stage 3 必须挂载与线上同版本的</text>
+  <text x="394" y="462" class="t-m">What-If CBO 改写器做真实编译验证，</text>
+  <text x="394" y="478" class="t-m">只把验证命中且计划更优的集合计入 Cov(m)。</text>
+  <text x="394" y="512" class="t-s"><tspan font-weight="700" fill="#b91c1c">红线：</tspan>未经 CBO 实测改写的候选一律丢弃</text>
+
+  <!-- Trap 3 -->
+  <rect x="722" y="326" width="320" height="220" class="box-blue"/>
+  <text x="736" y="346" class="tag-b">陷阱 3 · 视图间收益重叠与“次模性”衰减</text>
+  <text x="736" y="368" class="t-h">单看每个 MV 都很赚，全建了收益不叠加</text>
+  <text x="736" y="390" class="t-s">MV1 和 MV2 各自都能覆盖同一批 100 条高</text>
+  <text x="736" y="406" class="t-s">频查询；独立打分它们分列 Top 2，但同时</text>
+  <text x="736" y="422" class="t-s">物化时边际收益骤降，只多花双份刷新费。</text>
+  <text x="736" y="446" class="t-m">解法：采用增量边际收益贪心（Marginal</text>
+  <text x="736" y="462" class="t-m">Benefit per Cost）或整数线性规划 ILP，</text>
+  <text x="736" y="478" class="t-m">每选入一个 MV 立刻动态重算剩余候选收益。</text>
+  <text x="736" y="512" class="t-s"><tspan font-weight="700" fill="#1d4ed8">控制面：</tspan>限制单表关联 MV 上限以防编译劣化</text>
+</svg>

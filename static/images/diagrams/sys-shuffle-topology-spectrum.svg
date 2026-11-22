@@ -1,0 +1,165 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 560" width="1120" height="560" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">大规模 Shuffle 四类拓扑演进全景：扁平直连、机内两阶段、跨机两阶段/RSS 与异构 GPU 拓扑分层</title>
+  <desc id="desc">横向对比四类分布式 Shuffle 拓扑的扇出复杂度、网络流量放大倍数、延迟跳数、代表引擎与适用边界，直观区分机内两阶段（1x 流量）与跨机两阶段（2x 流量）。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .col-r { fill: #ffffff; stroke: #dc2626; stroke-width: 1.6; rx: 10; }
+      .col-b { fill: #ffffff; stroke: #2563eb; stroke-width: 1.6; rx: 10; }
+      .col-o { fill: #ffffff; stroke: #d97706; stroke-width: 1.6; rx: 10; }
+      .col-p { fill: #ffffff; stroke: #7c3aed; stroke-width: 1.6; rx: 10; }
+      .hdr-r { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 13px; font-weight: 700; fill: #b91c1c; }
+      .hdr-b { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 13px; font-weight: 700; fill: #1d4ed8; }
+      .hdr-o { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 13px; font-weight: 700; fill: #b45309; }
+      .hdr-p { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 13px; font-weight: 700; fill: #6d28d9; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11.6px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.4px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10.2px; font-weight: 600; fill: #0f172a; }
+      .box-r { fill: #fef2f2; stroke: #ef4444; stroke-width: 1.2; rx: 7; }
+      .box-b { fill: #eff6ff; stroke: #3b82f6; stroke-width: 1.2; rx: 7; }
+      .box-o { fill: #fffbeb; stroke: #f59e0b; stroke-width: 1.2; rx: 7; }
+      .box-p { fill: #f5f3ff; stroke: #8b5cf6; stroke-width: 1.2; rx: 7; }
+      .box-g { fill: #ecfdf5; stroke: #10b981; stroke-width: 1.2; rx: 7; }
+      .pill-r { fill: #fee2e2; rx: 5; }
+      .pill-b { fill: #dbeafe; rx: 5; }
+      .pill-o { fill: #fef3c7; rx: 5; }
+      .pill-p { fill: #ede9fe; rx: 5; }
+      .arr { stroke: #475569; stroke-width: 1.5; fill: none; }
+    </style>
+    <marker id="m-a" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="560" class="bg"/>
+
+  <rect x="18" y="18" width="258" height="524" class="col-r"/>
+  <text x="32" y="42" class="hdr-r">① 扁平并发直连 (M × N)</text>
+  <text x="32" y="60" class="t-s">早期 MPP / 未合并的按核互联</text>
+
+  <rect x="32" y="74" width="230" height="56" class="box-r"/>
+  <text x="44" y="94" class="t-h">M = P × C 并发 Sender</text>
+  <text x="44" y="112" class="t-m">4,096 ~ 8,192 独立通道起点</text>
+
+  <path d="M 147 130 L 147 166" class="arr" marker-end="url(#m-a)"/>
+  <text x="58" y="153" class="t-m" fill="#b91c1c">全网 O((P·C)²) 小包直连</text>
+
+  <rect x="32" y="168" width="230" height="56" class="box-r"/>
+  <text x="44" y="188" class="t-h">N = P × C 并发 Receiver</text>
+  <text x="44" y="206" class="t-m">单机 Buffer 达 64 GB+</text>
+
+  <rect x="32" y="246" width="230" height="122" class="pill-r"/>
+  <text x="44" y="267" class="t-h">核心物理账本</text>
+  <text x="44" y="287" class="t-m">• 扇出：O((P·C)²)</text>
+  <text x="44" y="305" class="t-m">• 网络流量：1x（但有效带宽极低）</text>
+  <text x="44" y="323" class="t-m">• 延迟跳数：1 Hop（易坠入 RTO）</text>
+  <text x="44" y="341" class="t-s">• 均摊单包 &lt; 1 行，瞬间撞 PPS 墙</text>
+  <text x="44" y="358" class="t-s">• 30TB 级几乎必爆 OOM / Incast</text>
+
+  <rect x="32" y="384" width="230" height="142" class="box-r"/>
+  <text x="44" y="405" class="t-h">定位与淘汰原因</text>
+  <text x="44" y="425" class="t-s">• 仅适用于极小规模（&lt; 8 节点）</text>
+  <text x="44" y="443" class="t-s">• 现代多核大内存服务器（64–128 核）</text>
+  <text x="44" y="460" class="t-s">  使 C 飙升，(P·C)² 呈二次方失控</text>
+  <text x="44" y="482" class="t-s">• 现代 OLAP 已全面淘汰该模式</text>
+
+  <rect x="292" y="18" width="262" height="524" class="col-b"/>
+  <text x="306" y="42" class="hdr-b">② 机内两阶段（MPP 必选）</text>
+  <text x="306" y="60" class="t-s">Node-level 跨机 + LocalExchange</text>
+
+  <rect x="306" y="74" width="234" height="52" class="box-b"/>
+  <text x="318" y="93" class="t-h">发端按目标节点汇聚攒批</text>
+  <text x="318" y="111" class="t-s">本机分区内存零拷贝短路 + BRPC 复用</text>
+
+  <path d="M 423 126 L 423 156" class="arr" marker-end="url(#m-a)"/>
+  <text x="330" y="146" class="t-m" fill="#1d4ed8">Phase 1: 跨机 O(P²) 大块直达</text>
+
+  <rect x="306" y="158" width="234" height="66" class="box-g"/>
+  <text x="318" y="177" class="t-h">Phase 2: 机内 LocalExchange</text>
+  <text x="318" y="195" class="t-s">进程内无锁队列分发给 64 Driver</text>
+  <text x="318" y="212" class="t-m">内存带宽 100–300 GB/s（零跨网）</text>
+
+  <rect x="306" y="246" width="234" height="122" class="pill-b"/>
+  <text x="318" y="267" class="t-h">核心物理账本</text>
+  <text x="318" y="287" class="t-m">• 扇出：O(P²)（缩小 C² ≈ 4,096×）</text>
+  <text x="318" y="305" class="t-m">• 网络流量：严格 1x（无流量放大）</text>
+  <text x="318" y="323" class="t-m">• 延迟跳数：1 Hop 跨网</text>
+  <text x="318" y="341" class="t-s">• Broadcast 共享只读 HashTable</text>
+  <text x="318" y="358" class="t-s">• 配合错峰发包 + Credit 防 Incast</text>
+
+  <rect x="306" y="384" width="234" height="142" class="box-b"/>
+  <text x="318" y="405" class="t-h">代表引擎与最佳场景</text>
+  <text x="318" y="425" class="t-s">• StarRocks / Apache Doris Pipeline</text>
+  <text x="318" y="443" class="t-s">• Snowflake / Redshift 节点间流式</text>
+  <text x="318" y="465" class="t-h">适用：64–128 台 30TB OLAP 打榜</text>
+  <text x="318" y="484" class="t-s">Bandwidth-bound 场景，绝不能承受</text>
+  <text x="318" y="501" class="t-s">跨机中转带来的 2x 网络流量翻倍</text>
+
+  <rect x="570" y="18" width="262" height="524" class="col-o"/>
+  <text x="584" y="42" class="hdr-o">③ 跨机两阶段 / RSS（条件项）</text>
+  <text x="584" y="60" class="t-s">2D 层次化 √P 或独立 Push 合并层</text>
+
+  <rect x="584" y="74" width="234" height="44" class="box-o"/>
+  <text x="596" y="92" class="t-h">Phase 1: Mapper 主动 Push / 跨组发</text>
+  <text x="596" y="109" class="t-s">按 Group 或 Partition 推给中转合并层</text>
+
+  <path d="M 701 118 L 701 140" class="arr" marker-end="url(#m-a)"/>
+
+  <rect x="584" y="142" width="234" height="42" class="box-o"/>
+  <text x="596" y="160" class="t-h">中转聚合层（2D 代表 / RSS Server）</text>
+  <text x="596" y="176" class="t-s">内存/NVMe/对象存储分层合并成大顺序块</text>
+
+  <path d="M 701 184 L 701 206" class="arr" marker-end="url(#m-a)"/>
+
+  <rect x="584" y="208" width="234" height="28" class="box-g"/>
+  <text x="596" y="226" class="t-h">Phase 2: Reducer 顺序大块拉取</text>
+
+  <rect x="584" y="246" width="234" height="122" class="pill-o"/>
+  <text x="596" y="267" class="t-h">核心物理账本</text>
+  <text x="596" y="287" class="t-m">• 扇出：O(√P) 或 O(M + N)</text>
+  <text x="596" y="305" class="t-m">• 网络流量：2x（每字节跨网两次）</text>
+  <text x="596" y="323" class="t-m">• 延迟跳数：2 Hops + 额外编解码</text>
+  <text x="596" y="341" class="t-s">• 天然提供 Stage Checkpoint 容错</text>
+  <text x="596" y="358" class="t-s">• 彻底解耦计算节点本地盘与 Spot 抢占</text>
+
+  <rect x="584" y="384" width="234" height="142" class="box-o"/>
+  <text x="596" y="405" class="t-h">代表引擎与最佳场景</text>
+  <text x="596" y="425" class="t-s">• Celeborn / Uniffle / Spark Magnet</text>
+  <text x="596" y="443" class="t-s">• Google Dremel Disaggregated Shuffle</text>
+  <text x="596" y="461" class="t-s">• Trino FTE Exchange Spooling / Jiffy</text>
+  <text x="596" y="483" class="t-h">适用：500+ 超大集群 / 批处理存算分离</text>
+  <text x="596" y="502" class="t-s">或跨机架/跨 AZ 带宽严重超售场景</text>
+
+  <rect x="848" y="18" width="254" height="524" class="col-p"/>
+  <text x="862" y="42" class="hdr-p">④ 异构 GPU 与多模态演化</text>
+  <text x="862" y="60" class="t-s">带宽剪刀差驱动分层 + 瘦引用</text>
+
+  <rect x="862" y="74" width="226" height="62" class="box-p"/>
+  <text x="874" y="93" class="t-h">Layer 1: 机内 NVLink 预聚合</text>
+  <text x="874" y="111" class="t-m">NVSwitch 900–1,800 GB/s</text>
+  <text x="874" y="127" class="t-s">多卡先按目标节点高速合并重排</text>
+
+  <path d="M 975 136 L 975 164" class="arr" marker-end="url(#m-a)"/>
+
+  <rect x="862" y="166" width="226" height="62" class="box-p"/>
+  <text x="874" y="185" class="t-h">Layer 2: 跨机 GPUDirect RDMA</text>
+  <text x="874" y="203" class="t-m">IB / RoCEv2 200–400 Gbps</text>
+  <text x="874" y="219" class="t-s">绕过主机 PCIe 零拷贝大块直传</text>
+
+  <rect x="862" y="246" width="226" height="122" class="pill-p"/>
+  <text x="874" y="267" class="t-h">两大核心突破</text>
+  <text x="874" y="287" class="t-s">• 拓扑感知 Hierarchical All-to-All</text>
+  <text x="874" y="305" class="t-s">• NCCL Double Binary Tree 广播</text>
+  <text x="874" y="323" class="t-s">  （O(log P) 步数，上下行双打满）</text>
+  <text x="874" y="343" class="t-h">多模态零大对象 Shuffle：</text>
+  <text x="874" y="360" class="t-s">仅传轻量 BlobRef，下游延迟拉取</text>
+
+  <rect x="862" y="384" width="226" height="142" class="box-p"/>
+  <text x="874" y="405" class="t-h">代表系统与前沿场景</text>
+  <text x="874" y="425" class="t-s">• RAPIDS Spark UCX GPU Shuffle</text>
+  <text x="874" y="443" class="t-s">• DeepEP（MoE All-to-All 内核）</text>
+  <text x="874" y="461" class="t-s">• NCCL 2.4+ Double Binary Tree</text>
+  <text x="874" y="483" class="t-s">• Lance / Iceberg / Daft 多模态</text>
+  <text x="874" y="501" class="t-s">  BlobRef 瘦控制面 Shuffle</text>
+</svg>
