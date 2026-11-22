@@ -1,0 +1,93 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 420" width="1080" height="420" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">SQL 引擎融合全文检索与向量检索的四层混合去重漏斗</title>
+  <desc id="desc">展示从 Layer 1 精确去重、Layer 2 词法与分区 Blocking、Layer 3 向量 ANN 语义精排到 Layer 4 聚类裁决的四层混合去重架构，以及 MinHash 粗筛与 SQL 语义精排的上下游分工。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #2563eb; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .t-tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .t-tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .t-tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; fill: #0f172a; }
+      .flow-b { stroke: #2563eb; stroke-width: 2; fill: none; }
+    </style>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="420" class="bg"/>
+
+  <!-- Top Panel: 4-Layer Funnel -->
+  <rect x="20" y="16" width="1040" height="232" class="panel"/>
+  <text x="38" y="42" class="p-title">SQL 引擎内“多级混合去重（Hybrid Dedup）”四层漏斗</text>
+  <text x="1042" y="42" text-anchor="end" class="p-sub">原则：微秒级规则与索引优先裁剪，避免昂贵的全局 O(N²) 向量自连接</text>
+
+  <!-- Layer 1 -->
+  <rect x="38" y="60" width="224" height="170" class="box-blue"/>
+  <text x="50" y="82" class="t-tag-b">LAYER 1 · Exact Dedup</text>
+  <text x="50" y="102" class="t-h">1. 主键与精确哈希去重</text>
+  <text x="50" y="126" class="t-s">• Primary Key Upsert / MD5</text>
+  <text x="50" y="146" class="t-s">• ClickHouse ReplacingMergeTree</text>
+  <text x="50" y="166" class="t-s">• ROW_NUMBER() 窗口裁决</text>
+  <text x="50" y="206" class="t-m" fill="#1d4ed8">零推理成本，砍掉 30%~40% 冗余</text>
+
+  <path d="M 262 145 L 292 145" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Layer 2 -->
+  <rect x="296" y="60" width="228" height="170" class="box-amber"/>
+  <text x="308" y="82" class="t-tag-a">LAYER 2 · Lexical Blocking</text>
+  <text x="308" y="102" class="t-h">2. 分区裁剪与词法召回</text>
+  <text x="308" y="126" class="t-s">• 业务 Blocking：语种/类目/时间窗</text>
+  <text x="308" y="146" class="t-s">• 倒排 BM25（ParadeDB / Doris）</text>
+  <text x="308" y="166" class="t-s">• Trigram（pg_trgm）或 MinHash</text>
+  <text x="308" y="206" class="t-m" fill="#b45309">将比对空间缩小 2~4 个数量级</text>
+
+  <path d="M 524 145 L 554 145" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Layer 3 -->
+  <rect x="558" y="60" width="232" height="170" class="box-purple"/>
+  <text x="570" y="82" class="t-tag-p">LAYER 3 · Vector Semantic</text>
+  <text x="570" y="102" class="t-h">3. 向量 ANN 语义精排</text>
+  <text x="570" y="126" class="t-s">• VECTOR_SEARCH (ScaNN / HNSW)</text>
+  <text x="570" y="146" class="t-s">• Cosine 距离阈值（如 &lt; 0.05）</text>
+  <text x="570" y="166" class="t-s">• RRF 融合词法 + 语义得分</text>
+  <text x="570" y="206" class="t-m" fill="#6d28d9">捕获改写、翻译与跨模态同款</text>
+
+  <path d="M 790 145 L 820 145" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Layer 4 -->
+  <rect x="824" y="60" width="218" height="170" class="box-green"/>
+  <text x="836" y="82" class="t-tag-g">LAYER 4 · Resolution</text>
+  <text x="836" y="102" class="t-h">4. 在线拦截与离线聚类</text>
+  <text x="836" y="126" class="t-s">• 在线入库：Top-1 命中直接拦截</text>
+  <text x="836" y="146" class="t-s">• 中小规模：SQL Recursive CTE</text>
+  <text x="836" y="166" class="t-s">• 超大规模：移交 Graph WCC</text>
+  <text x="836" y="206" class="t-m" fill="#047857">ACID 事务落库 + 血缘留痕</text>
+
+  <!-- Bottom Panel: Division of Labor -->
+  <rect x="20" y="266" width="1040" height="136" class="panel"/>
+  <text x="38" y="292" class="p-title">工业界上下游分工：MinHash + LSH 离线粗筛 vs SQL + Vector 语义精排</text>
+
+  <rect x="38" y="308" width="470" height="78" class="box-blue"/>
+  <text x="52" y="328" class="t-tag-b">TIER 1 · PB 级预训练语料粗筛（MinHash + LSH + WCC）</text>
+  <text x="52" y="348" class="t-s">• 工具：NeMo Curator (cuDF) / Ray / Spark / Dolma (Rust)</text>
+  <text x="52" y="368" class="t-s">• 优势：无神经网络推理开销，512B/篇指纹低成本压减 80%+ 词面冗余</text>
+
+  <path d="M 508 347 L 568 347" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <rect x="572" y="308" width="470" height="78" class="box-purple"/>
+  <text x="586" y="328" class="t-tag-p">TIER 2 · 千万~十亿级高价值语义精排（SQL + Vector / FTS）</text>
+  <text x="586" y="348" class="t-s">• 工具：BigQuery / Snowflake / Hologres / StarRocks / PG+ParadeDB / Daft+LanceDB</text>
+  <text x="586" y="368" class="t-s">• 优势：零外部同步开销，支持 SemDeDup 语义去重、多模态清洗与实时 RAG 防重</text>
+</svg>

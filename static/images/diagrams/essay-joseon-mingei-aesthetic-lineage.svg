@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 540" width="1080" height="540" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">从李朝民间杂器到当代天真市集：东亚日常美学的五重演进脉络</title>
+  <desc id="desc">展示从朝鲜李朝无心日用、16世纪日本茶道见立、1920年代柳宗悦民艺运动、1970年代坂田和实古道具转向，到当代中国本土民艺与古道具市集的审美流转与价值坐标迁移。</desc>
+  <defs>
+    <style>
+      .bg { fill: #faf8f5; }
+      .header-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif; font-size: 18px; font-weight: 700; fill: #1f2421; }
+      .header-sub { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 12px; fill: #646b65; }
+      .stage-num { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 700; }
+      .stage-era { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11px; font-weight: 600; fill: #57534e; }
+      .card-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 14px; font-weight: 700; fill: #1c1917; }
+      .card-kw { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11.5px; font-weight: 600; }
+      .card-body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11px; fill: #44403c; }
+      .card-ex { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; fill: #57534e; }
+      .c1 { fill: #ffffff; stroke: #8c7a6b; stroke-width: 1.5; rx: 10; }
+      .c2 { fill: #ffffff; stroke: #6b7d65; stroke-width: 1.5; rx: 10; }
+      .c3 { fill: #ffffff; stroke: #4b6e82; stroke-width: 1.5; rx: 10; }
+      .c4 { fill: #ffffff; stroke: #9a6b4c; stroke-width: 1.5; rx: 10; }
+      .c5 { fill: #ffffff; stroke: #4d7c6f; stroke-width: 1.8; rx: 10; }
+      .tag1 { fill: #f4efe9; rx: 5; }
+      .tag2 { fill: #eef3ec; rx: 5; }
+      .tag3 { fill: #ebf2f6; rx: 5; }
+      .tag4 { fill: #f7efe8; rx: 5; }
+      .tag5 { fill: #eaf4f1; rx: 5; }
+      .arrow { stroke: #78716c; stroke-width: 1.8; fill: none; }
+      .axis-box { fill: #f2eee8; stroke: #d6cfc4; stroke-width: 1.2; rx: 10; }
+      .axis-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12.5px; font-weight: 700; fill: #292524; }
+      .axis-item-l { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11.5px; fill: #78716c; }
+      .axis-item-r { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11.5px; font-weight: 700; fill: #2c5e50; }
+      .axis-arrow { stroke: #a8a29e; stroke-width: 1.5; stroke-dasharray: 4 3; fill: none; }
+    </style>
+    <marker id="arr" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#78716c"/>
+    </marker>
+    <marker id="arr-teal" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 1.5 L 8.5 5 L 0 8.5 z" fill="#2c5e50"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="540" class="bg"/>
+
+  <!-- Header -->
+  <text x="36" y="40" class="header-title">东亚日常美学的五重演进：从朝鲜李朝杂器到当代古道具市集</text>
+  <text x="36" y="62" class="header-sub">四百余年间，审美评判权如何一步步从“宫廷与大师”下沉到“无名工匠”，最终交还给普通人的眼睛与日常</text>
+  <line x1="36" y1="78" x2="1044" y2="78" stroke="#e5dfd5" stroke-width="1.2"/>
+
+  <!-- Stage 1 -->
+  <rect x="36" y="102" width="182" height="266" class="c1"/>
+  <rect x="48" y="114" width="158" height="24" class="tag1"/>
+  <text x="58" y="130" class="stage-num" fill="#7c6350">01 · 1392–1910</text>
+  <text x="48" y="160" class="card-title">朝鲜李朝民间土壤</text>
+  <text x="48" y="180" class="card-kw" fill="#7c6350">无心之用 · 朴素天真</text>
+  <line x1="48" y1="192" x2="206" y2="192" stroke="#ebe5dc" stroke-width="1"/>
+  <text x="48" y="212" class="card-body">• 崇尚朱子理学与节俭</text>
+  <text x="48" y="230" class="card-body">• 无名窑工、木匠为日常</text>
+  <text x="48" y="246" class="card-body">  吃饭储物而作，不求留名</text>
+  <text x="48" y="266" class="card-body">• 顺应泥土、柴火与手感</text>
+  <text x="48" y="282" class="card-body">  自然生出歪斜松弛感</text>
+  <line x1="48" y1="298" x2="206" y2="298" stroke="#ebe5dc" stroke-width="1"/>
+  <text x="48" y="316" class="card-ex">代表器物：</text>
+  <text x="48" y="334" class="card-ex">白瓷月亮罐 · 粉青沙器</text>
+  <text x="48" y="350" class="card-ex">乡间粗饭碗 · 李朝木膳</text>
+
+  <!-- Arrow 1->2 -->
+  <path d="M 218 235 L 238 235" class="arrow" marker-end="url(#arr)"/>
+
+  <!-- Stage 2 -->
+  <rect x="242" y="102" width="182" height="266" class="c2"/>
+  <rect x="254" y="114" width="158" height="24" class="tag2"/>
+  <text x="264" y="130" class="stage-num" fill="#4f6649">02 · 16世纪</text>
+  <text x="254" y="160" class="card-title">日本茶道“见立”</text>
+  <text x="254" y="180" class="card-kw" fill="#4f6649">侘茶转向 · 重新命名</text>
+  <line x1="254" y1="192" x2="412" y2="192" stroke="#e4ebe1" stroke-width="1"/>
+  <text x="254" y="212" class="card-body">• 千利休厌倦炫富式“唐物”</text>
+  <text x="254" y="230" class="card-body">• 以茶人眼光（见立）</text>
+  <text x="254" y="246" class="card-body">  重估朝鲜粗陶饭碗</text>
+  <text x="254" y="266" class="card-body">• 将缩釉、粗糙刀痕视作</text>
+  <text x="254" y="282" class="card-body">  侘寂（Wabi-sabi）巅峰</text>
+  <line x1="254" y1="298" x2="412" y2="298" stroke="#e4ebe1" stroke-width="1"/>
+  <text x="254" y="316" class="card-ex">关键标志：</text>
+  <text x="254" y="334" class="card-ex">喜左卫门井户茶碗</text>
+  <text x="254" y="350" class="card-ex">草庵茶室 · 第一次翻译</text>
+
+  <!-- Arrow 2->3 -->
+  <path d="M 424 235 L 444 235" class="arrow" marker-end="url(#arr)"/>
+
+  <!-- Stage 3 -->
+  <rect x="448" y="102" width="182" height="266" class="c3"/>
+  <rect x="460" y="114" width="158" height="24" class="tag3"/>
+  <text x="470" y="130" class="stage-num" fill="#35586d">03 · 1920年代</text>
+  <text x="460" y="160" class="card-title">柳宗悦与民艺运动</text>
+  <text x="460" y="180" class="card-kw" fill="#35586d">用之美 · 他力之美</text>
+  <line x1="460" y1="192" x2="618" y2="192" stroke="#dfeaf0" stroke-width="1"/>
+  <text x="460" y="212" class="card-body">• 浅川兄弟引领柳宗悦</text>
+  <text x="460" y="230" class="card-body">  深入朝鲜搜集民间杂器</text>
+  <text x="460" y="248" class="card-body">• 提出“民艺”概念：美在</text>
+  <text x="460" y="264" class="card-body">  大众日常高频使用的器物</text>
+  <text x="460" y="282" class="card-body">• 奠定东亚现代设计底色</text>
+  <line x1="460" y1="298" x2="618" y2="298" stroke="#dfeaf0" stroke-width="1"/>
+  <text x="460" y="316" class="card-ex">代表事件与人物：</text>
+  <text x="460" y="334" class="card-ex">秋草纹面取壶 · 朝鲜民族美术馆</text>
+  <text x="460" y="350" class="card-ex">河井宽次郎 · 滨田庄司</text>
+
+  <!-- Arrow 3->4 -->
+  <path d="M 630 235 L 650 235" class="arrow" marker-end="url(#arr)"/>
+
+  <!-- Stage 4 -->
+  <rect x="654" y="102" width="182" height="266" class="c4"/>
+  <rect x="666" y="114" width="158" height="24" class="tag4"/>
+  <text x="676" y="130" class="stage-num" fill="#825335">04 · 1970年代起</text>
+  <text x="666" y="160" class="card-title">战后“古道具”转向</text>
+  <text x="666" y="180" class="card-kw" fill="#825335">如其所是 · 个人眼力</text>
+  <line x1="666" y1="192" x2="824" y2="192" stroke="#f0e4d8" stroke-width="1"/>
+  <text x="666" y="212" class="card-body">• 青山二郎、白洲正子开启</text>
+  <text x="666" y="228" class="card-body">  直觉选物；坂田和实接棒</text>
+  <text x="666" y="248" class="card-body">• 拆除“古美术”尊卑门槛：</text>
+  <text x="666" y="264" class="card-body">  李朝木盘与非洲破布平等</text>
+  <text x="666" y="282" class="card-body">• 唯一标准：是否打动眼睛</text>
+  <line x1="666" y1="298" x2="824" y2="298" stroke="#f0e4d8" stroke-width="1"/>
+  <text x="666" y="316" class="card-ex">关键地标：</text>
+  <text x="666" y="334" class="card-ex">东京目白“古道具坂田”</text>
+  <text x="666" y="350" class="card-ex">千叶 Museum As It Is</text>
+
+  <!-- Arrow 4->5 -->
+  <path d="M 836 235 L 856 235" class="arrow" marker-end="url(#arr)"/>
+
+  <!-- Stage 5 -->
+  <rect x="860" y="102" width="184" height="266" class="c5"/>
+  <rect x="872" y="114" width="160" height="24" class="tag5"/>
+  <text x="882" y="130" class="stage-num" fill="#2c5e50">05 · 近十年回流</text>
+  <text x="872" y="160" class="card-title">本土民艺与天真市集</text>
+  <text x="872" y="180" class="card-kw" fill="#2c5e50">重看脚下 · 独立美学</text>
+  <line x1="872" y1="192" x2="1032" y2="192" stroke="#d8eae4" stroke-width="1"/>
+  <text x="872" y="212" class="card-body">• 借“古道具之眼”回望</text>
+  <text x="872" y="228" class="card-body">  中国庞大的民间老物富矿</text>
+  <text x="872" y="248" class="card-body">• 杭州西溪老宅、景德镇等</text>
+  <text x="872" y="264" class="card-body">  生长出松弛的旧物市集</text>
+  <text x="872" y="282" class="card-body">• 普通人低门槛建立审美主权</text>
+  <line x1="872" y1="298" x2="1032" y2="298" stroke="#d8eae4" stroke-width="1"/>
+  <text x="872" y="316" class="card-ex">常见选品：</text>
+  <text x="872" y="334" class="card-ex">明清民窑粗瓷 · 江南老木具</text>
+  <text x="872" y="350" class="card-ex">西南土布 · 李朝与亚洲旧物</text>
+
+  <!-- Bottom Coordinate Shift Panel -->
+  <rect x="36" y="394" width="1008" height="118" class="axis-box"/>
+  <text x="56" y="420" class="axis-title">底层审美坐标的根本迁移（为什么它最终成了普通人的“独立美学”？）</text>
+
+  <!-- Row 1 -->
+  <text x="56" y="448" class="axis-item-l">价值来源：官窑落款 · 宫廷背书 · 稀缺全品</text>
+  <path d="M 332 444 L 468 444" class="axis-arrow" marker-end="url(#arr-teal)"/>
+  <text x="484" y="448" class="axis-item-r">价值来源：真实日常 · 岁月包浆 · 与个人目光的共鸣</text>
+
+  <!-- Row 2 -->
+  <text x="56" y="472" class="axis-item-l">物件姿态：隔着展柜供奉 · 追求零瑕疵工业平滑</text>
+  <path d="M 332 468 L 468 468" class="axis-arrow" marker-end="url(#arr-teal)"/>
+  <text x="484" y="472" class="axis-item-r">物件姿态：回到餐桌与茶席 · 接纳窑变、残缺与修补痕迹</text>
+
+  <!-- Row 3 -->
+  <text x="56" y="496" class="axis-item-l">审美权力：拍卖行资本定价 · 商业潮流与算法定义</text>
+  <path d="M 332 492 L 468 492" class="axis-arrow" marker-end="url(#arr-teal)"/>
+  <text x="484" y="496" class="axis-item-r">审美权力：普通人以自己的眼睛和双手做出独立判断</text>
+</svg>

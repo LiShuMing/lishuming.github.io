@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 560" width="1080" height="560" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">PB 级模糊去重六阶段生产流水线与星型建边优化架构</title>
+  <desc id="desc">展示从原始语料规范化与 Shingling、异构加速 MinHash 签名、热点熔断与 O(k) 星型建边、假阳性消除、分布式大星小星 WCC 求解到聚类裁决与血缘审计的完整六阶段架构。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .panel { fill: #ffffff; stroke: #cbd5e1; stroke-width: 1.5; rx: 10; }
+      .p-title { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #0f172a; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; font-weight: 600; fill: #2563eb; }
+      .box-blue { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.6; rx: 8; }
+      .box-green { fill: #ecfdf5; stroke: #059669; stroke-width: 1.6; rx: 8; }
+      .box-purple { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.6; rx: 8; }
+      .box-amber { fill: #fffbeb; stroke: #d97706; stroke-width: 1.6; rx: 8; }
+      .box-red { fill: #fef2f2; stroke: #dc2626; stroke-width: 1.5; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-tag-b { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #1d4ed8; }
+      .t-tag-g { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #047857; }
+      .t-tag-p { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #6d28d9; }
+      .t-tag-a { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b45309; }
+      .t-tag-r { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 700; fill: #b91c1c; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 11px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; fill: #0f172a; }
+      .flow-b { stroke: #2563eb; stroke-width: 2; fill: none; }
+      .flow-g { stroke: #059669; stroke-width: 2; fill: none; }
+      .flow-p { stroke: #7c3aed; stroke-width: 2; fill: none; }
+      .edge-r { stroke: #ef4444; stroke-width: 1.3; opacity: 0.7; }
+      .edge-g { stroke: #059669; stroke-width: 1.8; }
+    </style>
+    <marker id="arr-b" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arr-g" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+    <marker id="arr-p" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#7c3aed"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="560" class="bg"/>
+
+  <!-- Top Panel: Stage 1 - 3 -->
+  <rect x="20" y="16" width="1040" height="240" class="panel"/>
+  <text x="38" y="42" class="p-title">上游特征提取与防倾斜建边（CPU SIMD / GPU cuDF 加速）</text>
+  <text x="1042" y="42" text-anchor="end" class="p-sub">目标：压缩原始字节流，根除热点桶 O(k²) 边爆炸</text>
+
+  <!-- Stage 1 -->
+  <rect x="38" y="60" width="290" height="176" class="box-blue"/>
+  <text x="52" y="82" class="t-tag-b">STAGE 1 · Shingling &amp; Guardrail</text>
+  <text x="52" y="102" class="t-h">1. 规范化与前置脏数据拦截</text>
+  <text x="52" y="126" class="t-s">• 长度/熵值过滤：拦截短文本与空白模板</text>
+  <text x="52" y="146" class="t-s">• Unicode 归一化与标点折叠</text>
+  <text x="52" y="166" class="t-s">• 零拷贝滑动窗口提取 K-Shingles</text>
+  <text x="52" y="186" class="t-s">  (英文 5-gram / 中文 13-gram)</text>
+  <text x="52" y="216" class="t-m" fill="#1d4ed8">输出：uint64 Shingle Hash 连续数组</text>
+
+  <path d="M 328 148 L 368 148" class="flow-b" marker-end="url(#arr-b)"/>
+
+  <!-- Stage 2 -->
+  <rect x="372" y="60" width="290" height="176" class="box-blue"/>
+  <text x="386" y="82" class="t-tag-b">STAGE 2 · Vectorized MinHash &amp; LSH</text>
+  <text x="386" y="102" class="t-h">2. 向量化签名与 Band 切分</text>
+  <text x="386" y="126" class="t-s">• K=128 哈希族并行取最小值（512B/篇）</text>
+  <text x="386" y="146" class="t-s">• GPU cuDF 加速（~4 TB/h @ 8×H100）</text>
+  <text x="386" y="166" class="t-s">• 按目标阈值 s 切分 B×R Band：</text>
+  <text x="386" y="186" class="t-s">  16×8 (s≈0.71) / 8×16 (s≈0.88)</text>
+  <text x="386" y="216" class="t-m" fill="#1d4ed8">输出：(band_id, bucket_hash) → doc_id</text>
+
+  <path d="M 662 148 L 702 148" class="flow-g" marker-end="url(#arr-g)"/>
+
+  <!-- Stage 3 -->
+  <rect x="706" y="60" width="336" height="176" class="box-green"/>
+  <text x="720" y="82" class="t-tag-g">STAGE 3 · Anti-Skew Star Edge Gen</text>
+  <text x="720" y="102" class="t-h">3. 热点熔断与 O(k) 星型建边</text>
+  <text x="720" y="126" class="t-s">• 热点大桶熔断（k &gt; 20,000 旁路模板黑名单）</text>
+  <text x="720" y="146" class="t-s">• 桶内取锚点 d_min = min(C)，仅连 (d_min, d_i)</text>
+  <text x="720" y="166" class="t-s">• Map-Side Combiner 本地去重剪枝</text>
+  <!-- Mini Clique vs Star graphic inside Stage 3 -->
+  <rect x="720" y="178" width="142" height="46" rx="5" fill="#fef2f2" stroke="#fca5a5"/>
+  <text x="730" y="196" class="t-tag-r">Clique: O(k²)</text>
+  <text x="730" y="214" class="t-m" fill="#991b1b">10⁵ → 5×10⁹ 边</text>
+  <path d="M 865 201 L 885 201" class="flow-g" marker-end="url(#arr-g)"/>
+  <rect x="888" y="178" width="142" height="46" rx="5" fill="#dcfce7" stroke="#86efac"/>
+  <text x="898" y="196" class="t-tag-g">Star: O(k)</text>
+  <text x="898" y="214" class="t-m" fill="#065f46">10⁵ → 99,999 边</text>
+
+  <!-- Connector down from Stage 3 to Stage 4 -->
+  <path d="M 874 236 L 874 274 L 183 274 L 183 306" class="flow-p" marker-end="url(#arr-p)"/>
+
+  <!-- Bottom Panel: Stage 4 - 6 -->
+  <rect x="20" y="286" width="1040" height="254" class="panel"/>
+  <text x="38" y="312" class="p-title">下游图收敛、防雪崩校验与资产治理解耦（Ray / Spark / 分布式图引擎）</text>
+  <text x="1042" y="312" text-anchor="end" class="p-sub">目标：消除假阳性误合并，千亿边图 5–10 轮零 OOM 收敛</text>
+
+  <!-- Stage 4 -->
+  <rect x="38" y="330" width="290" height="190" class="box-amber"/>
+  <text x="52" y="352" class="t-tag-a">STAGE 4 · False-Positive Filter</text>
+  <text x="52" y="372" class="t-h">4. 假阳性消除（防雪崩合并）</text>
+  <text x="52" y="396" class="t-s">• 规避 LSH 碰撞传递性引发的“滚雪球”</text>
+  <text x="52" y="416" class="t-s">• 近线估算 128 维 MinHash 汉明重合率</text>
+  <text x="52" y="436" class="t-s">• 低于阈值 s 的噪声边直接丢弃</text>
+  <text x="52" y="456" class="t-s">• 高价值语料可选做精确 Jaccard 复验</text>
+  <text x="52" y="498" class="t-m" fill="#b45309">输出：高置信度稀疏无向边集 E'</text>
+
+  <path d="M 328 425 L 368 425" class="flow-p" marker-end="url(#arr-p)"/>
+
+  <!-- Stage 5 -->
+  <rect x="372" y="330" width="320" height="190" class="box-purple"/>
+  <text x="386" y="352" class="t-tag-p">STAGE 5 · Alternating WCC Engine</text>
+  <text x="386" y="372" class="t-h">5. 分布式大星-小星 WCC 收敛</text>
+  <text x="386" y="396" class="t-s">• Large-Star：高位邻居向全局 min 坍缩</text>
+  <text x="386" y="416" class="t-s">• Small-Star：低位邻居对齐，打断长链</text>
+  <text x="386" y="436" class="t-s">• 超级节点虚拟加盐（deg &gt; 50k 切分规约）</text>
+  <text x="386" y="456" class="t-s">• 加权装箱调度 + 75% 水位 NVMe Spill</text>
+  <text x="386" y="498" class="t-m" fill="#6d28d9">输出：全局连通分量 (doc_id → cluster_id)</text>
+
+  <path d="M 692 425 L 732 425" class="flow-g" marker-end="url(#arr-g)"/>
+
+  <!-- Stage 6 -->
+  <rect x="736" y="330" width="306" height="190" class="box-green"/>
+  <text x="750" y="352" class="t-tag-g">STAGE 6 · Survival &amp; Lineage</text>
+  <text x="750" y="372" class="t-h">6. 聚类裁决与血缘审计</text>
+  <text x="750" y="396" class="t-s">• 多维打分选留：质量分 + 长度 + 时效 - 毒性</text>
+  <text x="750" y="416" class="t-s">• 记录 cluster_size 支持 Rehydration 回补</text>
+  <text x="750" y="436" class="t-s">• 落盘血缘映射表支撑 Unlearning 合规</text>
+  <text x="750" y="456" class="t-s">• 监控：桶倾斜度 / 压缩比 / Delta Edges</text>
+  <text x="750" y="498" class="t-m" fill="#047857">产出：干净主语料表 + Lineage 审计表</text>
+</svg>

@@ -154,6 +154,52 @@ Ray Core 的立身之本在于把“固定阶段 DAG”拆成了“无状态细�
 - **Ray Data 更像“面向训练与推理集群的流式数据管道”**：如果你的核心链路是 `读取样本 → 轻度预处理 → 喂给 Ray Train 做多机多卡训练`，或者跑大规模 **vLLM / SGLang 离线批量 LLM 推理**（需要成熟的 TP/PP 放置组、动态 LoRA、Continuous Batching 多批重叠与 Ray Serve 复用），Ray Data 与 Ray 全家桶的无缝耦合能省去大量胶水代码。
 - **Daft 更像“长在 Ray 底座上的原生多模态查询引擎”**：一旦流水线里同时混杂了**海量云端小文件/WARC/Parquet 高速并发读取 + 图像解码/MinHash 去重/BPE 分词 + 多表 Join/Window/SQL 清洗 + 异步 API 或多模态 GPU 打标 + 断点续跑写回 Iceberg/Lance**，Daft 的 Rust Swordfish 核、Flotilla 调度、Arrow Flight Shuffle 和完整查询优化器会带来数量级的吞吐与内存稳定性优势——而且开发者在笔记本单机（Native Swordfish）与千核集群（Flotilla on Ray）上运行的是完全一致的 Rust 执行引擎，本地调通即可无痛上集群。
 
+### 3.4 控制面扩展墙：Ray Driver/GCS 与 Spark Driver 的同构瓶颈、工程取舍与业界解法
+
+把规模继续拉大到千级节点、十万级分块并发时，无论 Ray 还是 Spark 都会撞上一条共通的分布式铁律：**数据面容易水平扩展，但只要控制面存在“单一所有权（Single Owner）”或“全局一致视图（Global State）”，元数据扇入、内存膨胀与单点故障最终一定会先于算力触顶。**
+
+#### 1. Ray 的双重控制面瓶颈：Driver（Owner）与 GCS
+
+Ray 1.0 引入的 **Ownership（所有权）模型**把普通 Task 调度和 `ObjectRef` 追踪从中心化的 GCS 下放给了调用方，看似去中心化，但在真实大作业里反而形成了“Driver 扛高频任务、GCS 扛全局状态”的两道压力墙：
+
+- **Ray Driver（默认 Owner）的四重过载**：绝大多数脚本由单个 Python Driver 循环提交 `.remote()`，导致该进程成了几十万任务与对象的唯一 Owner：
+  1. **小对象内联（Inlining）撑爆堆内存**：Ray 默认把小于 **100 KB** 的返回值直接内联进 Owner（Driver）的堆内存而非分布式 Plasma 对象存储。一旦 Driver 扇出 100 万个各返回 50 KB 字典的任务，**50 GB 数据会直接灌进单机 Driver 触发 OOM**；
+  2. **引用表、血缘与 gRPC 扇出瓶颈**：每个 `ObjectRef` 的位置表与容错 Lineage 都驻留 Driver 内存（如 1.2 节源码所见，Ray Data 每块默认产生 2 个 `ObjectRef`），高频提交毫秒级短任务会迅速打满 Python GIL、CoreWorker gRPC 线程与单机网卡；
+  3. **`ray.get()` 汇聚单点带宽墙**；
+  4. **Fate Sharing 单点故障（SPOF）**：Owner 一旦崩溃或 OOM，其名下所有对象与派生任务连带失效。
+- **Ray GCS（Global Control Service）的三重上限**：运行在 Head Node 上的单进程 C++ 元数据中心，仍掌控着全集群所有全局可见状态：
+  1. **海量 Actor 生命周期风暴**：与普通 Task 不同，**每个 Actor 的创建调度、名字注册/发现（`ray.get_actor`）、死亡通知与 Placement Group 分配全必须串行过 GCS**，数万 Actor 并发启停（RL Rollout / Agent 沙箱）极易拖垮 GCS RPC 队列；
+  2. **千节点级资源视图广播（`O(N²)` 同步压力）**：各节点 `Raylet` 上报心跳与剩余资源、GCS 广播全集群资源视图，在千到万节点规模下极易打满 Head Node CPU 与网络带宽；
+  3. **Task/Job 可观测性事件堆积**：Dashboard 与 State API 汇聚千万级任务事件时若淘汰不及时，会引发 Head Node OOM，导致整套集群控制面失联。
+
+#### 2. Spark 的同构瓶颈：更中心化的 Driver 与 Cluster Manager
+
+Spark 不仅存在高度同构的控制面瓶颈，甚至因为缺乏 Ownership 下放，**单作业 Driver 的中心化程度比 Ray 更高**：
+
+- **Spark Driver（JVM）过载与 Full GC 雪崩**：整条作业哪怕十万级 Task 也全部由单个 JVM Driver 序列化闭包、下发并汇总状态；更致命的是 **`MapOutputTrackerMaster`** 在超大 Shuffle（例如 `10,000 Map × 10,000 Reduce`）中需要汇聚并广播 `M × R` 规模的 `MapStatus` 位置矩阵，极易撑爆 Driver 堆引发长达数十秒的 **Full GC Stop-the-World**，连带触发 Executor 心跳超时失联。此外，`collect()` / `toPandas()` 与估算失真的 Broadcast Join 同样是高频 Driver OOM 诱因；经典 Py4J 模式下用户 Python 脚本更直接与 Driver 共享宿主机内存。
+- **Cluster Manager（类 GCS 角色）的集群上限**：在 Spark on YARN 中，**ResourceManager（RM）** 承担全局心跳与容器装箱，高并发短作业下易出现分配排队毛刺；在 Spark on K8s 中，**K8s API Server + etcd** 就是集群的 GCS，万级 Executor Pod 瞬时启停会直接把 API Server Watch 队列与 etcd 写入打垮。
+
+#### 3. 核心工程取舍与业界的四条破局路径
+
+面对控制面扩展墙，没有银弹，本质都是在**“全局视图/细粒度容错”**与**“控制面去中心化/低元数据开销”**之间做架构取舍。业界由此分化出四条清晰的解法：
+
+| 破局思路 | 代表体系与核心机制 | 解决的核心瓶颈 | 付出的工程取舍（Trade-off） |
+| :--- | :--- | :--- | :--- |
+| **1. 控制面粒度粗化（节点级常驻内核架空底座）** | **Daft Flotilla**：每节点仅启 **1 个** `RaySwordfishActor`（压平 GCS Actor 数）；Worker 侧合并到 **64 MiB** 再上报 `ObjectRef`；Arrow Flight Shuffle 把 `O(M×N)` 矩阵折叠为 **`O(M)` 节点映射** | 同时给 Ray Driver（引用表/RPC）与 GCS（Actor/调度风暴）大幅减负，保留 Rust 层全局深度优先背压 | 放弃了 Ray Core 单 Task 粒度的细粒度弹性抢占与血缘重算，需额外自研 **Key 级 S3 Checkpoint** 补齐长作业容错 |
+| **2. 层级所有权下放（Hierarchical Ownership）** | **Ray 生态最佳实践**：Driver 只拉起几十个顶层调度 Actor，将子任务提交与对象所有权分散到多层子 Actor，辅以 `ray.wait()` 限流；GCS 侧引入增量资源同步、广播节流、多线程化与多集群联邦 | 打破单进程 Driver 的内存内联与提交扇出上限，避免单集群突破千节点 GCS 同步红线 | 丧失了单点全局视图，跨多层 Actor 协同做全局内存背压与大规模 Shuffle 的复杂度陡增 |
+| **3. 用户代码与重元数据外置卸载** | **Spark 现代栈**：**Spark Connect**（gRPC+Protobuf）剥离用户 Python 出 Driver；**AQE** 动态合并小分区压缩 `M×R`；**Apache Celeborn / Uniffle（RSS）** 将 Shuffle 元数据彻底移出 Driver；K8s 侧引入 **Volcano / YuniKorn** 与 Pod 池复用 | 根治用户脚本拖垮共享 Driver、Shuffle 元数据引发 Driver Full GC 与 K8s API Server 过载 | 平台组件链路变长，新增独立 RSS 集群与批调度插件的运维成本及跨跳网络开销 |
+| **4. 无状态多前端水平切分（MPP 范式）** | **StarRocks 等 OLAP 引擎**：多 **FE（Follower/Observer）** 水平分担高并发短查询解析规划，**BE** 节点内用 C++ Pipeline 协作式用户态微调度 | 消除单点控制面 QPS 上限，支撑千级并发亚秒点查 | 放弃长耗时批处理的中间落盘与 Task 级局部重算，单节点故障直接整条查询秒级重试 |
+
+回到本文主线就能恍然大悟：**Daft 之所以能从 Ray 生态里突围，不只是因为 Rust 比 Python 快，更是因为 Flotilla 用“每节点单 Actor + 64 MiB 块聚合 + `O(M)` Flight 元数据折叠”精准绕开了 Ray Driver 与 GCS 的控制面扩展墙**——这与 Spark 生态演化出 `Spark Connect + Celeborn` 的底层逻辑殊途同归，都是把最沉重的细粒度元数据与执行状态从脆弱的单点控制面剥离出去。
+
+#### 4. Daft 究竟解决到什么程度？还剩哪三道硬边界？
+
+不过必须客观区分：**Daft 绕开了 Ray 90% 的数据面调度痛点，但只要它仍运行在 Ray 底座上，就并未从物理根源消灭全部控制面天花板**：
+
+1. **Flotilla 自身仍是单例 Rust 头调度器**：虽然 `RemoteFlotillaRunner` 基于 Rust + Tokio 实现，吞吐与内存紧凑度甩开 Ray Data 单线程 Python 控制面 1–2 个数量级，但它本质上依然是一个单例 Head Actor。在极端多租户高并发短查询场景下仍受单点控制面限制，且 Head Node 宕机当前查询会中断（依赖自研 S3 **Key 级 Checkpoint** 断点续跑兜底）。
+2. **底层仍受限于 Ray GCS 的物理节点数上限**：只要 Flotilla 还依赖 Ray 做集群底座（定期通过 Ray 发现节点与资源），当底层集群本身膨胀到 5,000–10,000 台物理节点时，Raylet 心跳与 GCS 节点维护天花板依然属于 Ray 自身（除非未来演进出完全脱离 Ray、直连 Kubernetes 的原生 Flotilla 调度层）。
+3. **有状态 GPU 模型池仍需注册为 Ray Actor**：运行 `@daft.cls` 或 `VLLMProject` 时仍会经由 GCS 注册 GPU Actor——不过其数量受限于物理 GPU 卡数（百到千级），远小于按数据分块爆炸的 Task 量级。
+
 ---
 
 ## 四、演进脉络与生态全景：从 Ray → Daft 看 AI 数据栈的四代演化
@@ -184,6 +230,28 @@ Ray Core 的立身之本在于把“固定阶段 DAG”拆成了“无状态细�
   - **一体化云湖仓派（Databricks / Snowflake / BigQuery）**：服务看重统一安全、血缘审计与低运维门槛的企业客户。**Databricks** 通过 Spark + Photon 原生向量化 + Unity Catalog + **Databricks AI Runtime（AIR，支持 Serverless GPU、NeMo 与 Ray on Spark）** 把 AI 流水线拉回湖仓内部；**Snowflake** 则通过 **Snowflake Cortex AI**（如 `Cortex AI COMPLETE Multimodal`）和 Snowpark Container Services，让业务分析师用一条 SQL 就能直接分析表里的文本、图像与音频。
 
 两条商业路线正在 **Apache Iceberg / Delta Lake / Lance 等开放表格式** 上交汇：企业不再被迫把所有数据锁死在单一引擎的私有存储里，而是同一份湖上数据，交互式报表走 StarRocks/Snowflake，传统数仓 ETL 走 Spark，多模态语料清洗与大模型批推理走 Daft / Ray Data。
+
+### 生态博弈与大厂真实落地：Ray 会因为 Daft 失去用户吗？头部 AI 公司怎么选？
+
+看完 Daft 对 Ray 数据面诸多痛点的降维打击，一个最容易被追问的问题是：**“既然 Daft 解决了 Ray Data 的这么多瓶颈，Ray 会不会因为 Daft 失去用户？大家都在往 Daft 迁移吗？”**
+
+回答这个问题必须先剥离一个常见误区——**千万不要把“Ray”等同于“Ray Data”**：
+
+- **Ray 的真正护城河是“AI 分布式操作系统”底座**：Ray 的核心壁垒在于 **Ray Core + Ray Train + Ray Serve + KubeRay + 强化学习后训练编排（如 veRL / OpenRLHF）**。Daft 根本不与这些层竞争——**Daft 自己就运行在 Ray 底座之上**。
+- **真实发生的迁移路径是 `PySpark / Ray Data → Daft on Ray`**：业界确实有大量 AI 团队正在把重度多模态清洗、去重与湖仓 ETL 从容易 OOM 的 Ray Data（或笨重的 PySpark）迁移至 **Daft on Ray**，但他们**并没有离开 Ray**——而是继续保留 Ray / KubeRay 作为统一异构 GPU 集群底座，上游用 Daft 做多模态加工，下游依然在同一套 Ray 集群上跑 Ray Train / veRL / Ray Serve。因此，**Ray 不仅不会因 Daft 失去底座用户，反而会因 Daft 补齐了多模态 SQL/ETL 短板而更具生态黏性**；真正流失份额的是“拿纯 Ray Data 硬扛复杂多模态 ETL”以及“拿传统 JVM Spark 硬扛图片/视频解码”的存量场景。
+
+把视角投向真实的大厂公开披露（严格基于公开演讲、开源项目与官方技术博客，不臆测未公开的内部闭源栈），可以看到前沿基模实验室与大型互联网/企业平台的清晰分化：
+
+| 公司 / 阵营 | 对 Ray 的公开采用情况 | 对 Daft 的公开采用情况 | 基础设施路线特征 |
+| :--- | :--- | :--- | :--- |
+| **OpenAI** | **早期深度采用并公开背书**（Ray Summit 2022 公开分享在 ChatGPT 时代依托 Ray 编排分布式训练与大规模 RLHF 探索，并参与 Alpa 生态） | **无公开生产案例** | 演进至万卡级前沿模型后，核心预训练与内部编排高度闭源自研 |
+| **Anthropic** | **无公开核心训练采用记录**（外部生态网关 / Ray Serve 广泛兼容 Anthropic API） | **无公开生产案例** | 高度闭源，围绕 AWS Trainium / Google TPU / NVIDIA GPU 自研定制编排 |
+| **DeepSeek** | **未作为核心训练底座** | **无公开生产案例** | 极致贴近裸金属硬件的 C++/CUDA/PTX 全自研路线（开源了 3FS 分布式文件系统、DualPipe、DeepEP、FlashMLA 等底层基础设施） |
+| **字节跳动（ByteDance）** | **重度深度采用**：开源顶流 LLM 后训练框架 **`veRL`** 基于 Ray 混合控制面构建；公开过用 **Ray + KubeRay** 跑 200 TB 级多模态 LLM 离线推理 | **公开评估与生产实践**：分享过在百万级图像分类与大规模多模态流水线上对比并应用 **Daft on Ray** | 典型的“统一 Ray / KubeRay 异构底座 + 多引擎混用（Ray Data / Daft / veRL）”大厂范式 |
+| **Amazon / Essential AI / Together AI / CloudKitchens** | 多数同样依托 Ray / Kubernetes 集群底座运行 | **官方公开的生产标杆用户**（Eventual 披露用于 PB 级多模态清洗、基础模型训练语料构建与非结构化 ETL） | 开放云湖仓（S3 + Iceberg / Delta / Lance）上的 AI-Native 多模态栈 |
+| **Uber / Pinterest / 蚂蚁集团 / Shopify** | **超大规模企业级 Ray 标杆**（统一异构调度、推荐特征、大规模 RL 与在线推理） | 处于评估或局部多模态管线试点阶段 | 存量大数据（Spark / Flink）与 AI（Ray）双轨并存的平台级架构 |
+
+总体来看，**DeepSeek、Anthropic 与如今的 OpenAI** 这类超一线前沿实验室为了压榨万卡集群最后 5% 的硬件利用率（MFU），普遍选择绕过通用高层框架走裸金属全栈自研；而绝大多数头部互联网公司、AI 独角兽与企业级团队，则正在快速收敛到 **“KubeRay / Ray 统一异构底座 + Daft 承接重度多模态 ETL 与湖仓处理 + veRL / vLLM 承接后训练与推理”** 这套高性价比开源组合。
 
 ---
 

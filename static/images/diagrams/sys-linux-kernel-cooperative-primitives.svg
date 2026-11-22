@@ -1,0 +1,146 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 560" width="1080" height="560" role="img" lang="zh-CN" aria-labelledby="title desc">
+  <title id="title">现代 Linux 内核与用户态协同高性能原语全景图</title>
+  <desc id="desc">展示从 rseq、membarrier、vDSO、io_uring、AF_XDP、userfaultfd、HugePages 到 sched_ext 与 PMU/LBR 的用户态与内核态协作边界，说明它们如何绕过传统系统调用、原子锁与内存拷贝税。</desc>
+  <defs>
+    <style>
+      .bg { fill: #f8fafc; }
+      .zone-u { fill: #ffffff; stroke: #2563eb; stroke-width: 1.5; rx: 10; }
+      .zone-k { fill: #ffffff; stroke: #059669; stroke-width: 1.5; rx: 10; }
+      .boundary { stroke: #94a3b8; stroke-width: 1.6; stroke-dasharray: 6 4; }
+      .p-title-u { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #1d4ed8; }
+      .p-title-k { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; font-size: 14px; font-weight: 700; fill: #047857; }
+      .p-sub { font-family: "JetBrains Mono", Menlo, monospace; font-size: 11px; fill: #475569; }
+      .card-sync { fill: #eff6ff; stroke: #2563eb; stroke-width: 1.4; rx: 8; }
+      .card-io { fill: #ecfdf5; stroke: #059669; stroke-width: 1.4; rx: 8; }
+      .card-mem { fill: #fffbeb; stroke: #d97706; stroke-width: 1.4; rx: 8; }
+      .card-sched { fill: #f5f3ff; stroke: #7c3aed; stroke-width: 1.4; rx: 8; }
+      .t-h { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 12.5px; font-weight: 700; fill: #0f172a; }
+      .t-s { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", sans-serif; font-size: 10.5px; fill: #334155; }
+      .t-m { font-family: "JetBrains Mono", Menlo, monospace; font-size: 10px; font-weight: 600; fill: #0f172a; }
+      .link-down { stroke: #475569; stroke-width: 1.6; fill: none; }
+      .link-up { stroke: #059669; stroke-width: 1.6; stroke-dasharray: 4 3; fill: none; }
+      .pill { fill: #f1f5f9; stroke: #cbd5e1; stroke-width: 1.2; rx: 6; }
+    </style>
+    <marker id="arr-dark" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569"/>
+    </marker>
+    <marker id="arr-green" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1 L 10 5 L 0 9 z" fill="#059669"/>
+    </marker>
+  </defs>
+
+  <rect width="1080" height="560" class="bg"/>
+
+  <!-- User Space Zone -->
+  <rect x="20" y="16" width="1040" height="236" class="zone-u"/>
+  <text x="40" y="42" class="p-title-u">用户态热路径（User Space Fast Path）：零系统调用、无锁/无屏障、零拷贝直访</text>
+  <text x="1040" y="42" text-anchor="end" class="p-sub">数据库 / Allocator / 异步运行时（tcmalloc · RocksDB · Seastar · Go/JVM）</text>
+
+  <!-- Column 1: Sync & Concurrency -->
+  <rect x="38" y="60" width="236" height="172" class="card-sync"/>
+  <text x="52" y="82" class="t-h">1. 并发同步与零屏障</text>
+  <text x="52" y="102" class="t-m" fill="#1d4ed8">rseq (4.18+) · membarrier (4.3+)</text>
+  <text x="52" y="124" class="t-s">• rseq: Per-CPU 普通 mov 提交</text>
+  <text x="52" y="142" class="t-s">  消除 LOCK CMPXCHG 原子税</text>
+  <text x="52" y="162" class="t-s">• membarrier: 读路径去掉 mfence</text>
+  <text x="52" y="180" class="t-s">  成本转移给极低频写端</text>
+  <text x="52" y="200" class="t-s">• vDSO: clock_gettime ~10ns</text>
+  <text x="52" y="218" class="t-s">• futex_waitv: 无竞争 0 syscall</text>
+
+  <!-- Column 2: Async I/O & Network -->
+  <rect x="294" y="60" width="236" height="172" class="card-io"/>
+  <text x="308" y="82" class="t-h">2. 异步 I/O 与网卡旁路</text>
+  <text x="308" y="102" class="t-m" fill="#047857">io_uring (5.1+) · AF_XDP (4.18+)</text>
+  <text x="308" y="124" class="t-s">• SQ/CQ 共享双环批量收发 I/O</text>
+  <text x="308" y="142" class="t-s">• SQPOLL 模式下热路径 0 syscall</text>
+  <text x="308" y="162" class="t-s">• Fixed Buffers 省去锁页与 fd 计数</text>
+  <text x="308" y="180" class="t-s">• AF_XDP: 共享 UMEM 直收网卡包</text>
+  <text x="308" y="200" class="t-s">• MSG_ZEROCOPY / SEND_ZC</text>
+  <text x="308" y="218" class="t-s">  消除内核与用户态 memcpy</text>
+
+  <!-- Column 3: Virtual Memory -->
+  <rect x="550" y="60" width="236" height="172" class="card-mem"/>
+  <text x="564" y="82" class="t-h">3. 虚拟内存与缺页接管</text>
+  <text x="564" y="102" class="t-m" fill="#b45309">userfaultfd · madvise · HugePages</text>
+  <text x="564" y="124" class="t-s">• userfaultfd: 缺页由用户态线程</text>
+  <text x="564" y="142" class="t-s">  从远端/S3/压缩池透明按需拉取</text>
+  <text x="564" y="162" class="t-s">• MADV_DONTNEED / MADV_FREE</text>
+  <text x="564" y="180" class="t-s">  还物理页保虚址，避 mmap_lock</text>
+  <text x="564" y="200" class="t-s">• 2MB/1GB HugePages: dTLB</text>
+  <text x="564" y="218" class="t-s">  覆盖范围扩大 512 倍</text>
+
+  <!-- Column 4: Scheduling & Profiling -->
+  <rect x="806" y="60" width="236" height="172" class="card-sched"/>
+  <text x="820" y="82" class="t-h">4. 可编程调度与硬件剖析</text>
+  <text x="820" y="102" class="t-m" fill="#6d28d9">sched_ext (6.12+) · PMU / LBR</text>
+  <text x="820" y="124" class="t-s">• sched_ext: eBPF 热插拔自定义</text>
+  <text x="820" y="142" class="t-s">  CPU 调度器，保尾延迟与亲和性</text>
+  <text x="820" y="162" class="t-s">• XDP: sk_buff 分配前线速过滤</text>
+  <text x="820" y="180" class="t-s">• perf_event_open 读 PMU 硬件计数</text>
+  <text x="820" y="200" class="t-s">• LBR 精确分支栈驱动 AutoFDO /</text>
+  <text x="820" y="218" class="t-s">  LLVM BOLT 二进制布局重排</text>
+
+  <!-- Boundary Line -->
+  <line x1="20" y1="274" x2="1060" y2="274" class="boundary"/>
+  <rect x="330" y="261" width="420" height="26" class="pill"/>
+  <text x="540" y="278" text-anchor="middle" class="t-m" fill="#334155">共享内存契约（TLS / Ring Buffer / VMA / eBPF Map）取代逐次 Syscall</text>
+
+  <!-- Kernel Space Zone -->
+  <rect x="20" y="296" width="1040" height="196" class="zone-k"/>
+  <text x="40" y="322" class="p-title-k">内核态慢路径兜底与硬件接管（Linux Kernel Slow Path &amp; Hardware Control）</text>
+  <text x="1040" y="322" text-anchor="end" class="p-sub">仅在抢占、缺页、极端竞争或策略切换时介入</text>
+
+  <!-- Kernel Box 1 -->
+  <rect x="38" y="340" width="236" height="134" class="card-sync"/>
+  <text x="52" y="362" class="t-h">调度拦截与核间中断</text>
+  <text x="52" y="384" class="t-s">• rseq: 抢占/信号返回前检查 RIP</text>
+  <text x="52" y="402" class="t-s">  落入临界区则改 regs-&gt;ip = abort</text>
+  <text x="52" y="422" class="t-s">• membarrier: 向活跃核发 IPI</text>
+  <text x="52" y="440" class="t-s">  隐式触发全局内存屏障</text>
+  <text x="52" y="458" class="t-s">• vDSO: 映射只读时钟/拓扑页</text>
+
+  <!-- Kernel Box 2 -->
+  <rect x="294" y="340" width="236" height="134" class="card-io"/>
+  <text x="308" y="362" class="t-h">轮询线程与 DMA 直通</text>
+  <text x="308" y="384" class="t-s">• 内核 SQPOLL 线程自动拉取 SQE</text>
+  <text x="308" y="402" class="t-s">  并异步下发 NVMe / Socket 队列</text>
+  <text x="308" y="422" class="t-s">• 网卡驱动 XDP Hook 直接将帧</text>
+  <text x="308" y="440" class="t-s">  DMA 到用户态预注册 UMEM</text>
+  <text x="308" y="458" class="t-s">• 保留标准协议栈共存运维能力</text>
+
+  <!-- Kernel Box 3 -->
+  <rect x="550" y="340" width="236" height="134" class="card-mem"/>
+  <text x="564" y="362" class="t-h">页表管理与缺页转发</text>
+  <text x="564" y="384" class="t-s">• Page Fault 挂起触发线程并将</text>
+  <text x="564" y="402" class="t-s">  缺失虚址投递给 UFFD 队列</text>
+  <text x="564" y="422" class="t-s">• UFFDIO_COPY 原位装页并唤醒</text>
+  <text x="564" y="440" class="t-s">• 减少 munmap 与跨核 TLB</text>
+  <text x="564" y="458" class="t-s">  Shootdown 风暴</text>
+
+  <!-- Kernel Box 4 -->
+  <rect x="806" y="340" width="236" height="134" class="card-sched"/>
+  <text x="820" y="362" class="t-h">BPF 校验器与硬件 PMU</text>
+  <text x="820" y="384" class="t-s">• eBPF Verifier 保证内核安全执行</text>
+  <text x="820" y="402" class="t-s">  挂接 struct_ops 调度回调</text>
+  <text x="820" y="422" class="t-s">• 配置 CPU 硬件 PMU / PEBS 寄存器</text>
+  <text x="820" y="440" class="t-s">  精确采样 IPC / LLC / dTLB Miss</text>
+  <text x="820" y="458" class="t-s">• 零业务侵入输出生产热点画像</text>
+
+  <!-- Vertical Connectors -->
+  <line x1="136" y1="232" x2="136" y2="338" class="link-down" marker-end="url(#arr-dark)"/>
+  <line x1="176" y1="340" x2="176" y2="234" class="link-up" marker-end="url(#arr-green)"/>
+
+  <line x1="392" y1="232" x2="392" y2="338" class="link-down" marker-end="url(#arr-dark)"/>
+  <line x1="432" y1="340" x2="432" y2="234" class="link-up" marker-end="url(#arr-green)"/>
+
+  <line x1="648" y1="232" x2="648" y2="338" class="link-down" marker-end="url(#arr-dark)"/>
+  <line x1="688" y1="340" x2="688" y2="234" class="link-up" marker-end="url(#arr-green)"/>
+
+  <line x1="904" y1="232" x2="904" y2="338" class="link-down" marker-end="url(#arr-dark)"/>
+  <line x1="944" y1="340" x2="944" y2="234" class="link-up" marker-end="url(#arr-green)"/>
+
+  <!-- Bottom Takeaway Bar -->
+  <rect x="20" y="506" width="1040" height="38" class="pill"/>
+  <text x="540" y="529" text-anchor="middle" class="t-h" fill="#0f172a">共同设计哲学：热路径留在用户态跑裸金属速度，内核退居幕后只在抢占、IPI、缺页或异常竞争的慢路径上兜底</text>
+</svg>
