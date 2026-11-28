@@ -1,0 +1,29 @@
+- question: 一条 SQL 怎样从计划变成执行？
+  guide: 从 StarRocks 看优化器怎样为同一句 SQL 枚举计划，再用 Calcite 弄清排序和分区要求如何改变选择。最后跟着 Hash Join 的建表和探测过程，看选中的计划怎样处理一行数据。
+  articles:
+    - title: StarRocks 优化器
+      path: posts/2026-09-01-dive-starrocks-optimizer.md
+    - title: Calcite 的代价与物理属性
+      path: posts/2026-09-02-dive-calcite-cost-and-traits.md
+    - title: Hash Join 的执行过程
+      path: posts/2026-08-26-dive-hash-join.md
+- question: 一张图片经过分布式计算，哪些字节真的搬动了？
+  guide: 先看 BlobRef 里存了什么、哪个算子才需要读原图，再跟踪一个 Ray 对象从创建到被另一个任务读取的过程。读到 Shuffle 时就能接着问，跨节点传的是引用还是内容，接收端又要为哪些字节付账。
+  articles:
+    - title: 对象表与 BlobRef
+      path: posts/2026-11-22-object-table-and-blobref-in-llm-era.md
+    - title: Ray 对象的生命周期
+      path: posts/2026-11-10-ray-object-as-currency-source-notes.md
+    - title: 大规模 Shuffle
+      path: posts/2026-11-22-large-scale-shuffle-stability-and-performance.md
+- question: 想读点技术之外的东西？
+  guide: 喜欢城市与艺术，可以从伊比利亚的街道和画作读起。想看西夏、黄河与沙漠，可以翻开银川纪行。再往前翻，还有两篇写于 2014 年初的旧文，记下了前一年读的书和生活里的小事。
+  articles:
+    - title: 伊比利亚游记
+      path: posts/2026-10-01-iberian-streets-stones-and-paintings.md
+    - title: 银川纪行
+      path: posts/2026-09-01-journey-through-yinchuan.md
+    - title: 2013 年读书回顾
+      path: posts/2014-01-05-2013-reading-retrospective.md
+    - title: 2013 年生活回顾
+      path: posts/2014-01-06-2013-life-retrospective.md

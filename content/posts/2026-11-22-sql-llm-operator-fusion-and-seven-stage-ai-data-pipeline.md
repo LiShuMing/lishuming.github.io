@@ -4,7 +4,7 @@ slug: "sql-llm-fused-engine-architecture"
 aliases:
   - "/2026/11/22/sql-llm-operator-fusion-and-seven-stage-ai-data-pipeline/"
 date: 2026-11-22T12:20:00+08:00
-lastmod: 2026-11-22T15:42:00+08:00
+lastmod: 2026-11-28
 categories:
   - AI 基础设施
   - 数据库
@@ -112,7 +112,7 @@ curated AS (
 INSERT INTO lakehouse.curated_knowledge_base
 SELECT
   doc_id, tenant_id, clean_text, emb,
-  -- 同一文档上的语义过滤与多字段抽取，交由优化器自动融合并级联代理模型
+  -- 同一文档上的过滤与抽取可评估融合方案，质量与代价见第 3 节
   AI_EXTRACT(
     clean_text,
     schema => 'STRUCT<summary STRING, risk_level STRING, entities ARRAY<STRING>>',
@@ -124,54 +124,50 @@ WHERE AI_FILTER(clean_text, 'contains actionable compliance or contract obligati
 
 ---
 
-## 三、第二块拼图：成本相差五个数量级，优化器如何自动排兵布阵？
+## 三、合同清洗管线里，哪些步骤可以换序？ {#三第二块拼图成本相差五个数量级优化器如何自动排兵布阵}
 
-逻辑计划透明之后，马上就会撞上第二个关键问题：在传统 OLAP 查询里，一次哈希探针和一次字符串正则最多相差几十倍开销；可是在上面这棵计划树里，标量过滤是微秒级，词面去重是百微秒级，而调用一次 70B 大模型是百毫秒乃至秒级，算力与美元账单横跨 **4–5 个数量级**。
+同一份合同先查文件大小，再查更新时间，调换这两步仍会留下相同的文件。脱敏和去重就不同了。假设两份合同只有签字人的姓名不同，脱敏把两个姓名都换成同一个占位符。按全文精确去重，先脱敏会把两份合同合成一份，先去重则会留下两份。业务要求在脱敏文本上判重，这个先后关系就已经写进了查询语义。优化器可以在其余合法的顺序里比较成本。
 
-如果继续靠工程师靠经验手调执行顺序，哪怕换个数据集分布或者换个模型价格，最优漏斗顺序就会失效。过去两年 SIGMOD / VLDB / CIDR 的一批前沿工作（**LOTUS、Palimpzest/Abacus、DocETL、SOLO**），给出的共同解法是把经典 Cascades 优化器的三件套——**代价模型、逻辑改写规则、物理属性与强制器（Property & Enforcer）**——系统性地拓展到语义计算领域。
+### 3.1 算一次过滤顺序的账 {#31-从三维帕累托代价里长出漏斗顺序}
 
-### 3.1 从三维帕累托代价里“长出”漏斗顺序
+假设有 100 份合同，大小检查 A 每份花 1 个成本单位，99 份通过。日期检查 B 每份花 5 个单位，10 份通过。两项检查只读同一份元数据，结果确定，逐份执行，成本固定。这组数字用来手算两种顺序。
 
-传统 CBO 只需要最小化执行时间，但包含 LLM 的查询天然存在三个相互拉扯的目标：**算力与 Token 费用（美元成本）、端到端延迟、以及语义输出质量（Precision / Recall）**。MIT 的 **Palimpzest / Abacus** 把这三者放入帕累托前沿搜索，为每个算子标定单位代价 \(C_i\) 与预估过滤选择率 \(S_i\)。
+| 执行顺序 | 第一遍检查 | 第二遍检查 | 总成本 |
+| --- | ---: | ---: | ---: |
+| A → B | 100 × 1 | 99 × 5 | 595 |
+| B → A | 100 × 5 | 10 × 1 | 510 |
 
-一旦代价模型落地，根本不需要人为写死“先过滤元数据 → 再脱敏 → 再词面去重 → 再向量聚类 → 最后调大模型”的固定步骤。优化器只需套用经典的谓词排秩法则：
+B 每查一份贵五倍，却能让 90 份合同跳过 A。把账摊回每份输入，两个顺序分别花 5.95 和 5.10 个单位。记每次检查的成本为 \(C_i\)，在这批输入上的通过率为 \(S_i\)。A 排在前面更省或持平的条件是
 
 \[
-\text{Rank}_i = \frac{C_i}{1 - S_i}
+C_A + S_A C_B \le C_B + S_B C_A
+\quad\Longleftrightarrow\quad
+C_A(1-S_B) \le C_B(1-S_A).
 \]
 
-单行代价相差数万倍的算子就会被**自动重排成一条严格单调的漏斗**——微秒级标量过滤与廉价词面去重永远冲在最前面吃掉绝大部分冗余与脏数据，昂贵的旗舰大模型永远只接触最后提纯下来的高价值行。这套顺序不再是人肉编排的业务约定，而是代价模型自动推导出的数学必然。
+两者都能淘汰一部分输入时，可以按 \(C_i/(1-S_i)\) 从小到大排。这个量是平均淘汰一行要付的检查成本。若一项检查让所有行通过，它排在前面就省不掉后续工作。比较这两个相邻过滤器，只需知道它们在**共同输入**上的通过率。前面若再加一道租户过滤，所选租户可能恰好全是近期合同，这时就得在该租户的数据上重估日期检查的通过率。[Hellerstein 与 Stonebraker，Predicate Migration](https://15721.courses.cs.cmu.edu/spring2019/papers/23-optimizer2/hellerstein-sigmod1993.pdf)
 
-### 3.2 三条高杠杆逻辑改写：经典 SQL 优化的语义镜像
+到了模型调用这一步，文档长短、批大小和前缀缓存都会改变单行成本，换模型还可能漏掉条款。Palimpzest 的房源查询里，地址和价格可以从文字里读到。先检查这两项，只有通过的房源才需要调用视觉模型判断房间的采光。作者在样本上收集计划统计量，用运行时间、费用和标注结果上的 F1 比较候选方案。迁移到合同管线，可以用同一批已标注合同估计通过率、记录推理账单，再检查每种方案漏掉了哪些条款。[Palimpzest，CIDR 2025，图 3](https://www.vldb.org/cidrdb/papers/2025/p12-liu.pdf)
 
-在排好执行顺序之外，优化器还能顺着同一张逻辑计划树做三类高收益的等价改写，而且每一条都能在经典数据库优化里找到精准的镜像：
+### 3.2 换一种模型执行计划，怎样检查质量？ {#32-三条高杠杆逻辑改写经典-sql-优化的语义镜像}
 
-1. **多任务算子融合（`Prompt Coalescing`，对应传统 Projection Merging）**
-   回头看前面 SQL 的最后几行：同一篇 `clean_text` 先经过 `AI_FILTER`，紧接着又进了 `AI_EXTRACT`。如果不做融合，一篇 10K Token 的合同会被送进推理引擎做两次重复 Prefill。优化器检测到相邻语义算子共享同一输入列且无数据依赖时，自动把它们合并为单次结构化输出调用，Prefill 算力直接砍半。
-2. **代理模型级联下推（`Proxy Cascade`，对应传统 Join Runtime Bloom Filter）**
-   传统 OLAP 引擎会在昂贵的 Hash Join 前自动下推轻量 Bloom Filter 挡掉 90% 无效探针；在 **LOTUS** 与 **Palimpzest** 的范式里，语义 CBO 对昂贵的 `SemFilter` 和 `SimilarityJoin` 干的是一模一样的事——在前面自动插一层廉价代理（BM25、Embedding 余弦分或 4B 小模型），借助少量校验样本做统计学阈值校准（Importance Sampling / Conformal Calibration），把高置信度通过或拒绝的 80%–90% 样本直接放行或截断，**只把落入置信灰区的 10% 难例路由给旗舰大模型**，同时在统计意义上严格守住用户声明的 `quality_target`。
-3. **长文档分治与稳定算子自蒸馏（DocETL + 代码合成）**
-   遇到动辄上百页的超长文档、单次 Prompt 容易漏检关键条款时，优化器可自动把单个 `SemProject` 改写为 `Split → Map → Resolve/Reduce` 并附带二次反思校验（Gleaning）；反过来，对于每天定时跑的固定版式管线（如标准发票或结构化日志抽取），系统在冷启动积累足够样本后，可将行为高度稳定的 LLM 算子**自动蒸馏为确定性 Python/Regex 或轻量微调小模型**，只在监测到数据分布漂移（Drift）时才回退大模型复核。
+开篇的 SQL 先用 `AI_FILTER` 判断合同里有没有可执行的义务，再用 `AI_EXTRACT` 从通过的合同里抽取字段。一种候选计划是让模型在同一次调用中返回判断和字段。通过的合同可以少读一遍正文，被拒绝的合同却可能多生成一段无用的答案。判断和抽取放进同一个提示词后，输出也可能改变。要比较这两种计划，可以在同一批合同上同时记录输入与输出 token 数、义务条款召回率和字段准确率。
 
-### 3.3 把 `PrefixLocality` 变成 Cascades 的第三个一等物理属性
+另一种做法是保留过滤步骤，先让廉价代理给合同打分。LOTUS 的过滤级联用参考模型的判断校准接受和拒绝阈值，落在两个阈值之间的样本再交给参考模型。代理节省了多少次调用，取决于这批合同的分数分布。阈值控制的是相对于参考模型的精确率和召回率。要知道合同中的真实义务漏了多少，仍需拿人工标注核对。[LOTUS，语义过滤与级联](https://arxiv.org/abs/2407.11418)
 
-前两步省的是“不该调模型的行”和“重复调的次数”，但真正决定 GPU 算力利用率的，还有隐藏在数据顺序里的巨大红利——**KV-Cache 亲和性**。
+如果错误集中在长合同尾部，例如模型读完正文却漏掉附录中的赔偿义务，可以尝试拆分文档、逐段抽取，再合并同一条款的结果。DocETL 将文档分块和任务分解作为候选改写，在样本上比较输出质量。对合同来说，一份条款正文在前一页、例外条件在后一页的样本，恰好可以检验分块是否切断了决定条款含义的上下文。[DocETL，改写规则与计划评估](https://arxiv.org/abs/2410.12189)
 
-熟悉 Calcite 或 StarRocks Cascades 优化器的工程师都知道，传统物理计划搜索靠两个核心物理属性（Physical Property）驱动全局最优：**`Distribution`**（数据分布，对应的 Enforcer 是 `Exchange`）和 **`Ordering`**（排序顺序，对应的 Enforcer 是 `Sort`）。
+### 3.3 让共享前缀的请求在同一个推理节点相遇 {#33-把-prefixlocality-变成-cascades-的第三个一等物理属性}
 
-但在批量跑大模型算子时，GPU 最大的耗时往往不在逐 Token 解码，而在 **Prefill 阶段**。关系表里的行往往天然共享大量相同前缀——相同的 System Prompt、相同的合同模板、相同的知识背景文档，或是同一 KMeans 主题簇的上下文。如果按磁盘原始顺序乱序送进 vLLM 或 SGLang，**RadixAttention / Prefix KV-Cache** 的命中率会跌到接近于零。
+即使每份合同只调一次模型，同一个节点仍可能反复计算相同的提示词前缀。设一批请求都以同一段抽取指令开头，随后拼入不同版本的合同模板和各自的正文。先发送使用同一模板的请求，可以让后来的请求在缓存被逐出前复用更长的前缀。已有工作在 Spark 和 vLLM 上研究了行顺序、行内字段顺序与 KV 缓存复用的关系。[Optimizing LLM Queries in Relational Workloads](https://arxiv.org/abs/2403.05821)
 
-因此，融合优化器完全可以在 Cascades 框架里引入第三个一等物理属性——**`PrefixLocality(prefix_cols)`**，并配上专属 Enforcer：**`PrefixReorder`（基于列基数与属性共现构建的 Radix 重排，如 SOLO 算法）+ `StickyExchange`（按前缀哈希粘性路由）**：
-
-- 物理计划树里的 `AsyncLLMOperator` 向上游子节点声明属性需求 `Requires PrefixLocality(prompt_prefix_cols)`；
-- 优化器像权衡 `Sort` 代价与 `Merge Join` 收益一样，精确对比“CPU 做一次 Radix 重排的耗时”与“Prefill KV-Cache 命中率翻倍省下的 GPU 算力与费用”；只要净收益为正，就自动插入 `PrefixReorder`；
-- 如果上游数据恰好已经按 `cluster_id` 或 `doc_id` 聚簇分布，优化器还能像传统属性满足（Property Satisfaction）那样**零成本直接消除多余重排**。
+沿着这个思路，本文设想在物理计划中增加 `PrefixLocality` 属性。执行器根据最终提示词的共同 token 前缀给请求分组，必要时重排，并把同组请求路由到持有缓存的节点。两份合同即使属于同一主题，也可能从第一个正文 token 就不同。优化器要估计的是实际可复用的前缀长度，并比较省下的预填充时间与排序、跨节点传输和排队的开销。
 
 ---
 
 ## 四、第三块拼图：计划画干净了，怎么喂饱 GPU 又不爆内存？
 
-逻辑代数和语义 CBO 把执行计划压缩到了最优，但真把这套计划拉到几百张 GPU 和 PB 级非结构化文件上跑起来，物理执行层立刻会暴露出新的矛盾：**异步对象存储下载、CPU 密集型文档解码、稠密 GPU 矩阵乘法、以及有状态的 LLM 连续批推理，是四种资源画像截然冲突的负载**。把它们混在同一个线程模型里，轻则 GPU 饥饿空转，重则内存雪崩。
+优化器选出了一个满足质量目标的候选计划，但真把这套计划拉到几百张 GPU 和 PB 级非结构化文件上跑起来，物理执行层立刻会暴露出新的矛盾：**异步对象存储下载、CPU 密集型文档解码、稠密 GPU 矩阵乘法、以及有状态的 LLM 连续批推理，是四种资源画像截然冲突的负载**。把它们混在同一个线程模型里，轻则 GPU 饥饿空转，重则内存雪崩。
 
 ### 4.1 单一 Arrow 零拷贝数据面 + 四类隔离执行池
 
@@ -235,6 +231,5 @@ WHERE AI_FILTER(clean_text, 'contains actionable compliance or contract obligati
 ---
 
 > **参考与调研基线**
-> - **SQL × LLM 语义算子、优化与前缀重排前沿**：Patel et al., *LOTUS: Semantic Operators: A Declarative Model for AI-Based Analytics* (VLDB 2025) · Liu et al., *Palimpzest / Abacus: Optimizing AI-Powered Analytical Queries* (CIDR 2025 / VLDB) · Shankar et al., *DocETL: Agentic Query Rewriting and Evaluation for Complex Document Processing* (VLDB 2025) · *ThalamusDB* (SIGMOD 2024) · DuckDB *FlockMTL* · 关系表 Prefix-Cache 感知重排研究（*SOLO* 等 2025–2026 前沿）。
 > - **工业界云数仓与 AI-Native 栈公开文档（2025–2026）**：Google Cloud BigQuery（`Object Table`/`ObjectRef`、BQML、`VECTOR_SEARCH`/`AI.SEARCH`、`AI.IF`/`AI.GENERATE`）；Snowflake Cortex AISQL（`FILE`、`AI_PARSE_DOCUMENT`、`AI_FILTER`/`AI_JOIN`/`AI_AGG`、Cortex Search、SPCS）；Databricks Mosaic AI（Unity Catalog Volumes、`ai_parse_document`/`ai_mask`/`ai_query`、Photon、Ray on Spark、Mosaic AI Vector Search）；Daft + Lance / Iceberg v3 / Paimon Blob 与 vLLM / SGLang / Mooncake 公开架构文档。
 > - **多模态去重与向量聚类实证**：Meta AI *SemDeDup* & *D4* · Hugging Face *FineWeb / FineWeb-2* 技术报告 · NVIDIA NeMo Curator & RAPIDS cuML / FAISS GPU 官方文档。

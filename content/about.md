@@ -16,9 +16,9 @@ description: "这个博客记录阅读、源码实验和行旅。"
 
 ## 建议阅读路径
 
-- **查询优化与执行（约半天）**：[Dive into StarRocks Optimizer]({{< ref "posts/2026-09-01-dive-starrocks-optimizer.md" >}})、[Dive into Calcite Cost and Traits]({{< ref "posts/2026-09-02-dive-calcite-cost-and-traits.md" >}})、[Dive into Hash Join]({{< ref "posts/2026-08-26-dive-hash-join.md" >}})、[Dynamic Filter 穿越 Outer Join]({{< ref "posts/2026-08-24-dynamic-filter-outer-join.md" >}})
-- **一次行旅**：[伊比利亚游记]({{< ref "posts/2026-10-01-iberian-streets-stones-and-paintings.md" >}})、[银川纪行]({{< ref "posts/2026-09-01-journey-through-yinchuan.md" >}})（现场照片还在补）
-- **更短的入口**：[现代硬件与数据库]({{< ref "posts/2026-11-19-hardware-evolution-and-database-programming-paradigms.md" >}})、[Database 阅读清单]({{< ref "posts/2025-08-09-database-reading-list.md" >}})
+{{< reading-routes >}}
+
+查论文时可以按主题翻[数据库阅读清单]({{< ref "posts/2025-08-09-database-reading-list.md" >}})。想沿着执行细节往下读，还有[动态过滤怎样穿过外连接]({{< ref "posts/2026-08-24-dynamic-filter-outer-join.md" >}})和[现代硬件如何影响数据库设计]({{< ref "posts/2026-11-19-hardware-evolution-and-database-programming-paradigms.md" >}})。
 
 ## 关于本站
 

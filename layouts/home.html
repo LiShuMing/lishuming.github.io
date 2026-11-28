@@ -1,6 +1,18 @@
 {{ define "main" }}
-<ul class="listing">
 {{ $paginator := .Paginate (where .Site.RegularPages "Type" "posts") }}
+{{ if eq $paginator.PageNumber 1 }}
+<section class="reading-routes" aria-labelledby="reading-routes-title">
+  <h2 id="reading-routes-title">从这里读起</h2>
+  <ul>
+    {{ range hugo.Data.reading_routes }}
+      {{ $first := index .articles 0 }}
+      <li><a href="{{ relref $ $first.path }}">{{ .question }}</a></li>
+    {{ end }}
+  </ul>
+  <a href="{{ relref . "/about" }}#建议阅读路径">查看完整阅读路线</a>
+</section>
+{{ end }}
+<ul class="listing">
 {{ $year := "" }}
 {{ range $paginator.Pages }}
   {{ $y := .Date.Format "2006-01" }}

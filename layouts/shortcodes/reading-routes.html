@@ -1,0 +1,5 @@
+{{ range hugo.Data.reading_routes }}
+  <h3>{{ .question }}</h3>
+  <p>{{ .guide }}</p>
+  <p>{{ range $i, $article := .articles }}{{ if $i }} · {{ end }}<a href="{{ relref $.Page $article.path }}">{{ $article.title }}</a>{{ end }}</p>
+{{ end }}
